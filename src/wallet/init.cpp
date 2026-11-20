@@ -21,11 +21,15 @@
 #include <univalue.h>
 #include <util/check.h>
 #include <util/moneystr.h>
+#include <util/readahead.h>
 #include <util/translation.h>
+#include <validationinterface.h>
 #ifdef USE_BDB
 #include <wallet/bdb.h>
 #endif
 #include <wallet/coincontrol.h>
+#include <wallet/display_balance.h>
+#include <wallet/scheduler_stats.h>
 #include <wallet/shadow_pow_claim_recovery_args.h>
 #include <wallet/wallet.h>
 #include <walletinitinterface.h>
@@ -78,6 +82,10 @@ void WalletInit::AddWalletOptions(ArgsManager& argsman) const
 #endif
     argsman.AddArg("-spendzeroconfchange", strprintf("Spend unconfirmed change when sending transactions (default: %u)", DEFAULT_SPEND_ZEROCONF_CHANGE), ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
     argsman.AddArg("-wallet=<path>", "Specify wallet path to load at startup. Can be used multiple times to load multiple wallets. Path is to a directory containing wallet data and log files. If the path is not absolute, it is interpreted relative to <walletdir>. This only loads existing wallets and does not create new ones. For backwards compatibility this also accepts names of existing top-level data files in <walletdir>.", ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::WALLET);
+    argsman.AddArg("-testwalletfullcheckdelay=<seconds>", "Regtest-only: seconds before the background wallet integrity check starts, without waiting for initial block download (default: 60 seconds and out of initial block download)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::WALLET_DEBUG_TEST);
+    argsman.AddArg("-walletreadahead", strprintf("Read the wallet file once, in order, before checking it, so a hard disk is not read in small pieces (default: %u). Skipped when the file is larger than a quarter of the memory.", util::DEFAULT_WALLET_READAHEAD), ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
+    argsman.AddArg("-walletfullcheck", strprintf("Run the full SQLite wallet integrity check before the wallet loads, as in earlier versions. By default start-up runs the quick check and the full check follows in the background, raising a warning if it finds damage (default: %u)", DEFAULT_WALLETFULLCHECK), ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
+    argsman.AddArg("-walletrpcexactbalance", strprintf("Make getwalletinfo, getbalances and getbalance wait for an exact balance when the caller does not pass exact (default: %u). By default they return the last calculated balance at once and say whether it is exact, so that polling never waits on a busy node.", DEFAULT_WALLET_RPC_EXACT_BALANCE), ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
     argsman.AddArg("-walletbroadcast",  strprintf("Make the wallet broadcast transactions (default: %u)", DEFAULT_WALLETBROADCAST), ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
     argsman.AddArg("-walletdir=<dir>", "Specify directory to hold wallets (default: <datadir>/wallets if it exists, otherwise <datadir>)", ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::WALLET);
 #if HAVE_SYSTEM
@@ -106,7 +114,7 @@ void WalletInit::AddWalletOptions(ArgsManager& argsman) const
     argsman.AddArg("-solostaking=<true/false>", strprintf("Stake on an isolated private chain without peers or a public-chain sync estimate (testnet/regtest only on this branch) (default: %u)", node::DEFAULT_SOLO_STAKING), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::WALLET);
     argsman.AddArg("-powmining=<true/false>", "Auto-start one built-in Gold Rush Proof-of-Work miner for every eligible private-key wallet loaded by this process (default: false). An encrypted wallet starts in a waiting state and resumes automatically after a normal (not staking-only) unlock. Each wallet uses the configured thread and per-core CPU limits, needs a spendable legacy fee UTXO, and must already own a payout key unless -qqallowautokeycreation=1 was separately authorized.", ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
     argsman.AddArg("-powminingthreads=<n>", "Worker threads (CPU cores) for the built-in Gold Rush PoW miner (default: 1)", ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
-    argsman.AddArg("-powminingcpu=<n>", "Per-core CPU utilization target (1-100) for the built-in Gold Rush PoW miner (default: 1)", ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
+    argsman.AddArg("-powminingcpu=<n>", "Per-core CPU utilization target (1-100) for the built-in Gold Rush PoW miner (default: 1). The percentage is a long-run average, not a limit at every instant: after a new block each worker may use a full core, with no sleep, for up to 10 seconds of proof search (less at low percentages, and never more than one block spacing of idle time pays for) plus a similar bounded allowance for other mining work, and then settles to the configured duty cycle. With several workers or wallets these short bursts can coincide.", ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
     argsman.AddArg("-powclaimreservestakecoins=<n>", strprintf("Minimum number of mature, stakeable legacy wallet coins protected from Gold Rush PoW claim input selection while staking is enabled (default: %u; set 0 to disable the reserve)", wallet::DEFAULT_POW_CLAIM_RESERVE_STAKE_COINS), ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
     argsman.AddArg("-autoresolvefailedclaims=<mode>", "Seed wallets whose recovery policy is still unset with an explicit Gold Rush PoW claim-recovery choice: automatic (or 1) or pause-and-ask (or 0). Default: no seed and no spending authority. A persisted wallet choice always wins. Automatic mode requires every -autoresolve* limit below and is separate standing consent for fee-paying conflicts that the component engine classifies as conflict-resolvable, including a disclosed legacy QQP2 proof that is invalid on the pinned tip but may validate on a normal descendant. The built-in miner's normal authenticated path instead uses exact relay or same-anchor continuation. Generic transient/local failures and future-origin/future-version proofs remain refused.", ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
     argsman.AddArg("-autoresolvemaxfee=<amt>", strprintf("Maximum fee for one automatic claim resolution in %s; required with -autoresolvefailedclaims=automatic", CURRENCY_UNIT), ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
@@ -262,6 +270,9 @@ void WalletInit::Construct(NodeContext& node) const
         LogPrintf("Wallet disabled!\n");
         return;
     }
+    // The wallet library has no scheduler of its own; the node supplies the
+    // number of validation callbacks still queued for the scheduler summary.
+    SetValidationQueueDepthProvider([] { return GetMainSignals().CallbacksPending(); });
     auto wallet_loader = node.init->makeWalletLoader(*node.chain);
     node.wallet_loader = wallet_loader.get();
     node.chain_clients.emplace_back(std::move(wallet_loader));

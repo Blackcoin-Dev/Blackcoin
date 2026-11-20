@@ -105,7 +105,8 @@ public:
     /** Disconnect core signals from GUI client */
     void unsubscribeFromCoreSignals();
 
-    void join();
+    void beginShutdown();
+    bool shutdownReady();
 
     bool isPrivacyModeActivated() const;
 
@@ -191,6 +192,15 @@ private:
 
 #ifdef Q_OS_MACOS
     CAppNapInhibitor* m_app_nap_inhibitor = nullptr;
+    //! The node is not in POST_INIT (initial sync, disk or reindex work); starts true until the first tip update.
+    bool m_app_nap_sync_work{true};
+    //! A loaded wallet is staking or mining.
+    bool m_app_nap_wallet_work{false};
+    QTimer* m_app_nap_timer = nullptr;
+    /** Begin or end the App Nap activity from the two flags above. */
+    void applyAppNapPolicy();
+    /** Any open wallet with staking enabled or in-process PoW mining requested. Cheap: two atomic flag reads per wallet, no locks. */
+    bool anyWalletStakingOrMining() const;
 #endif
 
     /** Keep track of previous number of blocks, to detect progress */
@@ -339,6 +349,11 @@ public Q_SLOTS:
 
 #ifdef ENABLE_WALLET
     void updateStakingIcon();
+#endif
+#ifdef Q_OS_MACOS
+    /** Re-evaluate whether a staking or mining wallet needs App Nap held off.
+     *  Declared without ENABLE_WALLET: the constructor connects it on every macOS build. */
+    void pollAppNapWalletWork();
 #endif
 
     /** called by a timer to check if ShutdownRequested() has been set **/

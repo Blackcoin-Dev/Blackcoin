@@ -49,12 +49,11 @@ UniValue blockheaderToJSON(const CBlockIndex* tip, const CBlockIndex* blockindex
 void CalculatePercentilesByWeight(CAmount result[NUM_GETBLOCKSTATS_PERCENTILES], std::vector<std::pair<CAmount, int64_t>>& scores, int64_t total_weight);
 
 /**
- * Helper to create UTXO snapshots given a chainstate and a file handle.
+ * Create a UTXO snapshot of the active chainstate, selected under cs_main.
  * @return a UniValue map containing metadata about the snapshot.
  */
 UniValue CreateUTXOSnapshot(
     node::NodeContext& node,
-    Chainstate& chainstate,
     AutoFile& afile,
     const fs::path& path,
     const fs::path& tmppath);

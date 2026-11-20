@@ -50,7 +50,14 @@ DIST_CONTRIB = \
 DIST_SHARE = \
   $(top_srcdir)/share/genbuild.sh \
   $(top_srcdir)/share/examples/blackcoin.conf \
-  $(top_srcdir)/share/rpcauth
+  $(top_srcdir)/share/rpcauth \
+  $(top_srcdir)/share/httpsseed/ca-bundle.pem \
+  $(top_srcdir)/share/httpsseed/generate_header.py \
+  $(top_srcdir)/share/httpsseed/provenance.json \
+  $(top_srcdir)/share/httpsseed/README.md \
+  $(top_srcdir)/share/httpsseed/LICENSE-MPL-2.0.txt \
+  $(top_srcdir)/share/httpsseed/LICENSE-curl.txt \
+  $(top_srcdir)/share/httpsseed/LICENSE-OpenSSL.txt
 
 BIN_CHECKS=$(top_srcdir)/contrib/devtools/symbol-check.py \
            $(top_srcdir)/contrib/devtools/security-check.py \

@@ -294,6 +294,14 @@ public:
     bool HaveCoinInCache(const COutPoint &outpoint) const;
 
     /**
+     * Read a coin without changing this cache: the cached entry when there is
+     * one, otherwise whatever the backing view returns, which is not kept.
+     * For bulk read-only lookups (wallet display accounting) that must not
+     * grow the chainstate cache. Same result as GetCoin().
+     */
+    bool PeekCoin(const COutPoint &outpoint, Coin &coin) const;
+
+    /**
      * Return a reference to Coin in the cache, or coinEmpty if not found. This is
      * more efficient than GetCoin.
      *

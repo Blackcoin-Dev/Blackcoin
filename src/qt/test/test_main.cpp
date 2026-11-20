@@ -12,6 +12,8 @@
 #include <qt/test/apptests.h>
 #include <qt/test/chainstaterebuildassistanttests.h>
 #include <qt/test/optiontests.h>
+#include <qt/test/presentationefficiencytests.h>
+#include <qt/test/uiworkertests.h>
 #include <qt/test/rpcnestedtests.h>
 #include <qt/test/shadowresourcedialogtests.h>
 #include <qt/test/uritests.h>
@@ -22,12 +24,17 @@
 #include <qt/test/addressbooktests.h>
 #include <qt/test/themetests.h>
 #include <qt/test/wallettests.h>
+#include <qt/test/uirenderingtests.h>
 #endif // ENABLE_WALLET
 
 #include <QApplication>
 #include <QDebug>
+#include <QSettings>
+#include <QTemporaryDir>
 #include <QObject>
 #include <QTest>
+#include <cstring>
+#include <QStringList>
 
 #include <functional>
 
@@ -52,6 +59,17 @@ const std::function<void(const std::string&)> G_TEST_LOG_FUN{};
 const std::function<std::vector<const char*>()> G_TEST_COMMAND_LINE_ARGUMENTS{};
 
 // This is all you need to run all the tests
+//! Developer filter, unset in CI: BLACKCOIN_QT_TEST_ONLY=<class> runs one class, and BLACKCOIN_QT_TEST_FUNCTION=<slot>
+//! (optionally with :<data row>) narrows it further. Without them every class runs exactly as before.
+static int ExecSelected(QObject* object)
+{
+    const char* only = getenv("BLACKCOIN_QT_TEST_ONLY");
+    if (only && std::strcmp(only, object->metaObject()->className()) != 0) return 0;
+    const char* function = getenv("BLACKCOIN_QT_TEST_FUNCTION");
+    if (only && function) return QTest::qExec(object, QStringList{QStringLiteral("test"), QString::fromUtf8(function)});
+    return QTest::qExec(object);
+}
+
 int main(int argc, char* argv[])
 {
     // Initialize persistent globals with the testing setup state for sanity.
@@ -86,6 +104,12 @@ int main(int argc, char* argv[])
         setenv("QT_QPA_PLATFORM", "minimal", 0 /* overwrite */);
     #endif
 
+    QTemporaryDir isolated_settings;
+    if (!isolated_settings.isValid()) return 2;
+    QSettings::setDefaultFormat(QSettings::IniFormat);
+    QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, isolated_settings.path());
+    QSettings::setPath(QSettings::IniFormat, QSettings::SystemScope, isolated_settings.path());
+
     BitcoinApplication app;
     app.setApplicationName("Blackcoin-Qt-test");
     app.createNode(*init);
@@ -93,32 +117,41 @@ int main(int argc, char* argv[])
     int num_test_failures{0};
 
     AppTests app_tests(app);
-    num_test_failures += QTest::qExec(&app_tests);
+    num_test_failures += ExecSelected(&app_tests);
 
     ChainstateRebuildAssistantTests chainstate_rebuild_assistant_tests;
-    num_test_failures += QTest::qExec(&chainstate_rebuild_assistant_tests);
+    num_test_failures += ExecSelected(&chainstate_rebuild_assistant_tests);
+
+    PresentationEfficiencyTests presentation_efficiency_tests(app.node());
+    num_test_failures += ExecSelected(&presentation_efficiency_tests);
+
+    UiWorkerTests ui_worker_tests;
+    num_test_failures += ExecSelected(&ui_worker_tests);
 
     OptionTests options_tests(app.node());
-    num_test_failures += QTest::qExec(&options_tests);
+    num_test_failures += ExecSelected(&options_tests);
 
     URITests test1;
-    num_test_failures += QTest::qExec(&test1);
+    num_test_failures += ExecSelected(&test1);
 
     RPCNestedTests test3(app.node());
-    num_test_failures += QTest::qExec(&test3);
+    num_test_failures += ExecSelected(&test3);
 
     ShadowResourceDialogTests shadow_resource_dialog_tests;
-    num_test_failures += QTest::qExec(&shadow_resource_dialog_tests);
+    num_test_failures += ExecSelected(&shadow_resource_dialog_tests);
 
 #ifdef ENABLE_WALLET
+    UiRenderingTests ui_rendering_tests;
+    num_test_failures += ExecSelected(&ui_rendering_tests);
+
     WalletTests test5(app.node());
-    num_test_failures += QTest::qExec(&test5);
+    num_test_failures += ExecSelected(&test5);
 
     AddressBookTests test6(app.node());
-    num_test_failures += QTest::qExec(&test6);
+    num_test_failures += ExecSelected(&test6);
 
     ThemeTests theme_tests;
-    num_test_failures += QTest::qExec(&theme_tests);
+    num_test_failures += ExecSelected(&theme_tests);
 #endif
 
     if (num_test_failures) {

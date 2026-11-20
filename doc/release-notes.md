@@ -1,3 +1,20 @@
+30.1.6 Release Notes
+====================
+
+This release makes Gold Rush claims reach the network faster, cuts the wallet
+work done for every block, shortens start-up and crash recovery on large
+wallets and hard disks, and keeps the window responsive with many wallets
+loaded. It also carries the QQ peer discovery, header replay tracking,
+mining-control, block-template and UTXO scan changes. Consensus and storage
+formats are unchanged.
+
+The final source is RC0 with `CLIENT_VERSION_IS_RELEASE=true`. See
+`doc/release-notes/release-notes-30.1.6.md` for the changes, the measured
+results, the new options and RPC fields, the minimum memory and the known
+limitations.
+
+The following sections preserve prior release history.
+
 30.1.5.2 Maintenance Release Notes
 ==================================
 

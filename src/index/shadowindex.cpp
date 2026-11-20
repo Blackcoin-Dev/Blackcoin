@@ -805,7 +805,9 @@ void ShadowIndex::BlockDisconnected(const std::shared_ptr<const CBlock>& block,
     const IndexSummary after = GetSummary();
     if (after.synced && after.best_block_height == pindex->pprev->nHeight &&
         after.best_block_hash == pindex->pprev->GetBlockHash()) {
-        m_revision.fetch_add(1, std::memory_order_release);
+        if (before.best_block_hash != after.best_block_hash) {
+            m_revision.fetch_add(1, std::memory_order_release);
+        }
         if (m_event_stream_suppressed) {
             if (IndexMatchesActiveTip(after)) {
                 m_event_stream_suppressed = false;
@@ -959,25 +961,11 @@ bool ShadowIndex::CustomInit(const std::optional<interfaces::BlockKey>& block)
     return true;
 }
 
-bool ShadowIndex::CustomAppend(const interfaces::BlockInfo& block)
+BaseIndex::AppendResult ShadowIndex::CustomAppendWithStatus(const interfaces::BlockInfo& block)
 {
     if (!block.data || (block.height > 0 && !block.prev_hash)) {
-        return error("%s: missing block data at height %d", __func__, block.height);
-    }
-
-    ShadowIndexBlockRecord existing;
-    if (block.height >= SHADOW_REWARD_START_HEIGHT && m_db->ReadBlock(block.hash, existing)) {
-        return existing.height == block.height && existing.block_hash == block.hash;
-    }
-    if (block.height >= SHADOW_REWARD_START_HEIGHT && m_db->Exists(DBBlockKey{block.hash})) {
-        return error("%s: unreadable shadow block record for %s", __func__, block.hash.ToString());
-    }
-
-    QuantumWitnessBlockUndo existing_witness_undo;
-    const bool witness_block_already_indexed = m_db->Read(
-        DBQuantumWitnessBlockKey{block.hash}, existing_witness_undo);
-    if (!witness_block_already_indexed && m_db->Exists(DBQuantumWitnessBlockKey{block.hash})) {
-        return error("%s: unreadable quantum witness block record for %s", __func__, block.hash.ToString());
+        error("%s: missing block data at height %d", __func__, block.height);
+        return AppendResult::FAILED;
     }
 
     const CBlockIndex* pindex{nullptr};
@@ -989,7 +977,22 @@ bool ShadowIndex::CustomAppend(const interfaces::BlockInfo& block)
         pindex = m_chainstate->m_blockman.LookupBlockIndex(block.hash);
         if (!pindex || pindex->nHeight != block.height ||
             pindex->GetBlockHash() != block.hash) {
-            return error("%s: block index mismatch for %s", __func__, block.hash.ToString());
+            error("%s: block index mismatch for %s", __func__, block.hash.ToString());
+            return AppendResult::FAILED;
+        }
+        // Validation callbacks and the background sync reader can lag a reorg.
+        // Authenticate membership together with the mutable chainstate reads;
+        // a skipped block must not acquire an index record or advance its tip.
+        if (!m_chainstate->m_chain.Contains(pindex)) return AppendResult::STALE;
+
+        ShadowIndexBlockRecord existing;
+        if (block.height >= SHADOW_REWARD_START_HEIGHT && m_db->ReadBlock(block.hash, existing)) {
+            return existing.height == block.height && existing.block_hash == block.hash
+                ? AppendResult::APPLIED : AppendResult::FAILED;
+        }
+        if (block.height >= SHADOW_REWARD_START_HEIGHT && m_db->Exists(DBBlockKey{block.hash})) {
+            error("%s: unreadable shadow block record for %s", __func__, block.hash.ToString());
+            return AppendResult::FAILED;
         }
         block_mtp = pindex->pprev ? pindex->pprev->GetMedianTimePast() : pindex->GetBlockTime();
         if (block.height >= SHADOW_REWARD_START_HEIGHT) {
@@ -998,10 +1001,26 @@ bool ShadowIndex::CustomAppend(const interfaces::BlockInfo& block)
             if (PrepareShadowPowClaimAccounting(m_chainstate->CoinsTip(), *block.data, pindex,
                                                 pow_accounting_context) !=
                 ShadowPowAccountingResult::OK) {
-                return error("%s: unable to authenticate POW claim context for %s",
-                             __func__, block.hash.ToString());
+                error("%s: unable to authenticate POW claim context for %s",
+                      __func__, block.hash.ToString());
+                return AppendResult::FAILED;
             }
         }
+    }
+    return AppendPrepared(block, pindex, block_mtp, payouts, pow_accounting_context)
+        ? AppendResult::APPLIED : AppendResult::FAILED;
+}
+
+bool ShadowIndex::AppendPrepared(const interfaces::BlockInfo& block, const CBlockIndex* pindex,
+                                int64_t block_mtp,
+                                const std::vector<ShadowSyntheticPayoutTransaction>& payouts,
+                                const ShadowPowAccountingContext& pow_accounting_context)
+{
+    QuantumWitnessBlockUndo existing_witness_undo;
+    const bool witness_block_already_indexed = m_db->Read(
+        DBQuantumWitnessBlockKey{block.hash}, existing_witness_undo);
+    if (!witness_block_already_indexed && m_db->Exists(DBQuantumWitnessBlockKey{block.hash})) {
+        return error("%s: unreadable quantum witness block record for %s", __func__, block.hash.ToString());
     }
 
     // Preparing the immutable context above performs no Argon2 work. Read undo
@@ -1529,7 +1548,9 @@ bool ShadowIndex::CustomRewind(const interfaces::BlockKey& current_tip,
         return error("%s: unexpected shadowindex custom tip below reward start", __func__);
     }
 
-    std::vector<interfaces::BlockKey> disconnected;
+    // Block-index ancestry is immutable; retain it to construct a locator for
+    // the exact disconnected branch's parent, even when it is no longer active.
+    std::vector<const CBlockIndex*> disconnected;
     {
         LOCK(cs_main);
         const CBlockIndex* current = m_chainstate->m_blockman.LookupBlockIndex(current_tip.hash);
@@ -1539,16 +1560,15 @@ bool ShadowIndex::CustomRewind(const interfaces::BlockKey& current_tip,
             return error("%s: invalid shadowindex rewind range", __func__);
         }
         while (current != stop) {
-            disconnected.push_back({current->GetBlockHash(), current->nHeight});
+            disconnected.push_back(current);
             current = current->pprev;
         }
     }
 
-    for (size_t i = 0; i < disconnected.size(); ++i) {
-        const interfaces::BlockKey& disconnected_block = disconnected[i];
-        const interfaces::BlockKey parent = i + 1 < disconnected.size()
-            ? disconnected[i + 1]
-            : new_tip;
+    for (const CBlockIndex* block_index : disconnected) {
+        const interfaces::BlockKey disconnected_block{block_index->GetBlockHash(), block_index->nHeight};
+        const CBlockIndex* parent_index = block_index->pprev;
+        const interfaces::BlockKey parent{parent_index->GetBlockHash(), parent_index->nHeight};
         const uint256& block_hash = disconnected_block.hash;
         CDBBatch batch(*m_db);
         bool has_writes{false};
@@ -1624,7 +1644,15 @@ bool ShadowIndex::CustomRewind(const interfaces::BlockKey& current_tip,
             }
             has_writes = true;
         }
-        if (has_writes && !m_db->WriteBatch(batch)) return false;
+        if (has_writes) {
+            // Undo, the custom tip (including its reward-boundary erase), and
+            // BaseIndex's restart point must advance in the same atomic batch.
+            // A crash or failed final BaseIndex::Commit can then resume from
+            // this exact parent without pointing at records already removed.
+            m_db->WriteBestBlock(batch, GetLocator(parent_index));
+            if (!m_db->WriteBatch(batch)) return false;
+            if (m_after_rewind_batch_for_testing) m_after_rewind_batch_for_testing();
+        }
     }
     return true;
 }

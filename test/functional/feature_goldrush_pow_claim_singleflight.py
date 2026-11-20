@@ -16,6 +16,7 @@ durable relay authority must survive restart without changing the signed bytes.
 import ast
 from copy import deepcopy
 from decimal import Decimal
+import json
 from pathlib import Path
 from threading import Thread
 import time
@@ -248,6 +249,54 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
             if entry.get("comment") == "PoW Claim"
         }
 
+    def _mine_until_no_retained_claim_is_valid(self, funding_address):
+        """Leave a tip at which no retained claim of any loaded wallet is valid.
+
+        A historical QQP2 proof is not bound to its origin block: its hash is
+        taken over the current tip, so a claim that went stale is valid again
+        at a later tip with probability 2^-bits (about one tip in a thousand
+        on this chain). The wallet that owns it then puts it back into the
+        mempool on its own, by design, within milliseconds of the block. Below
+        the competing-claims height the mempool holds one proof, so such a
+        claim of an earlier section would make the next claim of the wallet
+        under test fail with shadow-proof-mempool-limit.
+
+        Validity at a tip is a pure function of the claim and the tip, so it is
+        checked directly: when a retained claim is valid here (or already back
+        in the mempool), one more empty block makes it stale again.
+        """
+        node = self.nodes[0]
+        occupied = {
+            "txn-already-in-mempool",
+            "shadow-proof-mempool-limit",
+            "shadow-proof-mempool-duplicate",
+        }
+        for _ in range(16):
+            node.syncwithvalidationinterfacequeue()
+            mempool = set(node.getrawmempool())
+            revalidated = []
+            for name in node.listwallets():
+                wallet = node.get_wallet_rpc(name)
+                for txid in self._claim_txids(wallet):
+                    claim = wallet.gettransaction(txid)
+                    if claim["confirmations"] != 0:
+                        continue
+                    result = node.testmempoolaccept([claim["hex"]])[0]
+                    if (
+                        txid in mempool
+                        or result["allowed"]
+                        or result.get("reject-reason") in occupied
+                    ):
+                        revalidated.append((name, txid))
+            if not revalidated:
+                return
+            self.log.info(
+                "Retained claim(s) valid again at tip %s by chance, mining past them: %s",
+                node.getbestblockhash(), revalidated,
+            )
+            self.generateblock(node, output=funding_address, transactions=[])
+        raise AssertionError("retained claims stayed valid across 16 consecutive tips")
+
     def _quarantined_claim_txids(self, wallet):
         mempool = set(self.nodes[0].getrawmempool())
         return {
@@ -376,8 +425,13 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
                 if input_locked:
                     assert_equal(builtin_race.lockunspent(True, [selected_input]), True)
         assert_equal(self._claim_input(claim), selected_input)
-        self.generateblock(node, output=funding_address, transactions=[])
-        self.wait_until(lambda: claim not in node.getrawmempool(), timeout=20)
+        # A historical QQP2 proof can also validate against a descendant tip.
+        # Observe actual retained/ineligible state before testing abandonment.
+        self._wait_for_claims_to_become_current_branch_ineligible(
+            {"worker_group": {"wallet": builtin_race, "txid": claim,
+                              "hex": builtin_race.gettransaction(claim)["hex"]}},
+            funding_address,
+        )
         self._assert_generic_abandon_rejected(builtin_race, claim)
 
     def _wait_for_new_quarantined_claim(self, wallet, before, timeout=180):
@@ -494,16 +548,56 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
             f"claims did not become retained/current-branch-ineligible: {sorted(pending)}"
         )
 
+    @staticmethod
+    def _claim_liveness_sample(info):
+        # Bounded failure-only evidence from the status RPC already polled.
+        # In-progress duty periods are omitted by the RPC; hashes are a lower
+        # bound, not proof that a worker did no work during a long batch.
+        fields = (
+            "enabled", "state", "threads", "cpu_percent", "workers_hashing",
+            "workers_error", "hashrate", "claims_submitted", "epoch_active",
+            "current_height", "mining_gate_action", "mining_gate_can_submit",
+            "mining_gate_coherent", "mining_gate_database_ambiguous",
+            "mining_gate_live_claims", "mining_gate_eligible_claims",
+            "mining_gate_unresolved_components", "mining_gate_unsafe_claims",
+            "raw_quarantined_claims", "blocking_quarantined_claims",
+            "indeterminate_quarantined_claims",
+        )
+        sample = {key: info[key] for key in fields if key in info}
+        duty = info.get("duty_cycle", {})
+        workers = duty.get("workers", [])
+        worker_fields = (
+            "worker", "completed_periods", "completed_work_periods",
+            "completed_successful_hashes", "successful_hashes",
+            "completed_active_ns", "completed_explicit_wait_ns",
+            "completed_duty_wait_ns", "truncated_periods",
+        )
+        sample["duty_cycle"] = {
+            "session_id": duty.get("session_id"),
+            "cpu_percent": duty.get("cpu_percent"),
+            "worker_count": len(workers),
+            "workers": [
+                {key: worker[key] for key in worker_fields if key in worker}
+                for worker in workers[:4]
+            ],
+        }
+        return sample
+
     def _wait_for_one_new_submitted_claim(
         self, wallets, claims_before, timeout=180
     ):
         """Wait for one submitted proof claim from each current miner run."""
         submitted = {name: 0 for name in wallets}
         new_claims = {}
-        deadline = time.monotonic() + timeout
+        started = time.monotonic()
+        deadline = started + timeout
+        first_samples, last_samples = {}, {}
         while time.monotonic() < deadline:
             for name, wallet in wallets.items():
                 info = get_pow_mining_info(wallet)
+                sample = self._claim_liveness_sample(info)
+                first_samples.setdefault(name, sample)
+                last_samples[name] = sample
                 submitted[name] = info["claims_submitted"]
                 assert submitted[name] <= 1, (
                     f"{name} submitted more than one claim in one miner run: "
@@ -528,7 +622,9 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
             time.sleep(0.02)
         raise AssertionError(
             "miners did not submit exactly one new proof claim each: "
-            f"submitted={submitted}, new={new_claims}"
+            f"submitted={submitted}, new={new_claims}; "
+            f"elapsed={time.monotonic() - started:.3f}s, "
+            f"first_status={first_samples}, last_status={last_samples}"
         )
 
     def _observe_proof_without_submission(
@@ -828,13 +924,36 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         )
         assert_equal(self._is_abandoned(wallet, txid), False)
 
-    def _wait_for_quarantine_observation(self, wallet, txid, tip):
+    def _advance_to_ineligible_qqp2_tip(self, wallet, txid, funding_address, max_blocks=32):
+        """Find a descendant where the exact retained claim is proof-ineligible."""
+        node = self.nodes[0]
+        raw = wallet.gettransaction(txid)["hex"]
+        for blocks in range(1, max_blocks + 1):
+            tip = self.generateblock(node, output=funding_address, transactions=[])["hash"]
+            node.syncwithvalidationinterfacequeue()
+            result = node.testmempoolaccept([raw])[0]
+            assert_equal(result["txid"], txid)
+            assert_equal(node.getbestblockhash(), tip)
+            if result["allowed"]:
+                continue
+            if result.get("reject-reason") != "shadow-proof-invalid":
+                raise AssertionError(f"Unexpected rejection of retained QQP2 claim {txid} at tip {tip}: {result}")
+            self.log.info("Retained QQP2 claim %s became proof-ineligible at tip %s after %d empty block(s)", txid, tip, blocks)
+            return tip
+        raise AssertionError(f"Retained QQP2 claim {txid} remained eligible across {max_blocks} descendant tips")
+
+    def _wait_for_quarantine_observation(self, wallet, txid, tip, *, diagnose_observation=False):
         """Review only after asynchronous branch-quarantine metadata is durable."""
         reviewed = None
+        first = last = None
 
         def observation_is_current():
-            nonlocal reviewed
+            nonlocal reviewed, first, last
             info = get_recovery_info(wallet, True)
+            if diagnose_observation:
+                if first is None:
+                    first = info
+                last = info
             if not info["wallet_tip_matches"] or info["active_tip"] != tip:
                 return False
             components = [component for component in info["component_details"]
@@ -849,8 +968,98 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
             reviewed = info
             return True
 
-        self.wait_until(observation_is_current, timeout=20)
+        timed_out = False
+        try:
+            self.wait_until(observation_is_current, timeout=20)
+        except AssertionError:
+            timed_out = True
+            raise
+        finally:
+            if diagnose_observation:
+                try:
+                    self.log.info("Quarantine observation for claim %s at expected tip %s", txid, tip)
+                    self.log.info("First recovery observation %s", self._quarantine_observation_sample(first, txid))
+                    self.log.info("Last recovery observation %s", self._quarantine_observation_sample(last, txid))
+                    if timed_out:
+                        node = self.nodes[0]
+                        current_tip = node.getbestblockhash()
+                        raw = wallet.gettransaction(txid)["hex"]
+                        result = node.testmempoolaccept([raw])[0]
+                        self.log.error("Claim %s testmempoolaccept at current chain tip %s returned %s", txid, current_tip, result)
+                except Exception as error:
+                    self.log.error("Could not collect quarantine observation diagnostics (%s)", error)
         return reviewed
+
+    @staticmethod
+    def _quarantine_observation_sample(info, txid):
+        if info is None:
+            return None
+        top_fields = (
+            "chain_ready", "active_tip", "active_height", "wallet_processed_tip",
+            "wallet_processed_height", "wallet_generation", "wallet_tip_matches",
+            "database_outcome_ambiguous", "raw_claim_objects", "claim_ownership_pending",
+            "claim_ownership_capacity_exceeded", "claim_inventory_capacity_exceeded",
+            "proof_evaluation_budget_exhausted", "proof_evaluation_capacity_exceeded",
+            "proof_evaluation_retryable_local_failure", "proof_evaluation_retryable_local_state",
+        )
+        component_fields = (
+            "classification", "all_claims_quarantined", "stale_depth_known", "minimum_stale_depth",
+            "has_revalidating_unbound_proof", "anchor_authenticated", "anchor_unspent",
+        )
+        node_fields = (
+            "disposition", "proof_version", "proof_origin_bound", "proof_input_bound",
+            "proof_may_revalidate_on_descendant", "quarantined", "in_mempool",
+            "stale_depth_known", "stale_depth",
+        )
+        matches = [component for component in info["component_details"] if txid in component["claim_txids"]]
+        sample = {field: info.get(field) for field in top_fields}
+        sample["matching_components"] = len(matches)
+        sample["claim_unanchored"] = txid in info.get("unanchored_claim_txids", ())
+        sample["claim_components"] = []
+        for component in matches[:2]:
+            summary = {field: component.get(field) for field in component_fields}
+            claim = next((node for node in component["nodes"] if node["txid"] == txid), {})
+            summary["claim"] = {field: claim.get(field) for field in node_fields}
+            sample["claim_components"].append(summary)
+        return sample
+
+    def _wait_for_automatic_resolution(self, wallet, node, claim_txid, tip):
+        """Return one complete, tip-bound observation and its relayed resolution."""
+        last = None
+        accepted = None
+        blockers = (
+            "claim_ownership_pending", "claim_ownership_capacity_exceeded",
+            "claim_inventory_capacity_exceeded", "proof_evaluation_budget_exhausted",
+            "proof_evaluation_capacity_exceeded", "proof_evaluation_retryable_local_failure",
+            "proof_evaluation_retryable_local_state",
+        )
+
+        def ready():
+            nonlocal last, accepted
+            info = get_recovery_info(wallet, True)
+            last = info
+            if (not info["usage_available"] or not info["wallet_tip_matches"]
+                    or info["active_tip"] != tip or any(info[key] for key in blockers)
+                    or info["pending_automatic_resolutions"] != 1):
+                return False
+            components = [c for c in info["component_details"] if claim_txid in c["claim_txids"]]
+            nodes = [(c, n) for c in info["component_details"] for n in c["nodes"]
+                     if n["kind"] == "managed_resolution"]
+            if len(components) != 1 or len(nodes) != 1 or nodes[0][0] is not components[0]:
+                return False
+            resolution = nodes[0][1]
+            txid = resolution["txid"]
+            if not resolution["resolution_relay_authorized"] or txid not in node.getrawmempool():
+                return False
+            accepted = info, txid
+            return True
+
+        try:
+            self.wait_until(ready, timeout=30)
+        except AssertionError:
+            self.log.error("Automatic resolution did not stabilize; last snapshot: %s", json.dumps(last, default=str))
+            raise
+        return accepted
 
     def _wait_for_live_claim_family(self, wallet, root_txid, tip):
         """Return the live observations accepted by the bounded liveness wait."""
@@ -1561,31 +1770,20 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
             # active-branch blocks, then let the next scheduler pass create,
             # persist, authorize, and relay the exact resolution bytes.
             self.generateblock(node, output=funding_address, transactions=[])
+            automatic_recovery_tip = node.getbestblockhash()
             self.wait_until(
                 lambda: get_recovery_info(policy, True)["component_details"][0]["minimum_stale_depth"]
                 >= automatic_limits["minimum_stale_blocks"],
                 timeout=20,
             )
             node.mockscheduler(61)
-            self.wait_until(
-                lambda: get_recovery_info(policy)["pending_automatic_resolutions"] == 1,
-                timeout=30,
+            pending_automatic_info, automatic_resolution_txid = self._wait_for_automatic_resolution(
+                policy, node, policy_claim["txid"], automatic_recovery_tip
             )
 
             # Keep the miner enabled while its automatic resolution confirms.
             # The confirmed same-script output must release the quarantine gate
             # and return the miner to an active state without operator action.
-            pending_automatic_info = get_recovery_info(policy, True)
-            pending_resolution_nodes = [
-                graph_node
-                for component in pending_automatic_info["component_details"]
-                for graph_node in component["nodes"]
-                if graph_node["kind"] == "managed_resolution"
-            ]
-            assert_equal(len(pending_resolution_nodes), 1)
-            automatic_resolution_txid = pending_resolution_nodes[0]["txid"]
-            assert_equal(pending_resolution_nodes[0]["resolution_relay_authorized"], True)
-            assert automatic_resolution_txid in node.getrawmempool()
             automatic_resolution_block = self.generateblock(
                 node,
                 output=funding_address,
@@ -1792,6 +1990,10 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         )
 
         self.log.info("Two concurrent RPC callers create at most one clean claim")
+        # The first caller needs the single QQP2 mempool slot: no claim of an
+        # earlier section may be valid at this tip.
+        self._mine_until_no_retained_claim_is_valid(funding_address)
+        assert_equal(node.getrawmempool(), [])
         manual_payout = manual.getnewquantumaddress("single-flight-payout")["address"]
         first_results = []
         first_errors = []
@@ -2095,20 +2297,59 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         node.setmocktime(self.mock_time)
         manual = self._load_wallet(MANUAL_WALLET)
         stake_height = node.getblockcount()
+        stake_tip = node.getbestblockhash()
+        claim_outpoint = (first_txid, 0)
+        claim_utxo = node.gettxout(*claim_outpoint)
+        assert claim_utxo is not None
+        assert_equal(claim_utxo["value"], claim_change)
+        claim_script = claim_utxo["scriptPubKey"]["hex"]
+        assert_equal(node.gettxout(*claim_outpoint, False)["scriptPubKey"]["hex"], claim_script)
+        stake_mempool = set(node.getrawmempool())
         expected_stake_weight = int(claim_change * COIN)
+        weight_observed = False
+
+        def stake_evidence():
+            nonlocal weight_observed
+            info = manual.getstakinginfo()
+            weight_observed = (info["weight_cache_height"] == stake_height and
+                               info["weight"] == expected_stake_weight)
+            return weight_observed or node.getblockcount() > stake_height
+
         manual.staking(True)
         try:
             self._bump_mocktime(16)
-            self.wait_until(
-                lambda: (
-                    manual.getstakinginfo()["weight_cache_height"] == stake_height
-                    and manual.getstakinginfo()["weight"] == expected_stake_weight
-                ),
-                timeout=20,
-            )
+            self.wait_until(stake_evidence, timeout=20)
         finally:
             manual.staking(False)
+        # A successful kernel can win before the RPC stops the worker. Verify
+        # any new blocks are PoS descendants of the scan tip, then disconnect
+        # them so the claim output remains available for the next test.
+        if node.getblockcount() > stake_height:
+            assert_equal(node.getblockhash(stake_height), stake_tip)
+            first_stake = node.getblockhash(stake_height + 1)
+            claim_staked = False
+            for height in range(stake_height + 1, node.getblockcount() + 1):
+                block = node.getblock(node.getblockhash(height), 2)
+                assert_equal(block["flags"], "proof-of-stake")
+                claim_staked |= any((vin.get("txid"), vin.get("vout")) == claim_outpoint
+                                    for vin in block["tx"][1]["vin"])
+            assert claim_staked
+            node.invalidateblock(first_stake)
+            node.syncwithvalidationinterfacequeue()
+        else:
+            assert weight_observed
+        assert_equal(node.getbestblockhash(), stake_tip)
         assert_equal(node.getblockcount(), stake_height)
+        for include_mempool in (False, True):
+            restored = node.gettxout(*claim_outpoint, include_mempool)
+            assert restored is not None
+            assert_equal(restored["value"], claim_change)
+            assert_equal(restored["scriptPubKey"]["hex"], claim_script)
+        matching_unspent = [u for u in manual.listunspent(1, 9999999, [manual_address])
+                            if (u["txid"], u["vout"]) == claim_outpoint]
+        assert_equal(len(matching_unspent), 1)
+        assert_equal(matching_unspent[0]["amount"], claim_change)
+        assert_equal(set(node.getrawmempool()), stake_mempool)
 
         self.log.info("The clean confirmed claim can fund an ordinary descendant and a new claim")
         descendant = manual.signrawtransactionwithwallet(node.createrawtransaction(
@@ -2446,16 +2687,14 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         assert_equal(len(fault.listunspent(1, 9999999, [fault_address])), 0)
 
         self.log.info("A disabled wallet broadcaster retains exact commit-authorized resolution bytes")
-        # Advance beyond the failed QQP2 claim's intended height so its
-        # pinned-tip classification is eligible for the explicit conflict
-        # resolver. -walletbroadcast=0 is a real, deterministic relay-failure
-        # path: persistence and consent succeed, while wallet relay refuses.
-        fault_quarantine_tip = self.generateblock(
-            node, output=funding_address, transactions=[]
-        )["hash"]
-        node.syncwithvalidationinterfacequeue()
+        # An unbound QQP2 can remain valid on a descendant. Establish actual
+        # proof ineligibility before waiting for its durable branch observation.
+        # -walletbroadcast=0 still allows persistence and consent but refuses relay.
+        fault_quarantine_tip = self._advance_to_ineligible_qqp2_tip(
+            fault, first_fault_txid, funding_address
+        )
         self._wait_for_quarantine_observation(
-            fault, first_fault_txid, fault_quarantine_tip
+            fault, first_fault_txid, fault_quarantine_tip, diagnose_observation=True
         )
         failed_relay_preview = fault.resolveallshadowpowclaims()
         assert_equal(failed_relay_preview["actionable_components"], 1)
@@ -2699,6 +2938,12 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
                 timeout=180,
             )
             refreshed_claim_txid = next(iter(self._claim_txids(boundary) - before_refresh))
+            # The wallet record is published before the claim is handed to the
+            # mempool, and the worker counts it only after that returns.
+            self.wait_until(
+                lambda: get_pow_mining_info(boundary)["claims_submitted"] == 1,
+                timeout=60,
+            )
             info = get_pow_mining_info(boundary)
             assert_equal(info["claims_submitted"], 1)
             assert_equal(info["mining_gate_action"], "wait_for_live")
@@ -3626,6 +3871,12 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
             cross_head_txid = next(
                 iter(self._claim_txids(cross_boundary) - cross_before_refresh)
             )
+            # As above: wait for the worker to finish the submission it has
+            # already recorded in the wallet.
+            self.wait_until(
+                lambda: get_pow_mining_info(cross_boundary)["claims_submitted"] == 1,
+                timeout=60,
+            )
             cross_gate = get_pow_mining_info(cross_boundary)
             assert_equal(cross_gate["mining_gate_coherent"], True)
             assert_equal(cross_gate["mining_gate_database_ambiguous"], False)
@@ -4050,6 +4301,81 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
 
 
 class RecoveryPaginationHelperTest(unittest.TestCase):
+    def test_automatic_resolution_waits_for_one_coherent_authorized_node(self):
+        component = {"claim_txids": ["claim"], "nodes": [
+            {"kind": "managed_resolution", "txid": "resolution", "resolution_relay_authorized": True},
+        ]}
+        good = {"usage_available": True, "wallet_tip_matches": True, "active_tip": "tip",
+                "pending_automatic_resolutions": 1, "component_details": [component],
+                "claim_ownership_pending": False, "claim_ownership_capacity_exceeded": False,
+                "claim_inventory_capacity_exceeded": False, "proof_evaluation_budget_exhausted": False,
+                "proof_evaluation_capacity_exceeded": False, "proof_evaluation_retryable_local_failure": False,
+                "proof_evaluation_retryable_local_state": False}
+        delayed = {**good, "component_details": []}
+        wrong_claim = {**good, "component_details": [{**component, "claim_txids": ["other"]}]}
+        unauthorized = {**good, "component_details": [{**component, "nodes": [
+            {**component["nodes"][0], "resolution_relay_authorized": False}]}]}
+        duplicate = {**good, "component_details": [{**component, "nodes": component["nodes"] * 2}]}
+        failures = [delayed, {**good, "active_tip": "wrong"}, wrong_claim, unauthorized,
+                    duplicate, {**good, "usage_available": False},
+                    {**good, "claim_ownership_pending": True},
+                    {**good, "claim_inventory_capacity_exceeded": True},
+                    {**good, "proof_evaluation_budget_exhausted": True},
+                    {**good, "pending_automatic_resolutions": 0}]
+        node = mock.Mock()
+        node.getrawmempool.return_value = ["resolution"]
+        harness = mock.Mock()
+
+        def wait_until(predicate, timeout):
+            self.assertEqual(timeout, 30)
+            for _ in failures:
+                self.assertFalse(predicate())
+            self.assertTrue(predicate())
+
+        harness.wait_until.side_effect = wait_until
+        with mock.patch(__name__ + ".get_recovery_info", side_effect=[*failures, good]) as read:
+            snapshot, txid = GoldRushPowClaimSingleFlightTest._wait_for_automatic_resolution(
+                harness, mock.Mock(), node, "claim", "tip")
+        self.assertIs(snapshot, good)
+        self.assertEqual(txid, "resolution")
+        self.assertEqual(read.call_count, len(failures) + 1)
+
+    def test_automatic_resolution_requires_mempool_presence(self):
+        info = {"usage_available": True, "wallet_tip_matches": True, "active_tip": "tip",
+                "pending_automatic_resolutions": 1, "component_details": [{"claim_txids": ["claim"],
+                    "nodes": [{"kind": "managed_resolution", "txid": "r", "resolution_relay_authorized": True}]}],
+                "claim_ownership_pending": False, "claim_ownership_capacity_exceeded": False,
+                "claim_inventory_capacity_exceeded": False, "proof_evaluation_budget_exhausted": False,
+                "proof_evaluation_capacity_exceeded": False, "proof_evaluation_retryable_local_failure": False,
+                "proof_evaluation_retryable_local_state": False}
+        node = mock.Mock()
+        node.getrawmempool.side_effect = [[], ["r"]]
+        harness = mock.Mock()
+
+        def wait_until(predicate, timeout):
+            self.assertFalse(predicate())
+            self.assertTrue(predicate())
+        harness.wait_until.side_effect = wait_until
+        with mock.patch(__name__ + ".get_recovery_info", return_value=info):
+            self.assertEqual(GoldRushPowClaimSingleFlightTest._wait_for_automatic_resolution(
+                harness, mock.Mock(), node, "claim", "tip"), (info, "r"))
+
+    def test_automatic_resolution_timeout_reports_last_snapshot(self):
+        info = {"usage_available": False, "wallet_tip_matches": True, "active_tip": "tip"}
+        harness = mock.Mock()
+
+        def wait_until(predicate, timeout):
+            self.assertFalse(predicate())
+            raise AssertionError("bounded timeout")
+
+        harness.wait_until.side_effect = wait_until
+        with mock.patch(__name__ + ".get_recovery_info", return_value=info):
+            with self.assertRaisesRegex(AssertionError, "bounded timeout"):
+                GoldRushPowClaimSingleFlightTest._wait_for_automatic_resolution(
+                    harness, mock.Mock(), mock.Mock(), "claim", "tip")
+        harness.log.error.assert_called_once_with(
+            "Automatic resolution did not stabilize; last snapshot: %s", json.dumps(info, default=str))
+
     @staticmethod
     def live_family_fixture():
         info = {
@@ -4146,6 +4472,37 @@ class RecoveryPaginationHelperTest(unittest.TestCase):
             if isinstance(response, Exception):
                 raise response
             return response
+
+    def test_fault_claim_descendant_selection(self):
+        allowed = {"txid": "claim", "allowed": True}
+        ineligible = {"txid": "claim", "allowed": False, "reject-reason": "shadow-proof-invalid"}
+        unrelated = {"txid": "claim", "allowed": False, "reject-reason": "missing-inputs"}
+        for results, expected_tip, expected_error in (
+            ([allowed, ineligible], "tip-2", None),
+            ([unrelated], None, "Unexpected rejection.*missing-inputs"),
+            ([allowed, allowed], None, "remained eligible across 2 descendant tips"),
+        ):
+            with self.subTest(results=results):
+                node = mock.Mock()
+                wallet = mock.Mock()
+                wallet.gettransaction.return_value = {"hex": "persisted-claim"}
+                harness = mock.Mock(nodes=[node])
+                tips = [f"tip-{i}" for i in range(1, len(results) + 1)]
+                harness.generateblock.side_effect = [{"hash": tip} for tip in tips]
+                node.getbestblockhash.side_effect = tips
+                node.testmempoolaccept.side_effect = [[result] for result in results]
+                advance = GoldRushPowClaimSingleFlightTest._advance_to_ineligible_qqp2_tip
+                if expected_error is None:
+                    self.assertEqual(advance(harness, wallet, "claim", "funding", max_blocks=2), expected_tip)
+                else:
+                    with self.assertRaisesRegex(AssertionError, expected_error):
+                        advance(harness, wallet, "claim", "funding", max_blocks=2)
+                wallet.gettransaction.assert_called_once_with("claim")
+                self.assertEqual(harness.generateblock.call_args_list, [
+                    mock.call(node, output="funding", transactions=[])
+                ] * len(results))
+                self.assertEqual(node.syncwithvalidationinterfacequeue.call_count, len(results))
+                self.assertEqual(node.testmempoolaccept.call_args_list, [mock.call(["persisted-claim"])] * len(results))
 
     def test_quarantine_review_waits_for_exact_durable_observation(self):
         known = {

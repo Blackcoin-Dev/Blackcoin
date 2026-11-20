@@ -67,6 +67,11 @@ $(foreach TOOL,$(cctools_TOOLS),$(eval darwin_$(TOOL) = $$(build_prefix)/bin/$$(
 #         those normally included for libc and libc++. The only path that
 #         remains implicitly is the clang resource dir.
 #
+#     -isystem$(host_prefix)/include
+#
+#         Prefer depends headers over SDK copies, including when package flags
+#         mark the same directory as a system include directory.
+#
 #     -iwithsysroot / -iframeworkwithsysroot
 #
 #         Adds the desired paths from the SDK
@@ -79,6 +84,7 @@ darwin_CC=env -u C_INCLUDE_PATH -u CPLUS_INCLUDE_PATH \
               -Qunused-arguments \
               -B$(build_prefix)/bin -mlinker-version=$(LD64_VERSION) \
               -isysroot$(OSX_SDK) -nostdlibinc \
+              -isystem$(host_prefix)/include \
               -iwithsysroot/usr/include -iframeworkwithsysroot/System/Library/Frameworks
 
 darwin_CXX=env -u C_INCLUDE_PATH -u CPLUS_INCLUDE_PATH \
@@ -89,6 +95,7 @@ darwin_CXX=env -u C_INCLUDE_PATH -u CPLUS_INCLUDE_PATH \
                -B$(build_prefix)/bin -mlinker-version=$(LD64_VERSION) \
                -isysroot$(OSX_SDK) -nostdlibinc \
                -iwithsysroot/usr/include/c++/v1 \
+               -isystem$(host_prefix)/include \
                -iwithsysroot/usr/include -iframeworkwithsysroot/System/Library/Frameworks
 
 darwin_CFLAGS=-Qunused-arguments -pipe -std=$(C_STANDARD)

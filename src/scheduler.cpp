@@ -201,3 +201,9 @@ size_t SingleThreadedSchedulerClient::CallbacksPending()
     LOCK(m_callbacks_mutex);
     return m_callbacks_pending.size();
 }
+
+bool SingleThreadedSchedulerClient::CallbacksBusy()
+{
+    LOCK(m_callbacks_mutex);
+    return m_are_callbacks_running || !m_callbacks_pending.empty();
+}

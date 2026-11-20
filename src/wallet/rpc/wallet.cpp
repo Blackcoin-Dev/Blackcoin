@@ -11,6 +11,7 @@
 #include <rpc/util.h>
 #include <util/translation.h>
 #include <wallet/context.h>
+#include <wallet/display_balance.h>
 #include <wallet/receive.h>
 #include <wallet/rpc/wallet.h>
 #include <wallet/rpc/util.h>
@@ -67,8 +68,12 @@ bool HaveKey(const SigningProvider& wallet, const CKey& key)
 static RPCHelpMan getwalletinfo()
 {
     return RPCHelpMan{"getwalletinfo",
-                "Returns an object containing various wallet state info.\n",
-                {},
+                "Returns an object containing various wallet state info.\n"
+                "The balances are the last calculated ones (see balance_exact and balance_state); the call does not wait\n"
+                "for the node's locks to calculate them and so answers while blocks are being connected.\n",
+                {
+                    {"exact", RPCArg::Type::BOOL, RPCArg::DefaultHint{"false, or the value of -walletrpcexactbalance"}, HELP_BALANCE_EXACT_ARG},
+                },
                 RPCResult{
                     RPCResult::Type::OBJ, "", "",
                     {
@@ -95,6 +100,10 @@ static RPCHelpMan getwalletinfo()
                                 }},
                             }},
                         }},
+                        RESULT_BALANCE_EXACT,
+                        RESULT_BALANCE_HEIGHT,
+                        RESULT_BALANCE_BLOCKHASH,
+                        RESULT_BALANCE_STATE,
                         {RPCResult::Type::NUM, "txcount", "the total number of transactions in the wallet"},
                         {RPCResult::Type::NUM_TIME, "keypoololdest", /*optional=*/true, "the " + UNIX_EPOCH_TIME + " of the oldest pre-generated key in the key pool. Legacy wallets only."},
                         {RPCResult::Type::NUM, "keypoolsize", "how many new keys are pre-generated (only counts external keys)"},
@@ -127,26 +136,24 @@ static RPCHelpMan getwalletinfo()
     const std::shared_ptr<const CWallet> pwallet = GetWalletForJSONRPCRequest(request);
     if (!pwallet) return UniValue::VNULL;
 
-    for (;;) {
-    // Make sure the results are valid at least up to the most recent block
-    // the user could have gotten from another RPC command prior to now. A
-    // block can connect after this wait and before both locks are held, so
-    // retry until wallet transactions and the UTXO set identify the same tip.
-    pwallet->BlockUntilSyncedToCurrentChain();
+    // The balances come from the published snapshot of the display balance
+    // worker: neither cs_main nor cs_wallet is taken for them. An exact
+    // request first lets the wallet catch up with the chain and then waits,
+    // still without a lock, for a snapshot computed after this call.
+    PolledBalanceOptions balance_options;
+    balance_options.exact = WantExactBalance(request.params[0]);
+    if (balance_options.exact) pwallet->BlockUntilSyncedToCurrentChain();
+    const PolledBalance polled = GetPolledBalance(*pwallet, balance_options);
+    const Balance bal = polled.snapshot ? polled.snapshot->balance : Balance{};
+    const WalletLifecycleSummary lifecycle = polled.snapshot ? polled.snapshot->lifecycle : WalletLifecycleSummary{};
 
-    LOCK2(::cs_main, pwallet->cs_wallet);
-    if (!WalletLifecycleViewIsSynchronized(*pwallet)) continue;
+    {
+    // Everything else needs the wallet only, briefly.
+    LOCK(pwallet->cs_wallet);
 
     UniValue obj(UniValue::VOBJ);
 
     size_t kpExternalSize = pwallet->KeypoolCountExternalKeys();
-    Balance bal;
-    WalletLifecycleSummary lifecycle;
-    std::string lifecycle_error;
-    if (!GetLifecycleAdjustedBalance(*pwallet, 0, /*avoid_reuse=*/true,
-                                     bal, lifecycle, lifecycle_error)) {
-        throw JSONRPCError(RPC_WALLET_ERROR, lifecycle_error);
-    }
     obj.pushKV("walletname", pwallet->GetName());
     obj.pushKV("walletversion", pwallet->GetVersion());
     obj.pushKV("format", pwallet->GetDatabase().Format());
@@ -156,6 +163,7 @@ static RPCHelpMan getwalletinfo()
     obj.pushKV("immature_balance", ValueFromAmount(bal.m_mine_immature));
     obj.pushKV("lifecycle", WalletLifecycleInfoToJSON(
         lifecycle.mine, lifecycle.evaluation_height, lifecycle.evaluation_mtp));
+    AppendPolledBalanceState(obj, *pwallet, polled);
     obj.pushKV("txcount",       (int)pwallet->mapWallet.size());
     const auto kp_oldest = pwallet->GetOldestKeyPoolTime();
     if (kp_oldest.has_value()) {

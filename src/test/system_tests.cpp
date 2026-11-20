@@ -6,6 +6,7 @@
 //
 #include <test/util/setup_common.h>
 #include <common/run_command.h>
+#include <common/system.h>
 #include <univalue.h>
 
 #ifdef ENABLE_EXTERNAL_SIGNER
@@ -20,6 +21,10 @@ namespace blackcoin_boost_process = boost::process;
 
 #include <boost/test/unit_test.hpp>
 
+#include <cstdint>
+#include <optional>
+#include <string>
+
 BOOST_FIXTURE_TEST_SUITE(system_tests, BasicTestingSetup)
 
 // At least one test is required (in case ENABLE_EXTERNAL_SIGNER is not defined).
@@ -27,6 +32,55 @@ BOOST_FIXTURE_TEST_SUITE(system_tests, BasicTestingSetup)
 BOOST_AUTO_TEST_CASE(dummy)
 {
     BOOST_CHECK(true);
+}
+
+BOOST_AUTO_TEST_CASE(ram_detection_is_sane)
+{
+    const std::optional<uint64_t> total{GetTotalRAM()};
+    const std::optional<uint64_t> available{GetAvailableRAM()};
+#if defined(WIN32) || defined(__APPLE__) || defined(__linux__)
+    BOOST_REQUIRE(total.has_value());
+    BOOST_REQUIRE(available.has_value());
+#endif
+    if (total) {
+        // Nothing this software runs on has less than 16 MiB of memory.
+        BOOST_CHECK_GT(*total, uint64_t{16} << 20);
+    }
+    if (available) {
+        BOOST_CHECK_GT(*available, uint64_t{0});
+    }
+    if (total && available) {
+        BOOST_CHECK_LE(*available, *total);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(meminfo_and_cgroup_parsing)
+{
+    const std::string meminfo{
+        "MemTotal:       16314420 kB\n"
+        "MemFree:          238304 kB\n"
+        "MemAvailable:   11034520 kB\n"
+        "Buffers:          123456 kB\n"
+        "HugePages_Total:       0\n"};
+    BOOST_CHECK(ParseMeminfoField(meminfo, "MemAvailable") == uint64_t{11034520} * 1024);
+    BOOST_CHECK(ParseMeminfoField(meminfo, "MemTotal") == uint64_t{16314420} * 1024);
+    BOOST_CHECK(ParseMeminfoField(meminfo, "HugePages_Total") == uint64_t{0});
+    // A field name must match the whole name before the colon.
+    BOOST_CHECK(!ParseMeminfoField(meminfo, "Mem"));
+    BOOST_CHECK(!ParseMeminfoField(meminfo, "Available"));
+    BOOST_CHECK(!ParseMeminfoField(meminfo, "SwapTotal"));
+    BOOST_CHECK(!ParseMeminfoField("", "MemAvailable"));
+    BOOST_CHECK(!ParseMeminfoField("MemAvailable: lots kB\n", "MemAvailable"));
+    BOOST_CHECK(!ParseMeminfoField("MemAvailable:\n", "MemAvailable"));
+    BOOST_CHECK(!ParseMeminfoField("MemAvailable: 99999999999999999999 kB\n", "MemAvailable"));
+    BOOST_CHECK(!ParseMeminfoField("MemAvailable: 18446744073709551615 kB\n", "MemAvailable"));
+
+    BOOST_CHECK(ParseCgroupMemoryLimit("2147483648\n") == uint64_t{2147483648});
+    BOOST_CHECK(ParseCgroupMemoryLimit("9223372036854771712\n") == uint64_t{9223372036854771712U});
+    BOOST_CHECK(!ParseCgroupMemoryLimit("max\n"));
+    BOOST_CHECK(!ParseCgroupMemoryLimit("0\n"));
+    BOOST_CHECK(!ParseCgroupMemoryLimit(""));
+    BOOST_CHECK(!ParseCgroupMemoryLimit("-1"));
 }
 
 #ifdef ENABLE_EXTERNAL_SIGNER

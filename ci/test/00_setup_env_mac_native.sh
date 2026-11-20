@@ -23,6 +23,10 @@ export FUZZ_TESTS_CONFIG="--exclude banman"  # https://github.com/bitcoin/bitcoi
 
 if command -v brew >/dev/null; then
     QT5_PREFIX="$(brew --prefix qt@5 2>/dev/null || true)"
+    CURL_PREFIX="$(brew --prefix)/opt/curl"
+    if [[ -n "$CURL_PREFIX" ]]; then
+        export PKG_CONFIG_PATH="$CURL_PREFIX/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+    fi
     LIBOQS_PREFIX="$(brew --prefix liboqs 2>/dev/null || true)"
     if [[ -n "$QT5_PREFIX" ]]; then
         export PATH="$QT5_PREFIX/bin:$PATH"

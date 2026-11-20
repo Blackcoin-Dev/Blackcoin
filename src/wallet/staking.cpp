@@ -125,12 +125,12 @@ bool IsDemurrageLockedStakeCandidate(const CWallet& wallet, const COutPoint& out
         latest_attestation ? std::optional<int>{static_cast<int>(latest_attestation->coverage_start_height)} : std::nullopt).locked;
 }
 
-bool HasUnderCapRedelegationAlternative(const CCoinsViewCache& view, const uint256& source_staker_hash, const uint256& target_staker_hash, CAmount delegation_amount)
+bool HasUnderCapRedelegationAlternative(const node::QuantumPoolShareCalculator& pool_shares, const uint256& source_staker_hash, const uint256& target_staker_hash, CAmount delegation_amount)
 {
     std::vector<QuantumRedelegationCandidate> candidates;
     for (const uint256& staker_hash : node::ListQuantumPoolOperators()) {
         if (staker_hash == source_staker_hash || staker_hash == target_staker_hash) continue;
-        const node::QuantumPoolShare share = node::ComputeQuantumPoolShare(view, staker_hash, node::GetQuantumPoolClaims(staker_hash));
+        const node::QuantumPoolShare share = pool_shares.ComputeShare(staker_hash, node::GetQuantumPoolClaims(staker_hash));
         QuantumRedelegationCandidate candidate;
         candidate.staker_pubkey_hash = staker_hash;
         candidate.staker_pubkey = share.operator_share.staker_pubkey;
@@ -1245,7 +1245,8 @@ bool CreateQuantumColdStakeRedelegationTransaction(
     {
         LOCK(cs_main);
         const CCoinsViewCache& view = wallet.chain().getCoinsTip();
-        const node::QuantumPoolShare share = node::ComputeQuantumPoolShare(view, target_staker_hash, node::GetQuantumPoolClaims(target_staker_hash));
+        const node::QuantumPoolShareCalculator pool_shares{view};
+        const node::QuantumPoolShare share = pool_shares.ComputeShare(target_staker_hash, node::GetQuantumPoolClaims(target_staker_hash));
         if (options.require_verified_operator && !share.operator_share.operator_commitment_verified) {
             error = _("Target Quantum cold-stake operator commitment is not verified in the local registry");
             return false;
@@ -1261,7 +1262,7 @@ bool CreateQuantumColdStakeRedelegationTransaction(
         }
         projected_operator_value += input_amount;
         const bool would_exceed_cap = node::WouldQuantumPoolExceedCap(share.total_coldstake, projected_operator_value, 0);
-        const bool has_under_cap_alternative = would_exceed_cap && HasUnderCapRedelegationAlternative(view, source_staker_hash, target_staker_hash, input_amount);
+        const bool has_under_cap_alternative = would_exceed_cap && HasUnderCapRedelegationAlternative(pool_shares, source_staker_hash, target_staker_hash, input_amount);
         if (options.enforce_pool_cap && would_exceed_cap && has_under_cap_alternative) {
             error = _("Target Quantum cold-stake pool cap would be exceeded by this redelegation");
             return false;
@@ -1320,7 +1321,8 @@ bool CreateQuantumColdStakeRedelegationTransaction(
     {
         LOCK(cs_main);
         const CCoinsViewCache& view = wallet.chain().getCoinsTip();
-        const node::QuantumPoolShare share = node::ComputeQuantumPoolShare(view, target_staker_hash, node::GetQuantumPoolClaims(target_staker_hash));
+        const node::QuantumPoolShareCalculator pool_shares{view};
+        const node::QuantumPoolShare share = pool_shares.ComputeShare(target_staker_hash, node::GetQuantumPoolClaims(target_staker_hash));
         if (options.require_verified_operator && !share.operator_share.operator_commitment_verified) {
             return fail_after_created_key(_("Target Quantum cold-stake operator commitment is not verified in the local registry"));
         }
@@ -1337,7 +1339,7 @@ bool CreateQuantumColdStakeRedelegationTransaction(
         post_operator_value += output_amount;
         const CAmount post_total_coldstake = share.total_coldstake - input_amount + output_amount;
         const bool would_exceed_cap = node::WouldQuantumPoolExceedCap(post_total_coldstake, post_operator_value, 0);
-        const bool cap_filter_unlocked = would_exceed_cap && !HasUnderCapRedelegationAlternative(view, source_staker_hash, target_staker_hash, output_amount);
+        const bool cap_filter_unlocked = would_exceed_cap && !HasUnderCapRedelegationAlternative(pool_shares, source_staker_hash, target_staker_hash, output_amount);
         if (would_exceed_cap && options.enforce_pool_cap && !cap_filter_unlocked) {
             return fail_after_created_key(_("Target Quantum cold-stake pool cap would be exceeded by this redelegation"));
         }
@@ -1814,10 +1816,11 @@ int MaybeAutoRedelegateQuantumColdStake(CWallet& wallet)
         {
             LOCK(cs_main);
             const CCoinsViewCache& view = wallet.chain().getCoinsTip();
-            const node::QuantumPoolShare current_share = node::ComputeQuantumPoolShare(view, source.staker_pubkey_hash, node::GetQuantumPoolClaims(source.staker_pubkey_hash));
+            const node::QuantumPoolShareCalculator pool_shares{view};
+            const node::QuantumPoolShare current_share = pool_shares.ComputeShare(source.staker_pubkey_hash, node::GetQuantumPoolClaims(source.staker_pubkey_hash));
             total_coldstake = current_share.total_coldstake;
             for (const uint256& staker_hash : node::ListQuantumPoolOperators()) {
-                const node::QuantumPoolShare share = node::ComputeQuantumPoolShare(view, staker_hash, node::GetQuantumPoolClaims(staker_hash));
+                const node::QuantumPoolShare share = pool_shares.ComputeShare(staker_hash, node::GetQuantumPoolClaims(staker_hash));
                 QuantumRedelegationCandidate candidate;
                 candidate.staker_pubkey_hash = staker_hash;
                 candidate.staker_pubkey = share.operator_share.staker_pubkey;
@@ -2001,19 +2004,19 @@ struct StakeCandidateScanContext
     bool lineage_active;
     bool final_quantum_lockout;
     bool spend_state_prevalidated{false};
+    // True when the caller walks only outputs that already passed IsStakeCandidateScript.
+    bool script_class_prevalidated{false};
     std::set<uint256> trusted_parents;
     std::map<uint256, StakeTransactionEligibility> transaction_eligibility;
 };
 
 /**
- * Authoritative producer-side staking eligibility check. The wallet index is
- * intentionally only a live-unspent prefilter; every mutable policy and phase
- * rule is evaluated here for both stake weight and kernel selection.
- *
- * Gold Rush synthetic payout maturity remains output-specific, so that
- * exception is evaluated below rather than cached as transaction eligibility.
+ * The staking eligibility predicate exactly as it stood before the per-slot
+ * scan was narrowed (same conjuncts, same order, eager solvability). It is only
+ * used by AvailableCoinsForStakingReference so tests can prove the narrowed
+ * scan selects the identical set.
  */
-static bool EvaluateStakeCandidate(const CWallet& wallet, const COutPoint& outpoint,
+static bool EvaluateStakeCandidateReference(const CWallet& wallet, const COutPoint& outpoint,
                                    const CWalletTx& wtx, StakeCandidateScanContext& context,
                                    bool& spendable)
 {
@@ -2105,6 +2108,113 @@ static bool EvaluateStakeCandidate(const CWallet& wallet, const COutPoint& outpo
     return true;
 }
 
+/**
+ * Authoritative producer-side staking eligibility check. The wallet index is
+ * intentionally only a live-unspent, stakable-script prefilter; every mutable
+ * policy and phase rule is evaluated here for both stake weight and kernel
+ * selection.
+ *
+ * Gold Rush synthetic payout maturity remains output-specific, so that
+ * exception is evaluated below rather than cached as transaction eligibility.
+ *
+ * The result is the conjunction of independent side-effect-free tests. They
+ * run cheapest first (amount, lock, ownership) so an output that cannot stake
+ * never reaches the chain-view lookups, and solvability, which builds a
+ * signing provider, is only computed when it can change the answer.
+ */
+static bool EvaluateStakeCandidate(const CWallet& wallet, const COutPoint& outpoint,
+                                   const CWalletTx& wtx, StakeCandidateScanContext& context,
+                                   bool& spendable)
+{
+    spendable = false;
+    if (!wtx.tx || outpoint.n >= wtx.tx->vout.size()) return false;
+
+    const CTxOut& output = wtx.tx->vout[outpoint.n];
+    if (output.nValue < wallet.m_min_staking_amount ||
+        output.nValue < context.params.min_amount ||
+        output.nValue > context.params.max_amount) {
+        return false;
+    }
+    if (wallet.IsLockedCoin(outpoint) && context.params.skip_locked) return false;
+
+    const bool quantum_output = IsQuantumMigrationScript(output.scriptPubKey) ||
+                                IsQuantumColdStakeScript(output.scriptPubKey);
+    if ((quantum_output && !context.lineage_active) ||
+        (context.final_quantum_lockout && !quantum_output)) {
+        return false;
+    }
+
+    // CreateCoinStake can only construct kernels for these legacy types. Keep
+    // status weight and actual kernel selection on the same candidate set.
+    if (!quantum_output && !context.script_class_prevalidated &&
+        !IsStakeCandidateScript(output.scriptPubKey)) {
+        return false;
+    }
+
+    const isminetype mine = wallet.IsMine(output);
+    if (mine == ISMINE_NO) return false;
+    if (!context.allow_used_addresses && wallet.IsSpentKey(output.scriptPubKey)) return false;
+
+    // Without watch-only access the result cannot depend on solvability.
+    const bool watch_only_allowed = (mine & ISMINE_WATCH_ONLY) != ISMINE_NO &&
+        context.coin_control && context.coin_control->fAllowWatchOnly;
+    const bool mine_spendable = (mine & ISMINE_SPENDABLE) != ISMINE_NO;
+    if (!mine_spendable && !watch_only_allowed && context.params.only_spendable) return false;
+
+    auto [eligibility, inserted] = context.transaction_eligibility.emplace(
+        wtx.GetHash(), StakeTransactionEligibility{});
+    if (inserted) {
+        const int depth = wallet.GetTxDepthInMainChain(wtx);
+        const bool active = depth >= 0 &&
+            !(depth == 0 && !wtx.InMempool()) &&
+            depth >= context.min_depth && depth <= context.max_depth &&
+            CachedTxIsTrusted(wallet, wtx, context.trusted_parents);
+        eligibility->second = {active, wallet.IsTxImmature(wtx)};
+    }
+    if (!eligibility->second.active) return false;
+    if (eligibility->second.immature &&
+        !IsNextBlockMatureGoldRushPayout(wallet, outpoint, context.spend_height, context.spend_time)) {
+        return false;
+    }
+
+    // The exact live-unspent index should make this redundant. Keep the check
+    // as a fail-closed invariant guard if a future wallet mutation path is
+    // introduced without an index hook.
+    if (!context.spend_state_prevalidated && wallet.IsSpent(outpoint)) {
+        return false;
+    }
+
+    if (context.lineage_active) {
+        const Coin& coin = wallet.chain().getCoinsTip().AccessCoin(outpoint);
+        if (coin.IsSpent() || !IsWalletProtectedLineageInput(
+                wallet, outpoint, coin, context.consensus,
+                context.spend_time, context.spend_height)) {
+            return false;
+        }
+    }
+
+    if (IsGeneratedQuantumStakeCandidate(wallet, outpoint, output.scriptPubKey) ||
+        IsDemurrageLockedStakeCandidate(wallet, outpoint, output.scriptPubKey,
+                                        context.spend_height, context.spend_time) ||
+        context.protected_rgb_seals.count(outpoint)) {
+        return false;
+    }
+
+    bool solvable = quantum_output;
+    if (!mine_spendable && watch_only_allowed && !solvable) {
+        std::unique_ptr<SigningProvider> provider = wallet.GetSolvingProvider(output.scriptPubKey);
+        if (provider) {
+            if (auto desc = InferDescriptor(output.scriptPubKey, *provider)) {
+                solvable = desc->IsSolvable();
+            }
+        }
+    }
+    spendable = mine_spendable || (watch_only_allowed && solvable);
+    if (!spendable && context.params.only_spendable) return false;
+
+    return true;
+}
+
 BoundedLegacyStakeCandidates GetBoundedLegacyStakeCandidates(
     const CWallet& wallet,
     const std::vector<BoundedLegacyStakeSource>& sources,
@@ -2139,6 +2249,7 @@ BoundedLegacyStakeCandidates GetBoundedLegacyStakeCandidates(
         /*lineage_active=*/false,
         /*final_quantum_lockout=*/false,
         /*spend_state_prevalidated=*/true,
+        /*script_class_prevalidated=*/false,
         {},
         {},
     };
@@ -2175,7 +2286,8 @@ BoundedLegacyStakeCandidates GetBoundedLegacyStakeCandidates(
     return result;
 }
 
-void AvailableCoinsForStaking(const CWallet& wallet,
+template <bool REFERENCE>
+static void AvailableCoinsForStakingImpl(const CWallet& wallet,
                            std::vector<std::pair<const CWalletTx*, unsigned int> >& vCoins,
                            const CCoinControl* coinControl,
                            const CoinFilterParams& params)
@@ -2212,16 +2324,25 @@ void AvailableCoinsForStaking(const CWallet& wallet,
         lineage_active,
         consensus.IsQuantumFinalLockout(spend_time, spend_height),
         /*spend_state_prevalidated=*/false,
+        /*script_class_prevalidated=*/!REFERENCE,
         {},
         {},
     };
 
-    for (const COutPoint& outpoint : wallet.GetLiveUnspentStakeOutpoints()) {
+    // The candidate subset holds exactly the live outpoints whose script can
+    // stake, in the same order, so the selected set equals a walk of the full
+    // live index; the reference path walks the full index to prove that.
+    const std::set<COutPoint>& scan_set = REFERENCE ? wallet.GetLiveUnspentStakeOutpoints()
+                                                    : wallet.GetLiveUnspentStakeCandidateOutpoints();
+    for (const COutPoint& outpoint : scan_set) {
         const auto wallet_tx = wallet.mapWallet.find(outpoint.hash);
         if (wallet_tx == wallet.mapWallet.end()) continue;
 
         bool spendable{false};
-        if (!EvaluateStakeCandidate(wallet, outpoint, wallet_tx->second, context, spendable)) continue;
+        const bool evaluated = REFERENCE
+            ? EvaluateStakeCandidateReference(wallet, outpoint, wallet_tx->second, context, spendable)
+            : EvaluateStakeCandidate(wallet, outpoint, wallet_tx->second, context, spendable);
+        if (!evaluated) continue;
 
         const CTxOut& output = wallet_tx->second.tx->vout[outpoint.n];
         if (spendable) vCoins.emplace_back(&wallet_tx->second, outpoint.n);
@@ -2230,6 +2351,38 @@ void AvailableCoinsForStaking(const CWallet& wallet,
         if (params.min_sum_amount != MAX_MONEY && nTotal >= params.min_sum_amount) return;
         if (params.max_count > 0 && vCoins.size() >= params.max_count) return;
     }
+}
+
+void AvailableCoinsForStaking(const CWallet& wallet,
+                           std::vector<std::pair<const CWalletTx*, unsigned int> >& vCoins,
+                           const CCoinControl* coinControl,
+                           const CoinFilterParams& params)
+{
+    AvailableCoinsForStakingImpl</*REFERENCE=*/false>(wallet, vCoins, coinControl, params);
+}
+
+void AvailableCoinsForStakingReference(const CWallet& wallet,
+                           std::vector<std::pair<const CWalletTx*, unsigned int> >& vCoins,
+                           const CCoinControl* coinControl,
+                           const CoinFilterParams& params)
+{
+    AvailableCoinsForStakingImpl</*REFERENCE=*/true>(wallet, vCoins, coinControl, params);
+}
+
+// Publish the stake weight of a completed full scan for status RPC/GUI readers.
+static void PublishCachedStakeWeight(const CWallet& wallet, CAmount value_in)
+{
+    const CAmount available = value_in > wallet.m_reserve_balance
+        ? value_in - wallet.m_reserve_balance
+        : 0;
+    // Publish the cache pair under the same mutex used to assemble the
+    // typed staking snapshot. The atomics keep legacy low-latency readers
+    // available, while telemetry never combines weight from one scan with
+    // the height from another.
+    LOCK(wallet.m_staking_telemetry_mutex);
+    wallet.m_cached_stake_weight.store(static_cast<uint64_t>(available), std::memory_order_relaxed);
+    const CBlockIndex* tip = wallet.chain().getTip();
+    wallet.m_cached_stake_weight_height.store(tip ? tip->nHeight : -1, std::memory_order_release);
 }
 
 // Select some coins without random shuffle or best subset approximation
@@ -2274,21 +2427,146 @@ bool SelectCoinsForStaking(const CWallet& wallet, CAmount& nTargetValue, std::se
     // Both current callers request the complete staking set. Publish that
     // completed scan for status RPC/GUI readers so they never need to repeat
     // the O(wallet history) walk on a latency-sensitive thread.
-    if (nTargetValue == MAX_MONEY) {
-        const CAmount available = nValueRet > wallet.m_reserve_balance
-            ? nValueRet - wallet.m_reserve_balance
-            : 0;
-        // Publish the cache pair under the same mutex used to assemble the
-        // typed staking snapshot. The atomics keep legacy low-latency readers
-        // available, while telemetry never combines weight from one scan with
-        // the height from another.
-        LOCK(wallet.m_staking_telemetry_mutex);
-        wallet.m_cached_stake_weight.store(static_cast<uint64_t>(available), std::memory_order_relaxed);
-        const CBlockIndex* tip = wallet.chain().getTip();
-        wallet.m_cached_stake_weight_height.store(tip ? tip->nHeight : -1, std::memory_order_release);
-    }
+    if (nTargetValue == MAX_MONEY) PublishCachedStakeWeight(wallet, nValueRet);
 
     return true;
+}
+
+std::atomic<bool> g_stake_slot_cache_enabled{true};
+
+StakeSlotCacheState& CWallet::GetStakeSlotCacheStateLocked() const
+{
+    AssertLockHeld(cs_wallet);
+    if (!m_stake_slot_cache) m_stake_slot_cache = std::make_shared<StakeSlotCacheState>();
+    return *m_stake_slot_cache;
+}
+
+void DropStakeSlotCache(const CWallet& wallet)
+{
+    AssertLockHeld(wallet.cs_wallet);
+    wallet.GetStakeSlotCacheStateLocked().cache.reset();
+}
+
+/** True while every input of the selection is what the cache was built from. */
+static bool StakeSlotCacheIsCurrent(const CWallet& wallet, const StakeSlotCache& cache, const CBlockIndex* tip)
+    EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet)
+{
+    return cache.tip_hash == tip->GetBlockHash() &&
+           cache.live_generation == wallet.GetLiveUnspentStakeGenerationLocked() &&
+           cache.balance_marker == wallet.GetBalanceScanMarker() &&
+           cache.coin_lock_generation == wallet.GetCoinLockGenerationLocked() &&
+           cache.wallet_locked == wallet.IsLocked() &&
+           cache.staking_only == wallet.m_wallet_unlock_staking_only.load() &&
+           cache.protected_rgb_seals == wallet.GetProtectedRGBSeals() &&
+           std::chrono::steady_clock::now() - cache.built_at < STAKE_SLOT_CACHE_MAX_AGE;
+}
+
+static std::shared_ptr<StakeSlotCache> BuildStakeSlotCache(const CWallet& wallet, CBlockIndex* tip, bool with_kernels)
+    EXCLUSIVE_LOCKS_REQUIRED(::cs_main, wallet.cs_wallet)
+{
+    auto cache = std::make_shared<StakeSlotCache>();
+    cache->tip_hash = tip->GetBlockHash();
+    cache->live_generation = wallet.GetLiveUnspentStakeGenerationLocked();
+    cache->balance_marker = wallet.GetBalanceScanMarker();
+    cache->coin_lock_generation = wallet.GetCoinLockGenerationLocked();
+    cache->wallet_locked = wallet.IsLocked();
+    cache->staking_only = wallet.m_wallet_unlock_staking_only.load();
+    cache->protected_rgb_seals = wallet.GetProtectedRGBSeals();
+    cache->built_at = std::chrono::steady_clock::now();
+    CAmount target{MAX_MONEY};
+    SelectCoinsForStaking(wallet, target, cache->coins, cache->value_in);
+    // Under demurrage a kernel value depends on the live coin view, which
+    // CheckKernel reads per call whatever the cache holds.
+    if (with_kernels &&
+        !Params().GetConsensus().IsDemurrageActive(tip->nHeight + 1, tip->GetMedianTimePast())) {
+        CCoinsViewCache& view = wallet.chain().getCoinsTip();
+        for (const auto& [wtx, n] : cache->coins) {
+            CacheKernel(cache->kernels, COutPoint{wtx->GetHash(), n}, tip, view);
+        }
+    }
+    return cache;
+}
+
+std::shared_ptr<const StakeSlotCache> AcquireStakeSlotCache(const CWallet& wallet, CBlockIndex* tip)
+{
+    AssertLockHeld(::cs_main);
+    AssertLockHeld(wallet.cs_wallet);
+    StakeSlotCacheState& state = wallet.GetStakeSlotCacheStateLocked();
+    if (!g_stake_slot_cache_enabled.load()) {
+        // Select as before the cache existed and leave the stored one alone;
+        // it is checked against its key before it is ever served again.
+        return BuildStakeSlotCache(wallet, tip, /*with_kernels=*/false);
+    }
+    if (state.cache && StakeSlotCacheIsCurrent(wallet, *state.cache, tip)) {
+        ++state.stats.hits;
+        PublishCachedStakeWeight(wallet, state.cache->value_in);
+        return state.cache;
+    }
+    state.cache = BuildStakeSlotCache(wallet, tip, /*with_kernels=*/true);
+    ++state.stats.rebuilds;
+    return state.cache;
+}
+
+StakeSlotKernel CheckStakeSlotKernel(const CWallet& wallet, const StakeSlotCache& slot, CBlockIndex* tip,
+                                     unsigned int nBits, uint32_t nTime, const COutPoint& prevout)
+{
+    AssertLockHeld(::cs_main);
+    AssertLockHeld(wallet.cs_wallet);
+    CCoinsViewCache& view = wallet.chain().getCoinsTip();
+    if (!CheckKernel(tip, nBits, nTime, prevout, view, slot.kernels)) return StakeSlotKernel::NONE;
+    // The slot's candidate selection may come from the cache, so a kernel is
+    // only reported once a fresh uncached selection gives the same candidates.
+    // This holds on every path: an output with no kernel entry (every output
+    // once demurrage is active, any CacheKernel miss) was checked against the
+    // coins view above, but its membership in the selection still rests on the
+    // cache. An output with an entry is also confirmed against the coins view
+    // the way validation would see it.
+    const bool has_entry = slot.kernels.find(prevout) != slot.kernels.end();
+    bool confirmed = !has_entry || CheckKernel(tip, nBits, nTime, prevout, view);
+    if (confirmed) {
+        std::set<std::pair<const CWalletTx*, unsigned int>> fresh;
+        CAmount fresh_value{0};
+        CAmount target{MAX_MONEY};
+        SelectCoinsForStaking(wallet, target, fresh, fresh_value);
+        confirmed = fresh == slot.coins && fresh_value == slot.value_in;
+    }
+    if (!confirmed) {
+        StakeSlotCacheState& state = wallet.GetStakeSlotCacheStateLocked();
+        ++state.stats.rejections;
+        state.cache.reset();
+        LogPrint(BCLog::COINSTAKE, "CheckStakeSlotKernel : cached kernel for %s not confirmed, cache dropped\n", prevout.ToString());
+        return StakeSlotKernel::CACHE_REJECTED;
+    }
+    return StakeSlotKernel::FOUND;
+}
+
+std::vector<StakeKernelHit> ScanStakeKernels(const CWallet& wallet, unsigned int nBits, uint32_t nTime,
+                                             int64_t nSearchInterval, bool use_cache, bool* rejected)
+{
+    AssertLockHeld(::cs_main);
+    AssertLockHeld(wallet.cs_wallet);
+    if (rejected) *rejected = false;
+    std::vector<StakeKernelHit> hits;
+    CBlockIndex* tip = wallet.chain().getTip();
+    if (!tip) return hits;
+    const bool previous = g_stake_slot_cache_enabled.exchange(use_cache);
+    const auto slot = AcquireStakeSlotCache(wallet, tip);
+    g_stake_slot_cache_enabled.store(previous);
+    for (const auto& [wtx, n] : slot->coins) {
+        const COutPoint prevout{wtx->GetHash(), n};
+        for (unsigned int i = 0; i < std::min<int64_t>(nSearchInterval, 60); ++i) {
+            const StakeSlotKernel result = CheckStakeSlotKernel(wallet, *slot, tip, nBits, nTime - i, prevout);
+            if (result == StakeSlotKernel::CACHE_REJECTED) {
+                if (rejected) *rejected = true;
+                return hits;
+            }
+            if (result == StakeSlotKernel::FOUND) {
+                hits.push_back({prevout, nTime - i});
+                break;
+            }
+        }
+    }
+    return hits;
 }
 
 // peercoin: create coin stake transaction
@@ -2320,10 +2598,8 @@ bool CreateCoinStake(CWallet& wallet, unsigned int nBits, int64_t nSearchInterva
     scriptEmpty.clear();
     txNew.vout.push_back(CTxOut(0, scriptEmpty));
 
-    std::set<std::pair<const CWalletTx*, unsigned int> > setCoins;
     std::vector<CTransactionRef> vwtxPrev;
     CAmount nValueIn = 0;
-    CAmount nTargetValue = MAX_MONEY;
     const int64_t stake_mtp = pindexPrev->GetMedianTimePast();
     const int stake_height = pindexPrev->nHeight + 1;
     const Consensus::Params& consensus = Params().GetConsensus();
@@ -2331,9 +2607,11 @@ bool CreateCoinStake(CWallet& wallet, unsigned int nBits, int64_t nSearchInterva
     const bool final_quantum_lockout = consensus.IsQuantumFinalLockout(stake_mtp, stake_height);
     const bool stake_reward_split_active = consensus.IsStakeRewardSplitActive(stake_height);
 
-    // Select coins with suitable depth
-    if (!SelectCoinsForStaking(wallet, nTargetValue, setCoins, nValueIn))
-        return false;
+    // Select coins with suitable depth. The selection and the kernel inputs
+    // are shared by every slot of this tip (see StakeSlotCache).
+    const std::shared_ptr<const StakeSlotCache> stake_slot = AcquireStakeSlotCache(wallet, pindexPrev);
+    const std::set<std::pair<const CWalletTx*, unsigned int>>& setCoins = stake_slot->coins;
+    nValueIn = stake_slot->value_in;
 
     if (setCoins.empty() || nValueIn <= wallet.m_reserve_balance)
         return false;
@@ -2388,7 +2666,10 @@ bool CreateCoinStake(CWallet& wallet, unsigned int nBits, int64_t nSearchInterva
             // Search backward in time from the given txNew timestamp
             // Search nSearchInterval seconds back up to nMaxStakeSearchInterval
             const uint32_t kernel_time = txNew.nTime - n;
-            if (CheckKernel(pindexPrev, nBits, kernel_time, prevoutStake, wallet.chain().getCoinsTip()))
+            const StakeSlotKernel kernel_result = CheckStakeSlotKernel(wallet, *stake_slot, pindexPrev, nBits, kernel_time, prevoutStake);
+            // The cache is dropped; the next slot rebuilds it from scratch.
+            if (kernel_result == StakeSlotKernel::CACHE_REJECTED) return false;
+            if (kernel_result == StakeSlotKernel::FOUND)
             {
                 CAmount kernel_principal{0};
                 if (!GetCoinStakeInputPrincipal(wallet.chain().getCoinsTip(), prevoutStake, consensus, pindexPrev->nHeight + 1, stake_mtp, kernel_principal)) {

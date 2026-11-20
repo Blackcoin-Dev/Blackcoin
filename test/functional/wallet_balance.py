@@ -28,8 +28,17 @@ def assert_balance_result(node, actual, expected):
         "lastprocessedblock",
         "lifecycle_evaluation_height",
         "lifecycle_evaluation_mtp",
+        "balance_exact",
+        "balance_height",
+        "balance_blockhash",
+        "balance_state",
     }
     assert_equal(set(actual), expected_top_level)
+    # The framework asks for exact balances (walletrpcexactbalance=1).
+    assert_equal(actual["balance_exact"], True)
+    assert_equal(actual["balance_state"], "exact")
+    assert_equal(actual["balance_height"], actual["lastprocessedblock"]["height"])
+    assert_equal(actual["balance_blockhash"], actual["lastprocessedblock"]["hash"])
     assert_equal(actual["lifecycle_evaluation_height"], node.getblockcount() + 1)
     assert_equal(
         actual["lifecycle_evaluation_mtp"],

@@ -77,6 +77,7 @@ bench_bench_blackcoin_LDADD = \
   $(LIBUNIVALUE) \
   $(EVENT_PTHREADS_LIBS) \
   $(EVENT_LIBS) \
+  $(CURL_LIBS) \
   $(MINIUPNPC_LIBS) \
   $(NATPMP_LIBS) \
   $(LIBOQS_LIBS)

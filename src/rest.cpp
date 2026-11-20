@@ -821,8 +821,7 @@ static bool rest_getutxos(const std::any& context, HTTPRequest* req, const std::
                 if (fInputParsed) //don't allow sending input over URI and HTTP RAW DATA
                     return RESTERR(req, HTTP_BAD_REQUEST, "Combination of URI scheme inputs and raw post data is not allowed");
 
-                CDataStream oss(SER_NETWORK);
-                oss << strRequestMutable;
+                CDataStream oss{MakeUCharSpan(strRequestMutable), SER_NETWORK};
                 oss >> fCheckMemPool;
                 oss >> vOutPoints;
             }

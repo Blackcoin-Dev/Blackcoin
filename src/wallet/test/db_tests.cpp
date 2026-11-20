@@ -9,6 +9,8 @@
 #include <test/util/setup_common.h>
 #include <util/check.h>
 #include <util/fs.h>
+#include <util/string.h>
+#include <util/time.h>
 #include <util/translation.h>
 #ifdef USE_BDB
 #include <wallet/bdb.h>
@@ -19,11 +21,16 @@
 #endif
 #include <wallet/test/util.h>
 #include <wallet/walletutil.h> // for WALLET_FLAG_DESCRIPTORS
+#include <warnings.h>
 
 #include <fstream>
+#include <atomic>
 #include <chrono>
+#include <functional>
 #include <future>
+#include <iterator>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 
@@ -425,7 +432,400 @@ BOOST_AUTO_TEST_CASE(sqlite_batch_unabortable_close_poisoned_until_reload)
     BOOST_CHECK(!reloaded->Exists(std::string{"new-batch"}));
     BOOST_CHECK(reloaded->Write(std::string{"after-reload"}, 4));
 }
+
+static int CountCommits(sqlite3* db, const std::function<void()>& fn)
+{
+    int commits{0};
+    sqlite3_commit_hook(db, [](void* arg) -> int { ++*static_cast<int*>(arg); return 0; }, &commits);
+    fn();
+    sqlite3_commit_hook(db, nullptr, nullptr);
+    return commits;
+}
+
+BOOST_AUTO_TEST_CASE(sqlite_bulk_scope_groups_writes_into_one_commit)
+{
+    DatabaseOptions options;
+    DatabaseStatus status;
+    bilingual_str error;
+    auto database = MakeSQLiteDatabase(m_path_root / "bulk", options, status, error);
+    BOOST_REQUIRE_MESSAGE(database, error.original);
+    SQLiteHooksReset reset{database->m_db};
+
+    // Without a scope every write is its own commit, whichever batch makes it.
+    BOOST_CHECK_EQUAL(CountCommits(database->m_db, [&] {
+        for (int i = 0; i < 4; ++i) BOOST_REQUIRE(database->MakeBatch()->Write(std::string{"plain"} + ToString(i), i));
+    }), 4);
+
+    // With a scope the same writes, through separate batches, commit once.
+    BOOST_CHECK_EQUAL(CountCommits(database->m_db, [&] {
+        auto scope = database->MakeBulkScope();
+        BOOST_REQUIRE(scope);
+        // Only one scope, and no transaction of another kind, at a time.
+        BOOST_CHECK(!database->MakeBulkScope());
+        for (int i = 0; i < 4; ++i) BOOST_REQUIRE(database->MakeBatch()->Write(std::string{"bulk"} + ToString(i), i));
+        int value{0};
+        BOOST_REQUIRE(database->MakeBatch()->Read(std::string{"bulk3"}, value));
+        BOOST_CHECK_EQUAL(value, 3);
+        BOOST_CHECK(scope->Commit());
+        BOOST_CHECK(scope->Commit());
+    }), 1);
+    BOOST_CHECK_EQUAL(sqlite3_get_autocommit(database->m_db), 1);
+    BOOST_CHECK(!database->m_bulk_active);
+    for (int i = 0; i < 4; ++i) BOOST_CHECK(database->MakeBatch()->Exists(std::string{"bulk"} + ToString(i)));
+
+    // An atomic unit inside the scope nests as a savepoint: a commit joins the
+    // scope's single commit, an abort undoes only that unit.
+    BOOST_CHECK_EQUAL(CountCommits(database->m_db, [&] {
+        auto scope = database->MakeBulkScope();
+        BOOST_REQUIRE(scope);
+        auto unit = database->MakeBatch();
+        BOOST_REQUIRE(unit->TxnBegin(/*durable=*/true));
+        BOOST_REQUIRE(unit->Write(std::string{"unit-kept"}, 1));
+        BOOST_REQUIRE(unit->TxnCommit());
+        BOOST_REQUIRE(unit->TxnBegin(/*durable=*/true));
+        BOOST_REQUIRE(unit->Write(std::string{"unit-dropped"}, 2));
+        BOOST_REQUIRE(unit->TxnAbort());
+        BOOST_REQUIRE(database->MakeBatch()->Write(std::string{"after-units"}, 3));
+        BOOST_CHECK_EQUAL(sqlite3_get_autocommit(database->m_db), 0);
+        // The scope does not give other batches a transaction of their own.
+        BOOST_CHECK(!database->MakeBatch()->TxnCommit());
+    }), 1);
+    auto reader = database->MakeBatch();
+    BOOST_CHECK(reader->Exists(std::string{"unit-kept"}));
+    BOOST_CHECK(!reader->Exists(std::string{"unit-dropped"}));
+    BOOST_CHECK(reader->Exists(std::string{"after-units"}));
+
+    // Leaving the scope early still commits what was written.
+    try {
+        auto scope = database->MakeBulkScope();
+        BOOST_REQUIRE(scope);
+        BOOST_REQUIRE(database->MakeBatch()->Write(std::string{"before-throw"}, 4));
+        throw std::runtime_error("unwind");
+    } catch (const std::runtime_error&) {
+    }
+    BOOST_CHECK_EQUAL(sqlite3_get_autocommit(database->m_db), 1);
+    BOOST_CHECK(reader->Exists(std::string{"before-throw"}));
+
+    // An open ordinary transaction refuses a scope.
+    auto owner = database->MakeBatch();
+    BOOST_REQUIRE(owner->TxnBegin());
+    BOOST_CHECK(!database->MakeBulkScope());
+    BOOST_REQUIRE(owner->TxnAbort());
+
+    // Everything the scope committed is on disk after a reopen.
+    reader.reset();
+    owner.reset();
+    database->Close();
+    database->Open();
+    auto reopened = database->MakeBatch();
+    BOOST_CHECK(reopened->Exists(std::string{"bulk0"}));
+    BOOST_CHECK(reopened->Exists(std::string{"unit-kept"}));
+    BOOST_CHECK(reopened->Exists(std::string{"before-throw"}));
+}
+
+static std::vector<char> ReadWholeFile(const std::string& path)
+{
+    std::ifstream in{path, std::ios::binary};
+    return {std::istreambuf_iterator<char>{in}, std::istreambuf_iterator<char>{}};
+}
+
+static void WriteWholeFile(const std::string& path, const std::vector<char>& data)
+{
+    std::ofstream out{path, std::ios::binary | std::ios::trunc};
+    out.write(data.data(), data.size());
+}
+
+static std::vector<size_t> FindAll(const std::vector<char>& data, std::string_view needle)
+{
+    std::vector<size_t> hits;
+    for (size_t i = 0; i + needle.size() <= data.size(); ++i) {
+        if (std::string_view{data.data() + i, needle.size()} == needle) hits.push_back(i);
+    }
+    return hits;
+}
+
+/** Make a closed wallet file holding three rows. */
+static std::string MakeSmallSQLiteWallet(const fs::path& dir)
+{
+    DatabaseOptions options;
+    options.use_unsafe_sync = true;
+    DatabaseStatus status;
+    bilingual_str error;
+    auto database = MakeSQLiteDatabase(dir, options, status, error);
+    BOOST_REQUIRE_MESSAGE(database, error.original);
+    auto batch = database->MakeBatch();
+    for (int i : {1, 2, 3}) {
+        const std::string key = i == 1 ? "k-aaaa" : (i == 2 ? "k-bbbb" : "k-cccc");
+        BOOST_REQUIRE(batch->Write(key, i));
+    }
+    batch.reset();
+    const std::string file = database->Filename();
+    database->Close();
+    return file;
+}
+
+BOOST_AUTO_TEST_CASE(sqlite_quick_check_still_fails_start_on_page_damage)
+{
+    const std::string file = MakeSmallSQLiteWallet(m_path_root / "quickdamage");
+    std::vector<char> data = ReadWholeFile(file);
+    BOOST_REQUIRE_GE(data.size(), 3U * 4096U);
+    // Page 2 is the table's root: an invalid b-tree page type.
+    data[4096] = 0x7f;
+    WriteWholeFile(file, data);
+
+    DatabaseOptions options;
+    options.use_unsafe_sync = true;
+    options.verify = true;
+    options.full_integrity_check = false; // the start-up setting
+    DatabaseStatus status;
+    bilingual_str error;
+    auto database = MakeSQLiteDatabase(m_path_root / "quickdamage", options, status, error);
+    BOOST_CHECK(!database);
+    BOOST_CHECK(status == DatabaseStatus::FAILED_VERIFY || status == DatabaseStatus::FAILED_LOAD);
+}
+
+BOOST_AUTO_TEST_CASE(sqlite_background_check_reports_what_quick_check_misses)
+{
+    const std::string file = MakeSmallSQLiteWallet(m_path_root / "indexmismatch");
+    std::vector<char> data = ReadWholeFile(file);
+    // The key is stored in the table row and in the index row. Change the
+    // index copy to a key that sorts the same: only the full check sees it.
+    const auto hits = FindAll(data, "k-bbbb");
+    BOOST_REQUIRE_EQUAL(hits.size(), 2U);
+    data[hits.back() + 5] = 'c';
+    WriteWholeFile(file, data);
+
+    DatabaseOptions options;
+    options.use_unsafe_sync = true;
+    options.verify = true;
+
+    // The synchronous full check, as -walletfullcheck=1, rejects it.
+    options.full_integrity_check = true;
+    DatabaseStatus status;
+    bilingual_str error;
+    BOOST_CHECK(!MakeSQLiteDatabase(m_path_root / "indexmismatch", options, status, error));
+    BOOST_CHECK(status == DatabaseStatus::FAILED_VERIFY);
+
+    // The quick check passes (this is why the full check must still run).
+    options.full_integrity_check = false;
+    bilingual_str quick_error;
+    auto database = MakeSQLiteDatabase(m_path_root / "indexmismatch", options, status, quick_error);
+    BOOST_REQUIRE_MESSAGE(database, quick_error.original);
+
+    // The background check on the quick-checked database reports it and
+    // raises the warning, without closing or failing the database.
+    SetWalletIntegrityWarning({});
+    database->StartBackgroundIntegrityCheck();
+    database->JoinBackgroundIntegrityCheck();
+    BOOST_CHECK(database->GetBackgroundCheckState() == SQLiteDatabase::BackgroundCheckState::FAILED);
+    BOOST_CHECK(GetWarnings(false).original.find("integrity check") != std::string::npos);
+    BOOST_CHECK(database->MakeBatch()->Exists(std::string{"k-aaaa"}));
+    BOOST_CHECK(!fs::exists(fs::PathFromString(file + ".fullcheck")));
+    SetWalletIntegrityWarning({});
+}
+
+BOOST_AUTO_TEST_CASE(sqlite_background_check_passes_on_clean_wallet_with_concurrent_writes)
+{
+    DatabaseOptions options;
+    options.use_unsafe_sync = true;
+    DatabaseStatus status;
+    bilingual_str error;
+    auto database = MakeSQLiteDatabase(m_path_root / "cleanbg", options, status, error);
+    BOOST_REQUIRE_MESSAGE(database, error.original);
+    {
+        auto batch = database->MakeBatch();
+        for (int i = 0; i < 2000; ++i) BOOST_REQUIRE(batch->Write(strprintf("row-%d", i), std::string(100, 'x')));
+    }
+    SetWalletIntegrityWarning({});
+    database->m_check_step_pages = 4;
+    database->m_check_step_delay_ms = 1;
+    database->StartBackgroundIntegrityCheck();
+    // The wallet stays usable, and writes made during the copy are mirrored.
+    for (int i = 0; i < 200; ++i) {
+        auto batch = database->MakeBatch();
+        BOOST_CHECK(batch->Write(strprintf("late-%d", i), std::string(100, 'y')));
+    }
+    database->JoinBackgroundIntegrityCheck();
+    BOOST_CHECK(database->GetBackgroundCheckState() == SQLiteDatabase::BackgroundCheckState::PASSED);
+    BOOST_CHECK(GetWarnings(false).original.find("integrity check") == std::string::npos);
+}
+
+BOOST_AUTO_TEST_CASE(sqlite_background_check_is_cancelled_by_close)
+{
+    DatabaseOptions options;
+    options.use_unsafe_sync = true;
+    DatabaseStatus status;
+    bilingual_str error;
+    auto database = MakeSQLiteDatabase(m_path_root / "cancelbg", options, status, error);
+    BOOST_REQUIRE_MESSAGE(database, error.original);
+    {
+        auto batch = database->MakeBatch();
+        for (int i = 0; i < 4000; ++i) BOOST_REQUIRE(batch->Write(strprintf("row-%d", i), std::string(100, 'x')));
+    }
+    const fs::path copy = fs::PathFromString(database->Filename() + ".fullcheck");
+    // One page per step and a long pause: the check cannot finish by itself
+    // within the test, so only cancellation can end it.
+    database->m_check_step_pages = 1;
+    database->m_check_step_delay_ms = 5000;
+    database->StartBackgroundIntegrityCheck();
+    for (int i = 0; i < 500 && !fs::exists(copy); ++i) UninterruptibleSleep(std::chrono::milliseconds{10});
+    const auto t0 = std::chrono::steady_clock::now();
+    database->Close();
+    const auto elapsed = std::chrono::steady_clock::now() - t0;
+    BOOST_CHECK(elapsed < std::chrono::seconds{4});
+    BOOST_CHECK(database->GetBackgroundCheckState() == SQLiteDatabase::BackgroundCheckState::CANCELLED);
+    BOOST_CHECK(!fs::exists(copy));
+    database->Open();
+    BOOST_CHECK(database->MakeBatch()->Exists(std::string{"row-1"}));
+}
+
+static std::unique_ptr<SQLiteDatabase> MakeQueuedWallet(const fs::path& dir, int rows)
+{
+    DatabaseOptions options;
+    options.use_unsafe_sync = true;
+    DatabaseStatus status;
+    bilingual_str error;
+    auto database = MakeSQLiteDatabase(dir, options, status, error);
+    BOOST_REQUIRE_MESSAGE(database, error.original);
+    auto batch = database->MakeBatch();
+    for (int i = 0; i < rows; ++i) BOOST_REQUIRE(batch->Write(strprintf("row-%d", i), std::string(100, 'x')));
+    return database;
+}
+
+BOOST_AUTO_TEST_CASE(sqlite_background_checks_run_one_at_a_time_in_order)
+{
+    SQLiteDatabase::ConfigureBackgroundChecks(std::chrono::milliseconds{0}, std::chrono::milliseconds{0}, nullptr);
+    (void)SQLiteDatabase::BackgroundChecksMaxConcurrent(/*reset=*/true);
+    std::vector<std::unique_ptr<SQLiteDatabase>> dbs;
+    for (int i = 0; i < 3; ++i) {
+        dbs.push_back(MakeQueuedWallet(m_path_root / fs::PathFromString(strprintf("queue%d", i)), 1500));
+        dbs.back()->m_check_step_pages = 8;
+        dbs.back()->m_check_step_delay_ms = 1;
+    }
+    for (auto& db : dbs) db->StartBackgroundIntegrityCheck();
+    // The shared worker never has two checks running at once.
+    for (int i = 0; i < 3; ++i) {
+        dbs[i]->JoinBackgroundIntegrityCheck();
+        BOOST_CHECK(dbs[i]->GetBackgroundCheckState() == SQLiteDatabase::BackgroundCheckState::PASSED);
+    }
+    BOOST_CHECK_EQUAL(SQLiteDatabase::BackgroundChecksMaxConcurrent(), 1);
+}
+
+BOOST_AUTO_TEST_CASE(sqlite_queued_database_leaves_the_queue_when_closed)
+{
+    // The gate stays shut, so nothing runs while the databases wait.
+    SQLiteDatabase::ConfigureBackgroundChecks(std::chrono::hours{1}, std::chrono::milliseconds{0}, nullptr);
+    auto a = MakeQueuedWallet(m_path_root / "qa", 10);
+    auto b = MakeQueuedWallet(m_path_root / "qb", 10);
+    a->StartBackgroundIntegrityCheck();
+    b->StartBackgroundIntegrityCheck();
+    BOOST_CHECK(a->GetBackgroundCheckState() == SQLiteDatabase::BackgroundCheckState::QUEUED);
+    const auto t0 = std::chrono::steady_clock::now();
+    a->Close();
+    BOOST_CHECK(a->GetBackgroundCheckState() == SQLiteDatabase::BackgroundCheckState::CANCELLED);
+    BOOST_CHECK(b->GetBackgroundCheckState() == SQLiteDatabase::BackgroundCheckState::QUEUED);
+    // Shutdown with a database still queued returns promptly.
+    b.reset();
+    BOOST_CHECK(std::chrono::steady_clock::now() - t0 < std::chrono::seconds{5});
+    a.reset();
+    // Later tests run with the gate open.
+    SQLiteDatabase::ConfigureBackgroundChecks(std::chrono::milliseconds{0}, std::chrono::milliseconds{0}, nullptr);
+}
+
+BOOST_AUTO_TEST_CASE(sqlite_background_check_waits_for_readiness)
+{
+    std::atomic<bool> ready{false};
+    SQLiteDatabase::ConfigureBackgroundChecks(std::chrono::milliseconds{0}, std::chrono::milliseconds{0}, [&ready] { return ready.load(); });
+    auto a = MakeQueuedWallet(m_path_root / "ready", 10);
+    a->StartBackgroundIntegrityCheck();
+    UninterruptibleSleep(std::chrono::milliseconds{200});
+    BOOST_CHECK(a->GetBackgroundCheckState() == SQLiteDatabase::BackgroundCheckState::QUEUED);
+    // Closing returns at once even though the worker is inside its wait for readiness.
+    const auto t0 = std::chrono::steady_clock::now();
+    a->Close();
+    BOOST_CHECK(std::chrono::steady_clock::now() - t0 < std::chrono::seconds{3});
+    SQLiteDatabase::ConfigureBackgroundChecks(std::chrono::milliseconds{0}, std::chrono::milliseconds{0}, nullptr);
+}
+
 #endif // USE_SQLITE
+
+BOOST_AUTO_TEST_CASE(sqlite_commit_counters_split_by_kind)
+{
+    DatabaseOptions options;
+    options.use_unsafe_sync = true;
+    DatabaseStatus status;
+    bilingual_str error;
+    auto database = MakeSQLiteDatabase(m_path_root / "commit_counters", options, status, error);
+    BOOST_REQUIRE_MESSAGE(database, error.original);
+    ProcessSqliteCommits().Reset();
+    const auto count = [&](SqliteCommitKind kind) {
+        return database->CommitCounters().Snapshot()[static_cast<size_t>(kind)].count;
+    };
+
+    // A write outside any transaction commits by itself.
+    BOOST_REQUIRE(database->MakeBatch()->Write(std::string{"plain"}, 1));
+    BOOST_CHECK_EQUAL(count(SqliteCommitKind::AUTOCOMMIT), 1U);
+    BOOST_REQUIRE(database->MakeBatch()->Erase(std::string{"plain"}));
+    BOOST_CHECK_EQUAL(count(SqliteCommitKind::AUTOCOMMIT), 2U);
+
+    // Writes inside a transaction are not commits; its COMMIT is, by flag.
+    {
+        auto batch = database->MakeBatch();
+        BOOST_REQUIRE(batch->TxnBegin(/*durable=*/false));
+        BOOST_REQUIRE(batch->Write(std::string{"a"}, 1));
+        BOOST_REQUIRE(batch->Write(std::string{"b"}, 2));
+        BOOST_CHECK_EQUAL(count(SqliteCommitKind::AUTOCOMMIT), 2U);
+        BOOST_REQUIRE(batch->TxnCommit());
+    }
+    BOOST_CHECK_EQUAL(count(SqliteCommitKind::NON_DURABLE), 1U);
+    BOOST_CHECK_EQUAL(count(SqliteCommitKind::DURABLE), 0U);
+    {
+        auto batch = database->MakeBatch();
+        BOOST_REQUIRE(batch->TxnBegin(/*durable=*/true));
+        BOOST_REQUIRE(batch->Write(std::string{"c"}, 3));
+        BOOST_REQUIRE(batch->TxnCommit());
+    }
+    BOOST_CHECK_EQUAL(count(SqliteCommitKind::DURABLE), 1U);
+
+    // A bulk scope commits once, a unit inside it commits nothing, and an
+    // aborted transaction is no commit at all.
+    {
+        auto scope = database->MakeBulkScope();
+        BOOST_REQUIRE(scope);
+        auto batch = database->MakeBatch();
+        BOOST_REQUIRE(batch->TxnBegin(/*durable=*/true));
+        BOOST_REQUIRE(batch->Write(std::string{"d"}, 4));
+        BOOST_REQUIRE(batch->TxnCommit());
+        BOOST_REQUIRE(database->MakeBatch()->Write(std::string{"e"}, 5));
+        BOOST_REQUIRE(scope->Commit());
+    }
+    BOOST_CHECK_EQUAL(count(SqliteCommitKind::BULK_SCOPE), 1U);
+    BOOST_CHECK_EQUAL(count(SqliteCommitKind::DURABLE), 1U);
+    BOOST_CHECK_EQUAL(count(SqliteCommitKind::AUTOCOMMIT), 2U);
+    // A bulk scope in which nothing was written (reads only) touches no disk
+    // and is not a commit.
+    {
+        auto scope = database->MakeBulkScope();
+        BOOST_REQUIRE(scope);
+        int value{0};
+        BOOST_CHECK(database->MakeBatch()->Read(std::string{"d"}, value));
+        BOOST_CHECK_EQUAL(value, 4);
+        BOOST_CHECK(scope->Commit());
+    }
+    BOOST_CHECK_EQUAL(count(SqliteCommitKind::BULK_SCOPE), 1U);
+    {
+        auto batch = database->MakeBatch();
+        BOOST_REQUIRE(batch->TxnBegin());
+        BOOST_REQUIRE(batch->Write(std::string{"f"}, 6));
+        BOOST_REQUIRE(batch->TxnAbort());
+    }
+    BOOST_CHECK_EQUAL(count(SqliteCommitKind::NON_DURABLE), 1U);
+
+    // The process-wide counters saw the same commits: 2 + 1 + 1 + 1.
+    uint64_t process_total{0};
+    for (const SqliteCommitCounts& c : ProcessSqliteCommits().Snapshot()) process_total += c.count;
+    BOOST_CHECK_EQUAL(process_total, 5U);
+}
 
 BOOST_AUTO_TEST_CASE(db_cursor_prefix_range_test)
 {

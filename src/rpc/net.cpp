@@ -133,9 +133,9 @@ static RPCHelpMan getpeerinfo()
                     {RPCResult::Type::NUM, "bytesrecv", "The total bytes received"},
                     {RPCResult::Type::NUM_TIME, "conntime", "The " + UNIX_EPOCH_TIME + " of the connection"},
                     {RPCResult::Type::NUM, "timeoffset", "The time offset in seconds"},
-                    {RPCResult::Type::NUM, "pingtime", /*optional=*/true, "The last ping time in milliseconds (ms), if any"},
-                    {RPCResult::Type::NUM, "minping", /*optional=*/true, "The minimum observed ping time in milliseconds (ms), if any"},
-                    {RPCResult::Type::NUM, "pingwait", /*optional=*/true, "The duration in milliseconds (ms) of an outstanding ping (if non-zero)"},
+                    {RPCResult::Type::NUM, "pingtime", /*optional=*/true, "The last ping time in seconds, if any"},
+                    {RPCResult::Type::NUM, "minping", /*optional=*/true, "The minimum observed ping time in seconds, if any"},
+                    {RPCResult::Type::NUM, "pingwait", /*optional=*/true, "The duration in seconds of an outstanding ping (if non-zero)"},
                     {RPCResult::Type::NUM, "version", "The peer version, such as 70001"},
                     {RPCResult::Type::STR, "subver", "The string version"},
                     {RPCResult::Type::BOOL, "inbound", "Inbound (true) or Outbound (false)"},
@@ -621,6 +621,32 @@ static RPCHelpMan getnetworkinfo()
                         {RPCResult::Type::NUM, "connections_in", "the number of inbound connections"},
                         {RPCResult::Type::NUM, "connections_out", "the number of outbound connections"},
                         {RPCResult::Type::BOOL, "networkactive", "whether p2p networking is enabled"},
+                        {RPCResult::Type::OBJ, "publicendpoint", /*optional=*/true, "Runtime public endpoint (-publicendpointfile); present only when that option is on",
+                        {
+                            {RPCResult::Type::BOOL, "active", "A pair is bound, listening and advertised"},
+                            {RPCResult::Type::BOOL, "listening", "The extra runtime listening socket is open"},
+                            {RPCResult::Type::STR, "address", /*optional=*/true, "Advertised public address (only while active)"},
+                            {RPCResult::Type::NUM, "port", /*optional=*/true, "Advertised public port (only while active)"},
+                            {RPCResult::Type::STR, "via", /*optional=*/true, "configured: an existing listener already serves the port; runtime: an extra socket was opened (only while active)"},
+                            {RPCResult::Type::NUM, "age", /*optional=*/true, "Seconds since the file's observed_at (only while active)"},
+                            {RPCResult::Type::STR, "status", "active, or why nothing is advertised"},
+                        }},
+                        {RPCResult::Type::OBJ, "qqoutbound", "Current-chain QQ connection preference; not future-fork readiness",
+                        {
+                            {RPCResult::Type::NUM, "requested", "Requested preference, -1 means automatic half capacity"},
+                            {RPCResult::Type::NUM, "target", "Effective preference after capacity clamping"},
+                            {RPCResult::Type::NUM, "confirmed", "Accepted QQ VERSION and VERACK automatic full-relay peers"},
+                            {RPCResult::Type::NUM, "eligible", "Retained peers with matching pong and validated current-chain header evidence"},
+                            {RPCResult::Type::NUM, "deficit", "Unfilled eligible preference"},
+                            {RPCResult::Type::BOOL, "pending", "A replacement transaction is in probation or retiring its victim"},
+                            {RPCResult::Type::NUM, "generation", "Qualification snapshot generation"},
+                            {RPCResult::Type::STR, "constraint", "Last observed constraint, or empty"},
+                            {RPCResult::Type::NUM, "candidate_draws", "Weighted addrman draws for replacement probes"},
+                            {RPCResult::Type::NUM, "no_hint_rounds", "Probe selection rounds finding no eligible QQ hint"},
+                            {RPCResult::Type::NUM, "connect_attempts", "Replacement socket connection attempts, including fallback"},
+                            {RPCResult::Type::NUM, "connect_failures", "Replacement socket connection failures"},
+                            {RPCResult::Type::NUM, "dns_rounds", "Discovery rounds requested by QQ deficit"},
+                        }},
                         {RPCResult::Type::ARR, "networks", "information per network",
                         {
                             {RPCResult::Type::OBJ, "", "",
@@ -671,6 +697,35 @@ static RPCHelpMan getnetworkinfo()
     obj.pushKV("timeoffset",    GetTimeOffset());
     if (node.connman) {
         obj.pushKV("networkactive", node.connman->GetNetworkActive());
+        const auto status = node.connman->GetQQStatus();
+        UniValue qq(UniValue::VOBJ);
+        qq.pushKV("requested", status.requested);
+        qq.pushKV("target", status.target);
+        qq.pushKV("confirmed", status.confirmed);
+        qq.pushKV("eligible", status.eligible);
+        qq.pushKV("deficit", status.deficit);
+        qq.pushKV("pending", status.pending);
+        qq.pushKV("generation", status.generation);
+        qq.pushKV("constraint", status.constraint);
+        qq.pushKV("candidate_draws", status.candidate_draws);
+        qq.pushKV("no_hint_rounds", status.no_hint_rounds);
+        qq.pushKV("connect_attempts", status.connect_attempts);
+        qq.pushKV("connect_failures", status.connect_failures);
+        qq.pushKV("dns_rounds", status.dns_rounds);
+        obj.pushKV("qqoutbound", std::move(qq));
+        if (const auto pe = publicendpoint::GetInfo(); pe.enabled) {
+            UniValue pe_obj(UniValue::VOBJ);
+            pe_obj.pushKV("active", pe.active);
+            pe_obj.pushKV("listening", pe.listening);
+            if (pe.active) {
+                pe_obj.pushKV("address", pe.address);
+                pe_obj.pushKV("port", pe.port);
+                pe_obj.pushKV("via", pe.via);
+                pe_obj.pushKV("age", pe.age);
+            }
+            pe_obj.pushKV("status", pe.status);
+            obj.pushKV("publicendpoint", std::move(pe_obj));
+        }
         obj.pushKV("connections", node.connman->GetNodeCount(ConnectionDirection::Both));
         obj.pushKV("connections_in", node.connman->GetNodeCount(ConnectionDirection::In));
         obj.pushKV("connections_out", node.connman->GetNodeCount(ConnectionDirection::Out));
@@ -764,12 +819,12 @@ static RPCHelpMan setban()
         if (isSubnet) {
             banman.Ban(subNet, banTime, absolute);
             if (node.connman) {
-                node.connman->DisconnectNode(subNet);
+                node.connman->DisconnectNode(subNet, DisconnectReason::LOCAL_BANNED);
             }
         } else {
             banman.Ban(netAddr, banTime, absolute);
             if (node.connman) {
-                node.connman->DisconnectNode(netAddr);
+                node.connman->DisconnectNode(netAddr, DisconnectReason::LOCAL_BANNED);
             }
         }
     }

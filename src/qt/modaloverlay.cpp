@@ -89,10 +89,15 @@ void ModalOverlay::setKnownBestHeight(int count, const QDateTime& blockDate, boo
 
 void ModalOverlay::tipUpdate(int count, const QDateTime& blockDate, double nVerificationProgress)
 {
-    QDateTime currentDate = QDateTime::currentDateTime();
+    // Read the clock once. The local-time conversion behind
+    // QDateTime::toMSecsSinceEpoch() is costly and was repeated for every
+    // stored sample on every update.
+    const qint64 nowMSecs = QDateTime::currentMSecsSinceEpoch();
+    const qint64 sampleCutoffMSecs = nowMSecs - 500 * 1000;
+    const QDateTime currentDate = QDateTime::fromMSecsSinceEpoch(nowMSecs);
 
     // keep a vector of samples of verification progress at height
-    blockProcessTime.push_front(qMakePair(currentDate.toMSecsSinceEpoch(), nVerificationProgress));
+    blockProcessTime.push_front(qMakePair(nowMSecs, nVerificationProgress));
 
     // show progress speed if we have more than one sample
     if (blockProcessTime.size() >= 2) {
@@ -105,7 +110,7 @@ void ModalOverlay::tipUpdate(int count, const QDateTime& blockDate, double nVeri
             QPair<qint64, double> sample = blockProcessTime[i];
 
             // take first sample after 500 seconds or last available one
-            if (sample.first < (currentDate.toMSecsSinceEpoch() - 500 * 1000) || i == blockProcessTime.size() - 1) {
+            if (sample.first < sampleCutoffMSecs || i == blockProcessTime.size() - 1) {
                 progressDelta = blockProcessTime[0].second - sample.second;
                 timeDelta = blockProcessTime[0].first - sample.first;
                 progressPerHour = (progressDelta > 0) ? progressDelta / (double)timeDelta * 1000 * 3600 : 0;

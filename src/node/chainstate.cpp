@@ -24,6 +24,7 @@
 #include <uint256.h>
 #include <util/fs.h>
 #include <util/fs_helpers.h>
+#include <util/readahead.h>
 #include <util/signalinterrupt.h>
 #include <util/strencodings.h>
 #include <util/time.h>
@@ -35,6 +36,7 @@
 #include <array>
 #include <atomic>
 #include <cassert>
+#include <chrono>
 #include <cstdio>
 #include <exception>
 #include <fstream>
@@ -949,6 +951,23 @@ static ChainstateLoadResult CompleteChainstateInitialization(
             disk_base.nHeight != assumeutxo->height) {
             return {ChainstateLoadStatus::FAILURE_FULL_REINDEX_REQUIRED,
                     _("The snapshot chainstate base is not an approved entry in the local block index. No chainstate was moved or wiped. Move the chainstate_snapshot directory aside or use full -reindex.")};
+        }
+    }
+
+    // On a hard disk LevelDB reads the block index in many small pieces, which
+    // takes minutes. One sequential pass first puts the files in the OS cache.
+    // The wiped index of a reindex has nothing to read.
+    if (options.block_index_readahead && !options.reindex && !options.block_tree_db_in_memory) {
+        const fs::path index_dir{chainman.m_options.datadir / "blocks" / "index"};
+        const auto readahead_start{std::chrono::steady_clock::now()};
+        const util::ReadAheadStats ra{util::ReadAheadDirectory(index_dir, options.block_index_readahead_max_bytes, util::READAHEAD_CHUNK_BYTES, options.check_interrupt)};
+        const auto readahead_ms{std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - readahead_start).count()};
+        if (ra.skipped_too_large) {
+            LogPrintf("Block index read-ahead skipped: %u MiB of index files is more than a quarter of the memory\n", ra.dir_bytes >> 20);
+        } else if (ra.skipped_missing) {
+            LogPrintf("Block index read-ahead skipped: cannot list the index directory\n");
+        } else {
+            LogPrintf("Block index read-ahead: read %u bytes (%u MiB) from %u files in %d ms (%u files unreadable)\n", ra.bytes_read, ra.bytes_read >> 20, ra.files_read, readahead_ms, ra.files_failed);
         }
     }
 

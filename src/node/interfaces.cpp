@@ -39,6 +39,7 @@
 #include <policy/settings.h>
 #include <primitives/block.h>
 #include <primitives/transaction.h>
+#include <rpc/blockchain.h>
 #include <rpc/protocol.h>
 #include <rpc/server.h>
 #include <shutdown.h>
@@ -329,6 +330,24 @@ public:
         const CBlockIndex* tip = WITH_LOCK(::cs_main, return chainman().ActiveChain().Tip());
         return tip ? tip->GetBlockHash() : chainman().GetParams().GenesisBlock().GetHash();
     }
+    bool tryGetBestBlockHash(uint256& hash) override
+    {
+        TRY_LOCK(::cs_main, lock);
+        if (!lock) return false;
+        const CBlockIndex* tip = chainman().ActiveChain().Tip();
+        hash = tip ? tip->GetBlockHash() : chainman().GetParams().GenesisBlock().GetHash();
+        return true;
+    }
+    bool tryGetBlockHeight(const uint256& hash, int& height, bool& in_active_chain) override
+    {
+        TRY_LOCK(::cs_main, lock);
+        if (!lock) return false;
+        const CBlockIndex* index = chainman().m_blockman.LookupBlockIndex(hash);
+        if (!index) return false;
+        height = index->nHeight;
+        in_active_chain = chainman().ActiveChain().Contains(index);
+        return true;
+    }
     int64_t getLastBlockTime() override
     {
         LOCK(::cs_main);
@@ -410,7 +429,44 @@ public:
     }
     double getPoSKernelPS() override
     {
+        LOCK(::cs_main);
         return GetPoSKernelPS(chainman());
+    }
+    bool tryGetPoSKernelPS(uint256& header_hash, double& estimate, uint256& current_header) override
+    {
+        current_header.SetNull();
+        TRY_LOCK(::cs_main, lock);
+        if (!lock) return false;
+        const CBlockIndex* tip = chainman().m_best_header;
+        if (!tip) return false;
+        current_header = tip->GetBlockHash();
+        if (!m_kernel_sample.tip ||
+            (tip != m_kernel_sample.tip && (!m_kernel_sample.cursor || m_kernel_sample.stakes >= 72))) {
+            // Finish a frozen target even while headers advance. Callers see
+            // its hash and can reject stale data; the next call starts newer work.
+            m_kernel_sample = {};
+            m_kernel_sample.tip = tip;
+            m_kernel_sample.cursor = tip;
+        }
+        // Same arithmetic and 72 stake-interval window as GetPoSKernelPS.
+        // The separate visit budget also bounds a sparse PoW header history.
+        for (size_t visited = 0; visited < 512 && m_kernel_sample.cursor && m_kernel_sample.stakes < 72; ++visited) {
+            const CBlockIndex* index = m_kernel_sample.cursor;
+            if (index->IsProofOfStake()) {
+                if (m_kernel_sample.previous_stake) {
+                    m_kernel_sample.work += GetDifficulty(m_kernel_sample.previous_stake) * 4294967296.0;
+                    m_kernel_sample.seconds += int64_t{m_kernel_sample.previous_stake->nTime} - int64_t{index->nTime};
+                    ++m_kernel_sample.stakes;
+                }
+                m_kernel_sample.previous_stake = index;
+            }
+            m_kernel_sample.cursor = index->pprev;
+        }
+        if (m_kernel_sample.cursor && m_kernel_sample.stakes < 72) return false;
+        header_hash = m_kernel_sample.tip->GetBlockHash();
+        estimate = m_kernel_sample.seconds ? m_kernel_sample.work / m_kernel_sample.seconds : 0;
+        estimate *= Params().GetConsensus().nStakeTimestampMask + 1;
+        return true;
     }
     std::unique_ptr<Handler> handleInitMessage(InitMessageFn fn) override
     {
@@ -469,6 +525,15 @@ public:
     }
     ArgsManager& args() { return *Assert(Assert(m_context)->args); }
     ChainstateManager& chainman() { return *Assert(m_context->chainman); }
+    struct KernelSample {
+        const CBlockIndex* tip{nullptr};
+        const CBlockIndex* cursor{nullptr};
+        const CBlockIndex* previous_stake{nullptr};
+        double work{0};
+        int64_t seconds{0};
+        int stakes{0};
+    };
+    KernelSample m_kernel_sample GUARDED_BY(::cs_main);
     NodeContext* m_context{nullptr};
 };
 
@@ -611,6 +676,29 @@ public:
         LOCK(::cs_main);
         const CBlockIndex* index = chainman().m_blockman.LookupBlockIndex(block_hash);
         return GetLocator(index);
+    }
+    CBlockLocator getDenseChainLocator(const uint256& block_hash) override
+    {
+        // Every loaded wallet asks for the same block's locator on each block
+        // connection, so remember the last one. A block's locator depends only
+        // on its own ancestry, so a block hash is a complete key and a reorg
+        // cannot make the cached value stale.
+        {
+            LOCK(m_dense_locator_mutex);
+            if (m_dense_locator_hash == block_hash && !m_dense_locator.IsNull()) return m_dense_locator;
+        }
+        CBlockLocator locator;
+        {
+            LOCK(::cs_main);
+            const CBlockIndex* index = chainman().m_blockman.LookupBlockIndex(block_hash);
+            locator = GetDenseLocator(index);
+        }
+        if (!locator.IsNull()) {
+            LOCK(m_dense_locator_mutex);
+            m_dense_locator_hash = block_hash;
+            m_dense_locator = locator;
+        }
+        return locator;
     }
     std::optional<int> findLocatorFork(const CBlockLocator& locator) override
     {
@@ -787,6 +875,7 @@ public:
         return chainman().IsInitialBlockDownload();
     }
     bool shutdownRequested() override { return ShutdownRequested(); }
+    bool validationCallbacksBusy() override { return GetMainSignals().CallbacksBusy(); }
     void initMessage(const std::string& message) override { ::uiInterface.InitMessage(message); }
     void initWarning(const bilingual_str& message) override { InitWarning(message); }
     void initError(const bilingual_str& message) override { InitError(message); }
@@ -913,6 +1002,9 @@ public:
     ChainstateManager& chainman() override { return *Assert(m_node.chainman); }
     const CTxMemPool& mempool() override { return *Assert(m_node.mempool); }
     NodeContext& m_node;
+    Mutex m_dense_locator_mutex;
+    uint256 m_dense_locator_hash GUARDED_BY(m_dense_locator_mutex);
+    CBlockLocator m_dense_locator GUARDED_BY(m_dense_locator_mutex);
 };
 } // namespace
 } // namespace node

@@ -42,6 +42,8 @@
 #include <validation.h>
 
 #include <algorithm>
+#include <cmath>
+#include <limits>
 #include <functional>
 
 #include <QAction>
@@ -190,7 +192,7 @@ BitcoinGUI::BitcoinGUI(interfaces::Node& node, const PlatformStyle *_platformSty
 #ifdef ENABLE_WALLET
 	if (node::CanStake())
     {
-        QTimer *timerStakingIcon = new QTimer(labelStakingIcon);
+        timerStakingIcon = new QTimer(labelStakingIcon);
         connect(timerStakingIcon, SIGNAL(timeout()), this, SLOT(updateStakingIcon()));
         timerStakingIcon->start(1000);
 
@@ -240,6 +242,12 @@ BitcoinGUI::BitcoinGUI(interfaces::Node& node, const PlatformStyle *_platformSty
 
 #ifdef Q_OS_MACOS
     m_app_nap_inhibitor = new CAppNapInhibitor;
+    // Held until the first tip update says otherwise: the application also
+    // holds its own activity from the start of init, so there is no gap.
+    m_app_nap_inhibitor->disableAppNap();
+    m_app_nap_timer = new QTimer(this);
+    connect(m_app_nap_timer, &QTimer::timeout, this, &BitcoinGUI::pollAppNapWalletWork);
+    m_app_nap_timer->start(5000);
 #endif
 
     GUIUtil::handleCloseWindowShortcut(this);
@@ -758,6 +766,10 @@ void BitcoinGUI::setWalletController(WalletController* wallet_controller, bool s
 
     GUIUtil::ExceptionSafeConnect(wallet_controller, &WalletController::walletAdded, this, &BitcoinGUI::addWallet);
     connect(wallet_controller, &WalletController::walletRemoved, this, &BitcoinGUI::removeWallet);
+    connect(wallet_controller, &WalletController::walletBackupWarning, this,
+        [this](const QString& title, const QString& body, unsigned int style) {
+            message(title, body, style);
+        });
     connect(wallet_controller, &WalletController::destroyed, this, [this] {
         // wallet_controller gets destroyed manually, but it leaves our member copy dangling
         m_wallet_controller = nullptr;
@@ -934,10 +946,10 @@ void BitcoinGUI::createTrayIconMenu()
 #else
     // Note: On macOS, the Dock icon is used to provide the tray's functionality.
     MacDockIconHandler* dockIconHandler = MacDockIconHandler::instance();
-    connect(dockIconHandler, &MacDockIconHandler::dockIconClicked, [this] {
+    connect(dockIconHandler, &MacDockIconHandler::dockIconClicked, this, [this] {
         if (m_node.shutdownRequested()) return; // nothing to show, node is shutting down.
-        show();
-        activateWindow();
+        // A reopen event must clear the minimized state as well as activate.
+        GUIUtil::bringToFront(this);
     });
     trayIconMenu->setAsDockMenu();
 #endif // Q_OS_MACOS
@@ -1077,7 +1089,7 @@ void BitcoinGUI::updateNetworkState()
     QString icon;
     switch(count)
     {
-    case 0: icon = ":/icons/connect_0"; break;
+    case -1: case 0: icon = ":/icons/connect_0"; break;
     case 1: case 2: case 3: icon = ":/icons/connect_1"; break;
     case 4: case 5: case 6: icon = ":/icons/connect_2"; break;
     case 7: case 8: case 9: icon = ":/icons/connect_3"; break;
@@ -1088,7 +1100,7 @@ void BitcoinGUI::updateNetworkState()
 
     if (m_node.getNetworkActive()) {
         //: A substring of the tooltip.
-        tooltip = tr("%n active connection(s) to Blackcoin network.", "", count);
+        tooltip = count < 0 ? tr("Connection count unavailable.") : tr("%n active connection(s) to Blackcoin network.", "", count);
     } else {
         //: A substring of the tooltip.
         tooltip = tr("Network activity disabled.");
@@ -1160,13 +1172,11 @@ void BitcoinGUI::openOptionsDialogWithTab(OptionsDialog::Tab tab)
 
 void BitcoinGUI::setNumBlocks(int count, const QDateTime& blockDate, double nVerificationProgress, SyncType synctype, SynchronizationState sync_state)
 {
-// Disabling macOS App Nap on initial sync, disk and reindex operations.
+// Disabling macOS App Nap on initial sync, disk and reindex operations, and
+// while any loaded wallet is staking or mining (see applyAppNapPolicy()).
 #ifdef Q_OS_MACOS
-    if (sync_state == SynchronizationState::POST_INIT) {
-        m_app_nap_inhibitor->enableAppNap();
-    } else {
-        m_app_nap_inhibitor->disableAppNap();
-    }
+    m_app_nap_sync_work = sync_state != SynchronizationState::POST_INIT;
+    applyAppNapPolicy();
 #endif
 
     if (modalOverlay)
@@ -1185,6 +1195,10 @@ void BitcoinGUI::setNumBlocks(int count, const QDateTime& blockDate, double nVer
     // Acquire current block source
     BlockSource blockSource{clientModel->getBlockSource()};
     switch (blockSource) {
+        case BlockSource::UNKNOWN:
+            // Startup/churn must not be presented as confirmed zero peers.
+            progressBarLabel->setText(tr("Checking network status…"));
+            break;
         case BlockSource::NETWORK:
             if (synctype == SyncType::HEADER_PRESYNC) {
                 updateHeadersPresyncProgressLabel(count, blockDate);
@@ -1684,10 +1698,19 @@ void BitcoinGUI::updateStakingIcon()
     if (staking.enabled && staking.worker_running && staking.eligible &&
             staking.state == interfaces::WalletStakingState::SEARCHING)
     {
-        uint64_t nNetworkWeight = 1.1429 * walletModel->node().getPoSKernelPS();
-        const Consensus::Params& consensusParams = Params().GetConsensus();
-        int64_t nTargetSpacing = consensusParams.nTargetSpacing;
-        unsigned nEstimateTime = 1.0455 * nTargetSpacing * nNetworkWeight / nWeight;
+        const auto network_estimate = clientModel->cachedPoSKernelPS();
+        const double network_weight = network_estimate ? 1.1429 * *network_estimate : 0;
+        const double estimate_seconds = nWeight ? 1.0455 * Params().GetConsensus().nTargetSpacing * network_weight / nWeight : 0;
+        if (!network_estimate || !nWeight || !std::isfinite(network_weight) || network_weight <= 0 ||
+            network_weight >= static_cast<double>(std::numeric_limits<uint64_t>::max()) ||
+            !std::isfinite(estimate_seconds) || estimate_seconds <= 0 ||
+            estimate_seconds > std::numeric_limits<unsigned>::max()) {
+            labelStakingIcon->setPixmap(platformStyle->SingleColorIcon(":/icons/staking_on").pixmap(STATUSBAR_ICONSIZE, STATUSBAR_ICONSIZE));
+            labelStakingIcon->setToolTip(tr("Staking. A network-weight estimate for the current header is pending."));
+            return;
+        }
+        uint64_t nNetworkWeight = static_cast<uint64_t>(network_weight);
+        const unsigned nEstimateTime = static_cast<unsigned>(estimate_seconds);
 
         QString text;
         if (nEstimateTime < 60)
@@ -1717,13 +1740,9 @@ void BitcoinGUI::updateStakingIcon()
     {
         labelStakingIcon->setPixmap(platformStyle->SingleColorIcon(":/icons/staking_off").pixmap(STATUSBAR_ICONSIZE,STATUSBAR_ICONSIZE));
         if (staking.enabled) {
-            if (m_node.getNodeCount(ConnectionDirection::Both) == 0)
-                labelStakingIcon->setToolTip(tr("Not staking because wallet is offline"));
-            else if (m_node.isInitialBlockDownload())
-                labelStakingIcon->setToolTip(tr("Not staking because wallet is syncing"));
-            else if (!walletModel->wallet().hasPrivateKeys())
-                labelStakingIcon->setToolTip(tr("Not staking because private keys are disabled"));
-            else if (staking.state == interfaces::WalletStakingState::LOCKED)
+            // Telemetry already carries the worker's eligibility reason. Do
+            // not take fresh node or wallet locks from this one-second timer.
+            if (staking.state == interfaces::WalletStakingState::LOCKED)
                 labelStakingIcon->setToolTip(tr("Not staking because wallet is locked"));
             else if (staking.state == interfaces::WalletStakingState::NO_ELIGIBLE_COINS || !nWeight)
                 labelStakingIcon->setToolTip(tr("Not staking because you don't have mature coins"));
@@ -1811,20 +1830,62 @@ void BitcoinGUI::unsubscribeFromCoreSignals()
     m_handler_question->disconnect();
 }
 
-void BitcoinGUI::join()
+#ifdef Q_OS_MACOS
+void BitcoinGUI::applyAppNapPolicy()
 {
-    // Stop accepting new resource work and begin cooperative cancellation.
-    // BitcoinApplication requests global node shutdown immediately after this
-    // method, then setClientModel(nullptr) performs the bounded worker join.
+    if (!m_app_nap_inhibitor) return;
+    if (m_app_nap_sync_work || m_app_nap_wallet_work) {
+        m_app_nap_inhibitor->disableAppNap();
+    } else {
+        m_app_nap_inhibitor->enableAppNap();
+    }
+}
+
+bool BitcoinGUI::anyWalletStakingOrMining() const
+{
+#ifdef ENABLE_WALLET
+    if (!m_wallet_controller) return false;
+    for (WalletModel* wallet_model : m_wallet_controller->getOpenWallets()) {
+        // Two atomic flag reads per wallet: no lock, no chainstate access, safe on the UI thread.
+        if (wallet_model->wallet().isStakingOrPowMiningRequested()) return true;
+    }
+#endif
+    return false;
+}
+
+void BitcoinGUI::pollAppNapWalletWork()
+{
+    if (!clientModel) return;
+    const bool work = anyWalletStakingOrMining();
+    if (work == m_app_nap_wallet_work) return;
+    m_app_nap_wallet_work = work;
+    applyAppNapPolicy();
+}
+#endif
+
+void BitcoinGUI::beginShutdown()
+{
+#ifdef Q_OS_MACOS
+    // Closing the wallets flushes every database; keep the process out of App Nap until it exits.
+    if (m_app_nap_timer) m_app_nap_timer->stop();
+    if (m_app_nap_inhibitor) m_app_nap_inhibitor->disableAppNap();
+#endif
     shadowResourceDialog->requestShutdown();
+    if (rpcConsole) rpcConsole->beginShutdown();
 #ifdef ENABLE_WALLET
     if (timerStakingIcon) timerStakingIcon->stop();
-    if (m_wallet_controller) {
-        for (WalletModel* wallet_model : m_wallet_controller->getOpenWallets()) {
-            wallet_model->join();
-        }
-    }
-#endif // ENABLE_WALLET
+    if (m_wallet_controller) m_wallet_controller->beginShutdown();
+#endif
+}
+
+bool BitcoinGUI::shutdownReady()
+{
+    bool ready = shadowResourceDialog->shutdownReady();
+    if (rpcConsole) ready = rpcConsole->shutdownReady() && ready;
+#ifdef ENABLE_WALLET
+    if (m_wallet_controller) ready = m_wallet_controller->shutdownReady() && ready;
+#endif
+    return ready;
 }
 
 bool BitcoinGUI::isPrivacyModeActivated() const

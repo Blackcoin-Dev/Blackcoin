@@ -4867,6 +4867,104 @@ BOOST_FIXTURE_TEST_CASE(
     CheckLogicalProofWindowStopsAtGoldRushEnd();
 }
 
+BOOST_AUTO_TEST_CASE(replay_window_matches_fresh_reads_and_is_discarded_on_failure)
+{
+    CCoinsView base;
+    CCoinsViewCache seed{&base, true};
+    uint256 whitelist_hash, reward_hash, parent_hash;
+    CBlockIndex whitelist, reward, parent;
+    InitIndex(whitelist, SHADOW_WHITELIST_HEIGHT, nullptr, whitelist_hash);
+    BOOST_REQUIRE(ApplyLegacyWhitelistSnapshot(seed, &whitelist));
+    CBlock block;
+    block.vtx = {MakeCoinbaseTx(CScript{} << OP_TRUE)};
+    InitIndex(reward, SHADOW_REWARD_START_HEIGHT, &whitelist, reward_hash);
+    BOOST_REQUIRE(ApplyShadowAndCheckpoint(seed, block, &reward));
+
+    const auto& consensus = Params().GetConsensus();
+    const int activation = consensus.nShadowCompetingClaimsActivationHeight;
+    InitIndex(parent, activation - 1, &reward, parent_hash);
+    BOOST_REQUIRE(AdvanceGoldRushInventoryTip(seed, &parent));
+    std::array<CBlockIndex, SHADOW_POW_LATE_ORIGIN_WINDOW + 1> indexes;
+    std::array<uint256, SHADOW_POW_LATE_ORIGIN_WINDOW + 1> hashes;
+    for (size_t i = 0; i < SHADOW_POW_LATE_ORIGIN_WINDOW; ++i) {
+        InitIndex(indexes[i], activation + i, i ? &indexes[i - 1] : &parent, hashes[i]);
+        BOOST_REQUIRE(ApplyShadowAndCheckpoint(seed, block, &indexes[i]));
+    }
+
+    auto& previous = indexes[SHADOW_POW_LATE_ORIGIN_WINDOW - 1];
+    const auto previous_outpoint = ShadowLogicalProofBucketOutpointForTesting(&previous);
+    // Fill one predecessor bucket with distinct nonempty proof IDs. All the
+    // other predecessor buckets remain empty, so the entire window is valid.
+    BOOST_REQUIRE(seed.SpendCoin(previous_outpoint));
+    BOOST_REQUIRE(WriteShadowLogicalProofBucketForTesting(seed, &previous, MAX_SHADOW_POW_EVALS_PER_BLOCK));
+    Coin previous_coin;
+    BOOST_REQUIRE(seed.GetCoin(previous_outpoint, previous_coin));
+    BOOST_REQUIRE_GT(previous_coin.out.scriptPubKey.size(), MAX_SHADOW_POW_EVALS_PER_BLOCK * uint256::size());
+
+    auto& tip = indexes.back();
+    InitIndex(tip, previous.nHeight + 1, &previous, hashes.back());
+    CCoinsViewCache view{&seed, true};
+    ShadowReplayProofWindow window;
+    BOOST_REQUIRE(ApplyShadowBlockResult(view, block, &tip, nullptr, true, &window) == ShadowApplyResult::OK);
+    const Coin* captured = window.Find(view, &tip, &previous);
+    BOOST_REQUIRE(captured);
+    BOOST_CHECK(captured->out.scriptPubKey == previous_coin.out.scriptPubKey);
+    BOOST_CHECK(!window.Find(seed, &tip, &previous));
+    BOOST_CHECK(!window.Find(view, &previous, previous.pprev));
+    BOOST_CHECK(!window.Find(view, &tip, &tip));
+    CBlockIndex unrelated;
+    unrelated.nHeight = previous.nHeight;
+    BOOST_CHECK(!window.Find(view, &tip, &unrelated));
+    BOOST_REQUIRE(AdvanceGoldRushInventoryTip(view, &tip));
+    WriteShadowReplayStateMarker(view, &tip, consensus, &window);
+    const auto cached = GetShadowReplayStateInfo(view, consensus, &tip);
+    BOOST_REQUIRE(cached.valid_for_tip);
+    WriteShadowReplayStateMarker(view, &tip, consensus);
+    const auto uncached = GetShadowReplayStateInfo(view, consensus, &tip);
+    BOOST_REQUIRE(uncached.valid_for_tip);
+    BOOST_CHECK(cached.commitment == uncached.commitment);
+
+    // The current bucket is never reused from the predecessor capture.
+    const auto current_outpoint = ShadowLogicalProofBucketOutpointForTesting(&tip);
+    const auto replay_outpoint = ShadowReplayStateOutpointForTesting();
+    Coin current_coin, original_marker, missing_marker;
+    BOOST_REQUIRE(view.GetCoin(current_outpoint, current_coin));
+    BOOST_REQUIRE(view.GetCoin(replay_outpoint, original_marker));
+    BOOST_REQUIRE(view.SpendCoin(current_outpoint));
+    WriteShadowReplayStateMarker(view, &tip, consensus, &window);
+    BOOST_REQUIRE(view.GetCoin(replay_outpoint, missing_marker));
+    BOOST_CHECK(missing_marker.out.scriptPubKey != original_marker.out.scriptPubKey);
+    BOOST_CHECK(!GetShadowReplayStateInfo(view, consensus, &tip).valid_for_tip);
+    view.AddCoin(current_outpoint, std::move(current_coin), false);
+    WriteShadowReplayStateMarker(view, &tip, consensus, &window);
+    BOOST_CHECK(GetShadowReplayStateInfo(view, consensus, &tip).commitment == uncached.commitment);
+
+    CCoinsViewCache missing{&seed, true};
+    BOOST_REQUIRE(missing.SpendCoin(ShadowLogicalProofBucketOutpointForTesting(&previous)));
+    BOOST_CHECK(ApplyShadowBlockResult(missing, block, &tip, nullptr, true, &window) ==
+                ShadowApplyResult::LOCAL_INTERNAL_ERROR);
+    BOOST_CHECK(!window.Find(view, &tip, &previous));
+    BOOST_CHECK(!missing.HaveCoin(ShadowLogicalProofBucketOutpointForTesting(&tip)));
+
+    CCoinsViewCache corrupt{&seed, true};
+    Coin malformed;
+    BOOST_REQUIRE(corrupt.GetCoin(previous_outpoint, malformed));
+    malformed.out.scriptPubKey = CScript{} << OP_TRUE;
+    corrupt.AddCoin(previous_outpoint, std::move(malformed), true);
+    BOOST_CHECK(ApplyShadowBlockResult(corrupt, block, &tip, nullptr, true, &window) ==
+                ShadowApplyResult::LOCAL_INTERNAL_ERROR);
+    BOOST_CHECK(!window.Find(corrupt, &tip, &previous));
+    BOOST_CHECK(!corrupt.HaveCoin(ShadowLogicalProofBucketOutpointForTesting(&tip)));
+
+    BOOST_REQUIRE(UndoShadowAndRewind(view, block, &tip));
+    RewindShadowReplayStateMarker(view, &tip, consensus);
+    BOOST_CHECK(GetShadowReplayStateInfo(view, consensus, &previous).valid_for_tip);
+    BOOST_REQUIRE(ApplyShadowBlockResult(view, block, &tip, nullptr, true, &window) == ShadowApplyResult::OK);
+    BOOST_REQUIRE(AdvanceGoldRushInventoryTip(view, &tip));
+    WriteShadowReplayStateMarker(view, &tip, consensus, &window);
+    BOOST_CHECK(GetShadowReplayStateInfo(view, consensus, &tip).commitment == uncached.commitment);
+}
+
 BOOST_AUTO_TEST_CASE(logical_proof_bucket_serialized_resource_bounds)
 {
     constexpr int first_height{5'993'200};

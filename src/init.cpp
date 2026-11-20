@@ -81,9 +81,11 @@
 #include <util/asmap.h>
 #include <util/chaintype.h>
 #include <util/check.h>
+#include <util/io_counters.h>
 #include <util/fs.h>
 #include <util/fs_helpers.h>
 #include <util/moneystr.h>
+#include <util/readahead.h>
 #include <util/result.h>
 #include <util/strencodings.h>
 #include <util/string.h>
@@ -482,6 +484,7 @@ void SetupServerArgs(ArgsManager& argsman)
     argsman.AddArg("-alertnotify=<cmd>", "Execute command when an alert is raised (%s in cmd is replaced by message)", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
 #endif
     argsman.AddArg("-assumevalid=<hex>", strprintf("If this block is in the chain assume that it and its ancestors are valid and potentially skip their script verification (0 to verify all, default: %s, testnet: %s, signet: %s)", defaultChainParams->GetConsensus().defaultAssumeValid.GetHex(), testnetChainParams->GetConsensus().defaultAssumeValid.GetHex(), signetChainParams->GetConsensus().defaultAssumeValid.GetHex()), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
+    argsman.AddArg("-blockindexreadahead", strprintf("Read the block index files once, in order, before loading them, so a hard disk is not read in small pieces (default: %u). Skipped when the index is larger than a quarter of the memory.", util::DEFAULT_BLOCKINDEX_READAHEAD), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-blocksdir=<dir>", "Specify directory to hold blocks subdirectory for *.dat files (default: <datadir>)", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
 #if HAVE_SYSTEM
     argsman.AddArg("-blocknotify=<cmd>", "Execute command when the best block changes (%s in cmd is replaced by block hash)", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
@@ -493,7 +496,7 @@ void SetupServerArgs(ArgsManager& argsman)
     argsman.AddArg("-conf=<file>", strprintf("Specify path to read-only configuration file. Relative paths will be prefixed by datadir location (only useable from command line, not configuration file) (default: %s)", BITCOIN_CONF_FILENAME), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-datadir=<dir>", "Specify data directory", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-dbbatchsize", strprintf("Maximum database write batch size in bytes (default: %u)", nDefaultDbBatchSize), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::OPTIONS);
-    argsman.AddArg("-dbcache=<n>", strprintf("Maximum database cache size <n> MiB (%d to %d, default: %d). In addition, unused mempool memory is shared for this cache (see -maxmempool).", nMinDbCache, nMaxDbCache, nDefaultDbCache), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
+    argsman.AddArg("-dbcache=<n>", strprintf("Maximum database cache size <n> MiB (%d to %d, default: one sixteenth of the system memory, between %d and %d, halved when little memory is available; %d when the system memory cannot be detected). The chain state database's own cache takes at most %d MiB of it. In addition, unused mempool memory is shared for this cache (see -maxmempool).", nMinDbCache, nMaxDbCache, node::MIN_DYNAMIC_DB_CACHE, node::MAX_DYNAMIC_DB_CACHE, nDefaultDbCache, nMaxCoinsDBCache), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-includeconf=<file>", "Specify additional configuration file, relative to the -datadir path (only useable from configuration file, not command line)", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-allowignoredconf", strprintf("For backwards compatibility, treat an unused %s file in the datadir as a warning, not an error.", BITCOIN_CONF_FILENAME), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-loadblock=<file>", "Imports blocks from external file on startup", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
@@ -535,6 +538,10 @@ void SetupServerArgs(ArgsManager& argsman)
     argsman.AddArg("-dns", strprintf("Allow DNS lookups for -addnode, -seednode and -connect (default: %u)", DEFAULT_NAME_LOOKUP), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
     argsman.AddArg("-dnsseed", strprintf("Query for peer addresses via DNS lookup, if low on addresses (default: %u unless -connect used or -maxconnections=0)", DEFAULT_DNSSEED), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
     argsman.AddArg("-externalip=<ip>", "Specify your own public address", ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
+    argsman.AddArg("-publicendpointfile=<name>", "Name of a file inside the data directory that an external process keeps up to date with this node's currently reachable public IPv4 address and port, as one JSON object of at most 256 bytes: {\"schema\":\"blackcoin.public-endpoint/1\",\"address\":\"<ipv4>\",\"port\":<port>,\"observed_at\":<unix seconds>}. Turns the feature on (default: off). The node polls the file, opens an extra listening socket on 0.0.0.0:<port>, and advertises exactly that pair; with no valid pair it advertises nothing. Inert with -listen=0 or an IPv4 proxy. With this option, -externalip is not advertised and -discover defaults to 0.", ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
+    argsman.AddArg("-publicendpointmaxage=<seconds>", strprintf("Withdraw the public endpoint when the file's observed_at is older than this many seconds (default: %d; range 1-86400)", publicendpoint::DEFAULT_MAX_AGE), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
+    argsman.AddArg("-publicendpointpollinterval=<seconds>", strprintf("Seconds between reads of the -publicendpointfile file (default: %d; regtest only, range 1-60)", publicendpoint::DEFAULT_POLL_INTERVAL), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::CONNECTION);
+    argsman.AddArg("-httpsseed", "Fetch bounded peer hints from the mainnet HTTPS directory (default: 1; disabled by -dnsseed=0, -dns=0, -connect, -maxconnections=0 or non-IP-only networks)", ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
     argsman.AddArg("-fixedseeds", strprintf("Allow fixed seeds if DNS seeds don't provide peers (default: %u)", DEFAULT_FIXEDSEEDS), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
     argsman.AddArg("-forcednsseed", strprintf("Always query for peer addresses via DNS lookup (default: %u)", DEFAULT_FORCEDNSSEED), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
     argsman.AddArg("-listen", strprintf("Accept connections from outside (default: %u if no -proxy, -connect or -maxconnections=0)", DEFAULT_LISTEN), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
@@ -558,6 +565,7 @@ void SetupServerArgs(ArgsManager& argsman)
     argsman.AddArg("-proxy=<ip:port>", "Connect through SOCKS5 proxy, set -noproxy to disable (default: disabled)", ArgsManager::ALLOW_ANY | ArgsManager::DISALLOW_ELISION, OptionsCategory::CONNECTION);
     argsman.AddArg("-proxyrandomize", strprintf("Randomize credentials for every proxy connection. This enables Tor stream isolation (default: %u)", DEFAULT_PROXYRANDOMIZE), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
     argsman.AddArg("-seednode=<ip>", "Connect to a node to retrieve peer addresses, and disconnect. This option can be specified multiple times to connect to multiple nodes.", ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
+    argsman.AddArg("-qqoutboundtarget=<n>", "Preferred number of responsive current-chain QQ automatic full-relay peers (default: half of full-relay capacity; explicit values clamp below full capacity; 0 disables pursuit)", ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
     argsman.AddArg("-networkactive", "Enable all P2P network activity (default: 1). Can be changed by the setnetworkactive RPC command", ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
     argsman.AddArg("-timeout=<n>", strprintf("Specify socket connection timeout in milliseconds. If an initial attempt to connect is unsuccessful after this amount of time, drop it (minimum: 1, default: %d)", DEFAULT_CONNECT_TIMEOUT), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
     argsman.AddArg("-peertimeout=<n>", strprintf("Specify a p2p connection timeout delay in seconds. After connecting to a peer, wait this amount of time before considering disconnection based on inactivity (minimum: 1, default: %d)", DEFAULT_PEER_CONNECT_TIMEOUT), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::CONNECTION);
@@ -623,6 +631,9 @@ void SetupServerArgs(ArgsManager& argsman)
     argsman.AddArg("-checkpoints", strprintf("Enable rejection of any forks from the known historical chain until block %s (default: %u)", defaultChainParams->Checkpoints().GetHeight(), DEFAULT_CHECKPOINTS_ENABLED), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
     argsman.AddArg("-deprecatedrpc=<method>", "Allows deprecated RPC method(s) to be used", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
     argsman.AddArg("-fastprune", "Use smaller block files and lower minimum prune height for functional tests", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
+    argsman.AddArg("-testdbreaddelayus=<n>", "Sleep <n> microseconds on every database read, to reproduce a slow disk (regtest only, 0-1000000, default: 0)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
+    argsman.AddArg("-testwalletsyncdelayus=<n>", "Sleep <n> microseconds on every wallet database commit, to reproduce a slow disk (regtest only, 0-1000000, default: 0)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
+    argsman.AddArg("-testrecordreadkeys", "Record the key of every database read so the getiocounters RPC can report their order (regtest only, default: 0)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
     argsman.AddArg("-stopafterblockimport", strprintf("Stop running after importing blocks from disk (default: %u)", DEFAULT_STOPAFTERBLOCKIMPORT), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
     argsman.AddArg("-stopatheight", strprintf("Stop running after reaching the given height in the main chain (default: %u)", DEFAULT_STOPATHEIGHT), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
     argsman.AddArg("-limitancestorcount=<n>", strprintf("Do not accept transactions if number of in-mempool ancestors is <n> or more (default: %u)", DEFAULT_ANCESTOR_LIMIT), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
@@ -683,6 +694,7 @@ void SetupServerArgs(ArgsManager& argsman)
     argsman.AddArg("-rpcpassword=<pw>", "Password for JSON-RPC connections", ArgsManager::ALLOW_ANY | ArgsManager::SENSITIVE, OptionsCategory::RPC);
     argsman.AddArg("-rpcport=<port>", strprintf("Listen for JSON-RPC connections on <port> (default: %u, testnet: %u, signet: %u, regtest: %u)", defaultBaseParams->RPCPort(), testnetBaseParams->RPCPort(), signetBaseParams->RPCPort(), regtestBaseParams->RPCPort()), ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::RPC);
     argsman.AddArg("-rpcserialversion", strprintf("Sets the serialization of raw transaction or block hex returned in non-verbose mode, non-segwit(0) or segwit(1) (default: %d)", DEFAULT_RPC_SERIALIZE_VERSION), ArgsManager::ALLOW_ANY, OptionsCategory::RPC);
+    argsman.AddArg("-bindretryseconds=<n>", strprintf("Seconds to keep retrying a P2P listen bind that fails with \"address in use\" (default: %d)", DEFAULT_BIND_RETRY_SECONDS), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
     argsman.AddArg("-rpcservertimeout=<n>", strprintf("Timeout during HTTP requests (default: %d)", DEFAULT_HTTP_SERVER_TIMEOUT), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::RPC);
     argsman.AddArg("-rpcthreads=<n>", strprintf("Set the number of threads to service RPC calls (default: %d)", DEFAULT_HTTP_THREADS), ArgsManager::ALLOW_ANY, OptionsCategory::RPC);
     argsman.AddArg("-rpcuser=<user>", "Username for JSON-RPC connections", ArgsManager::ALLOW_ANY | ArgsManager::SENSITIVE, OptionsCategory::RPC);
@@ -701,7 +713,7 @@ void SetupServerArgs(ArgsManager& argsman)
 
     // Header spam filter
     argsman.AddArg("-headerspamfilter=<n>", strprintf("Use header spam filter (default: %u)", DEFAULT_HEADER_SPAM_FILTER), false, OptionsCategory::OPTIONS);
-    argsman.AddArg("-headerspamfiltermaxsize=<n>", strprintf("Maximum size of the list of indexes in the header spam filter (default: %u)", DEFAULT_HEADER_SPAM_FILTER_MAX_SIZE), false, OptionsCategory::OPTIONS);
+    argsman.AddArg("-headerspamfiltermaxsize=<n>", strprintf("Maximum retained heights per header replay identity, 0-%u (default: %u). Up to 1024 identities retain reconnect history for one disconnected hour; 64 slots are reserved for locally initiated peers", MAX_HEADER_SPAM_FILTER_POINTS, DEFAULT_HEADER_SPAM_FILTER_MAX_SIZE), false, OptionsCategory::OPTIONS);
     argsman.AddArg("-headerspamfiltermaxavg=<n>", strprintf("Maximum average size of an index occurrence in the header spam filter (default: %u)", DEFAULT_HEADER_SPAM_FILTER_MAX_AVG), false, OptionsCategory::OPTIONS);
     argsman.AddArg("-headerspamfilterignoreport=<n>", strprintf("Ignore the port in the ip address when looking for header spam, determine whether or not multiple nodes can be on the same IP (default: %u)", DEFAULT_HEADER_SPAM_FILTER_IGNORE_PORT), false, OptionsCategory::OPTIONS);
     argsman.AddArg("-headerspamfilterduringibd=<n>", strprintf("Enable header spam filter during IBD (default: %u)", DEFAULT_HEADER_SPAM_FILTER_DURING_IBD), false, OptionsCategory::OPTIONS);
@@ -735,6 +747,22 @@ static void StartupNotify(const ArgsManager& args)
     }
 }
 #endif
+
+/** -publicendpointfile is inert without inbound listening or when IPv4 is only reachable through a proxy. */
+static bool PublicEndpointRequested(const ArgsManager& args)
+{
+    if (!args.IsArgSet("-publicendpointfile")) return false;
+    Proxy ipv4_proxy;
+    if (!args.GetBoolArg("-listen", DEFAULT_LISTEN)) {
+        LogPrintf("-publicendpointfile ignored: -listen=0\n");
+        return false;
+    }
+    if (GetProxy(NET_IPV4, ipv4_proxy)) {
+        LogPrintf("-publicendpointfile ignored: IPv4 is reached through a proxy\n");
+        return false;
+    }
+    return true;
+}
 
 static bool AppInitServers(NodeContext& node)
 {
@@ -805,6 +833,12 @@ void InitParameterInteraction(ArgsManager& args)
         if (args.SoftSetBoolArg("-i2pacceptincoming", false)) {
             LogPrintf("%s: parameter interaction: -listen=0 -> setting -i2pacceptincoming=0\n", __func__);
         }
+    }
+
+    if (args.IsArgSet("-publicendpointfile")) {
+        // the runtime pair is the only address this node advertises
+        if (args.SoftSetBoolArg("-discover", false))
+            LogPrintf("%s: parameter interaction: -publicendpointfile set -> setting -discover=0\n", __func__);
     }
 
     if (args.IsArgSet("-externalip")) {
@@ -966,6 +1000,32 @@ bool AppInitParameterInteraction(const ArgsManager& args)
                   ChainTypeToString(chain), SHADOW_WHITELIST_HEIGHT, SHADOW_REWARD_START_HEIGHT, SHADOW_REWARD_END_HEIGHT);
     }
 
+    if (args.IsArgSet("-publicendpointfile")) {
+        if (!publicendpoint::ValidFileName(args.GetArg("-publicendpointfile", ""))) {
+            return InitError(Untranslated("-publicendpointfile must be a plain file name inside the data directory (no path, no '..')"));
+        }
+        const int64_t max_age = args.GetIntArg("-publicendpointmaxage", publicendpoint::DEFAULT_MAX_AGE);
+        if (max_age < 1 || max_age > 86400) {
+            return InitError(Untranslated("-publicendpointmaxage must be between 1 and 86400 seconds"));
+        }
+    }
+    if (args.IsArgSet("-publicendpointpollinterval")) {
+        const int64_t poll = args.GetIntArg("-publicendpointpollinterval", publicendpoint::DEFAULT_POLL_INTERVAL);
+        if (chain != ChainType::REGTEST) return InitError(Untranslated("-publicendpointpollinterval is only supported on regtest."));
+        if (poll < 1 || poll > 60) return InitError(Untranslated("-publicendpointpollinterval must be between 1 and 60 seconds"));
+    }
+    for (const char* name : {"-testdbreaddelayus", "-testwalletsyncdelayus"}) {
+        if (!args.IsArgSet(name)) continue;
+        if (const auto err = iocounters::CheckTestDelayOption(name, args.GetIntArg(name, 0), chain == ChainType::REGTEST)) {
+            return InitError(Untranslated(*err));
+        }
+    }
+    if (args.GetBoolArg("-testrecordreadkeys", false) && chain != ChainType::REGTEST) {
+        return InitError(Untranslated("-testrecordreadkeys is only supported on regtest."));
+    }
+    iocounters::SetDbReadDelayUs(args.GetIntArg("-testdbreaddelayus", 0));
+    iocounters::SetWalletCommitDelayUs(args.GetIntArg("-testwalletsyncdelayus", 0));
+    iocounters::SetKeyRecorder(args.GetBoolArg("-testrecordreadkeys", false));
     if (args.IsArgSet("-shadowcompetingclaimsheight") && chain != ChainType::REGTEST) {
         return InitError(_("-shadowcompetingclaimsheight is only supported on regtest."));
     }
@@ -1065,6 +1125,14 @@ bool AppInitParameterInteraction(const ArgsManager& args)
         }
 
         nLocalServices = ServiceFlags(nLocalServices | NODE_COMPACT_FILTERS);
+    }
+
+    const int64_t header_points = args.GetIntArg("-headerspamfiltermaxsize", DEFAULT_HEADER_SPAM_FILTER_MAX_SIZE);
+    if (header_points < 0 || header_points > static_cast<int64_t>(MAX_HEADER_SPAM_FILTER_POINTS)) {
+        return InitError(strprintf(_("-headerspamfiltermaxsize must be between 0 and %u"), MAX_HEADER_SPAM_FILTER_POINTS));
+    }
+    if (args.GetIntArg("-headerspamfiltermaxavg", DEFAULT_HEADER_SPAM_FILTER_MAX_AVG) < 0) {
+        return InitError(_("-headerspamfiltermaxavg must be nonnegative"));
     }
 
     // If -forcednsseed is set to true, ensure -dnsseed has not been set to false
@@ -1598,10 +1666,14 @@ static bool AppInitMainImpl(NodeContext& node,
         g_reachable_nets.Remove(NET_ONION);
     }
 
+    const bool public_endpoint_on{PublicEndpointRequested(args)};
+
     for (const std::string& strAddr : args.GetArgs("-externalip")) {
         const std::optional<CService> addrLocal{Lookup(strAddr, GetListenPort(), fNameLookup)};
-        if (addrLocal.has_value() && addrLocal->IsValid())
-            AddLocal(addrLocal.value(), LOCAL_MANUAL);
+        if (addrLocal.has_value() && addrLocal->IsValid()) {
+            // With a runtime public endpoint the configured address is not advertised.
+            if (!public_endpoint_on) AddLocal(addrLocal.value(), LOCAL_MANUAL);
+        }
         else
             return InitError(ResolveErrMsg("externalip", strAddr));
     }
@@ -1718,6 +1790,8 @@ static bool AppInitMainImpl(NodeContext& node,
         options.mempool = Assert(node.mempool.get());
         options.reindex = node::fReindex;
         options.reindex_chainstate = fReindexChainState;
+        options.block_index_readahead = args.GetBoolArg("-blockindexreadahead", util::DEFAULT_BLOCKINDEX_READAHEAD);
+        options.block_index_readahead_max_bytes = util::ReadAheadMaxBytesFromRam(GetTotalRAM().value_or(0));
         options.check_blocks = args.GetIntArg("-checkblocks", DEFAULT_CHECKBLOCKS);
         options.check_level = args.GetIntArg("-checklevel", DEFAULT_CHECKLEVEL);
         options.require_full_verification = args.IsArgSet("-checkblocks") || args.IsArgSet("-checklevel");
@@ -2128,8 +2202,14 @@ static bool AppInitMainImpl(NodeContext& node,
     CConnman::Options connOptions;
     connOptions.nLocalServices = nLocalServices;
     connOptions.nMaxConnections = nMaxConnections;
+    connOptions.m_bind_retry_seconds = std::max<int64_t>(0, std::min<int64_t>(args.GetIntArg("-bindretryseconds", DEFAULT_BIND_RETRY_SECONDS), 3600));
+    connOptions.m_shutdown_requested = [] { return ShutdownRequested(); };
     connOptions.m_max_outbound_full_relay = std::min(MAX_OUTBOUND_FULL_RELAY_CONNECTIONS, connOptions.nMaxConnections);
     connOptions.m_max_outbound_block_relay = std::min(MAX_BLOCK_RELAY_ONLY_CONNECTIONS, connOptions.nMaxConnections-connOptions.m_max_outbound_full_relay);
+    if (args.IsArgSet("-qqoutboundtarget") && args.GetIntArg("-qqoutboundtarget", 0) < 0) {
+        return InitError(_("-qqoutboundtarget must be nonnegative"));
+    }
+    connOptions.m_qq_outbound_target = args.IsArgSet("-qqoutboundtarget") ? std::min<int64_t>(args.GetIntArg("-qqoutboundtarget", 0), MAX_OUTBOUND_FULL_RELAY_CONNECTIONS) : -1;
     connOptions.nMaxAddnode = MAX_ADDNODE_CONNECTIONS;
     connOptions.nMaxFeeler = MAX_FEELER_CONNECTIONS;
     connOptions.uiInterface = &uiInterface;
@@ -2231,6 +2311,17 @@ static bool AppInitMainImpl(NodeContext& node,
     }
 
     connOptions.vSeedNodes = args.GetArgs("-seednode");
+    connOptions.m_https_seed = args.GetBoolArg("-httpsseed", true);
+
+    if (PublicEndpointRequested(args)) {
+        connOptions.m_public_endpoint_file = args.GetArg("-publicendpointfile", "");
+        connOptions.m_public_endpoint_max_age = args.GetIntArg("-publicendpointmaxage", publicendpoint::DEFAULT_MAX_AGE);
+        connOptions.m_public_endpoint_poll_interval = args.GetIntArg("-publicendpointpollinterval", publicendpoint::DEFAULT_POLL_INTERVAL);
+        // Ports this node uses for something else can never be a public pair.
+        connOptions.m_public_endpoint_excluded_ports.insert(static_cast<uint16_t>(args.GetIntArg("-rpcport", BaseParams().RPCPort())));
+        connOptions.m_public_endpoint_excluded_ports.insert(BaseParams().OnionServiceTargetPort());
+        LogPrintf("Public endpoint file %s in the data directory, max age %d s\n", connOptions.m_public_endpoint_file, connOptions.m_public_endpoint_max_age);
+    }
 
     // Initiate outbound connections unless connect=0
     connOptions.m_use_addrman_outgoing = !args.IsArgSet("-connect");

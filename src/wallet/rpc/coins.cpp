@@ -13,6 +13,7 @@
 #include <util/moneystr.h>
 #include <validation.h>
 #include <wallet/coincontrol.h>
+#include <wallet/display_balance.h>
 #include <wallet/receive.h>
 #include <wallet/rpc/util.h>
 #include <wallet/spend.h>
@@ -190,12 +191,17 @@ RPCHelpMan getbalance()
     return RPCHelpMan{"getbalance",
                 "\nReturns the total available balance.\n"
                 "The available balance is what the wallet considers currently spendable, and is\n"
-                "thus affected by options which limit spendability such as -spendzeroconfchange.\n",
+                "thus affected by options which limit spendability such as -spendzeroconfchange.\n"
+                "With default arguments this is the last calculated balance (see getbalances for the block it belongs to\n"
+                "and whether it is exact); the call does not wait for the node's locks. Any other minconf or avoid_reuse\n"
+                "is calculated for the call, in the background and without stalling the node, and fails with an error\n"
+                "when that takes longer than 30 seconds.\n",
                 {
                     {"dummy", RPCArg::Type::STR, RPCArg::Optional::OMITTED, "Remains for backward compatibility. Must be excluded or set to \"*\"."},
                     {"minconf", RPCArg::Type::NUM, RPCArg::Default{0}, "Only include transactions confirmed at least this many times."},
                     {"include_watchonly", RPCArg::Type::BOOL, RPCArg::DefaultHint{"true for watch-only wallets, otherwise false"}, "Also include balance in watch-only addresses (see 'importaddress')"},
                     {"avoid_reuse", RPCArg::Type::BOOL, RPCArg::Default{true}, "(only available if avoid_reuse wallet flag is set) Do not include balance in dirty outputs; addresses are considered dirty if they have previously been used in a transaction."},
+                    {"exact", RPCArg::Type::BOOL, RPCArg::DefaultHint{"false, or the value of -walletrpcexactbalance"}, "Wait until the balance of the wallet as it is now has been calculated. Fails with an error, instead of returning an older balance, when that takes longer than 30 seconds."},
                 },
                 RPCResult{
                     RPCResult::Type::STR_AMOUNT, "amount", "The total amount in " + CURRENCY_UNIT + " received for this wallet."
@@ -213,15 +219,6 @@ RPCHelpMan getbalance()
     const std::shared_ptr<const CWallet> pwallet = GetWalletForJSONRPCRequest(request);
     if (!pwallet) return UniValue::VNULL;
 
-    for (;;) {
-    // Make sure the results are valid at least up to the most recent block
-    // the user could have gotten from another RPC command prior to now. Retry
-    // if chainstate advances before the wallet and chain locks are acquired.
-    pwallet->BlockUntilSyncedToCurrentChain();
-
-    LOCK2(::cs_main, pwallet->cs_wallet);
-    if (!WalletLifecycleViewIsSynchronized(*pwallet)) continue;
-
     const auto dummy_value{self.MaybeArg<std::string>(0)};
     if (dummy_value && *dummy_value != "*") {
         throw JSONRPCError(RPC_METHOD_DEPRECATED, "dummy first argument must be excluded or set to \"*\".");
@@ -232,20 +229,42 @@ RPCHelpMan getbalance()
         min_depth = request.params[1].getInt<int>();
     }
 
-    bool include_watchonly = ParseIncludeWatchonly(request.params[2], *pwallet);
+    const bool include_watchonly = ParseIncludeWatchonly(request.params[2], *pwallet);
+    // The flag is read without the wallet lock, as GetAvoidReuseFlag does.
+    const bool avoid_reuse = GetAvoidReuseFlag(*pwallet, request.params[3]);
+    const bool reuse_filter_matters = pwallet->IsWalletFlagSet(WALLET_FLAG_AVOID_REUSE);
 
-    bool avoid_reuse = GetAvoidReuseFlag(*pwallet, request.params[3]);
+    PolledBalanceOptions balance_options;
+    balance_options.exact = WantExactBalance(request.params[4]);
 
     Balance bal;
-    WalletLifecycleSummary lifecycle;
-    std::string lifecycle_error;
-    if (!GetLifecycleAdjustedBalance(*pwallet, min_depth, avoid_reuse,
-                                     bal, lifecycle, lifecycle_error)) {
-        throw JSONRPCError(RPC_WALLET_ERROR, lifecycle_error);
+    if (min_depth == 0 && (avoid_reuse || !reuse_filter_matters)) {
+        // The published snapshot is this balance. Neither cs_main nor
+        // cs_wallet is taken.
+        if (balance_options.exact) pwallet->BlockUntilSyncedToCurrentChain();
+        const PolledBalance polled = GetPolledBalance(*pwallet, balance_options);
+        if (!polled.snapshot) {
+            throw JSONRPCError(RPC_WALLET_ERROR, "The wallet balance has not been calculated yet; try again shortly");
+        }
+        if (balance_options.exact && !polled.exact) {
+            throw JSONRPCError(RPC_WALLET_ERROR, strprintf(
+                "The exact wallet balance was not available within %d seconds (the node is busy); "
+                "call without exact for the last calculated balance", balance_options.exact_timeout.count() / 1000));
+        }
+        bal = polled.snapshot->balance;
+    } else {
+        // Other arguments than the snapshot's: computed for this call by the
+        // same sliced engine, on this thread, one bounded try-lock at a time.
+        // Never the walk under cs_main and cs_wallet together.
+        pwallet->BlockUntilSyncedToCurrentChain();
+        std::string error;
+        const std::optional<BalanceVariant> variant = ComputeBalanceVariant(
+            *pwallet, min_depth, avoid_reuse, balance_options.exact_timeout, error);
+        if (!variant) throw JSONRPCError(RPC_WALLET_ERROR, error);
+        bal = variant->balance;
     }
 
     return ValueFromAmount(bal.m_mine_trusted + (include_watchonly ? bal.m_watchonly_trusted : 0));
-    }
 },
     };
 }
@@ -505,8 +524,12 @@ RPCHelpMan getbalances()
 {
     return RPCHelpMan{
         "getbalances",
-        "Returns an object with all balances in " + CURRENCY_UNIT + ".\n",
-        {},
+        "Returns an object with all balances in " + CURRENCY_UNIT + ".\n"
+        "The balances are the last calculated ones (see balance_exact and balance_state); the call does not wait\n"
+        "for the node's locks to calculate them and so answers while blocks are being connected.\n",
+        {
+            {"exact", RPCArg::Type::BOOL, RPCArg::DefaultHint{"false, or the value of -walletrpcexactbalance"}, HELP_BALANCE_EXACT_ARG},
+        },
         RPCResult{
             RPCResult::Type::OBJ, "", "",
             {
@@ -516,7 +539,7 @@ RPCHelpMan getbalances()
                     {RPCResult::Type::STR_AMOUNT, "untrusted_pending", "untrusted pending balance (outputs created by others that are in the mempool)"},
                     {RPCResult::Type::STR_AMOUNT, "immature", "balance from immature coinbase outputs"},
                     {RPCResult::Type::STR_AMOUNT, "stake", "balance from immature coinstake outputs"},
-                    {RPCResult::Type::STR_AMOUNT, "used", /*optional=*/true, "(only present if avoid_reuse is set) balance from coins sent to addresses that were previously spent from (potentially privacy violating)"},
+                    {RPCResult::Type::STR_AMOUNT, "used", /*optional=*/true, "(only present if avoid_reuse is set) balance from coins sent to addresses that were previously spent from (potentially privacy violating). It is calculated for the call; without exact=true it is left out when that takes longer than two seconds or the other balances are not exact"},
                     {RPCResult::Type::OBJ, "lifecycle", "trusted wallet UTXOs classified for the candidate next block", {
                         {RPCResult::Type::STR_AMOUNT, "ordinary_available", "effective value available to ordinary sends"},
                         {RPCResult::Type::STR_AMOUNT, "spendable_legacy", "effective ordinary-spendable legacy value"},
@@ -553,6 +576,10 @@ RPCHelpMan getbalances()
                 }},
                 {RPCResult::Type::NUM, "lifecycle_evaluation_height", "candidate next-block height used for lifecycle classification"},
                 {RPCResult::Type::NUM_TIME, "lifecycle_evaluation_mtp", "tip median-time-past used for lifecycle classification"},
+                RESULT_BALANCE_EXACT,
+                RESULT_BALANCE_HEIGHT,
+                RESULT_BALANCE_BLOCKHASH,
+                RESULT_BALANCE_STATE,
                 RESULT_LAST_PROCESSED_BLOCK,
             }
             },
@@ -565,22 +592,17 @@ RPCHelpMan getbalances()
     if (!rpc_wallet) return UniValue::VNULL;
     const CWallet& wallet = *rpc_wallet;
 
-    for (;;) {
-    // Make sure the results are valid at least up to the most recent block
-    // the user could have gotten from another RPC command prior to now. Retry
-    // if chainstate advances before the wallet and chain locks are acquired.
-    wallet.BlockUntilSyncedToCurrentChain();
+    // The balances come from the published snapshot of the display balance
+    // worker: neither cs_main nor cs_wallet is taken for them.
+    PolledBalanceOptions balance_options;
+    balance_options.exact = WantExactBalance(request.params[0]);
+    balance_options.want_full = wallet.IsWalletFlagSet(WALLET_FLAG_AVOID_REUSE);
+    if (balance_options.exact) wallet.BlockUntilSyncedToCurrentChain();
+    const PolledBalance polled = GetPolledBalance(wallet, balance_options);
+    const Balance bal = polled.snapshot ? polled.snapshot->balance : Balance{};
+    const WalletLifecycleSummary lifecycle = polled.snapshot ? polled.snapshot->lifecycle : WalletLifecycleSummary{};
 
-    LOCK2(::cs_main, wallet.cs_wallet);
-    if (!WalletLifecycleViewIsSynchronized(wallet)) continue;
-
-    Balance bal;
-    WalletLifecycleSummary lifecycle;
-    std::string lifecycle_error;
-    if (!GetLifecycleAdjustedBalance(wallet, 0, /*avoid_reuse=*/true,
-                                     bal, lifecycle, lifecycle_error)) {
-        throw JSONRPCError(RPC_WALLET_ERROR, lifecycle_error);
-    }
+    LOCK(wallet.cs_wallet);
     UniValue balances{UniValue::VOBJ};
     {
         UniValue balances_mine{UniValue::VOBJ};
@@ -589,15 +611,10 @@ RPCHelpMan getbalances()
         balances_mine.pushKV("immature", ValueFromAmount(bal.m_mine_immature));
         balances_mine.pushKV("stake", ValueFromAmount(bal.m_mine_stake));
         balances_mine.pushKV("lifecycle", WalletLifecycleAmountsToJSON(lifecycle.mine));
-        if (wallet.IsWalletFlagSet(WALLET_FLAG_AVOID_REUSE)) {
-            // If the AVOID_REUSE flag is set, bal has been set to just the un-reused address balance. Get
-            // the total balance, and then subtract bal to get the reused address balance.
-            Balance full_bal;
-            WalletLifecycleSummary full_lifecycle;
-            if (!GetLifecycleAdjustedBalance(wallet, 0, /*avoid_reuse=*/false,
-                                             full_bal, full_lifecycle, lifecycle_error)) {
-                throw JSONRPCError(RPC_WALLET_ERROR, lifecycle_error);
-            }
+        if (polled.full) {
+            // If the AVOID_REUSE flag is set, bal has been set to just the un-reused address balance. The
+            // total balance of the same block and wallet state, minus bal, is the reused address balance.
+            const Balance& full_bal = *polled.full;
             balances_mine.pushKV("used", ValueFromAmount(full_bal.m_mine_trusted + full_bal.m_mine_untrusted_pending - bal.m_mine_trusted - bal.m_mine_untrusted_pending));
         }
         balances.pushKV("mine", balances_mine);
@@ -615,9 +632,9 @@ RPCHelpMan getbalances()
 
     balances.pushKV("lifecycle_evaluation_height", lifecycle.evaluation_height);
     balances.pushKV("lifecycle_evaluation_mtp", lifecycle.evaluation_mtp);
+    AppendPolledBalanceState(balances, wallet, polled);
     AppendLastProcessedBlock(balances, wallet);
     return balances;
-    }
 },
     };
 }

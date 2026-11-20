@@ -6,7 +6,9 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <wallet/wallet.h>
+#include <wallet/block_connect_activity.h>
 #include <wallet/claim_maintenance.h>
+#include <wallet/pow_mining_duty_cycle.h>
 
 #if defined(HAVE_CONFIG_H)
 #include <config/bitcoin-config.h>
@@ -15,6 +17,7 @@
 #include <blockfilter.h>
 #include <chain.h>
 #include <chainparams.h>
+#include <claim_relay_tracker.h>
 #include <coins.h>
 #include <common/args.h>
 #include <common/settings.h>
@@ -25,6 +28,7 @@
 #include <crypto/mldsa.h>
 #include <crypto/sha256.h>
 #include <external_signer.h>
+#include <clientversion.h>
 #include <hash.h>
 #include <index/disktxpos.h>
 #include <index/txindex.h>
@@ -71,6 +75,7 @@
 #include <util/fs.h>
 #include <util/fs_helpers.h>
 #include <util/getuniquepath.h>
+#include <util/thread_qos.h>
 #include <util/message.h>
 #include <util/moneystr.h>
 #include <util/result.h>
@@ -87,6 +92,7 @@
 #include <wallet/db.h>
 #include <wallet/external_signer_scriptpubkeyman.h>
 #include <wallet/fees.h>
+#include <wallet/scheduler_stats.h>
 #include <wallet/scriptpubkeyman.h>
 #include <wallet/shadow_pow_claim_recovery_args.h>
 #include <wallet/spend.h>
@@ -105,6 +111,7 @@
 #include <cstdio>
 #include <exception>
 #include <limits>
+#include <numeric>
 #include <optional>
 #include <set>
 #include <stdexcept>
@@ -136,6 +143,15 @@ bool IsShadowPowMiningTarget(const CScript& script)
            !IsEUTXOScript(script);
 }
 } // namespace
+
+bool IsStakeCandidateScript(const CScript& script)
+{
+    if (IsQuantumMigrationScript(script) || IsQuantumColdStakeScript(script)) return true;
+    std::vector<std::vector<unsigned char>> solutions;
+    const TxoutType type = Solver(script, solutions);
+    return type == TxoutType::PUBKEY || type == TxoutType::PUBKEYHASH ||
+           type == TxoutType::WITNESS_V0_KEYHASH || type == TxoutType::WITNESS_V1_TAPROOT;
+}
 
 void SetPowMinerWorkerCreationFailureAfterForTesting(int created_workers)
 {
@@ -344,7 +360,7 @@ static bool ShadowPowClaimPastRelayTtl(const CWalletTx& wtx,
 }
 
 static bool HasValidShadowPowTipObservation(
-    const mapValue_t& values, const char* height_key, const char* tip_key)
+    const WalletTxValueMap& values, const char* height_key, const char* tip_key)
 {
     const auto height = values.find(height_key);
     const auto tip = values.find(tip_key);
@@ -434,6 +450,7 @@ bool CWallet::UpdateShadowPowClaimRecoveryRecordsDurably(
     std::string_view operation, std::vector<uint256>* changed_txids)
 {
     AssertLockHeld(cs_wallet);
+    BumpBalanceScanMarker();
     if (changed_txids) changed_txids->clear();
     if (m_shadow_pow_claim_recovery_db_ambiguous ||
         m_locked_coins_db_ambiguous) {
@@ -492,6 +509,7 @@ bool CWallet::UpdateShadowPowClaimRecoveryRecordsDurably(
         assert(live != mapWallet.end());
         live->second.mapValue = std::move(update.record->mapValue);
         live->second.m_state = std::move(update.record->m_state);
+        UpdateUnconfirmedCoinstakeIndex(live->second);
         RefreshShadowPowClaimIndexEntryLocked(live->second);
         live->second.MarkDirty();
         if (changed_txids) changed_txids->push_back(update.txid);
@@ -794,19 +812,44 @@ static bool IsQuantumProtectedSpendAllowedOutput(const CTransaction& tx, unsigne
     return IsQuantumProtectedScript(txout.scriptPubKey);
 }
 
+// The payouts of a block are a pure function of that block's authenticated
+// claim markers, not of any wallet. The validation scheduler calls every loaded
+// wallet for each block, so remember the last non-empty result by block hash
+// and take cs_main once per block instead of once per wallet (L15). An empty
+// result is never cached: it can be a transient absence of markers.
+static Mutex g_shadow_payout_cache_mutex;
+static uint256 g_shadow_payout_cache_hash GUARDED_BY(g_shadow_payout_cache_mutex);
+static std::vector<ShadowSyntheticPayoutTransaction> g_shadow_payout_cache GUARDED_BY(g_shadow_payout_cache_mutex);
+
 static std::vector<ShadowSyntheticPayoutTransaction> GetWalletShadowPayoutTransactions(CWallet& wallet, const interfaces::BlockInfo& block)
 {
     AssertLockNotHeld(wallet.cs_wallet);
     if (!block.data) return {};
-    LOCK(cs_main);
-    return GetAppliedShadowClaimPayoutTransactionRecords(
-        wallet.chain().getCoinsTip(),
-        block.height,
-        block.hash,
-        block.data->GetBlockTime());
+    {
+        LOCK(g_shadow_payout_cache_mutex);
+        if (!g_shadow_payout_cache.empty() && g_shadow_payout_cache_hash == block.hash) {
+            return g_shadow_payout_cache;
+        }
+    }
+    // The cache mutex is not held while taking cs_main: no lock-order edge.
+    std::vector<ShadowSyntheticPayoutTransaction> payouts;
+    {
+        LOCK(cs_main);
+        payouts = GetAppliedShadowClaimPayoutTransactionRecords(
+            wallet.chain().getCoinsTip(),
+            block.height,
+            block.hash,
+            block.data->GetBlockTime());
+    }
+    if (!payouts.empty()) {
+        LOCK(g_shadow_payout_cache_mutex);
+        g_shadow_payout_cache_hash = block.hash;
+        g_shadow_payout_cache = payouts;
+    }
+    return payouts;
 }
 
-static void AnnotateWalletShadowPayout(CWallet& wallet, const ShadowSyntheticPayoutTransaction& payout, WalletBatch& batch)
+void AnnotateWalletShadowPayout(CWallet& wallet, const ShadowSyntheticPayoutTransaction& payout, WalletBatch& batch)
 {
     AssertLockHeld(wallet.cs_wallet);
     if (!payout.tx) return;
@@ -837,6 +880,10 @@ static void AnnotateWalletShadowPayout(CWallet& wallet, const ShadowSyntheticPay
     changed = wtx.mapValue.erase(SYNTHETIC_GOLD_RUSH_PAYOUT_STALE_HEIGHT_KEY) != 0 || changed;
 
     if (changed) {
+        // The stale mark is part of the record's digest term. A record
+        // re-confirmed on its block while it still carried the mark was
+        // indexed with it, so the index follows the cleared mark.
+        wallet.UpdateConfirmedSyntheticPayoutIndex(wtx);
         batch.WriteTx(wtx);
         wtx.MarkDirty();
         wallet.NotifyTransactionChanged(txid, CT_UPDATED);
@@ -847,6 +894,9 @@ void CWallet::UpdateConfirmedSyntheticPayoutIndex(const CWalletTx& wtx)
 {
     AssertLockHeld(cs_wallet);
     const uint256 txid = wtx.GetHash();
+    m_synthetic_payout_digest.Erase(txid);
+    if (wtx.tx && wtx.IsCoinStake()) m_coinstake_txids.insert(txid);
+    UpdateUnconfirmedCoinstakeIndex(wtx);
     const auto previous = m_confirmed_synthetic_payout_block_by_txid.find(txid);
     if (previous != m_confirmed_synthetic_payout_block_by_txid.end()) {
         const auto block = m_confirmed_synthetic_payouts_by_block.find(previous->second);
@@ -861,6 +911,24 @@ void CWallet::UpdateConfirmedSyntheticPayoutIndex(const CWalletTx& wtx)
     if (!confirmed || !IsSyntheticGoldRushPayoutRecord(wtx)) return;
     m_confirmed_synthetic_payouts_by_block[confirmed->confirmed_block_hash].insert(txid);
     m_confirmed_synthetic_payout_block_by_txid.emplace(txid, confirmed->confirmed_block_hash);
+    m_synthetic_payout_digest.Set(SyntheticPayoutRef{
+        txid, confirmed->confirmed_block_hash, confirmed->confirmed_block_height,
+        wtx.mapValue.count(SYNTHETIC_GOLD_RUSH_PAYOUT_STALE_KEY) != 0});
+}
+
+void CWallet::UpdateUnconfirmedCoinstakeIndex(const CWalletTx& wtx)
+{
+    AssertLockHeld(cs_wallet);
+    if (!wtx.tx || !wtx.IsCoinStake()) return;
+    // Only what the orphan sweep can act on is kept: a coinstake that is
+    // neither confirmed, nor conflicted, nor abandoned. A lost stake ends
+    // conflicted or abandoned and leaves the index for good, so the index
+    // does not grow with the number of stakes the wallet has lost.
+    if (wtx.isUnconfirmed()) {
+        m_unconfirmed_coinstake_txids.insert(wtx.GetHash());
+    } else {
+        m_unconfirmed_coinstake_txids.erase(wtx.GetHash());
+    }
 }
 
 void CWallet::RecomputeConfirmedSyntheticPayoutIndex()
@@ -868,9 +936,253 @@ void CWallet::RecomputeConfirmedSyntheticPayoutIndex()
     AssertLockHeld(cs_wallet);
     m_confirmed_synthetic_payouts_by_block.clear();
     m_confirmed_synthetic_payout_block_by_txid.clear();
+    m_synthetic_payout_digest.Clear();
+    m_coinstake_txids.clear();
+    m_unconfirmed_coinstake_txids.clear();
     for (const auto& [_, wtx] : mapWallet) {
         UpdateConfirmedSyntheticPayoutIndex(wtx);
     }
+}
+
+/** Announce payout authentication up front when it is large enough to be noticeable. */
+static constexpr size_t SYNTHETIC_PAYOUT_AUTHENTICATION_NOTICE_BLOCKS{1000};
+
+std::vector<SyntheticPayoutRef> CWallet::CollectSyntheticPayoutRefs() const
+{
+    AssertLockHeld(cs_wallet);
+    std::vector<SyntheticPayoutRef> refs;
+    for (const auto& [block_hash, txids] : m_confirmed_synthetic_payouts_by_block) {
+        for (const uint256& txid : txids) {
+            const auto wallet_tx = mapWallet.find(txid);
+            if (wallet_tx == mapWallet.end()) continue;
+            const CWalletTx& wtx = wallet_tx->second;
+            const auto* confirmed = wtx.state<TxStateConfirmed>();
+            if (!confirmed || confirmed->confirmed_block_hash != block_hash) continue;
+            refs.push_back(SyntheticPayoutRef{
+                txid, block_hash, confirmed->confirmed_block_height,
+                wtx.mapValue.count(SYNTHETIC_GOLD_RUSH_PAYOUT_STALE_KEY) != 0});
+        }
+    }
+    return refs;
+}
+
+arith_uint256 SyntheticPayoutDigest::Term(const SyntheticPayoutRef& ref)
+{
+    HashWriter hasher{};
+    hasher << std::string{"blackcoin-synthetic-payout-term-v2"} << ref.txid << ref.block_hash << ref.stale;
+    return UintToArith256(hasher.GetHash());
+}
+
+uint256 SyntheticPayoutDigest::Finalize(uint32_t count, const arith_uint256& sum)
+{
+    HashWriter hasher{};
+    hasher << std::string{"blackcoin-synthetic-payout-digest-v2"} << count << ArithToUint256(sum);
+    return hasher.GetHash();
+}
+
+void SyntheticPayoutDigest::Erase(const uint256& txid)
+{
+    const auto it = m_entries.find(txid);
+    if (it == m_entries.end()) return;
+    const auto bucket = m_buckets.find(it->second.height);
+    if (bucket != m_buckets.end()) {
+        bucket->second.sum -= it->second.term;
+        if (--bucket->second.count == 0) m_buckets.erase(bucket);
+    }
+    m_sum -= it->second.term;
+    --m_count;
+    m_entries.erase(it);
+}
+
+void SyntheticPayoutDigest::Set(const SyntheticPayoutRef& ref)
+{
+    Erase(ref.txid);
+    if (ref.height < 0) return;
+    const arith_uint256 term = Term(ref);
+    m_entries.emplace(ref.txid, Entry{ref.height, term});
+    Bucket& bucket = m_buckets[ref.height];
+    ++bucket.count;
+    bucket.sum += term;
+    ++m_count;
+    m_sum += term;
+}
+
+void SyntheticPayoutDigest::Clear()
+{
+    m_entries.clear();
+    m_buckets.clear();
+    m_count = 0;
+    m_sum = arith_uint256{};
+}
+
+std::pair<uint32_t, uint256> SyntheticPayoutDigest::At(int max_height) const
+{
+    uint32_t count = m_count;
+    arith_uint256 sum = m_sum;
+    for (auto bucket = m_buckets.upper_bound(max_height); bucket != m_buckets.end(); ++bucket) {
+        count -= bucket->second.count;
+        sum -= bucket->second.sum;
+    }
+    return {count, Finalize(count, sum)};
+}
+
+std::pair<uint32_t, uint256> SyntheticPayoutDigest::Compute(const std::vector<SyntheticPayoutRef>& refs, int max_height)
+{
+    uint32_t count{0};
+    arith_uint256 sum;
+    for (const SyntheticPayoutRef& ref : refs) {
+        if (ref.height < 0 || ref.height > max_height) continue;
+        ++count;
+        sum += Term(ref);
+    }
+    return {count, Finalize(count, sum)};
+}
+
+/**
+ * Count and digest of the synthetic payout records at heights [0, max_height], in the
+ * form of a stored checkpoint schema. Schema 1 is the sorted-txid hash of releases up to
+ * rc11 and exists only to recognise (once) a checkpoint those releases wrote.
+ */
+static std::pair<uint32_t, uint256> HashSyntheticPayoutRefs(std::vector<SyntheticPayoutRef> refs, int max_height, uint32_t schema)
+{
+    if (schema != SyntheticPayoutCheckpoint::LEGACY_SCHEMA) return SyntheticPayoutDigest::Compute(refs, max_height);
+    refs.erase(std::remove_if(refs.begin(), refs.end(), [max_height](const SyntheticPayoutRef& ref) {
+        return ref.height < 0 || ref.height > max_height;
+    }), refs.end());
+    std::sort(refs.begin(), refs.end(), [](const SyntheticPayoutRef& a, const SyntheticPayoutRef& b) {
+        return a.txid < b.txid;
+    });
+    HashWriter hasher{};
+    for (const SyntheticPayoutRef& ref : refs) {
+        hasher << ref.txid << ref.block_hash << ref.stale;
+    }
+    return {static_cast<uint32_t>(refs.size()), hasher.GetHash()};
+}
+
+bool SyntheticPayoutCheckpointMatches(const SyntheticPayoutCheckpoint& checkpoint, const std::vector<SyntheticPayoutRef>& refs)
+{
+    // A checkpoint written by an earlier release (schema 1) is checked once with
+    // the algorithm that wrote it and replaced by a schema 2 record on the next
+    // flush; it is never treated as a mismatch merely for its age.
+    if (checkpoint.schema != SyntheticPayoutCheckpoint::CURRENT_SCHEMA &&
+        checkpoint.schema != SyntheticPayoutCheckpoint::LEGACY_SCHEMA) {
+        return false;
+    }
+    const auto [count, digest] = HashSyntheticPayoutRefs(refs, checkpoint.height, checkpoint.schema);
+    return count == checkpoint.count && digest == checkpoint.digest;
+}
+
+std::pair<uint32_t, uint256> CWallet::RecomputeSyntheticPayoutDigestLocked(int height, uint32_t schema) const
+{
+    AssertLockHeld(cs_wallet);
+    return HashSyntheticPayoutRefs(CollectSyntheticPayoutRefs(), height, schema);
+}
+
+SyntheticPayoutCheckpointResult CheckSyntheticPayoutCheckpoint(
+    const SyntheticPayoutCheckpoint& checkpoint,
+    const std::vector<SyntheticPayoutRef>& refs,
+    const SyntheticPayoutCheckpointBlockStatus& block_status)
+{
+    using Verdict = SyntheticPayoutCheckpointVerdict;
+    SyntheticPayoutCheckpointResult result;
+    if (checkpoint.schema != SyntheticPayoutCheckpoint::CURRENT_SCHEMA &&
+        checkpoint.schema != SyntheticPayoutCheckpoint::LEGACY_SCHEMA) {
+        result.verdict = Verdict::UNKNOWN_SCHEMA;
+        return result;
+    }
+    if (checkpoint.client_version < SyntheticPayoutCheckpoint::OLDEST_TRUSTED_CLIENT_VERSION ||
+        checkpoint.client_version > CLIENT_VERSION) {
+        result.verdict = Verdict::OTHER_CLIENT_VERSION;
+        return result;
+    }
+    if (checkpoint.height < 0) {
+        result.verdict = Verdict::NO_HEIGHT;
+        return result;
+    }
+    result.verdict = block_status(checkpoint);
+    if (result.verdict != Verdict::ACCEPTED) return result;
+    // A checkpoint written by an earlier release (schema 1) is checked once with
+    // the algorithm that wrote it; see SyntheticPayoutCheckpointMatches.
+    const auto [count, digest] = HashSyntheticPayoutRefs(refs, checkpoint.height, checkpoint.schema);
+    result.records_found = count;
+    if (count != checkpoint.count) {
+        result.verdict = Verdict::COUNT_MISMATCH;
+    } else if (digest != checkpoint.digest) {
+        result.verdict = Verdict::DIGEST_MISMATCH;
+    }
+    return result;
+}
+
+std::string DescribeSyntheticPayoutCheckpointResult(const SyntheticPayoutCheckpoint& checkpoint, const SyntheticPayoutCheckpointResult& result)
+{
+    using Verdict = SyntheticPayoutCheckpointVerdict;
+    const std::string what{strprintf("height %d, %u payout records", checkpoint.height, checkpoint.count)};
+    switch (result.verdict) {
+    case Verdict::ACCEPTED: return what + ": accepted";
+    case Verdict::UNKNOWN_SCHEMA: return what + strprintf(": rejected, unknown schema %u", checkpoint.schema);
+    case Verdict::OTHER_CLIENT_VERSION: return what + strprintf(": rejected, written by client version %d, this is %d and honors %d and later", checkpoint.client_version, CLIENT_VERSION, SyntheticPayoutCheckpoint::OLDEST_TRUSTED_CLIENT_VERSION);
+    case Verdict::NO_HEIGHT: return what + ": rejected, no height";
+    case Verdict::BLOCK_NOT_IN_INDEX: return what + strprintf(": rejected, block %s is not in the block index", checkpoint.block_hash.ToString());
+    case Verdict::BLOCK_NOT_ACTIVE: return what + strprintf(": rejected, block %s is not on the active chain at that height", checkpoint.block_hash.ToString());
+    case Verdict::COUNT_MISMATCH: return what + strprintf(": rejected, count mismatch, the wallet holds %u payout records at or below that height", result.records_found);
+    case Verdict::DIGEST_MISMATCH: return what + ": rejected, digest mismatch, a payout record at or below that height changed";
+    } // no default case, so the compiler can warn about missing cases
+    assert(false);
+}
+
+std::optional<size_t> SelectSyntheticPayoutCheckpoint(
+    const std::vector<SyntheticPayoutCheckpoint>& checkpoints,
+    const std::vector<SyntheticPayoutRef>& refs,
+    const SyntheticPayoutCheckpointBlockStatus& block_status,
+    std::vector<SyntheticPayoutCheckpointResult>* results)
+{
+    // Every checkpoint is checked, also one below an accepted one: the load reports each.
+    std::optional<size_t> best;
+    if (results) results->clear();
+    for (size_t index{0}; index < checkpoints.size(); ++index) {
+        const SyntheticPayoutCheckpointResult result{CheckSyntheticPayoutCheckpoint(checkpoints[index], refs, block_status)};
+        if (results) results->push_back(result);
+        if (result.verdict != SyntheticPayoutCheckpointVerdict::ACCEPTED) continue;
+        if (!best || checkpoints[index].height > checkpoints[*best].height) best = index;
+    }
+    return best;
+}
+
+std::optional<SyntheticPayoutCheckpoint> CWallet::MakeSyntheticPayoutCheckpoint(const uint256& block_hash, int height) const
+{
+    AssertLockHeld(cs_wallet);
+    if (block_hash.IsNull() || height < 0) return std::nullopt;
+    // O(changes): the digest follows every add, move, stale flag and removal of a payout record.
+    const auto [count, digest] = m_synthetic_payout_digest.At(height);
+    if (count == 0) return std::nullopt;
+    SyntheticPayoutCheckpoint checkpoint;
+    checkpoint.schema = SyntheticPayoutCheckpoint::CURRENT_SCHEMA;
+    checkpoint.client_version = CLIENT_VERSION;
+    checkpoint.height = height;
+    checkpoint.block_hash = block_hash;
+    checkpoint.count = count;
+    checkpoint.digest = digest;
+    return checkpoint;
+}
+
+void CWallet::WriteSyntheticPayoutCheckpoint(WalletBatch& batch, const uint256& block_hash, int height)
+{
+    AssertLockHeld(cs_wallet);
+    const std::optional<SyntheticPayoutCheckpoint> checkpoint{MakeSyntheticPayoutCheckpoint(block_hash, height)};
+    if (!checkpoint) return;
+    if (m_synthetic_payout_checkpoint && *m_synthetic_payout_checkpoint == *checkpoint) return;
+    // The record is only a startup hint. If it cannot be written the next start authenticates everything.
+    if (batch.WriteSyntheticPayoutCheckpoint(*checkpoint)) m_synthetic_payout_checkpoint = checkpoint;
+}
+
+void CWallet::WriteSyntheticPayoutFlushCheckpoint(WalletBatch& batch, const uint256& block_hash, int height)
+{
+    AssertLockHeld(cs_wallet);
+    const std::optional<SyntheticPayoutCheckpoint> checkpoint{MakeSyntheticPayoutCheckpoint(block_hash, height)};
+    if (!checkpoint) return;
+    if (m_synthetic_payout_flush_checkpoint && *m_synthetic_payout_flush_checkpoint == *checkpoint) return;
+    // Also only a hint: without it a start after a crash authenticates everything.
+    if (batch.WriteSyntheticPayoutFlushCheckpoint(*checkpoint)) m_synthetic_payout_flush_checkpoint = checkpoint;
 }
 
 /**
@@ -888,6 +1200,7 @@ bool CWallet::ReconcileWalletShadowPayoutsForBlock(
     WalletBatch& batch)
 {
     AssertLockHeld(cs_wallet);
+    BumpBalanceScanMarker();
     bool write_ok{true};
     const auto indexed = m_confirmed_synthetic_payouts_by_block.find(block_hash);
     if (indexed == m_confirmed_synthetic_payouts_by_block.end()) return true;
@@ -908,6 +1221,7 @@ bool CWallet::ReconcileWalletShadowPayoutsForBlock(
             changed = wtx.mapValue.erase(SYNTHETIC_GOLD_RUSH_PAYOUT_STALE_BLOCK_KEY) != 0 || changed;
             changed = wtx.mapValue.erase(SYNTHETIC_GOLD_RUSH_PAYOUT_STALE_HEIGHT_KEY) != 0 || changed;
             if (changed) {
+                UpdateConfirmedSyntheticPayoutIndex(wtx);
                 wtx.MarkDirty();
                 write_ok = batch.WriteTx(wtx) && write_ok;
                 NotifyTransactionChanged(txid, CT_UPDATED);
@@ -923,6 +1237,7 @@ bool CWallet::ReconcileWalletShadowPayoutsForBlock(
         wtx.mapValue[SYNTHETIC_GOLD_RUSH_PAYOUT_STALE_BLOCK_KEY] = block_hash.GetHex();
         wtx.mapValue[SYNTHETIC_GOLD_RUSH_PAYOUT_STALE_HEIGHT_KEY] = ToString(block_height);
         wtx.m_state = TxStateInactive{};
+        UpdateShadowPowNonConfirmedProofIndexLocked(wtx);
         MarkShadowPowClaimCandidateStateChangedLocked();
         UpdateConfirmedSyntheticPayoutIndex(wtx);
         wtx.MarkDirty();
@@ -1120,6 +1435,9 @@ bool AddWallet(WalletContext& context, const std::shared_ptr<CWallet>& wallet)
     context.wallets.push_back(wallet);
     wallet->ConnectScriptPubKeyManNotifiers();
     wallet->NotifyCanGetAddressesChanged();
+    // A loaded wallet keeps a published balance snapshot for the RPCs that
+    // poll it, whether or not a window shows the wallet.
+    if (wallet->HaveChain()) AttachPolledBalance(*wallet);
     return true;
 }
 
@@ -1133,6 +1451,9 @@ bool RemoveWallet(WalletContext& context, const std::shared_ptr<CWallet>& wallet
     // Unregister with the validation interface which also drops shared pointers.
     wallet->m_chain_notifications_handler.reset();
     context.claim_maintenance->Unregister(*wallet);
+    // Take the wallet off the display balance worker (a no-op when AddWallet
+    // did not put it there). Returns once no slice of the wallet is running.
+    DetachPolledBalance(*wallet);
     LOCK(context.wallets_mutex);
     std::vector<std::shared_ptr<CWallet>>::iterator i = std::find(context.wallets.begin(), context.wallets.end(), wallet);
     if (i == context.wallets.end()) return false;
@@ -1198,6 +1519,9 @@ static void ReleaseWallet(CWallet* wallet)
 {
     const std::string name = wallet->GetName();
     wallet->WalletLogPrintf("Releasing wallet\n");
+    // Normally done by RemoveWallet; a wallet destroyed without it must not
+    // stay on the display balance worker.
+    DetachPolledBalance(*wallet);
     wallet->Flush();
     delete wallet;
     // Wallet is now released, notify UnloadWallet, if any.
@@ -1676,14 +2000,47 @@ bool CWallet::ChangeWalletPassphrase(const SecureString& strOldWalletPassphrase,
 
 void CWallet::chainStateFlushed(ChainstateRole role, const CBlockLocator& loc)
 {
+    if (role == ChainstateRole::BACKGROUND) return;
+    PersistBestBlockLocator(loc, /*chainstate_flushed=*/true);
+}
+
+void CWallet::PersistBestBlockLocator(const CBlockLocator& loc, bool chainstate_flushed)
+{
     LOCK(cs_wallet);
     // Don't update the best block until the chain is attached so that in case of a shutdown,
     // the rescan will be restarted at next startup.
-    if (m_attaching_chain || role == ChainstateRole::BACKGROUND) {
+    if (m_attaching_chain) {
         return;
     }
     WalletBatch batch(GetDatabase());
-    batch.WriteBestBlock(loc);
+    // The best block is two rows and the payout checkpoints two more: one commit.
+    const bool grouped{batch.TxnBegin()};
+    // This also covers any best block that blockConnected deferred.
+    if (batch.WriteBestBlock(loc)) BestBlockPersisted();
+    // Every synthetic payout up to the last processed block was authenticated
+    // when it was recorded; remember that so the next start can skip it.
+    if (m_synthetic_payout_checkpoint_trusted) {
+        WriteSyntheticPayoutCheckpoint(batch, m_last_block_processed, m_last_block_processed_height);
+        // The chainstate is on disk at the front of this locator. A process that dies
+        // restarts its chain there or at a later flush, where the record above (which
+        // keeps moving with every block the wallet processes) may name a block the chain
+        // no longer has, while a record for the flushed block still names an active one.
+        // It is written only when the wallet stands exactly on the flushed block. A flush
+        // made in the middle of connecting or disconnecting a block is announced before
+        // that block is, and the wallet is then off by that block; the record of the
+        // previous flush is kept. Written here and at load only, in a commit that
+        // happens anyway.
+        //
+        // The wallet also comes here with the chain tip after a rescan at attach and when
+        // it is created. That tip need not be on disk, so the record is left alone then:
+        // one for an unflushed block would replace a good one and be useless after a crash.
+        if (chainstate_flushed && !loc.IsNull() && loc.vHave.front() == m_last_block_processed) {
+            WriteSyntheticPayoutFlushCheckpoint(batch, m_last_block_processed, m_last_block_processed_height);
+        }
+    }
+    if (grouped && !batch.TxnCommit()) {
+        WalletLogPrintf("Failed to persist the best block on a chainstate flush; the next flush will record it\n");
+    }
 }
 
 void CWallet::SetMinVersion(enum WalletFeature nVersion, WalletBatch* batch_in)
@@ -1740,11 +2097,19 @@ bool CWallet::HasWalletSpend(const CTransactionRef& tx) const
 
 void CWallet::Flush()
 {
+    {
+        LOCK(cs_wallet);
+        PersistDeferredBestBlock();
+    }
     GetDatabase().Flush();
 }
 
 void CWallet::Close()
 {
+    {
+        LOCK(cs_wallet);
+        PersistDeferredBestBlock();
+    }
     GetDatabase().Close();
 }
 
@@ -1776,7 +2141,7 @@ void CWallet::SyncMetaData(std::pair<TxSpends::iterator, TxSpends::iterator> ran
         if (copyFrom == copyTo) continue;
         assert(copyFrom && "Oldest wallet transaction in range assumed to have been found.");
         if (!copyFrom->IsEquivalentTo(*copyTo)) continue;
-        const mapValue_t old_map_value = copyTo->mapValue;
+        const WalletTxValueMap old_map_value = copyTo->mapValue;
         const auto old_order_form = copyTo->vOrderForm;
         const int64_t old_time_smart = copyTo->nTimeSmart;
         const bool old_from_me = copyTo->fFromMe;
@@ -1936,6 +2301,13 @@ void CWallet::RefreshLiveUnspentStakeOutpoint(const COutPoint& outpoint)
                           wallet_tx->second.tx->vout[outpoint.n].scriptPubKey)
         ? m_live_unspent_legacy_claim_outpoints.insert(outpoint).second
         : m_live_unspent_legacy_claim_outpoints.erase(outpoint) != 0;
+    // The candidate subset follows live membership; it never changes the
+    // generation because it adds no observable state beyond the live index.
+    if (live && IsStakeCandidateScript(wallet_tx->second.tx->vout[outpoint.n].scriptPubKey)) {
+        m_live_unspent_stake_candidate_outpoints.insert(outpoint);
+    } else {
+        m_live_unspent_stake_candidate_outpoints.erase(outpoint);
+    }
     if (changed && ++m_live_unspent_stake_generation == 0) {
         ++m_live_unspent_stake_generation;
     }
@@ -1947,6 +2319,7 @@ bool CWallet::EraseLiveUnspentStakeOutpointForDrift(
     AssertLockHeld(cs_wallet);
     bool changed = m_live_unspent_stake_outpoints.erase(outpoint) != 0;
     changed |= m_live_unspent_legacy_claim_outpoints.erase(outpoint) != 0;
+    m_live_unspent_stake_candidate_outpoints.erase(outpoint);
     if (!changed) return false;
     if (++m_live_unspent_stake_generation == 0) {
         ++m_live_unspent_stake_generation;
@@ -2002,18 +2375,23 @@ void CWallet::RecomputeLiveUnspentStakeOutpoints()
     AssertLockHeld(cs_wallet);
     std::set<COutPoint> rebuilt;
     std::set<COutPoint> legacy_rebuilt;
+    std::set<COutPoint> candidate_rebuilt;
     for (const auto& [txid, wtx] : mapWallet) {
         if (!wtx.tx) continue;
         for (uint32_t output = 0; output < wtx.tx->vout.size(); ++output) {
             const COutPoint outpoint{txid, output};
             if (!IsSpentForStakeIndex(outpoint)) {
                 rebuilt.insert(outpoint);
+                if (IsStakeCandidateScript(wtx.tx->vout[output].scriptPubKey)) {
+                    candidate_rebuilt.insert(outpoint);
+                }
                 if (IsShadowPowMiningTarget(wtx.tx->vout[output].scriptPubKey)) {
                     legacy_rebuilt.insert(outpoint);
                 }
             }
         }
     }
+    m_live_unspent_stake_candidate_outpoints = std::move(candidate_rebuilt);
     if (rebuilt != m_live_unspent_stake_outpoints ||
         legacy_rebuilt != m_live_unspent_legacy_claim_outpoints) {
         m_live_unspent_stake_outpoints = std::move(rebuilt);
@@ -2043,7 +2421,10 @@ void CWallet::RefreshMempoolStatus(CWalletTx& wtx)
         wtx.m_state = TxStateInactive();
         state_changed = true;
     }
-    if (state_changed) MarkShadowPowClaimCandidateStateChangedLocked();
+    if (state_changed) {
+        MarkShadowPowClaimCandidateStateChangedLocked();
+        UpdateUnconfirmedCoinstakeIndex(wtx);
+    }
     // Ordinary inactive/mempool transitions preserve the reservation category.
     // Only admitting an excluded spender can change its inputs' live status.
     // Avoid traversing every same-input sibling on each removal callback.
@@ -2315,6 +2696,7 @@ void CWallet::MarkDirty()
 {
     {
         LOCK(cs_wallet);
+        BumpBalanceScanMarker();
         for (std::pair<const uint256, CWalletTx>& item : mapWallet)
             item.second.MarkDirty();
     }
@@ -2323,6 +2705,7 @@ void CWallet::MarkDirty()
 void CWallet::SetSpentKeyState(WalletBatch& batch, const uint256& hash, unsigned int n, bool used, std::set<CTxDestination>& tx_destinations)
 {
     AssertLockHeld(cs_wallet);
+    BumpBalanceScanMarker();
     const CWalletTx* srctx = GetWalletTx(hash);
     if (!srctx) return;
 
@@ -2375,6 +2758,7 @@ CWalletTx* CWallet::AddToWallet(CTransactionRef tx, const TxState& state, const 
                                 std::optional<WalletBlockTime> block_time)
 {
     LOCK(cs_wallet);
+    BumpBalanceScanMarker();
 
     WalletBatch batch(GetDatabase(), fFlushOnClose);
 
@@ -2425,11 +2809,26 @@ CWalletTx* CWallet::AddToWallet(CTransactionRef tx, const TxState& state, const 
         MaybeUpdateBirthTime(wtx.GetTxTime());
     }
 
+    // True when the state moved in memory only (see below).
+    bool state_changed_without_write{false};
     if (!fInsertedNew)
     {
         if (state.index() != wtx.m_state.index()) {
+            // A record that is not in a block and not abandoned is stored the
+            // same way whether or not the mempool holds it, so entering the
+            // mempool changes no byte of the stored record. Unless an update
+            // function changed something else, there is nothing to write.
+            const bool same_stored_record{!fUpdated &&
+                std::holds_alternative<TxStateInactive>(wtx.m_state) &&
+                std::holds_alternative<TxStateInMempool>(state) &&
+                TxStateSerializedIndex(wtx.m_state) == TxStateSerializedIndex(state) &&
+                TxStateSerializedBlockHash(wtx.m_state) == TxStateSerializedBlockHash(state)};
             wtx.m_state = state;
-            fUpdated = true;
+            if (same_stored_record) {
+                state_changed_without_write = true;
+            } else {
+                fUpdated = true;
+            }
             MarkShadowPowClaimCandidateStateChangedLocked();
         } else {
             assert(TxStateSerializedIndex(wtx.m_state) == TxStateSerializedIndex(state));
@@ -2449,6 +2848,7 @@ CWalletTx* CWallet::AddToWallet(CTransactionRef tx, const TxState& state, const 
     RefreshShadowPowClaimIndexEntryLocked(wtx);
 
     // Mark inactive coinbase and coinstake transactions and their descendants as abandoned
+    bool descendants_rewritten{false};
     if ((wtx.IsCoinBase() || wtx.IsCoinStake()) && wtx.isInactive()) {
         std::vector<std::pair<CWalletTx*, bool>> txs{{&wtx, false}};
 
@@ -2480,12 +2880,14 @@ CWalletTx* CWallet::AddToWallet(CTransactionRef tx, const TxState& state, const 
             // transition in the same wallet-critical section rather than
             // leaving authority dependent on a later callback or restart.
             RefreshShadowPowClaimIndexEntryLocked(*desc_tx);
+            UpdateUnconfirmedCoinstakeIndex(*desc_tx);
             RefreshLiveUnspentStakeOutpoints(*desc_tx);
             RemoveIndexedShadowSolve(desc_tx->GetHash());
             UpdatePendingShadowSignalIndex(*desc_tx);
             // Break caches since we have changed the state
             desc_tx->MarkDirty();
             batch.WriteTx(*desc_tx);
+            descendants_rewritten = true;
             MarkInputsDirty(desc_tx->tx);
             for (unsigned int i = 0; i < desc_tx->tx->vout.size(); ++i) {
                 COutPoint outpoint(desc_tx->GetHash(), i);
@@ -2510,8 +2912,12 @@ CWalletTx* CWallet::AddToWallet(CTransactionRef tx, const TxState& state, const 
     UpdateConfirmedSyntheticPayoutIndex(wtx);
     RefreshLiveUnspentStakeOutpoints(wtx);
 
-    //// debug print
-    WalletLogPrintf("AddToWallet %s  %s%s %s\n", hash.ToString(), (fInsertedNew ? "new" : ""), (fUpdated ? "update" : ""), TxStateString(state));
+    // A re-add that changes nothing (a rescan or a repeated callback for a
+    // record the wallet already holds in this state) is not logged.
+    const bool record_changed = fInsertedNew || fUpdated || descendants_rewritten || state_changed_without_write;
+    if (record_changed) {
+        WalletLogPrintf("AddToWallet %s  %s%s %s\n", hash.ToString(), (fInsertedNew ? "new" : ""), (fUpdated || state_changed_without_write ? "update" : ""), TxStateString(state));
+    }
 
     // Write to disk
     if (fInsertedNew || fUpdated) {
@@ -2533,6 +2939,8 @@ CWalletTx* CWallet::AddToWallet(CTransactionRef tx, const TxState& state, const 
     }
 
     // Notify UI of new or updated transaction
+    // Announced even when nothing changed: the GUI refresh, -walletnotify
+    // after a rescan and the wallet unit and functional tests rely on it.
     NotifyTransactionChanged(hash, fInsertedNew ? CT_NEW : CT_UPDATED);
 
 #if HAVE_SYSTEM
@@ -2568,6 +2976,7 @@ CWalletTx* CWallet::AddToWallet(CTransactionRef tx, const TxState& state, const 
 
 bool CWallet::LoadToWallet(const uint256& hash, const UpdateWalletTxFn& fill_wtx, bool reconcile_chainstate)
 {
+    BumpBalanceScanMarker();
     const auto& ins = mapWallet.emplace(std::piecewise_construct, std::forward_as_tuple(hash), std::forward_as_tuple(nullptr, TxStateInactive{}));
     CWalletTx& wtx = ins.first->second;
     if (!fill_wtx(wtx, ins.second)) {
@@ -2728,6 +3137,7 @@ bool CWallet::TransactionCanBeAbandoned(const uint256& hashTx) const
 
 void CWallet::MarkInputsDirty(const CTransactionRef& tx)
 {
+    BumpBalanceScanMarker();
     for (const CTxIn& txin : tx->vin) {
         auto it = mapWallet.find(txin.prevout.hash);
         if (it != mapWallet.end()) {
@@ -2740,6 +3150,7 @@ bool CWallet::AbandonTransaction(const uint256& hashTx, bool automatic_shadow_st
 {
     {
     LOCK(cs_wallet);
+    BumpBalanceScanMarker();
 
     // Can't mark abandoned if confirmed or in mempool
     auto it = mapWallet.find(hashTx);
@@ -2839,6 +3250,7 @@ bool CWallet::AbandonTransaction(const uint256& hashTx, bool automatic_shadow_st
 void CWallet::MarkConflicted(const uint256& hashBlock, int conflicting_height, const uint256& hashTx)
 {
     LOCK(cs_wallet);
+    BumpBalanceScanMarker();
 
     // If number of conflict confirms cannot be determined, this means
     // that the block is still unknown or not yet part of the main chain,
@@ -2856,6 +3268,10 @@ void CWallet::MarkConflicted(const uint256& hashBlock, int conflicting_height, c
             // Block is 'more conflicted' than current confirm; update.
             // Mark transaction as conflicted with this block.
             wtx.m_state = TxStateConflicted{hashBlock, conflicting_height};
+            // A confirmed transaction changed state: drop the memoized facts
+            // of its own outputs. Other transactions' entries describe blocks
+            // that are still in the chain and are checked on every lookup.
+            EraseOutputLifecycleMemoForTx(wtx.GetHash());
             return TxUpdate::CHANGED;
         }
         return TxUpdate::UNCHANGED;
@@ -2867,6 +3283,7 @@ void CWallet::MarkConflicted(const uint256& hashBlock, int conflicting_height, c
 }
 
 void CWallet::RecursiveUpdateTxState(const uint256& tx_hash, const TryUpdatingStateFn& try_updating_state) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet) {
+    BumpBalanceScanMarker();
     // Do not flush the wallet here for performance reasons
     WalletBatch batch(GetDatabase(), false);
 
@@ -2887,6 +3304,7 @@ void CWallet::RecursiveUpdateTxState(const uint256& tx_hash, const TryUpdatingSt
         if (update_state != TxUpdate::UNCHANGED) {
             MarkShadowPowClaimCandidateStateChangedLocked();
             RefreshShadowPowClaimIndexEntryLocked(wtx);
+            UpdateUnconfirmedCoinstakeIndex(wtx);
             RefreshLiveUnspentStakeOutpoints(wtx);
             if (wtx.isConfirmed()) {
                 IndexConfirmedShadowSolve(wtx);
@@ -2930,11 +3348,48 @@ void CWallet::SyncTransaction(const CTransactionRef& ptx, const SyncTxState& sta
 }
 
 void CWallet::transactionAddedToMempool(const CTransactionRef& tx) {
+    WalletCallbackTimer lock_timer{WalletCallbackKind::MEMPOOL_ADDED};
     LOCK(cs_wallet);
+    lock_timer.LockAcquired();
+    // Every mempool transaction of the network arrives here, for every loaded
+    // wallet. The balance scan marker moves only when this wallet's state can
+    // change: SyncTransaction bumps (AddToWallet, MarkInputsDirty) when the
+    // transaction pays or spends the wallet and so becomes a wallet
+    // transaction, and the block below bumps when it was one already.
+    // An unrelated transaction leaves the marker alone.
+
+    // A transaction of the wallet writes up to three things here: the next
+    // order position and the record (a new transaction), and the cleared
+    // quarantine marks (a claim that returns). Each was a commit of its own,
+    // and a commit is a full flush of the disk, which can take hundreds of
+    // milliseconds on a busy machine while cs_wallet is held. Group them in
+    // one commit, as the block callbacks do; the scope also commits on
+    // unwinding. A transaction that is not the wallet's (almost all of them,
+    // in every loaded wallet) writes nothing and opens no scope.
+    std::unique_ptr<DatabaseBulkScope> writes;
+    if (mapWallet.count(tx->GetHash()) != 0 || IsMine(*tx) || IsFromMe(*tx)) {
+        writes = GetDatabase().MakeBulkScope();
+    }
+    struct CommitWrites {
+        CWallet& wallet;
+        std::unique_ptr<DatabaseBulkScope>& scope;
+        const uint256 txid;
+        ~CommitWrites() NO_THREAD_SAFETY_ANALYSIS
+        {
+            if (scope && !scope->Commit()) {
+                // As in blockConnected: memory may now differ from disk.
+                wallet.m_shadow_pow_claim_recovery_db_ambiguous = true;
+                wallet.WalletLogPrintf("Failed to persist the wallet writes of mempool transaction %s\n", txid.ToString());
+            }
+            scope.reset();
+        }
+    } commit_writes{*this, writes, tx->GetHash()};
+
     SyncTransaction(tx, TxStateInMempool{});
 
     auto it = mapWallet.find(tx->GetHash());
     if (it != mapWallet.end()) {
+        BumpBalanceScanMarker();
         RefreshMempoolStatus(it->second);
         UpdatePendingShadowSignalIndex(it->second);
         // Validation-interface delivery can lag a later eviction/removal.
@@ -3016,9 +3471,15 @@ void CWallet::transactionSubmittedByRpc(const CTransactionRef& tx)
 }
 
 void CWallet::transactionRemovedFromMempool(const CTransactionRef& tx, MemPoolRemovalReason reason) {
+    WalletCallbackTimer lock_timer{WalletCallbackKind::MEMPOOL_REMOVED};
     LOCK(cs_wallet);
+    lock_timer.LockAcquired();
+    // As above: only a wallet transaction changes wallet state here (the
+    // CONFLICT path below goes through SyncTransaction, which bumps when the
+    // transaction is, or turns out to be, ours).
     auto it = mapWallet.find(tx->GetHash());
     if (it != mapWallet.end()) {
+        BumpBalanceScanMarker();
         RefreshMempoolStatus(it->second);
         UpdatePendingShadowSignalIndex(it->second);
 
@@ -3029,7 +3490,7 @@ void CWallet::transactionRemovedFromMempool(const CTransactionRef& tx, MemPoolRe
         // in this callback. Unknown ownership is handled by bounded repair.
         size_t record_work{0}, record_bytes{0};
         if (reason != MemPoolRemovalReason::BLOCK &&
-            m_shadow_pow_claim_txids.count(tx->GetHash()) != 0 &&
+            IsShadowPowLocalClaimIndexedLocked(tx->GetHash()) &&
             ConsumeShadowPowRepairRecordBudget(it->second, record_work, record_bytes)) {
             auto root_it = mapWallet.find(tx->GetHash());
             if (root_it != mapWallet.end() && root_it->second.isUnconfirmed()) {
@@ -3085,6 +3546,87 @@ void CWallet::transactionRemovedFromMempool(const CTransactionRef& tx, MemPoolRe
         // new recovery authority. The executor rechecks exact relay guards.
         RequestWalletClaimMaintenance(m_claim_maintenance,
                                       /*resolve=*/false, /*relay=*/true);
+        if (m_pow_mining_enabled.load(std::memory_order_acquire)) {
+            // The miner's worker zero relays or replaces the claim. Wake it
+            // now instead of leaving that to its one-second poll.
+            WalletLogPrintf("Waking the Gold Rush PoW miner after %s mempool removal of claim %s\n",
+                            RemovalReasonToString(reason),
+                            tx->GetHash().ToString());
+            m_pow_tip_signal.NotifyClaimRemoved();
+        }
+    }
+}
+
+void CWallet::PersistBlockProgress(WalletBatch& batch, const CBlockLocator& locator, bool atomic_with_block,
+                                   const uint256& block_hash, int block_height, bool block_wrote_records)
+{
+    AssertLockHeld(cs_wallet);
+    // Only inside the block's single commit scope: the best block then moves
+    // in the same commit as the block's records, so a crash leaves either both
+    // or neither and the wallet never claims a block whose records it lost.
+    // Without a scope (a database that cannot group writes) the old rule holds
+    // and the best block advances only on a chainstate flush.
+    if (!atomic_with_block || m_attaching_chain || locator.IsNull()) return;
+    if (!block_wrote_records) {
+        // The block changed nothing in this wallet, so the best block would be
+        // the only write and would cost a synced commit by itself. Leave the
+        // stored best block where it is: after a crash the wallet scans the
+        // deferred blocks again and finds, again, nothing in them. The stored
+        // best block never names a block whose records are missing, because a
+        // block that writes a record still moves it in the same commit.
+        const bool within_blocks{m_best_block_deferred_blocks < MAX_DEFERRED_BEST_BLOCKS};
+        const bool within_time{NodeClock::now() - m_best_block_persisted_at < MAX_BEST_BLOCK_DEFERRAL};
+        if (within_blocks && within_time) {
+            ++m_best_block_deferred_blocks;
+            m_deferred_best_block = DeferredBestBlock{locator, block_hash, block_height};
+            return;
+        }
+    }
+    if (!WriteBlockProgress(batch, locator, block_hash, block_height)) {
+        // Still owed; the next block, flush or close writes it.
+        m_deferred_best_block = DeferredBestBlock{locator, block_hash, block_height};
+    }
+}
+
+bool CWallet::WriteBlockProgress(WalletBatch& batch, const CBlockLocator& locator,
+                                 const uint256& block_hash, int block_height)
+{
+    AssertLockHeld(cs_wallet);
+    if (!batch.WriteBestBlock(locator)) {
+        WalletLogPrintf("Failed to persist the best block %s (height %d); the next flush will record it\n",
+                        block_hash.ToString(), block_height);
+        return false;
+    }
+    BestBlockPersisted();
+    // The block's payouts were authenticated against the chainstate when they
+    // were recorded above, so the payout checkpoint may move with the block.
+    if (m_synthetic_payout_checkpoint_trusted) {
+        WriteSyntheticPayoutCheckpoint(batch, block_hash, block_height);
+    }
+    return true;
+}
+
+void CWallet::BestBlockPersisted()
+{
+    AssertLockHeld(cs_wallet);
+    m_deferred_best_block.reset();
+    m_best_block_deferred_blocks = 0;
+    m_best_block_persisted_at = NodeClock::now();
+}
+
+void CWallet::PersistDeferredBestBlock()
+{
+    AssertLockHeld(cs_wallet);
+    if (!m_deferred_best_block || m_attaching_chain) return;
+    // The deferred block is the last block this wallet processed: a later
+    // connected block replaces or writes it and a disconnect drops it.
+    const DeferredBestBlock deferred{*m_deferred_best_block};
+    WalletBatch batch(GetDatabase());
+    // The best block is two rows and the payout checkpoint a third: one commit.
+    const bool grouped{batch.TxnBegin()};
+    WriteBlockProgress(batch, deferred.locator, deferred.hash, deferred.height);
+    if (grouped && !batch.TxnCommit()) {
+        WalletLogPrintf("Failed to persist the deferred best block %s; the next flush will record a best block\n", deferred.hash.ToString());
     }
 }
 
@@ -3094,8 +3636,22 @@ void CWallet::blockConnected(ChainstateRole role, const interfaces::BlockInfo& b
         return;
     }
     assert(block.data);
+    // The PoW miner measures its reaction time from this instant.
+    PowMinerTipInfo pow_miner_tip;
+    pow_miner_tip.hash = block.hash;
+    pow_miner_tip.height = block.height;
+    pow_miner_tip.block_time = block.data->GetBlockTime();
+    pow_miner_tip.seen = std::chrono::steady_clock::now();
+    pow_miner_tip.seen_unix_ms = TicksSinceEpoch<std::chrono::milliseconds>(SystemClock::now());
+    // Tell the GUI balance poll that block dispatch is in progress (L15).
+    const BlockConnectActivityScope block_connect_activity;
     const WalletBlockTime block_time{block.data->GetBlockTime(), block.chain_time_max};
     const std::vector<ShadowSyntheticPayoutTransaction> shadow_payout_txs = GetWalletShadowPayoutTransactions(*this, block);
+    // The locator that records this block as the wallet's best block. It is
+    // built from the block itself (not the current tip, which may already be
+    // ahead of this callback) and before cs_wallet is taken, because it needs
+    // cs_main.
+    const CBlockLocator best_block_locator = HaveChain() ? chain().getDenseChainLocator(block.hash) : CBlockLocator{};
     std::set<COutPoint> authenticated_shadow_payouts;
     for (const ShadowSyntheticPayoutTransaction& payout : shadow_payout_txs) {
         if (payout.tx && !payout.tx->vout.empty()) {
@@ -3103,10 +3659,41 @@ void CWallet::blockConnected(ChainstateRole role, const interfaces::BlockInfo& b
         }
     }
     {
+    WalletCallbackTimer lock_timer{WalletCallbackKind::BLOCK_CONNECTED};
     LOCK(cs_wallet);
+    lock_timer.LockAcquired();
+    BumpBalanceScanMarker();
 
     m_last_block_processed_height = block.height;
     m_last_block_processed = block.hash;
+    // Wake the PoW miner now, in the critical section that moves the wallet's
+    // tip. Its next wallet sample waits for this callback to finish.
+    m_pow_tip_signal.NotifyTip(pow_miner_tip);
+
+    // Every database write this callback makes for the block (payout
+    // reconciliation, block transactions, claim quarantine clears, payout
+    // records) is grouped into one commit per wallet per block. Atomic units
+    // inside nest as savepoints, so an inner abort still undoes only that
+    // unit. If the process dies mid-callback the wallet reopens with none of
+    // the block's writes and resynchronizes from its persisted best block.
+    // The scope also commits on unwinding, as one commit per write did.
+    std::unique_ptr<DatabaseBulkScope> block_writes = GetDatabase().MakeBulkScope();
+    // Every successful record write or erase advances this counter, and no
+    // other thread can write while the scope is open, so it tells whether the
+    // block changed anything in this wallet's database.
+    const unsigned int updates_before_block{GetDatabase().nUpdateCounter.load()};
+    const auto block_wrote_records = [&] { return GetDatabase().nUpdateCounter.load() != updates_before_block; };
+    const auto commit_block_writes = [&]() EXCLUSIVE_LOCKS_REQUIRED(cs_wallet) {
+        if (block_writes && !block_writes->Commit()) {
+            // Same stance as a failed record write in AddToWallet: memory may
+            // now differ from disk, so no new claim or recovery is authorized
+            // until the wallet is reloaded.
+            m_shadow_pow_claim_recovery_db_ambiguous = true;
+            WalletLogPrintf("Failed to persist the wallet writes of block %s\n",
+                            block.hash.ToString());
+        }
+        block_writes.reset();
+    };
 
     WalletBatch batch(GetDatabase());
     if (!ReconcileWalletShadowPayoutsForBlock(
@@ -3117,7 +3704,11 @@ void CWallet::blockConnected(ChainstateRole role, const interfaces::BlockInfo& b
 
     // No need to scan block if it was created before the wallet birthday.
     // Uses chain max time and twice the grace period to adjust time for block time variability.
-    if (block.chain_time_max < m_birth_time.load() - (TIMESTAMP_WINDOW * 2)) return;
+    if (block.chain_time_max < m_birth_time.load() - (TIMESTAMP_WINDOW * 2)) {
+        PersistBlockProgress(batch, best_block_locator, block_writes != nullptr, block.hash, block.height, block_wrote_records());
+        commit_block_writes();
+        return;
+    }
 
     // Scan block
     for (size_t index = 0; index < block.data->vtx.size(); index++) {
@@ -3148,13 +3739,16 @@ void CWallet::blockConnected(ChainstateRole role, const interfaces::BlockInfo& b
         }
         transactionRemovedFromMempool(block.data->vtx[index], MemPoolRemovalReason::BLOCK);
     }
-    for (size_t index = 0; index < shadow_payout_txs.size(); ++index) {
-        SyncTransaction(shadow_payout_txs[index].tx,
-                        TxStateConfirmed{block.hash, block.height, static_cast<int>(block.data->vtx.size() + index)},
-                        /*update_tx=*/true, /*rescanning_old_block=*/false, block_time);
-    }
-    for (const ShadowSyntheticPayoutTransaction& payout : shadow_payout_txs) {
-        AnnotateWalletShadowPayout(*this, payout, batch);
+    {
+        // Payout records are written inside the block's single commit scope.
+        for (size_t index = 0; index < shadow_payout_txs.size(); ++index) {
+            SyncTransaction(shadow_payout_txs[index].tx,
+                            TxStateConfirmed{block.hash, block.height, static_cast<int>(block.data->vtx.size() + index)},
+                            /*update_tx=*/true, /*rescanning_old_block=*/false, block_time);
+        }
+        for (const ShadowSyntheticPayoutTransaction& payout : shadow_payout_txs) {
+            AnnotateWalletShadowPayout(*this, payout, batch);
+        }
     }
     for (const CTransactionRef& ptx : block.data->vtx) {
         RecordQuantumRedelegationWins(*ptx, block.height, batch);
@@ -3163,9 +3757,25 @@ void CWallet::blockConnected(ChainstateRole role, const interfaces::BlockInfo& b
     // mempool, so it will not receive a stale-removal callback. Mark every
     // remaining unconfirmed proof for the scheduler's broadcast-independent
     // validation pass after each connected block.
-    for (auto& [txid, wtx] : mapWallet) {
-        if (!wtx.isUnconfirmed() || !TransactionHasShadowProof(*wtx.tx) ||
-            GetDebit(*wtx.tx, ISMINE_SPENDABLE) <= 0) continue;
+    // Only a record that is not confirmed can match, and those are indexed
+    // on their own (proof records and records too large to classify in a
+    // callback alike), so a wallet with a long confirmed claim history does
+    // not look every one of them up on every block. The matching records are
+    // collected first because the durable update refreshes the index being
+    // read.
+    std::vector<uint256> unconfirmed_proofs;
+    const auto collect_unconfirmed_proofs = [&](const std::set<uint256>& txids) {
+        for (const uint256& txid : txids) {
+            const auto wallet_tx = mapWallet.find(txid);
+            if (wallet_tx == mapWallet.end()) continue;
+            const CWalletTx& wtx = wallet_tx->second;
+            if (!wtx.isUnconfirmed() || !TransactionHasShadowProof(*wtx.tx) ||
+                GetDebit(*wtx.tx, ISMINE_SPENDABLE) <= 0) continue;
+            unconfirmed_proofs.push_back(txid);
+        }
+    };
+    collect_unconfirmed_proofs(m_shadow_pow_nonconfirmed_proof_txids);
+    for (const uint256& txid : unconfirmed_proofs) {
         UpdateShadowPowClaimRecoveryRecordDurably(
             txid,
             [&](CWalletTx& persisted) {
@@ -3174,6 +3784,8 @@ void CWallet::blockConnected(ChainstateRole role, const interfaces::BlockInfo& b
             },
             "mark connected-block claim quarantine");
     }
+    PersistBlockProgress(batch, best_block_locator, block_writes != nullptr, block.hash, block.height, block_wrote_records());
+    commit_block_writes();
     }
     ReconcileRGBAssignments(); // Re-sync the RGB ledger after a block connects.
 }
@@ -3181,8 +3793,12 @@ void CWallet::blockConnected(ChainstateRole role, const interfaces::BlockInfo& b
 void CWallet::blockDisconnected(const interfaces::BlockInfo& block)
 {
     assert(block.data);
+    const BlockConnectActivityScope block_connect_activity;
     {
+    WalletCallbackTimer lock_timer{WalletCallbackKind::BLOCK_DISCONNECTED};
     LOCK(cs_wallet);
+    lock_timer.LockAcquired();
+    BumpBalanceScanMarker();
 
     // At block disconnection, this will change an abandoned transaction to
     // be unconfirmed, whether or not the transaction is added back to the mempool.
@@ -3190,6 +3806,46 @@ void CWallet::blockDisconnected(const interfaces::BlockInfo& block)
     // future with a stickier abandoned state or even removing abandontransaction call.
     m_last_block_processed_height = block.height - 1;
     m_last_block_processed = *Assert(block.prev_hash);
+    // A best block deferred by blockConnected names the last processed block.
+    // Once that block is disconnected it is not written at all; the stored
+    // best block stays at the older block it already names.
+    if (m_deferred_best_block && m_deferred_best_block->height >= block.height) m_deferred_best_block.reset();
+    {
+        // A disconnect is a tip change for the PoW miner too: work for the
+        // disconnected block is dead. The parent's timestamp is not at hand.
+        PowMinerTipInfo pow_miner_tip;
+        pow_miner_tip.hash = m_last_block_processed;
+        pow_miner_tip.height = m_last_block_processed_height;
+        pow_miner_tip.seen = std::chrono::steady_clock::now();
+        pow_miner_tip.seen_unix_ms = TicksSinceEpoch<std::chrono::milliseconds>(SystemClock::now());
+        m_pow_tip_signal.NotifyTip(pow_miner_tip);
+    }
+
+    // As for a connected block, group every database write this callback makes
+    // (state changes of the block's transactions and payout records, orphaned
+    // coinstake abandons, the redelegation history) into one commit instead of
+    // one autocommit per record. The scope also commits on unwinding.
+    std::unique_ptr<DatabaseBulkScope> block_writes = GetDatabase().MakeBulkScope();
+
+    // Drop only the memoized chainstate facts of outputs confirmed in the
+    // disconnected block or above. Entries exist only for outputs at least
+    // LIFECYCLE_MEMO_MIN_DEPTH deep and are checked against the confirming
+    // block's hash prefix and height on every lookup, so a shallow reorg
+    // cannot make a deeper entry wrong; the rolling re-verification against
+    // the chainstate still catches anything else. Keeping them spares every
+    // loaded wallet a full warm-up after a reorg.
+    BlockDisconnectWork work;
+    work.height = block.height;
+    work.block_txs = block.data->vtx.size();
+    const auto work_start = std::chrono::steady_clock::now();
+    auto phase_start = work_start;
+    const auto end_phase = [&](std::chrono::microseconds& phase) {
+        const auto now = std::chrono::steady_clock::now();
+        phase += std::chrono::duration_cast<std::chrono::microseconds>(now - phase_start);
+        phase_start = now;
+    };
+    work.memo_entries_visited = EraseOutputLifecycleMemoFromHeight(block.height);
+    end_phase(work.memo);
 
     int disconnect_height = block.height;
     std::set<uint256> disconnected_block_txids;
@@ -3200,6 +3856,9 @@ void CWallet::blockDisconnected(const interfaces::BlockInfo& block)
     WalletBatch batch(GetDatabase());
     for (const CTransactionRef& ptx : Assert(block.data)->vtx) {
         SyncTransaction(ptx, TxStateInactive{});
+        // The node puts most disconnected transactions back into its mempool
+        // itself; one it refuses is retried when the chain moves on.
+        if (const auto own = mapWallet.find(ptx->GetHash()); own != mapWallet.end()) QueueResubmitRetry(own->second);
         if (TransactionHasShadowSignal(*ptx)) {
             const auto signal_it = mapWallet.find(ptx->GetHash());
             if (signal_it != mapWallet.end()) {
@@ -3268,26 +3927,65 @@ void CWallet::blockDisconnected(const interfaces::BlockInfo& block)
             }
         }
     }
+    end_phase(work.block_sync);
+    // Records confirmed in the disconnected block that the block itself does
+    // not contain are its synthetic payouts. They are indexed by block, so no
+    // pass over the whole wallet is needed. Copy the txids first: syncing a
+    // record updates the index being read.
     std::vector<CTransactionRef> synthetic_confirmed_txs;
-    for (const auto& [hash, wtx] : mapWallet) {
-        const auto* confirmed = wtx.state<TxStateConfirmed>();
-        if (!confirmed || confirmed->confirmed_block_hash != block.hash) continue;
-        if (disconnected_block_txids.count(hash)) continue;
-        synthetic_confirmed_txs.push_back(wtx.tx);
+    {
+        const auto indexed = m_confirmed_synthetic_payouts_by_block.find(block.hash);
+        if (indexed != m_confirmed_synthetic_payouts_by_block.end()) {
+            for (const uint256& hash : std::vector<uint256>{indexed->second.begin(), indexed->second.end()}) {
+                if (disconnected_block_txids.count(hash)) continue;
+                const auto wallet_tx = mapWallet.find(hash);
+                if (wallet_tx == mapWallet.end()) continue;
+                const auto* confirmed = wallet_tx->second.state<TxStateConfirmed>();
+                if (!confirmed || confirmed->confirmed_block_hash != block.hash) continue;
+                synthetic_confirmed_txs.push_back(wallet_tx->second.tx);
+            }
+        }
     }
     for (const CTransactionRef& tx : synthetic_confirmed_txs) {
         SyncTransaction(tx, TxStateInactive{});
     }
+    work.payouts_synced = synthetic_confirmed_txs.size();
+    end_phase(work.payouts);
 
     // Retained bytes and indexed anchors remain reserved immediately. Claim
     // classification, historical repair and relay run on the shared executor;
     // a disconnect never grants automatic recovery-spend authority.
 
     // Blackcoin - Call to abandon orphaned coinstakes after handling disconnections
-    AbandonOrphanedCoinstakes();
+    work.coinstakes_visited += AbandonOrphanedCoinstakes();
+    end_phase(work.coinstakes);
 
-    RecomputeQuantumRedelegationWinHistory(batch);
+    // The history holds, per delegation, the height of its newest confirmed
+    // win. Connecting a block only ever raises an entry to that block's
+    // height, so the disconnect can change the history only when an entry
+    // names the disconnected height (or one above it). Without such an entry
+    // a recomputation over every confirmed coinstake would reproduce what is
+    // there.
+    const bool redelegation_win_disconnected = std::any_of(
+        m_redelegation_last_win_height.begin(), m_redelegation_last_win_height.end(),
+        [&](const auto& entry) { return entry.second >= block.height; });
+    if (redelegation_win_disconnected) {
+        work.coinstakes_visited += RecomputeQuantumRedelegationWinHistory(batch);
+    }
+    end_phase(work.redelegation);
 
+    if (block_writes && !block_writes->Commit()) {
+        m_shadow_pow_claim_recovery_db_ambiguous = true;
+        WalletLogPrintf("Failed to persist the wallet writes of disconnecting block %s\n",
+                        block.hash.ToString());
+    }
+    block_writes.reset();
+    end_phase(work.commit);
+    work.total = std::chrono::duration_cast<std::chrono::microseconds>(phase_start - work_start);
+    m_last_block_disconnect_work = work;
+    if (work.total >= SLOW_BLOCK_DISCONNECT_LOG) {
+        WalletLogPrintf("Slow block disconnect: %s\n", work.ToString());
+    }
     }
     ReconcileRGBAssignments(); // Re-sync the RGB ledger after a reorg disconnects a block.
     RequestClaimMaintenance(/*resolve=*/false, /*relay=*/true);
@@ -3442,9 +4140,28 @@ bool CWallet::CanGetAddresses(bool internal) const
     return false;
 }
 
+bool CWallet::TryCanGetAddresses(bool& result, bool internal) const
+{
+    TRY_LOCK(cs_wallet, lock);
+    if (!lock) return false;
+    for (OutputType type : OUTPUT_TYPES) {
+        const auto* manager = GetScriptPubKeyMan(type, internal);
+        if (!manager) continue;
+        bool capable{false};
+        if (!manager->TryCanGetAddresses(capable, internal)) return false;
+        if (capable) {
+            result = true;
+            return true;
+        }
+    }
+    result = false;
+    return true;
+}
+
 void CWallet::SetWalletFlag(uint64_t flags)
 {
     LOCK(cs_wallet);
+    BumpBalanceScanMarker();
     m_wallet_flags |= flags;
     if (!WalletBatch(GetDatabase()).WriteWalletFlags(m_wallet_flags))
         throw std::runtime_error(std::string(__func__) + ": writing wallet flags failed");
@@ -3459,6 +4176,7 @@ void CWallet::UnsetWalletFlag(uint64_t flag)
 void CWallet::UnsetWalletFlagWithDB(WalletBatch& batch, uint64_t flag)
 {
     LOCK(cs_wallet);
+    BumpBalanceScanMarker();
     m_wallet_flags &= ~flag;
     if (!batch.WriteWalletFlags(m_wallet_flags))
         throw std::runtime_error(std::string(__func__) + ": writing wallet flags failed");
@@ -4014,13 +4732,20 @@ int64_t CWallet::RescanFromTime(int64_t startTime, const WalletRescanReserver& r
  * the main chain after to the addition of any new keys you want to detect
  * transactions for.
  */
-CWallet::ScanResult CWallet::ScanForWalletTransactions(const uint256& start_block, int start_height, std::optional<int> max_height, const WalletRescanReserver& reserver, bool fUpdate, const bool save_progress)
+CWallet::ScanResult CWallet::ScanForWalletTransactions(const uint256& start_block, int start_height, std::optional<int> max_height, const WalletRescanReserver& reserver, bool fUpdate, const bool save_progress, const bool wallet_lock_held)
 {
     constexpr auto INTERVAL_TIME{60s};
     auto current_time{reserver.now()};
     auto start_time{reserver.now()};
 
     assert(reserver.isReserved());
+    // The lifecycle memo is keyed by outpoint and checked against the
+    // confirming block's hash and height on every lookup. A scan from
+    // start_height only revisits transactions confirmed at or above it, so
+    // only those entries can be stale; a catch-up scan of the last few
+    // blocks leaves the deep entries (the ones worth keeping) alone. A scan
+    // from height 0 still drops everything.
+    WITH_LOCK(cs_wallet, EraseOutputLifecycleMemoFromHeight(start_height));
 
     uint256 block_hash = start_block;
     ScanResult result;
@@ -4040,6 +4765,12 @@ CWallet::ScanResult CWallet::ScanForWalletTransactions(const uint256& start_bloc
     double progress_end = chain().guessVerificationProgress(end_hash);
     double progress_current = progress_begin;
     int block_height = start_height;
+    // With cs_wallet held for the whole scan the database writes of a batch of
+    // blocks share one commit (and the progress locator is written in it);
+    // otherwise each block commits on its own inside its own lock scope.
+    constexpr size_t RESCAN_BATCH_BLOCKS{64};
+    std::unique_ptr<DatabaseBulkScope> batch_scope;
+    size_t batch_blocks{0};
     while (!fAbortRescan && !chain().shutdownRequested()) {
         if (progress_end - progress_begin > 0.0) {
             m_scanning_progress = (progress_current - progress_begin) / (progress_end - progress_begin);
@@ -4102,9 +4833,10 @@ CWallet::ScanResult CWallet::ScanForWalletTransactions(const uint256& start_bloc
                         authenticated_shadow_payouts.emplace(payout.tx->GetHash(), 0);
                     }
                 }
+                const bool batch_boundary = wallet_lock_held && batch_blocks + 1 >= RESCAN_BATCH_BLOCKS;
                 std::optional<CBlockLocator> progress_locator;
-                if (save_progress && next_interval) {
-                    CBlockLocator locator = m_chain->getActiveChainLocator(block_hash);
+                if (save_progress && (next_interval || batch_boundary)) {
+                    CBlockLocator locator = m_chain->getDenseChainLocator(block_hash);
                     if (!locator.IsNull()) progress_locator = std::move(locator);
                 }
                 LOCK(cs_wallet);
@@ -4114,6 +4846,12 @@ CWallet::ScanResult CWallet::ScanForWalletTransactions(const uint256& start_bloc
                     result.last_failed_block = block_hash;
                     result.status = ScanResult::FAILURE;
                     break;
+                }
+                std::unique_ptr<DatabaseBulkScope> block_scope;
+                if (wallet_lock_held) {
+                    if (!batch_scope) batch_scope = GetDatabase().MakeBulkScope();
+                } else {
+                    block_scope = GetDatabase().MakeBulkScope();
                 }
                 WalletBatch batch(GetDatabase());
                 if (!ReconcileWalletShadowPayoutsForBlock(
@@ -4151,6 +4889,15 @@ CWallet::ScanResult CWallet::ScanForWalletTransactions(const uint256& start_bloc
                     WalletBatch batch(GetDatabase());
                     batch.WriteBestBlock(*progress_locator);
                 }
+                ++batch_blocks;
+                if (batch_scope && batch_boundary) {
+                    // The batch's records and its progress locator become durable together.
+                    if (!batch_scope->Commit()) {
+                        WalletLogPrintf("Failed to persist the wallet writes of the rescan batch ending at block %d\n", block_height);
+                    }
+                    batch_scope.reset();
+                    batch_blocks = 0;
+                }
             } else {
                 // could not scan block, keep scanning but record this block as the most recent failure
                 result.last_failed_block = block_hash;
@@ -4181,6 +4928,8 @@ CWallet::ScanResult CWallet::ScanForWalletTransactions(const uint256& start_bloc
             }
         }
     }
+    // Commit the last, partial batch before anything else reads the wallet.
+    batch_scope.reset();
     if (!max_height) {
         WalletLogPrintf("Scanning current mempool transactions.\n");
         chain().requestMempoolTransactions(*this);
@@ -4201,7 +4950,30 @@ CWallet::ScanResult CWallet::ScanForWalletTransactions(const uint256& start_bloc
     return result;
 }
 
-void CWallet::AbandonOrphanedCoinstakes()
+void CWallet::ReconcileCoinstakesAfterAttach()
+{
+    std::unique_ptr<DatabaseBulkScope> writes = GetDatabase().MakeBulkScope();
+    AbandonOrphanedCoinstakes();
+    // The stored redelegation win history is only read at load, and a
+    // disconnect repairs it only when an entry names the disconnected height.
+    // A win orphaned while the node was offline, or between load and now, was
+    // marked inactive above but is still in the history, as is an entry no
+    // coinstake backs. Rebuild it once from the confirmed coinstakes. Not
+    // while the chain height is unknown (a reindex): the confirmed states are
+    // not trustworthy then, as for the sweep.
+    {
+        LOCK(cs_wallet);
+        if (m_last_block_processed_height >= 0) {
+            WalletBatch history_batch(GetDatabase());
+            RecomputeQuantumRedelegationWinHistory(history_batch);
+        }
+    }
+    if (writes && !writes->Commit()) {
+        WalletLogPrintf("Failed to persist the abandoned orphaned coinstakes; they are abandoned again at the next load\n");
+    }
+}
+
+size_t CWallet::AbandonOrphanedCoinstakes()
 {
 	LOCK(cs_wallet);
 
@@ -4209,12 +4981,20 @@ void CWallet::AbandonOrphanedCoinstakes()
     // when loading the wallet during a reindex. Do nothing in that
     // case.
     if (m_last_block_processed_height < 0) {
-        return;
+        return 0;
     }
+    size_t visited{0};
 
-    for (std::pair<const uint256, CWalletTx>& item : mapWallet) {
-        const uint256& wtxid = item.first;
-        CWalletTx& wtx = item.second;
+    // Walk only the wallet's coinstakes that are neither confirmed, conflicted
+    // nor abandoned, not every coinstake it ever made and not its whole
+    // history: only such a coinstake has depth zero and can be abandoned here.
+    // Abandoning removes the record from the index, so walk a copy.
+    const std::vector<uint256> unconfirmed{m_unconfirmed_coinstake_txids.begin(), m_unconfirmed_coinstake_txids.end()};
+    for (const uint256& wtxid : unconfirmed) {
+        ++visited;
+        const auto wallet_tx = mapWallet.find(wtxid);
+        if (wallet_tx == mapWallet.end()) continue;
+        CWalletTx& wtx = wallet_tx->second;
         assert(wtx.GetHash() == wtxid);
         if (GetTxDepthInMainChain(wtx) == 0 && !wtx.isAbandoned() && wtx.IsCoinStake()) {
             LogPrint(BCLog::COINSTAKE, "Abandoning coinstake wtx %s\n", wtx.GetHash().ToString());
@@ -4223,12 +5003,23 @@ void CWallet::AbandonOrphanedCoinstakes()
             }
         }
     }
+    return visited;
+}
+
+std::string BlockDisconnectWork::ToString() const
+{
+    return strprintf("height=%d block_txs=%d total_ms=%.1f (memo=%.1f block_sync=%.1f payouts=%.1f coinstakes=%.1f "
+                     "redelegation=%.1f commit=%.1f) visited: memo_entries=%d coinstakes=%d payouts=%d",
+                     height, block_txs, total.count() / 1000.0, memo.count() / 1000.0, block_sync.count() / 1000.0,
+                     payouts.count() / 1000.0, coinstakes.count() / 1000.0, redelegation.count() / 1000.0,
+                     commit.count() / 1000.0, memo_entries_visited, coinstakes_visited, payouts_synced);
 }
 
 bool CWallet::SubmitTxMemoryPoolAndRelay(
     const uint256& txid, std::string& err_string, bool relay,
     const ShadowPowClaimRecoveryBroadcastGuard* recovery_guard,
-    std::optional<CAmount> max_tx_fee_override)
+    std::optional<CAmount> max_tx_fee_override,
+    bool quiet_log)
 {
     // A guarded proof relay is an authorizing boundary. Observe and persist
     // every crossed schema or released-legacy frontier before acquiring the
@@ -4480,7 +5271,12 @@ bool CWallet::SubmitTxMemoryPoolAndRelay(
     }
 
     // Submit transaction to mempool for relay
-    WalletLogPrintf("Submitting wtx %s to mempool for relay\n", txid.ToString());
+    // A retry of a transaction the node already refused logs at debug level only.
+    if (quiet_log) {
+        LogPrint(BCLog::MEMPOOL, "%s Submitting wtx %s to mempool for relay\n", GetDisplayName(), txid.ToString());
+    } else {
+        WalletLogPrintf("Submitting wtx %s to mempool for relay\n", txid.ToString());
+    }
     // Validation-interface callbacks are the sole authority for the wallet's
     // mempool state. Writing TxStateInMempool here can race a later removal
     // callback that already ran before broadcastTransaction returned, leaving
@@ -4631,6 +5427,20 @@ void CWallet::RepairStaleShadowTransactions(bool force)
                         m_last_block_processed);
             }, "mark pre-broadcast claim quarantine slice");
         return;
+    }
+
+    // Everything below only repairs records of the hot claim sets. With all of
+    // them empty (the normal state of a wallet that holds no unconfirmed or
+    // unclassified claim) the inventory build is skipped; the per-minute pass
+    // then costs a few set size checks instead of a graph build.
+    {
+        LOCK(cs_wallet);
+        if (m_shadow_pow_unconfirmed_claim_txids.empty() &&
+            m_shadow_pow_unconfirmed_implicit_claim_txids.empty() &&
+            m_shadow_pow_unclassified_claim_txids.empty() &&
+            !ShadowPowProofInputIndexUnavailableLocked()) {
+            return;
+        }
     }
 
     // Reuse the bounded indexed graph and its wallet-scoped singleflight
@@ -4823,8 +5633,19 @@ void CWallet::ResubmitWalletTransactions(bool relay, bool force, bool include_cl
     // deadlocking the PoS thread.
     for (const uint256& txid : to_submit) {
         std::string err_string;
-        if (SubmitTxMemoryPoolAndRelay(txid, err_string, relay)) {
-            ++submitted_tx_count;
+        const bool accepted = SubmitTxMemoryPoolAndRelay(txid, err_string, relay);
+        if (accepted) ++submitted_tx_count;
+        // A refusal the next block can undo (not final yet, parents missing)
+        // goes to the retry set instead of waiting for the periodic resend.
+        LOCK(cs_wallet);
+        const auto it = mapWallet.find(txid);
+        if (accepted || it == mapWallet.end()) {
+            m_resubmit_retry.erase(txid);
+        } else if (IsTipDependentRefusal(err_string)) {
+            QueueResubmitRetry(it->second);
+            NoteResubmitRefusal(txid, m_last_block_processed, m_last_block_processed_height, err_string);
+        } else {
+            m_resubmit_retry.erase(txid);
         }
     }
 
@@ -4901,12 +5722,164 @@ void CWallet::RequestClaimMaintenance(bool resolve, bool relay)
 
 /** @} */ // end of mapWallet
 
+bool CWallet::IsGenericResubmitCandidate(const CWalletTx& wtx)
+{
+    if (!wtx.tx || !wtx.isUnconfirmed() || wtx.IsCoinBase() || wtx.IsCoinStake()) return false;
+    // Managed claim recovery records, signed recovery drafts and their cleanup
+    // transactions are relayed only by the recovery scheduler; QQSPROOF relay
+    // authority comes only from its typed gate; reorg-marked shadow records
+    // belong to the shadow repair pass. None of them is ever generic.
+    for (const char* key : {SHADOW_POW_RESOLUTION_SCHEMA_KEY, SHADOW_POW_CLEANUP_FOR_KEY,
+                            SHADOW_POW_QUARANTINE_KEY, LEGACY_SHADOW_POW_CLEANUP_QUARANTINE_KEY,
+                            REORG_SHADOW_RESUBMIT_KEY, AUTO_SHADOW_STALE_KEY, MANUAL_SHADOW_ABANDON_KEY}) {
+        if (wtx.mapValue.count(key) != 0) return false;
+    }
+    if (TransactionHasShadowProof(*wtx.tx)) return false;
+    return true;
+}
+
+bool CWallet::IsTipDependentRefusal(const std::string& err_string)
+{
+    // Validation reasons that depend on the height, the time or the contents
+    // of the chain and mempool, and so can clear when a block is connected.
+    static const char* const REASONS[] = {
+        "non-final", "non-BIP68-final", "time-too-new",
+        "bad-txns-inputs-missingorspent", "premature", "mempool full",
+        "mempool min fee not met", "too-long-mempool-chain",
+        "wallet-broadcast-in-flight",
+    };
+    for (const char* reason : REASONS) {
+        if (err_string.find(reason) != std::string::npos) return true;
+    }
+    return false;
+}
+
+void CWallet::NoteResubmitRefusal(const uint256& txid, const uint256& tip, int height,
+                                  const std::string& err_string)
+{
+    AssertLockHeld(cs_wallet);
+    const auto it = m_resubmit_retry.find(txid);
+    if (it == m_resubmit_retry.end()) return;
+    ResubmitRetryEntry& entry = it->second;
+    entry.last_attempt_tip = tip;
+    entry.last_attempt_height = height;
+    if (entry.attempts < std::numeric_limits<unsigned int>::max()) ++entry.attempts;
+    // 1, 2, 4, ... blocks between tries, capped.
+    const unsigned int shift = std::min(entry.attempts - 1, 6U);
+    entry.block_gap = std::min(1U << shift, MAX_RESUBMIT_RETRY_BLOCK_GAP);
+    entry.missing_inputs = err_string.find("bad-txns-inputs-missingorspent") != std::string::npos;
+}
+
+bool CWallet::IsResubmitRetryDue(const uint256& txid, const uint256& tip, int height) const
+{
+    AssertLockHeld(cs_wallet);
+    const auto it = m_resubmit_retry.find(txid);
+    if (it == m_resubmit_retry.end()) return false;
+    const ResubmitRetryEntry& entry = it->second;
+    if (entry.last_attempt_tip == tip) return false; // nothing new since the last try
+    if (entry.last_attempt_height < 0 || height < entry.last_attempt_height) return true;
+    return static_cast<unsigned int>(height - entry.last_attempt_height) >= entry.block_gap;
+}
+
+std::optional<CWallet::ResubmitRetryInfo> CWallet::GetResubmitRetryInfo(const uint256& txid) const
+{
+    AssertLockHeld(cs_wallet);
+    const auto it = m_resubmit_retry.find(txid);
+    if (it == m_resubmit_retry.end()) return std::nullopt;
+    return ResubmitRetryInfo{it->second.attempts, it->second.block_gap, it->second.missing_inputs};
+}
+
+bool CWallet::QueueResubmitRetry(const CWalletTx& wtx)
+{
+    AssertLockHeld(cs_wallet);
+    if (!fBroadcastTransactions || !IsGenericResubmitCandidate(wtx)) return false;
+    if (m_resubmit_retry.count(wtx.GetHash())) return true;
+    if (m_resubmit_retry.size() >= MAX_RESUBMIT_RETRY_TXS) return false;
+    m_resubmit_retry.emplace(wtx.GetHash(), ResubmitRetryEntry{});
+    return true;
+}
+
+void CWallet::PruneResubmitRetry()
+{
+    AssertLockHeld(cs_wallet);
+    for (auto it = m_resubmit_retry.begin(); it != m_resubmit_retry.end();) {
+        const auto wtx = mapWallet.find(it->first);
+        // Accepted (in the mempool), confirmed, conflicted, abandoned or removed.
+        const bool keep = wtx != mapWallet.end() && wtx->second.isInactive() &&
+                          IsGenericResubmitCandidate(wtx->second) &&
+                          it->second.attempts < (it->second.missing_inputs
+                              ? MAX_RESUBMIT_RETRY_MISSING_INPUT_ATTEMPTS
+                              : MAX_RESUBMIT_RETRY_ATTEMPTS);
+        it = keep ? std::next(it) : m_resubmit_retry.erase(it);
+    }
+}
+
+size_t CWallet::RetryDroppedTransactions()
+{
+    AssertLockNotHeld(cs_main);
+    AssertLockNotHeld(cs_wallet);
+    std::vector<uint256> to_submit;
+    uint256 tip;
+    int retry_height{-1};
+    {
+        LOCK(cs_wallet);
+        if (!fBroadcastTransactions) {
+            m_resubmit_retry.clear();
+            return 0;
+        }
+        PruneResubmitRetry();
+        if (m_resubmit_retry.empty() || m_last_block_processed.IsNull()) return 0;
+        tip = m_last_block_processed;
+        retry_height = m_last_block_processed_height;
+        // Insertion order, so that a parent is tried before its child.
+        std::set<const CWalletTx*, WalletTxOrderComparator> ordered;
+        for (const auto& retry : m_resubmit_retry) {
+            const uint256& txid = retry.first;
+            if (!IsResubmitRetryDue(txid, tip, m_last_block_processed_height)) continue;
+            ordered.insert(&mapWallet.at(txid));
+        }
+        for (const CWalletTx* wtx : ordered) {
+            if (to_submit.size() >= MAX_RESUBMIT_RETRY_PER_TICK) break;
+            to_submit.push_back(wtx->GetHash());
+        }
+    }
+    if (to_submit.empty() || !chain().isReadyToBroadcast()) return 0;
+
+    // Without cs_wallet, as in ResubmitWalletTransactions. No relay: the
+    // transaction was not new to the network, and the periodic resend relays
+    // it under the usual rules once it is old enough.
+    size_t accepted{0};
+    for (const uint256& txid : to_submit) {
+        std::string err_string;
+        const bool ok = SubmitTxMemoryPoolAndRelay(
+            txid, err_string, /*relay=*/false, /*recovery_guard=*/nullptr,
+            /*max_tx_fee_override=*/std::nullopt, /*quiet_log=*/true);
+        LOCK(cs_wallet);
+        const auto entry = m_resubmit_retry.find(txid);
+        if (entry == m_resubmit_retry.end()) continue;
+        if (ok) {
+            ++accepted;
+            m_resubmit_retry.erase(entry);
+        } else if (IsTipDependentRefusal(err_string)) {
+            NoteResubmitRefusal(txid, tip, retry_height, err_string);
+        } else {
+            m_resubmit_retry.erase(entry);
+        }
+    }
+    if (accepted > 0) {
+        WalletLogPrintf("%s: put %u own transactions back into the mempool\n", __func__, accepted);
+    }
+    return accepted;
+}
+
 void MaybeResendWalletTxs(WalletContext& context)
 {
     for (const std::shared_ptr<CWallet>& pwallet : GetWallets(context)) {
+        pwallet->RetryDroppedTransactions();
         MaybeAutoDemurrageAttest(*pwallet);
         MaybeAutoShadowSignal(*pwallet);
         MaybeAutoRedelegateQuantumColdStake(*pwallet);
+        pwallet->ReportLegacyClaimSourceCapacity(/*force=*/false);
         const bool resend = pwallet->ShouldResend();
         pwallet->RequestClaimMaintenance(/*resolve=*/true, /*relay=*/resend);
         if (!resend) continue;
@@ -5606,7 +6579,13 @@ bool CWallet::CommitTransaction(CTransactionRef tx, mapValue_t mapValue, std::ve
             shadow_pow_authority ? &::cs_main : nullptr,
             "::cs_main", __FILE__, __LINE__);
         LOCK(cs_wallet);
-        WalletLogPrintf("CommitTransaction:\n%s", tx->ToString()); // NOLINT(bitcoin-unterminated-logprintf)
+        BumpBalanceScanMarker();
+        // Formatting the whole transaction is not worth doing under both
+        // locks; the txid finds it. The dump stays available for debugging.
+        WalletLogPrintf("CommitTransaction: %s (%u bytes)\n", tx->GetHash().ToString(), tx->GetTotalSize());
+        if (LogAcceptCategory(BCLog::WALLETDB, BCLog::Level::Debug)) {
+            WalletLogPrintf("CommitTransaction:\n%s", tx->ToString()); // NOLINT(bitcoin-unterminated-logprintf)
+        }
 
         bool reopen_automatic_shadow_signal{false};
         if (automatic_shadow_signal_commit) {
@@ -5817,7 +6796,19 @@ bool CWallet::CommitTransaction(CTransactionRef tx, mapValue_t mapValue, std::ve
             });
         };
 
+        // The order position and the transaction record (and any address
+        // book or key pool row the add touches) reach the disk in one synced
+        // commit instead of one each. The commit completes here, before the
+        // wallet lock is released and before anything is relayed, so a
+        // transaction is never broadcast ahead of its durable record.
+        std::unique_ptr<DatabaseBulkScope> commit_writes = GetDatabase().MakeBulkScope();
         CWalletTx* wtx = add_wallet_record();
+        if (commit_writes && !commit_writes->Commit()) {
+            // The grouped writes were rolled back: memory holds a record the
+            // disk does not. Treat it exactly like a failed record write.
+            wtx = nullptr;
+        }
+        commit_writes.reset();
 
         // wtx can only be null if the db write failed.
         if (!wtx) {
@@ -5948,6 +6939,7 @@ bool CWallet::CommitRGBTransaction(CTransactionRef tx, mapValue_t mapValue, std:
     bool should_broadcast{false};
     {
     LOCK(cs_wallet);
+    BumpBalanceScanMarker();
 
     if (mapWallet.count(hash)) return fail("RGB anchor transaction is already in the wallet");
     if (rgb_data.contract_id.IsNull() || rgb_data.transition_id.IsNull()) return fail("RGB transition id is invalid");
@@ -6096,6 +7088,9 @@ bool CWallet::CommitRGBTransaction(CTransactionRef tx, mapValue_t mapValue, std:
     committed_wtx.m_it_wtxOrdered = wtxOrdered.insert(std::make_pair(committed_wtx.nOrderPos, &committed_wtx));
     AddToSpends(committed_wtx);
     RefreshLiveUnspentStakeOutpoints(committed_wtx);
+    // Every record that enters the wallet is classified for the proof
+    // indexes; blockConnected relies on them instead of a whole-wallet scan.
+    RefreshShadowPowClaimIndexEntryLocked(committed_wtx);
     MaybeUpdateBirthTime(committed_wtx.GetTxTime());
     MarkDestinationsDirty(tx_destinations);
     committed_wtx.MarkDirty();
@@ -6148,10 +7143,31 @@ DBErrors CWallet::LoadWallet()
     DBErrors nLoadWalletRet;
     std::set<uint256> referenced_blocks;
     std::set<uint256> synthetic_payout_blocks;
+    std::vector<SyntheticPayoutRef> synthetic_payout_refs;
+    // The stored payout checkpoints: the wallet's own first, then the flush-anchored one.
+    std::vector<SyntheticPayoutCheckpoint> payout_checkpoints;
+    bool have_tip_checkpoint{false};
+    bool have_flush_checkpoint{false};
+    const auto load_start{SteadyClock::now()};
+    const std::optional<int64_t> load_cpu_start{util::CurrentThreadCpuMicros()};
     {
         LOCK(cs_wallet);
-        nLoadWalletRet = WalletBatch(GetDatabase()).LoadWallet(this);
+        WalletBatch load_batch(GetDatabase());
+        nLoadWalletRet = load_batch.LoadWallet(this);
         if (HaveChain()) {
+            SyntheticPayoutCheckpoint stored;
+            m_synthetic_payout_checkpoint.reset();
+            m_synthetic_payout_flush_checkpoint.reset();
+            if (load_batch.ReadSyntheticPayoutCheckpoint(stored)) {
+                m_synthetic_payout_checkpoint = stored;
+                payout_checkpoints.push_back(stored);
+                have_tip_checkpoint = true;
+            }
+            if (load_batch.ReadSyntheticPayoutFlushCheckpoint(stored)) {
+                m_synthetic_payout_flush_checkpoint = stored;
+                payout_checkpoints.push_back(stored);
+                have_flush_checkpoint = true;
+            }
             for (const auto& [_, wtx] : mapWallet) {
                 if (const auto* conf = wtx.state<TxStateConfirmed>()) {
                     referenced_blocks.insert(conf->confirmed_block_hash);
@@ -6162,14 +7178,21 @@ DBErrors CWallet::LoadWallet()
                     referenced_blocks.insert(conf->conflicting_block_hash);
                 }
             }
+            synthetic_payout_refs = CollectSyntheticPayoutRefs();
         }
     }
+    const auto db_done{SteadyClock::now()};
 
     // Snapshot every referenced block against one active-chain view without
     // holding cs_wallet. Keeping database loading, chain lookup, and wallet
     // reconciliation in separate phases avoids nested chain/wallet locks.
     std::map<uint256, std::optional<int>> active_block_heights;
     std::map<uint256, std::set<COutPoint>> authenticated_shadow_payouts;
+    uint256 payout_tip_hash;
+    int payout_tip_height{-1};
+    // The active-chain block the chainstate holds on disk, when that is known.
+    uint256 payout_flushed_hash;
+    int payout_flushed_height{-1};
     if (HaveChain() && !referenced_blocks.empty()) {
         LOCK(::cs_main);
         ChainstateManager& chainman = chain().chainman();
@@ -6177,25 +7200,110 @@ DBErrors CWallet::LoadWallet()
             const CBlockIndex* block_index = chainman.m_blockman.LookupBlockIndex(block_hash);
             if (block_index && chainman.ActiveChain().Contains(block_index)) {
                 active_block_heights.emplace(block_hash, block_index->nHeight);
-                if (synthetic_payout_blocks.count(block_hash) != 0) {
-                    std::set<COutPoint> block_payouts;
-                    for (const ShadowSyntheticPayoutTransaction& payout :
-                         GetAppliedShadowClaimPayoutTransactionRecords(
-                             chainman.ActiveChainstate().CoinsTip(),
-                             block_index->nHeight,
-                             block_hash,
-                             block_index->GetBlockTime())) {
-                        if (payout.tx && !payout.tx->vout.empty()) {
-                            block_payouts.emplace(payout.tx->GetHash(), 0);
-                        }
-                    }
-                    authenticated_shadow_payouts.emplace(block_hash, std::move(block_payouts));
-                }
             } else {
                 active_block_heights.emplace(block_hash, std::nullopt);
             }
         }
+        if (const CBlockIndex* tip = chainman.ActiveChain().Tip()) {
+            payout_tip_hash = tip->GetBlockHash();
+            payout_tip_height = tip->nHeight;
+        }
+
+        // Payout authentication costs a pool-undo and one claim-marker
+        // chainstate lookup per claim for every payout block, which is slow
+        // on cold storage. Blocks at or below a still-valid checkpoint were
+        // authenticated by an earlier start (or when the wallet recorded
+        // them) and their records are unchanged, so only newer blocks are
+        // authenticated now. Anything that does not match exactly falls back
+        // to authenticating every payout block.
+        //
+        // Two checkpoints are stored. The wallet's own moves with every block
+        // it processes; after a crash the chain restarts at the last
+        // chainstate flush and that block may not be on it. The other one is
+        // anchored at a flushed block and still is. The highest one that
+        // passes every check is used.
+        int verified_through_height{-1};
+        if (!synthetic_payout_blocks.empty()) {
+            for (SyntheticPayoutRef& ref : synthetic_payout_refs) {
+                const auto snapshot = active_block_heights.find(ref.block_hash);
+                ref.height = (snapshot != active_block_heights.end() && snapshot->second) ? *snapshot->second : -1;
+            }
+            std::vector<SyntheticPayoutCheckpointResult> results;
+            const std::optional<size_t> usable{SelectSyntheticPayoutCheckpoint(
+                payout_checkpoints, synthetic_payout_refs, [&](const SyntheticPayoutCheckpoint& checkpoint) {
+                    const CBlockIndex* checkpoint_index = chainman.m_blockman.LookupBlockIndex(checkpoint.block_hash);
+                    if (!checkpoint_index) return SyntheticPayoutCheckpointVerdict::BLOCK_NOT_IN_INDEX;
+                    if (checkpoint_index->nHeight != checkpoint.height || !chainman.ActiveChain().Contains(checkpoint_index)) {
+                        return SyntheticPayoutCheckpointVerdict::BLOCK_NOT_ACTIVE;
+                    }
+                    return SyntheticPayoutCheckpointVerdict::ACCEPTED;
+                }, &results)};
+            if (usable) verified_through_height = payout_checkpoints[*usable].height;
+            // One line per record, also for a missing one: what a slow start needs to be explained.
+            size_t stored{0};
+            for (const auto& [name, present] : {std::pair{"wallet tip", have_tip_checkpoint}, std::pair{"chainstate flush", have_flush_checkpoint}}) {
+                if (!present) {
+                    WalletLogPrintf("Gold Rush payout checkpoint (%s): none stored (chain height %d)\n", name, payout_tip_height);
+                    continue;
+                }
+                WalletLogPrintf("Gold Rush payout checkpoint (%s): %s (chain height %d)\n", name,
+                                DescribeSyntheticPayoutCheckpointResult(payout_checkpoints[stored], results[stored]), payout_tip_height);
+                ++stored;
+            }
+        }
+        // Where the chainstate is on disk (one read). Every payout record at
+        // or below that block is authenticated by the end of this load, which
+        // is what the flush-anchored checkpoint written below records.
+        if (!synthetic_payout_blocks.empty()) {
+            const uint256 flushed_hash{chainman.ActiveChainstate().CoinsDB().GetBestBlock()};
+            const CBlockIndex* flushed_index = flushed_hash.IsNull() ? nullptr : chainman.m_blockman.LookupBlockIndex(flushed_hash);
+            if (flushed_index && chainman.ActiveChain().Contains(flushed_index)) {
+                payout_flushed_hash = flushed_hash;
+                payout_flushed_height = flushed_index->nHeight;
+            }
+        }
+
+        size_t blocks_to_authenticate{0};
+        size_t blocks_verified{0};
+        for (const uint256& block_hash : synthetic_payout_blocks) {
+            const auto snapshot = active_block_heights.find(block_hash);
+            if (snapshot == active_block_heights.end() || !snapshot->second) continue;
+            if (*snapshot->second > verified_through_height) {
+                ++blocks_to_authenticate;
+            } else {
+                ++blocks_verified;
+            }
+        }
+        if (blocks_to_authenticate >= SYNTHETIC_PAYOUT_AUTHENTICATION_NOTICE_BLOCKS) {
+            WalletLogPrintf("Authenticating synthetic Gold Rush payouts in %u blocks (%u already verified); the wallet logs nothing else until this finishes\n",
+                            blocks_to_authenticate, blocks_verified);
+        }
+        const auto authentication_start{SteadyClock::now()};
+        for (const uint256& block_hash : synthetic_payout_blocks) {
+            const auto snapshot = active_block_heights.find(block_hash);
+            if (snapshot == active_block_heights.end() || !snapshot->second || *snapshot->second <= verified_through_height) continue;
+            const CBlockIndex* block_index = chainman.m_blockman.LookupBlockIndex(block_hash);
+            if (!block_index) continue;
+            std::set<COutPoint> block_payouts;
+            for (const ShadowSyntheticPayoutTransaction& payout :
+                 GetAppliedShadowClaimPayoutTransactionRecords(
+                     chainman.ActiveChainstate().CoinsTip(),
+                     block_index->nHeight,
+                     block_hash,
+                     block_index->GetBlockTime())) {
+                if (payout.tx && !payout.tx->vout.empty()) {
+                    block_payouts.emplace(payout.tx->GetHash(), 0);
+                }
+            }
+            authenticated_shadow_payouts.emplace(block_hash, std::move(block_payouts));
+        }
+        // Always logged, also when there was nothing to authenticate, so the
+        // cost of this step (it runs under cs_main) is visible on every load.
+        WalletLogPrintf("Gold Rush payout check: %u payout blocks authenticated, %u already verified through height %d, took %d ms\n",
+                        blocks_to_authenticate, blocks_verified, verified_through_height,
+                        Ticks<std::chrono::milliseconds>(SteadyClock::now() - authentication_start));
     }
+    const auto chain_snapshot_done{SteadyClock::now()};
 
     LOCK(cs_wallet);
     bool reconciliation_write_ok{true};
@@ -6208,6 +7316,8 @@ DBErrors CWallet::LoadWallet()
                     if (!snapshot->second) {
                         // The transaction's block (or conflicting block) was
                         // reorged out while the wallet was offline.
+                        // block_hash refers into the state about to be replaced.
+                        m_load_inactivated_blocks.insert(block_hash);
                         wtx.m_state = TxStateInactive{};
                         MarkShadowPowClaimCandidateStateChangedLocked();
                 } else {
@@ -6229,6 +7339,14 @@ DBErrors CWallet::LoadWallet()
                 reconciliation_write_ok;
         }
     }
+    // wall is the whole load; thread-cpu is this thread's CPU time over the same span. CPU close to wall
+    // with every phase slow means slow cores; CPU far below wall means descheduled or waiting on I/O.
+    WalletLogPrintf("Wallet load: %d ms reading the database, %d ms chain snapshot and payout check, %d ms reconciling wallet records; total wall %d ms%s\n",
+                    Ticks<std::chrono::milliseconds>(db_done - load_start),
+                    Ticks<std::chrono::milliseconds>(chain_snapshot_done - db_done),
+                    Ticks<std::chrono::milliseconds>(SteadyClock::now() - chain_snapshot_done),
+                    Ticks<std::chrono::milliseconds>(SteadyClock::now() - load_start),
+                    util::FormatThreadLoadContext(load_cpu_start));
     if (!reconciliation_write_ok) {
         WalletLogPrintf("Failed to persist one or more synthetic Gold Rush payout reconciliation updates while loading the wallet\n");
         if (static_cast<int>(nLoadWalletRet) < static_cast<int>(DBErrors::NONCRITICAL_ERROR)) {
@@ -6239,6 +7357,27 @@ DBErrors CWallet::LoadWallet()
     RecomputeConfirmedSyntheticPayoutIndex();
     RecomputeLiveUnspentStakeOutpoints();
     RebuildShadowPowClaimIndexesLocked();
+    if (HaveChain() && reconciliation_write_ok && nLoadWalletRet == DBErrors::LOAD_OK) {
+        // Every confirmed synthetic payout at or below the tip is now authenticated.
+        m_synthetic_payout_checkpoint_trusted = true;
+        WalletBatch checkpoint_batch(GetDatabase());
+        WriteSyntheticPayoutCheckpoint(checkpoint_batch, payout_tip_hash, payout_tip_height);
+        // And at or below the block the chainstate holds on disk, so that a crash before
+        // the next chainstate flush does not cost a full authentication either.
+        WriteSyntheticPayoutFlushCheckpoint(checkpoint_batch, payout_flushed_hash, payout_flushed_height);
+    }
+    if (HaveChain() && !m_confirmed_synthetic_payouts_by_block.empty()) {
+        // What the next start will find, in one line, or why nothing was stored.
+        if (m_synthetic_payout_checkpoint_trusted) {
+            WalletLogPrintf("Gold Rush payout checkpoints stored: wallet tip %s, chainstate flush %s (chainstate on disk at height %d)\n",
+                            m_synthetic_payout_checkpoint ? strprintf("height %d, %u payout records", m_synthetic_payout_checkpoint->height, m_synthetic_payout_checkpoint->count) : "none",
+                            m_synthetic_payout_flush_checkpoint ? strprintf("height %d, %u payout records", m_synthetic_payout_flush_checkpoint->height, m_synthetic_payout_flush_checkpoint->count) : "none",
+                            payout_flushed_height);
+        } else {
+            WalletLogPrintf("Gold Rush payout checkpoints are not written until the wallet is loaded again: %s\n",
+                            reconciliation_write_ok ? strprintf("the wallet database loaded with result %d", static_cast<int>(nLoadWalletRet)) : "a payout record could not be written");
+        }
+    }
     if (nLoadWalletRet == DBErrors::NEED_REWRITE)
     {
         if (GetDatabase().Rewrite("\x04pool"))
@@ -6260,7 +7399,9 @@ DBErrors CWallet::LoadWallet()
 DBErrors CWallet::ZapSelectTx(std::vector<uint256>& vHashIn, std::vector<uint256>& vHashOut)
 {
     AssertLockHeld(cs_wallet);
+    BumpBalanceScanMarker();
     DBErrors nZapSelectTxRet = WalletBatch(GetDatabase()).ZapSelectTx(vHashIn, vHashOut);
+    bool removed_coinstake{false};
     for (const uint256& hash : vHashOut) {
         const auto& it = mapWallet.find(hash);
         std::vector<uint256> direct_spenders;
@@ -6273,6 +7414,7 @@ DBErrors CWallet::ZapSelectTx(std::vector<uint256>& vHashIn, std::vector<uint256
                 direct_spenders.push_back(spender->second);
             }
         }
+        removed_coinstake |= it->second.IsCoinStake();
         wtxOrdered.erase(it->second.m_it_wtxOrdered);
         std::vector<COutPoint> spent_inputs;
         spent_inputs.reserve(it->second.tx->vin.size());
@@ -6295,12 +7437,17 @@ DBErrors CWallet::ZapSelectTx(std::vector<uint256>& vHashIn, std::vector<uint256
             live_index_changed |=
                 m_live_unspent_legacy_claim_outpoints.erase(
                     COutPoint{hash, output}) != 0;
+            m_live_unspent_stake_candidate_outpoints.erase(
+                COutPoint{hash, output});
         }
         if (live_index_changed && ++m_live_unspent_stake_generation == 0) {
             ++m_live_unspent_stake_generation;
         }
         RemoveIndexedShadowSolve(hash);
         m_pending_shadow_signal_txids.erase(hash);
+        m_synthetic_payout_digest.Erase(hash);
+        m_coinstake_txids.erase(hash);
+        m_unconfirmed_coinstake_txids.erase(hash);
         const auto synthetic_block = m_confirmed_synthetic_payout_block_by_txid.find(hash);
         if (synthetic_block != m_confirmed_synthetic_payout_block_by_txid.end()) {
             const auto block = m_confirmed_synthetic_payouts_by_block.find(synthetic_block->second);
@@ -6326,8 +7473,12 @@ DBErrors CWallet::ZapSelectTx(std::vector<uint256>& vHashIn, std::vector<uint256
             --m_shadow_pow_claim_stale_ownership_records;
         }
         ClearShadowPowProofPresenceIndexLocked(hash);
+        // The proof, local-claim and relay-frontier indexes are stored on the
+        // record and go with it; only the ordered frontier entry remains.
+        const bool had_relay_frontier{it->second.m_shadow_pow_index.has_relay_frontier};
+        const bool legacy_relay_frontier{it->second.m_shadow_pow_index.legacy_relay_frontier};
+        const int64_t relay_frontier{it->second.m_shadow_pow_relay_frontier.value};
         mapWallet.erase(it);
-        m_shadow_pow_claim_txids.erase(hash);
         m_shadow_pow_managed_resolution_txids.erase(hash);
         m_shadow_pow_legacy_cleanup_pending_txids.erase(hash);
         m_shadow_pow_unconfirmed_claim_txids.erase(hash);
@@ -6336,14 +7487,11 @@ DBErrors CWallet::ZapSelectTx(std::vector<uint256>& vHashIn, std::vector<uint256
         m_shadow_pow_foreign_claim_txids.erase(hash);
         m_shadow_pow_unconfirmed_implicit_claim_txids.erase(hash);
         m_shadow_pow_claim_ownership_generation_by_txid.erase(hash);
-        const auto frontier =
-            m_shadow_pow_relay_frontier_by_txid.find(hash);
-        if (frontier != m_shadow_pow_relay_frontier_by_txid.end()) {
-            auto& domain = frontier->second.first
+        if (had_relay_frontier) {
+            auto& domain = legacy_relay_frontier
                 ? m_shadow_pow_legacy_relay_frontiers
                 : m_shadow_pow_schema_relay_frontiers;
-            domain.erase({frontier->second.second, hash});
-            m_shadow_pow_relay_frontier_by_txid.erase(frontier);
+            domain.erase({relay_frontier, hash});
         }
         for (const uint256& spender_txid : direct_spenders) {
             const auto spender = mapWallet.find(spender_txid);
@@ -6357,6 +7505,14 @@ DBErrors CWallet::ZapSelectTx(std::vector<uint256>& vHashIn, std::vector<uint256
             RefreshLiveUnspentStakeOutpoint(input);
         }
         NotifyTransactionChanged(hash, CT_DELETED);
+    }
+
+    // A removed coinstake may have been the only record behind a delegation's
+    // newest win; the history is otherwise repaired only by a disconnect of
+    // that height, so rebuild it from the coinstakes that remain.
+    if (removed_coinstake) {
+        WalletBatch history_batch(GetDatabase());
+        RecomputeQuantumRedelegationWinHistory(history_batch);
     }
 
     if (nZapSelectTxRet == DBErrors::NEED_REWRITE)
@@ -7099,12 +8255,17 @@ std::vector<CScript> CWallet::GetOwnedLegacyShadowScripts(size_t limit) const
     return scripts;
 }
 
-void CWallet::RecomputeQuantumRedelegationWinHistory(WalletBatch& batch)
+size_t CWallet::RecomputeQuantumRedelegationWinHistory(WalletBatch& batch)
 {
     AssertLockHeld(cs_wallet);
     std::map<std::vector<unsigned char>, int> rebuilt;
+    size_t visited{0};
 
-    for (const auto& [_, wtx] : mapWallet) {
+    for (const uint256& coinstake_txid : m_coinstake_txids) {
+        ++visited;
+        const auto wallet_tx = mapWallet.find(coinstake_txid);
+        if (wallet_tx == mapWallet.end()) continue;
+        const CWalletTx& wtx = wallet_tx->second;
         if (!wtx.IsCoinStake()) continue;
         const auto* confirmed = wtx.state<TxStateConfirmed>();
         if (!confirmed || confirmed->confirmed_block_height <= 0) continue;
@@ -7131,6 +8292,7 @@ void CWallet::RecomputeQuantumRedelegationWinHistory(WalletBatch& batch)
         }
     }
     m_redelegation_last_win_height = std::move(rebuilt);
+    return visited;
 }
 
 bool CWallet::LoadRGBContract(const uint256& contract_id, const RGBContractRecord& record)
@@ -8137,6 +9299,7 @@ std::optional<int64_t> CWallet::GetOldestKeyPoolTime() const
 }
 
 void CWallet::MarkDestinationsDirty(const std::set<CTxDestination>& destinations) {
+    BumpBalanceScanMarker();
     for (auto& entry : mapWallet) {
         CWalletTx& wtx = entry.second;
         if (wtx.m_is_cache_empty) continue;
@@ -8686,7 +9849,7 @@ std::shared_ptr<CWallet> CWallet::Create(WalletContext& context, const std::stri
         }
 
         if (chain) {
-            walletInstance->chainStateFlushed(ChainstateRole::NORMAL, chain->getTipLocator());
+            walletInstance->PersistBestBlockLocator(chain->getTipLocator(), /*chainstate_flushed=*/false);
         }
     } else if (wallet_creation_flags & WALLET_FLAG_DISABLE_PRIVATE_KEYS) {
         // Make it impossible to disable private keys after creation
@@ -8932,6 +10095,23 @@ bool CWallet::AttachChainUnpublished(const std::shared_ptr<CWallet>& walletInsta
 
     // If rescan_required = true, rescan_height remains equal to 0
     int rescan_height = 0;
+    // LoadWallet marked these transactions Inactive in memory (the database still
+    // says Confirmed) because their block was not in the active chain at its
+    // snapshot. A block connected between that snapshot and the subscription above
+    // was announced to nobody, and the stored best block can already be at or past
+    // it (it moves with every connected block), so the locator fork alone may start
+    // the rescan after those blocks or skip it. Start no later than the lowest such
+    // block that is in the active chain now, and rescan even when that block is the tip.
+    std::optional<int> inactivated_floor;
+    for (const uint256& block_hash : walletInstance->m_load_inactivated_blocks) {
+        const CBlockIndex* index = WITH_LOCK(
+            ::cs_main, return chain.chainman().m_blockman.LookupBlockIndex(block_hash));
+        if (index && reconciliation_tip && index->nHeight <= reconciliation_tip->nHeight &&
+            reconciliation_tip->GetAncestor(index->nHeight) == index) {
+            if (!inactivated_floor || index->nHeight < *inactivated_floor) inactivated_floor = index->nHeight;
+        }
+    }
+    walletInstance->m_load_inactivated_blocks.clear();
     if (!rescan_required)
     {
         WalletBatch batch(walletInstance->GetDatabase());
@@ -8941,6 +10121,7 @@ bool CWallet::AttachChainUnpublished(const std::shared_ptr<CWallet>& walletInsta
                 rescan_height = *fork_height;
             }
         }
+        if (inactivated_floor && *inactivated_floor < rescan_height) rescan_height = *inactivated_floor;
     }
 
     const std::optional<int> tip_height = chain.getHeight();
@@ -8952,7 +10133,7 @@ bool CWallet::AttachChainUnpublished(const std::shared_ptr<CWallet>& walletInsta
         walletInstance->m_last_block_processed_height = -1;
     }
 
-    if (tip_height && *tip_height != rescan_height)
+    if (tip_height && (*tip_height != rescan_height || (inactivated_floor && !rescan_required)))
     {
         // No need to read and scan block if block was created before
         // our wallet birthday (as adjusted for block time variability)
@@ -9006,15 +10187,25 @@ bool CWallet::AttachChainUnpublished(const std::shared_ptr<CWallet>& walletInsta
 
         {
             WalletRescanReserver reserver(*walletInstance);
-            if (!reserver.reserve() || (ScanResult::SUCCESS != walletInstance->ScanForWalletTransactions(chain.getBlockHash(rescan_height), rescan_height, /*max_height=*/{}, reserver, /*fUpdate=*/true, /*save_progress=*/true).status)) {
+            if (!reserver.reserve() || (ScanResult::SUCCESS != walletInstance->ScanForWalletTransactions(chain.getBlockHash(rescan_height), rescan_height, /*max_height=*/{}, reserver, /*fUpdate=*/true, /*save_progress=*/true, /*wallet_lock_held=*/true).status)) {
                 error = _("Failed to rescan the wallet during initialization");
                 return false;
             }
         }
         walletInstance->m_attaching_chain = false;
-        walletInstance->chainStateFlushed(ChainstateRole::NORMAL, chain.getTipLocator());
+        walletInstance->PersistBestBlockLocator(chain.getTipLocator(), /*chainstate_flushed=*/false);
         walletInstance->GetDatabase().IncrementUpdateCounter();
     }
+
+    // A coinstake whose block the node no longer has is Inactive after the load
+    // and the reconciliation above, and an Inactive coinstake that is not
+    // abandoned keeps its kernel inputs spent for as long as the block never
+    // returns. Abandon those now, after the rescan has re-confirmed every
+    // coinstake whose block is in the chain. A block that is merely not yet
+    // reconnected delivers its coinstake through a notification already queued
+    // behind this lock: AddToWallet takes the state over to Confirmed whenever
+    // the kind of state changes, abandoned or not, which reactivates it.
+    walletInstance->ReconcileCoinstakesAfterAttach();
     walletInstance->m_attaching_chain = false;
 
     // AttachChainUnpublished inherits Bitcoin Core's wallet -> chain lock order
@@ -9071,8 +10262,41 @@ bool CWallet::UpgradeWallet(int version, bilingual_str& error)
     return true;
 }
 
+void CWallet::ReportLegacyClaimSourceCapacity(bool force)
+{
+    LOCK(cs_wallet);
+    const auto now = std::chrono::steady_clock::now();
+    if (!force && m_legacy_source_capacity_reported &&
+        now - *m_legacy_source_capacity_reported < std::chrono::hours{1}) {
+        return;
+    }
+    m_legacy_source_capacity_reported = now;
+    const size_t count = m_live_unspent_legacy_claim_outpoints.size();
+    const size_t limit = SHADOW_POW_CLAIM_LEGACY_SOURCE_OUTPUT_CAPACITY;
+    if (count > limit) {
+        WalletLogPrintf("Warning: %u live legacy claim source outputs exceed the %u the PoW miner can snapshot; Gold Rush claim creation is stopped until the count is reduced by consolidating or spending outputs\n",
+                        count, limit);
+    } else if (count * 100 >= limit * SHADOW_POW_CLAIM_LEGACY_SOURCE_WARNING_PERCENT) {
+        WalletLogPrintf("Warning: %u of %u live legacy claim source outputs (%u%%); above %u the PoW miner's wallet snapshot fails and claim creation stops. Consolidate or spend small outputs\n",
+                        count, limit, count * 100 / limit, limit);
+    } else {
+        WalletLogPrintf("Live legacy claim source outputs: %u of %u\n", count, limit);
+    }
+}
+
 void CWallet::postInitProcess()
 {
+    ReportLegacyClaimSourceCapacity(/*force=*/true);
+
+    // Transactions the load marked inactive (their block is not in the active
+    // chain) are retried as the chain allows, not only at the periodic resend.
+    {
+        LOCK(cs_wallet);
+        for (const auto& [txid, wtx] : mapWallet) {
+            if (wtx.isInactive()) QueueResubmitRetry(wtx);
+        }
+    }
+
     // Add wallet transactions that aren't already in a block to mempool
     // Do this here as mempool requires genesis block to be loaded
     ResubmitWalletTransactions(/*relay=*/false, /*force=*/true);
@@ -9680,6 +10904,34 @@ bool CWallet::Lock()
     return true;
 }
 
+bool CWallet::TryRestoreGuiUnlockState(bool relock, bool staking_only)
+{
+    if (!relock && !staking_only) return true;
+    bool notify{false};
+    {
+        // Match Lock() ordering. A GUI shutdown poll must not block behind
+        // either lock or perform a partial restoration when one is busy.
+        TRY_LOCK(m_relock_mutex, relock_guard);
+        if (!relock_guard) return false;
+        TRY_LOCK(cs_wallet, wallet_guard);
+        if (!wallet_guard) return false;
+        if (relock && IsCrypted()) {
+            if (!vMasterKey.empty()) {
+                memory_cleanse(vMasterKey.data(), vMasterKey.size() * sizeof(decltype(vMasterKey)::value_type));
+                vMasterKey.clear();
+            }
+            PublishPowMiningWalletAuthorityLocked();
+            notify = true;
+        }
+        if (staking_only && !m_wallet_unlock_staking_only.exchange(true, std::memory_order_acq_rel)) {
+            PublishPowMiningWalletAuthorityLocked();
+            notify = true;
+        }
+    }
+    if (notify) NotifyStatusChanged(this);
+    return true;
+}
+
 bool CWallet::Unlock(const CKeyingMaterial& vMasterKeyIn, bool accept_no_keys,
                      std::optional<bool> staking_only)
 {
@@ -9805,6 +11057,7 @@ LegacyScriptPubKeyMan* CWallet::GetOrCreateLegacyScriptPubKeyMan()
 void CWallet::AddScriptPubKeyMan(const uint256& id, std::unique_ptr<ScriptPubKeyMan> spkm_man)
 {
     LOCK(cs_wallet);
+    BumpBalanceScanMarker();
     // Add spkm_man to m_spk_managers before calling any method
     // that might access it.
     const auto& spkm = m_spk_managers[id] = std::move(spkm_man);
@@ -10031,6 +11284,7 @@ std::optional<bool> CWallet::IsInternalScriptPubKeyMan(ScriptPubKeyMan* spk_man)
 ScriptPubKeyMan* CWallet::AddWalletDescriptor(WalletDescriptor& desc, const FlatSigningProvider& signing_provider, const std::string& label, bool internal, bilingual_str* error)
 {
     AssertLockHeld(cs_wallet);
+    BumpBalanceScanMarker();
 
     if (!IsWalletFlagSet(WALLET_FLAG_DESCRIPTORS)) {
         WalletLogPrintf("Cannot add WalletDescriptor to a non-descriptor wallet\n");
@@ -10845,41 +12099,297 @@ StakingTelemetrySnapshot CWallet::GetStakingTelemetrySnapshot() const
 }
 
 namespace {
-static constexpr uint64_t POW_MINER_BATCH_TRIES = 128;
+// Hashes per loop iteration. The search checks stop, authority, the tip and a
+// sibling's found proof before every hash, so the batch size only sets how
+// often the gate, input selection and work preparation are repeated.
+static constexpr uint64_t POW_MINER_BATCH_TRIES = 512;
+// Dedicated miner threads publish their own bounded telemetry slot. Other
+// callers (including pure-batch tests) retain wallet-scoped publication.
+thread_local int g_pow_miner_worker_id{-1};
+thread_local std::chrono::nanoseconds* g_pow_miner_explicit_wait{nullptr};
+thread_local std::chrono::nanoseconds* g_pow_miner_search_time{nullptr};
+thread_local uint64_t* g_pow_miner_period_hashes{nullptr};
 
-bool SleepPowMiner(CWallet& wallet, std::chrono::milliseconds duration,
-                   bool allow_locked_wait = false)
+/** What one loop iteration has seen of the tip signal. The baseline is taken
+ * before the iteration reads any chain or wallet state. */
+struct PowMinerTipWatch {
+    PowMinerTipSignal::Baseline baseline;
+    /** Workers other than zero also wake when worker zero publishes a gate. */
+    bool watch_gate{false};
+    /** A wait or a search of this iteration was cut short by the signal. */
+    bool woken{false};
+};
+thread_local PowMinerTipWatch* g_pow_miner_tip_watch{nullptr};
+
+class PowMinerWorkerIdentity {
+    const int m_previous{g_pow_miner_worker_id};
+public:
+    explicit PowMinerWorkerIdentity(int worker_id) { g_pow_miner_worker_id = worker_id; }
+    ~PowMinerWorkerIdentity() { g_pow_miner_worker_id = m_previous; }
+};
+
+class PowMinerWaitAccounting {
+    std::chrono::nanoseconds* const m_wait{g_pow_miner_explicit_wait};
+    const std::chrono::steady_clock::time_point m_start{std::chrono::steady_clock::now()};
+public:
+    ~PowMinerWaitAccounting()
+    {
+        if (m_wait) *m_wait += std::chrono::steady_clock::now() - m_start;
+    }
+};
+
+enum class PowMinerSleep {
+    FINISHED,  //!< The whole duration passed.
+    WOKEN,     //!< A new tip (or, for a sibling worker, a new gate) arrived.
+    CANCELLED, //!< Stop, unload, shutdown, or a wallet authority change.
+};
+
+/** Every wait of the miner goes through here. It ends early on a stop
+ * request or an authority change (checked at least every 100 ms, and at once
+ * when the signal is poked) and, unless wake_on_tip is false, the moment the
+ * wallet's tip moves past what this iteration has seen. */
+PowMinerSleep SleepPowMinerDetailed(
+    CWallet& wallet, std::chrono::milliseconds duration,
+    bool allow_locked_wait, std::optional<uint64_t> expected_generation,
+    bool wake_on_tip)
 {
-    const uint64_t authority_generation =
-        wallet.m_pow_wallet_authority_generation.load(std::memory_order_acquire);
+    PowMinerWaitAccounting wait_accounting;
+    const uint64_t authority_generation = expected_generation.value_or(
+        wallet.m_pow_wallet_authority_generation.load(std::memory_order_acquire));
     if (!allow_locked_wait &&
         wallet.m_pow_state.load(std::memory_order_acquire) ==
             WalletPowMiningState::WALLET_LOCKED_OR_STAKING_ONLY) {
-        return false;
+        return PowMinerSleep::CANCELLED;
     }
+    PowMinerTipWatch* const watch = wake_on_tip ? g_pow_miner_tip_watch : nullptr;
+    PowMinerTipSignal::Baseline baseline =
+        watch ? watch->baseline : wallet.m_pow_tip_signal.Sample();
+    const bool watch_gate = watch && watch->watch_gate;
     const auto step = std::chrono::milliseconds{100};
-    auto slept = std::chrono::milliseconds{0};
-    while (slept < duration) {
-        if (wallet.IsPowMiningClosing() || !wallet.m_pow_mining_enabled.load()) return false;
+    const auto deadline = std::chrono::steady_clock::now() + duration;
+    while (true) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) return PowMinerSleep::FINISHED;
+        if (wallet.IsPowMiningClosing() || !wallet.m_pow_mining_enabled.load()) {
+            return PowMinerSleep::CANCELLED;
+        }
         if (wallet.m_pow_wallet_authority_generation.load(
                 std::memory_order_acquire) != authority_generation) {
-            return false;
+            return PowMinerSleep::CANCELLED;
         }
-        const auto pause = std::min(step, duration - slept);
-        std::this_thread::sleep_for(pause);
-        slept += pause;
+        const auto pause = std::min<std::chrono::nanoseconds>(step, deadline - now);
+        const PowMinerTipSignal::Wake wake =
+            wallet.m_pow_tip_signal.WaitFor(pause, baseline, watch_gate);
+        if (wake == PowMinerTipSignal::Wake::TIMEOUT) continue;
+        if (wake == PowMinerTipSignal::Wake::POKE) {
+            // Only a request to re-check the stop conditions above.
+            baseline.poke = wallet.m_pow_tip_signal.Sample().poke;
+            continue;
+        }
+        // A removed claim ends a wait exactly as a new tip does: the gate is
+        // evaluated again now, so the claim is relayed or replaced without
+        // waiting out the poll.
+        if (watch) {
+            // While the node is syncing, reindexing or loading blocks, each
+            // connected block would start an iteration that can only find the
+            // chain not ready. Do not let the tip end the wait; the bounded
+            // wait itself brings the worker back at its normal cadence.
+            if (wallet.HaveChain() && !wallet.chain().isReadyToBroadcast()) {
+                baseline = wallet.m_pow_tip_signal.Sample();
+                continue;
+            }
+            watch->baseline = wallet.m_pow_tip_signal.Sample();
+            watch->woken = true;
+            return PowMinerSleep::WOKEN;
+        }
+        // Not watching the tip: take the new baseline and keep waiting.
+        baseline = wallet.m_pow_tip_signal.Sample();
     }
-    return true;
 }
 
-bool GrindShadowPowWorkInterruptibly(
+bool SleepPowMiner(CWallet& wallet, std::chrono::milliseconds duration,
+                   bool allow_locked_wait = false,
+                   std::optional<uint64_t> expected_generation = std::nullopt,
+                   bool wake_on_tip = true)
+{
+    return SleepPowMinerDetailed(wallet, duration, allow_locked_wait,
+                                 expected_generation, wake_on_tip) !=
+           PowMinerSleep::CANCELLED;
+}
+
+/** Duty state of one worker thread, kept across loop iterations. A telemetry
+ * period stays open until the carried debt is back to zero, so a completed
+ * period still never exceeds the configured duty. */
+struct PowMinerDutyState {
+    PowMiningDutyLedger ledger;
+    bool open{false};
+    //! Ledger debt when the open period began (see PowMiningClosePeriod()).
+    std::chrono::nanoseconds start_debt{0};
+    uint64_t session_id{0};
+    uint64_t generation{0};
+    std::chrono::nanoseconds elapsed{0};
+    std::chrono::nanoseconds wait{0};
+    std::chrono::nanoseconds duty_wait{0};
+    uint64_t hashes{0};
+
+    explicit PowMinerDutyState(PowMiningDutyLedger ledger_in) : ledger{ledger_in} {}
+
+    void Publish(CWallet& wallet, bool finished)
+    {
+        if (!open) return;
+        wallet.RecordPowMiningDutyPeriod(
+            g_pow_miner_worker_id, session_id, generation, elapsed, wait,
+            duty_wait, finished, hashes);
+        open = false;
+        elapsed = wait = duty_wait = std::chrono::nanoseconds{0};
+        hashes = 0;
+    }
+};
+
+/** One owner per loop iteration of a dedicated miner thread. Destruction runs
+ * for every continue, break and normal batch completion after all iteration
+ * locks are released, and is the only place a duty sleep is taken.
+ *
+ * Work first: while claim work for the current tip is pending (the search is
+ * still running, the gate is still settling, or a new tip arrived during this
+ * iteration) no duty sleep is taken as long as the ledger's ceilings allow
+ * the debt to be carried. Otherwise the whole debt is slept off here, and a
+ * new tip ends that sleep at once. */
+class PowMinerIterationBudget {
+    CWallet& m_wallet;
+    PowMinerDutyState& m_state;
+    uint64_t m_session_id;
+    uint64_t m_generation;
+    //! Taken after the constructor's wallet lock: waiting for cs_wallet before
+    //! the iteration starts is not work and is not charged as work.
+    std::chrono::steady_clock::time_point m_start;
+    std::chrono::nanoseconds m_wait{0};
+    std::chrono::nanoseconds m_search{0};
+    uint64_t m_hashes{0};
+    PowMinerTipWatch m_watch;
+    bool m_work_pending{false};
+    uint256 m_attempt_tip;
+public:
+    PowMinerIterationBudget(CWallet& wallet, PowMinerDutyState& state, int worker_id)
+        : m_wallet(wallet), m_state(state)
+    {
+        m_watch.baseline = m_wallet.m_pow_tip_signal.Sample();
+        m_watch.watch_gate = worker_id != 0;
+        {
+            LOCK(m_wallet.cs_wallet);
+            m_session_id = m_wallet.m_pow_duty_cycle.session_id;
+            m_generation = m_wallet.m_pow_wallet_authority_generation.load();
+        }
+        assert(!g_pow_miner_explicit_wait);
+        assert(!g_pow_miner_period_hashes);
+        g_pow_miner_explicit_wait = &m_wait;
+        g_pow_miner_search_time = &m_search;
+        g_pow_miner_period_hashes = &m_hashes;
+        g_pow_miner_tip_watch = &m_watch;
+        m_start = std::chrono::steady_clock::now();
+    }
+    /** Claim work for the current tip continues in the next iteration. */
+    void SetWorkPending() { m_work_pending = true; }
+    /** This iteration searched for a claim on this tip. */
+    void SetAttemptTip(const uint256& tip) { m_attempt_tip = tip; }
+    /** Called with cs_wallet held, where the wallet's tip is sampled: the
+     * signal is raised under the same lock, so the tip this iteration sees
+     * and its baseline agree exactly. */
+    void ObserveTipUnderWalletLock()
+    {
+        if (!m_watch.woken) m_watch.baseline.tip = m_wallet.m_pow_tip_signal.TipSequence();
+    }
+    uint64_t TipSequence() const { return m_watch.baseline.tip; }
+    ~PowMinerIterationBudget()
+    {
+        g_pow_miner_explicit_wait = nullptr;
+        g_pow_miner_search_time = nullptr;
+        g_pow_miner_period_hashes = nullptr;
+        g_pow_miner_tip_watch = nullptr;
+        const auto elapsed = std::chrono::steady_clock::now() - m_start;
+        const auto active = std::max(std::chrono::nanoseconds{0}, elapsed - m_wait);
+        const auto search = std::clamp(m_search, std::chrono::nanoseconds{0}, active);
+        if (m_state.open && (m_state.session_id != m_session_id ||
+                             m_state.generation != m_generation)) {
+            // A restart or a lock/unlock pulse ended the open period.
+            m_state.Publish(m_wallet, /*finished=*/false);
+        }
+        if (!m_state.open) m_state.start_debt = m_state.ledger.Debt();
+        m_state.open = true;
+        m_state.session_id = m_session_id;
+        m_state.generation = m_generation;
+        m_state.elapsed += elapsed;
+        m_state.wait += m_wait;
+        m_state.hashes += m_hashes;
+        // Lock waits and gate evaluation are charged as other work, never as
+        // search, so they cannot use up the search allowance.
+        const auto debt_before = m_state.ledger.Debt();
+        m_state.ledger.Charge(search, active - search);
+        const auto iteration_debt = m_state.ledger.Debt() - debt_before;
+        m_state.ledger.Credit(m_wait);
+
+        const bool tip_arrived = m_watch.woken ||
+            m_wallet.m_pow_tip_signal.TipSequence() != m_watch.baseline.tip;
+        // An iteration that searched never sleeps the carried debt itself:
+        // the next one first publishes what the worker is doing now.
+        const PowMiningSleepPlan plan = m_state.ledger.Plan(
+            PowMiningCarryRemainder(m_work_pending, tip_arrived,
+                                    /*searched=*/!m_attempt_tip.IsNull()),
+            iteration_debt);
+        PowMinerSleep outcome{PowMinerSleep::FINISHED};
+        const auto take_sleep = [&](std::chrono::milliseconds delay, bool wake_on_tip) {
+            if (delay.count() <= 0 || outcome == PowMinerSleep::CANCELLED) return;
+            // A duty sleep is not an explicit wait.
+            g_pow_miner_tip_watch = wake_on_tip ? &m_watch : nullptr;
+            const auto wait_start = std::chrono::steady_clock::now();
+            outcome = SleepPowMinerDetailed(
+                m_wallet, delay, /*allow_locked_wait=*/false, m_generation,
+                wake_on_tip);
+            const auto duty_wait = std::chrono::steady_clock::now() - wait_start;
+            g_pow_miner_tip_watch = nullptr;
+            m_state.ledger.Credit(duty_wait);
+            m_state.duty_wait += duty_wait;
+            if (!m_attempt_tip.IsNull()) {
+                m_wallet.NotePowClaimAttemptDutySleep(m_attempt_tip, duty_wait);
+            }
+        };
+        // The excess over the ceilings is the duty cycle: no tip cuts it short,
+        // or debt would grow past the ceiling with every block. The rest of
+        // the debt is slept only when no claim work is pending, and a new tip
+        // ends that part at once.
+        take_sleep(plan.excess, /*wake_on_tip=*/false);
+        take_sleep(plan.remainder, /*wake_on_tip=*/true);
+        if (outcome != PowMinerSleep::CANCELLED) m_state.ledger.ClampToCeilings();
+        if (outcome == PowMinerSleep::CANCELLED) {
+            m_state.Publish(m_wallet, /*finished=*/false);
+        } else {
+            switch (PowMiningClosePeriod(m_state.ledger.Debt(), m_state.start_debt,
+                                         plan.excess.count() > 0)) {
+            case PowMiningPeriodClose::COMPLETED:
+                m_state.Publish(m_wallet, /*finished=*/true);
+                break;
+            case PowMiningPeriodClose::TRUNCATED:
+                m_state.Publish(m_wallet, /*finished=*/false);
+                break;
+            case PowMiningPeriodClose::OPEN:
+                break;
+            }
+        }
+    }
+};
+
+WalletPowMiningGrindResult GrindShadowPowWorkInterruptibly(
     CWallet& wallet, const ShadowPowWork& work, uint64_t start_nonce,
     uint64_t nonce_step, uint64_t max_tries, uint64_t authority_generation,
-    std::vector<unsigned char>& data_out, uint64_t* tries_done)
+    std::vector<unsigned char>& data_out,
+    std::optional<uint64_t> tip_sequence = std::nullopt)
 {
+    WalletPowMiningGrindResult batch;
     data_out.clear();
-    if (tries_done) *tries_done = 0;
-    if (nonce_step == 0 || max_tries == 0) return false;
+    if (nonce_step == 0 || max_tries == 0) {
+        batch.status = WalletPowMiningGrindStatus::INVALID_WORK;
+        return batch;
+    }
 
     uint64_t nonce = start_nonce;
     for (uint64_t tries = 0; tries < max_tries; ++tries) {
@@ -10889,7 +12399,23 @@ bool GrindShadowPowWorkInterruptibly(
                 std::memory_order_acquire) != authority_generation ||
             wallet.m_pow_state.load(std::memory_order_acquire) ==
                 WalletPowMiningState::WALLET_LOCKED_OR_STAKING_ONLY) {
-            return false;
+            return batch;
+        }
+        if (tip_sequence &&
+            wallet.m_pow_tip_signal.TipSequence() != *tip_sequence) {
+            // The wallet moved to another tip: this work is dead. End the
+            // batch here, with the hashes done so far, so the caller goes
+            // straight back to the gate for the new tip.
+            batch.status = WalletPowMiningGrindStatus::EXHAUSTED;
+            return batch;
+        }
+        if (tip_sequence &&
+            wallet.m_pow_proof_found_tip_seq.load(
+                std::memory_order_acquire) == *tip_sequence + 1) {
+            // A sibling worker found the proof for this tip and is submitting
+            // it. Stop here; the loop then waits on the single-flight marker.
+            batch.status = WalletPowMiningGrindStatus::EXHAUSTED;
+            return batch;
         }
 
         std::vector<unsigned char> candidate;
@@ -10897,16 +12423,28 @@ bool GrindShadowPowWorkInterruptibly(
         const ShadowPowGrindResult result = GrindShadowPowWorkDetailed(
             work, nonce, nonce_step, /*max_tries=*/1, candidate,
             &candidate_tries);
-        if (tries_done) *tries_done += candidate_tries;
+        // The detailed API counts attempted calls, including a local failure.
+        // Only FOUND/EXHAUSTED completed this single hash successfully.
+        if (result == ShadowPowGrindResult::LOCAL_INTERNAL_ERROR) {
+            batch.status = WalletPowMiningGrindStatus::LOCAL_INTERNAL_ERROR;
+            return batch;
+        }
+        if (result == ShadowPowGrindResult::INVALID_WORK) {
+            batch.status = WalletPowMiningGrindStatus::INVALID_WORK;
+            return batch;
+        }
+        batch.successful_hashes += candidate_tries;
+        if (g_pow_miner_period_hashes) *g_pow_miner_period_hashes += candidate_tries;
         if (result == ShadowPowGrindResult::FOUND) {
             data_out = std::move(candidate);
-            return true;
+            batch.status = WalletPowMiningGrindStatus::FOUND;
+            return batch;
         }
-        if (result != ShadowPowGrindResult::EXHAUSTED) return false;
         if (std::numeric_limits<uint64_t>::max() - nonce < nonce_step) break;
         nonce += nonce_step;
     }
-    return false;
+    batch.status = WalletPowMiningGrindStatus::EXHAUSTED;
+    return batch;
 }
 
 bool IsShadowPowClaimConflict(const bilingual_str& error)
@@ -10951,7 +12489,7 @@ struct ShadowPowClaimStakeReserveSnapshot
  * Only the maintained immutable-script legacy subset consumes this budget:
  * quantum rewards and provably unusable outputs cannot be legacy claim or
  * reserve candidates. Keep this complete scan finite (not paginated). */
-constexpr size_t MAX_SHADOW_POW_CLAIM_WARM_OUTPUTS{65536};
+constexpr size_t MAX_SHADOW_POW_CLAIM_WARM_OUTPUTS{SHADOW_POW_CLAIM_LEGACY_SOURCE_OUTPUT_CAPACITY};
 // Charge outputs, protected-asset records, and spender edges together, with
 // headroom for spend history even at the output bound. The protected-asset
 // namespace retains its own, smaller preflight below.
@@ -11070,6 +12608,7 @@ ShadowPowClaimWarmSourceSnapshot BuildShadowPowClaimWarmSourceSnapshot(
     auto& diagnostics = snapshot.input_enumeration;
     diagnostics.live_outputs = wallet.GetLiveUnspentStakeOutpoints().size();
     diagnostics.legacy_source_outputs = wallet.GetLiveUnspentLegacyClaimOutpoints().size();
+    diagnostics.legacy_source_output_limit = MAX_SHADOW_POW_CLAIM_WARM_OUTPUTS;
     diagnostics.script_managers = wallet.GetScriptPubKeyManCountLocked();
 
     const Consensus::Params& consensus = Params().GetConsensus();
@@ -12138,7 +13677,8 @@ ShadowPowClaimInputSelectionResult CWallet::SelectShadowPowClaimInput(
 
 bool CWallet::SetPowMining(bool enabled, int threads, int cpu_percent, bilingual_str& error,
                            bool* created_payout, bool allow_new_payout_key,
-                           bool wait_for_normal_unlock)
+                           bool wait_for_normal_unlock,
+                           const std::function<bool()>& cancelled)
 {
     if (created_payout) *created_payout = false;
     bool created_payout_local{false};
@@ -12155,7 +13695,17 @@ bool CWallet::SetPowMining(bool enabled, int threads, int cpu_percent, bilingual
         }
     }
 
+    const auto cancellation_requested = [&] {
+        if (!cancelled || !cancelled()) return false;
+        error = _("Gold Rush PoW miner control was cancelled.");
+        if (*created_payout_result) {
+            error += _(" A new non-HD ML-DSA payout key was already created and remains in this wallet. Back up the wallet now; an older backup cannot recover it.");
+        }
+        return true;
+    };
+    if (cancellation_requested()) return false;
     LOCK(m_pow_recovery_authority_mutex);
+    if (cancellation_requested()) return false;
     // Reject an interactive start/reconfiguration without changing an
     // already-enabled startup worker. In particular, an encrypted wallet may
     // intentionally retain a zero-work worker while locked or staking-only so
@@ -12180,9 +13730,8 @@ bool CWallet::SetPowMining(bool enabled, int threads, int cpu_percent, bilingual
         }
     }
     if (!enabled) {
+        if (cancellation_requested()) return false;
         StopPowMiningLocked();
-        m_pow_threads = 1;
-        m_pow_cpu_percent = 1;
         return true;
     }
 
@@ -12209,6 +13758,8 @@ bool CWallet::SetPowMining(bool enabled, int threads, int cpu_percent, bilingual
         }
         payout_resolution_deferred = locked || staking_only;
     }
+
+    if (cancellation_requested()) return false;
 
     // Derive the gate decision and the pre-coherence relevance decision from
     // one inventory snapshot. Reading those facts separately could combine an
@@ -12308,10 +13859,11 @@ bool CWallet::SetPowMining(bool enabled, int threads, int cpu_percent, bilingual
             return false;
         }
     }
+    if (cancellation_requested()) return false;
     if (!payout_resolution_deferred &&
         should_resolve_payout &&
         !EnsurePowPayoutAddress(error, created_payout_result,
-                                allow_new_payout_key)) {
+                                allow_new_payout_key, cancelled)) {
         return false;
     }
 
@@ -12360,6 +13912,8 @@ bool CWallet::SetPowMining(bool enabled, int threads, int cpu_percent, bilingual
         payout_resolution_deferred = !normal_authority;
     }
 
+    if (cancellation_requested()) return false;
+
     // Construct every replacement worker behind a private launch barrier
     // before stopping the current group. std::thread construction can throw
     // after creating only part of a group; those partial workers are cancelled
@@ -12404,6 +13958,7 @@ bool CWallet::SetPowMining(bool enabled, int threads, int cpu_percent, bilingual
         worker_creation_error =
             _("Gold Rush PoW miner could not create its worker threads.");
     }
+    if (cancellation_requested()) worker_creation_error = error;
     if (!worker_creation_error.original.empty()) {
         if (launch_gate) {
             {
@@ -12461,6 +14016,11 @@ bool CWallet::SetPowMining(bool enabled, int threads, int cpu_percent, bilingual
                 ? WalletPowMiningState::WALLET_LOCKED_OR_STAKING_ONLY
                 : WalletPowMiningState::STARTING,
             std::memory_order_release);
+        m_pow_worker_states.assign(threads, m_pow_state.load());
+        m_pow_worker_successful_hashes.assign(threads, 0);
+        ResetPowMiningDutyCycleLocked(threads, cpu_percent);
+        m_pow_workers_hashing = 0;
+        m_pow_workers_error = 0;
         m_pow_mining_enabled.store(true, std::memory_order_release);
     }
 
@@ -12500,6 +14060,8 @@ void CWallet::StopPowMiningLocked()
         m_pow_mining_enabled = false;
         m_stop_pow_mining_thread = true;
     }
+    // Workers re-check the stop flag at once instead of at their next slice.
+    m_pow_tip_signal.Poke();
     std::unique_ptr<std::vector<std::thread>> group;
     {
         LOCK(m_pow_miner_mutex);
@@ -12513,14 +14075,75 @@ void CWallet::StopPowMiningLocked()
         }
         group->clear();
     }
-    m_pow_hashrate = 0.0;
-    m_pow_state = WalletPowMiningState::DISABLED;
+    {
+        LOCK(cs_wallet);
+        m_pow_worker_states.clear();
+        m_pow_worker_successful_hashes.clear();
+        m_pow_workers_hashing = 0;
+        m_pow_workers_error = 0;
+        m_pow_hashrate = 0.0;
+        m_pow_state = WalletPowMiningState::DISABLED;
+    }
     m_stop_pow_mining_thread = false;
 }
 
 bool CWallet::IsPowMiningClosing() const
 {
     return (HaveChain() && chain().shutdownRequested()) || m_stop_pow_mining_thread.load();
+}
+
+WalletPowMiningDutySnapshot CWallet::GetPowMiningDutyCycle() const
+{
+    LOCK(cs_wallet);
+    return m_pow_duty_cycle;
+}
+
+void CWallet::ResetPowMiningDutyCycleLocked(size_t workers, int cpu_percent)
+{
+    AssertLockHeld(cs_wallet);
+    assert(workers > 0 && workers <= 256);
+    assert(cpu_percent >= 1 && cpu_percent <= 100);
+    ++m_pow_duty_cycle.session_id;
+    m_pow_duty_cycle.cpu_percent = cpu_percent;
+    m_pow_duty_cycle.workers.assign(workers, {});
+}
+
+void CWallet::RecordPowMiningDutyPeriod(
+    int worker_id, uint64_t session_id, uint64_t authority_generation,
+    std::chrono::nanoseconds elapsed, std::chrono::nanoseconds explicit_wait,
+    std::chrono::nanoseconds duty_wait, bool wait_finished,
+    uint64_t successful_hashes)
+{
+    LOCK(cs_wallet);
+    if (session_id != m_pow_duty_cycle.session_id || worker_id < 0 ||
+        static_cast<size_t>(worker_id) >= m_pow_duty_cycle.workers.size()) return;
+    auto& record = m_pow_duty_cycle.workers[worker_id];
+    const bool completed = wait_finished && !IsPowMiningClosing() &&
+        m_pow_mining_enabled.load() && HasNormalPowMiningWalletAuthorityLocked() &&
+        m_pow_wallet_authority_generation.load() == authority_generation;
+    const auto nonnegative = [](std::chrono::nanoseconds value) {
+        return static_cast<uint64_t>(std::max(value, std::chrono::nanoseconds{0}).count());
+    };
+    const uint64_t active = nonnegative(elapsed - explicit_wait);
+    const uint64_t explicit_ns = nonnegative(explicit_wait);
+    const uint64_t duty_ns = nonnegative(duty_wait);
+    const auto add = [](uint64_t& total, uint64_t value) {
+        total += std::min(value, std::numeric_limits<uint64_t>::max() - total);
+    };
+    add(record.successful_hashes, successful_hashes);
+    if (completed) {
+        add(record.completed_periods, 1);
+        if (successful_hashes != 0) add(record.completed_work_periods, 1);
+        add(record.completed_active_ns, active);
+        add(record.completed_explicit_wait_ns, explicit_ns);
+        add(record.completed_duty_wait_ns, duty_ns);
+        add(record.completed_successful_hashes, successful_hashes);
+    } else {
+        add(record.truncated_periods, 1);
+        add(record.truncated_active_ns, active);
+        add(record.truncated_explicit_wait_ns, explicit_ns);
+        add(record.truncated_duty_wait_ns, duty_ns);
+    }
 }
 
 bool CWallet::HasNormalPowMiningWalletAuthorityLocked() const
@@ -12553,6 +14176,10 @@ void CWallet::PublishPowMiningWalletAuthorityLocked()
     if (m_pow_mining_enabled.load(std::memory_order_acquire) &&
         !HasNormalPowMiningWalletAuthorityLocked()) {
         m_pow_hashrate.store(0.0, std::memory_order_release);
+        std::fill(m_pow_worker_states.begin(), m_pow_worker_states.end(),
+                  WalletPowMiningState::WALLET_LOCKED_OR_STAKING_ONLY);
+        m_pow_workers_hashing = 0;
+        m_pow_workers_error = 0;
         m_pow_state.store(
             WalletPowMiningState::WALLET_LOCKED_OR_STAKING_ONLY,
             std::memory_order_release);
@@ -12601,6 +14228,9 @@ bool CWallet::PublishPowMiningWorkerState(
         m_pow_hashrate.store(0.0, std::memory_order_release);
     }
     if (!enabled) {
+        std::fill(m_pow_worker_states.begin(), m_pow_worker_states.end(), WalletPowMiningState::DISABLED);
+        m_pow_workers_hashing = 0;
+        m_pow_workers_error = 0;
         m_pow_hashrate.store(0.0, std::memory_order_release);
         if (state != WalletPowMiningState::RUNTIME_ERROR &&
             state != WalletPowMiningState::DISABLED) {
@@ -12615,12 +14245,24 @@ bool CWallet::PublishPowMiningWorkerState(
             std::memory_order_release);
         return false;
     }
+    if (enabled && g_pow_miner_worker_id >= 0 &&
+        static_cast<size_t>(g_pow_miner_worker_id) < m_pow_worker_states.size()) {
+        m_pow_worker_states[g_pow_miner_worker_id] = state;
+        const int hashing = std::count(m_pow_worker_states.begin(), m_pow_worker_states.end(), WalletPowMiningState::HASHING);
+        const int errors = std::count(m_pow_worker_states.begin(), m_pow_worker_states.end(), WalletPowMiningState::RUNTIME_ERROR);
+        m_pow_workers_hashing = hashing;
+        m_pow_workers_error = errors;
+        // A healthy worker cannot erase a sibling's unresolved error, and a
+        // waiting worker cannot advertise the entire group as idle.
+        if (errors > 0) state = WalletPowMiningState::RUNTIME_ERROR;
+        else if (hashing > 0) state = WalletPowMiningState::HASHING;
+    }
     m_pow_state.store(state, std::memory_order_release);
     return true;
 }
 
 bool CWallet::PublishPowMiningHashrate(
-    double hashrate, std::optional<uint64_t> expected_generation)
+    double hashrate, std::optional<uint64_t> expected_generation, bool local_error)
 {
     LOCK(cs_wallet);
     if ((expected_generation &&
@@ -12631,7 +14273,30 @@ bool CWallet::PublishPowMiningHashrate(
         m_pow_hashrate.store(0.0, std::memory_order_release);
         return false;
     }
-    m_pow_hashrate.store(hashrate, std::memory_order_release);
+    if (local_error && g_pow_miner_worker_id >= 0) {
+        bool sibling_work{false};
+        for (size_t i = 0; i < m_pow_worker_successful_hashes.size(); ++i) {
+            sibling_work |= i != static_cast<size_t>(g_pow_miner_worker_id) &&
+                m_pow_worker_successful_hashes[i] != 0;
+        }
+        if (sibling_work) {
+            // A healthy sibling may be READY in its duty wait. Its completed
+            // successful work still contributes to the aggregate average.
+            const int64_t elapsed = GetTime<std::chrono::milliseconds>().count() -
+                m_pow_hashrate_start_ms.load();
+            if (elapsed > 0) {
+                m_pow_hashrate.store(1000.0 * m_pow_total_tries.load() / elapsed,
+                                     std::memory_order_release);
+            }
+            return true;
+        }
+    }
+    const bool this_worker_hashing = g_pow_miner_worker_id >= 0 &&
+        static_cast<size_t>(g_pow_miner_worker_id) < m_pow_worker_states.size() &&
+        m_pow_worker_states[g_pow_miner_worker_id] == WalletPowMiningState::HASHING;
+    if (hashrate != 0.0 || m_pow_workers_hashing.load() <= (this_worker_hashing ? 1 : 0)) {
+        m_pow_hashrate.store(hashrate, std::memory_order_release);
+    }
     return true;
 }
 
@@ -12696,12 +14361,21 @@ QuantumAddressBindingResult CWallet::ResolveConfiguredQuantumAddress(
     return QuantumAddressBindingResult::RESOLVED;
 }
 
-bool CWallet::EnsurePowPayoutAddress(bilingual_str& error, bool* created, bool allow_new_key)
+bool CWallet::EnsurePowPayoutAddress(bilingual_str& error, bool* created, bool allow_new_key,
+                                     const std::function<bool()>& cancelled)
 {
-    LOCK(m_pow_payout_mutex);
     if (created) *created = false;
+    const auto cancellation_requested = [&] {
+        if (!cancelled || !cancelled()) return false;
+        error = _("Gold Rush PoW miner control was cancelled.");
+        return true;
+    };
+    if (cancellation_requested()) return false;
+    LOCK(m_pow_payout_mutex);
+    if (cancellation_requested()) return false;
     {
         LOCK(cs_wallet);
+        if (cancellation_requested()) return false;
         if (m_quantum_key_db_ambiguous) {
             error = _("Gold Rush PoW payout-key durability has an uncertain database outcome; reload the wallet before selecting a payout address.");
             return false;
@@ -12719,6 +14393,7 @@ bool CWallet::EnsurePowPayoutAddress(bilingual_str& error, bool* created, bool a
         bool binding_changed{false};
         {
             LOCK(cs_wallet);
+            if (cancellation_requested()) return false;
             if (m_pow_payout_quantum != encoded) {
                 m_pow_payout_quantum = encoded;
                 binding_changed = true;
@@ -12741,6 +14416,7 @@ bool CWallet::EnsurePowPayoutAddress(bilingual_str& error, bool* created, bool a
     bool restored_label_ambiguous{false};
     {
         LOCK(cs_wallet);
+        if (cancellation_requested()) return false;
         if (m_address_book_db_ambiguous) {
             error = _("Gold Rush PoW payout labels have an uncertain database outcome; reload the wallet before selecting an automatic payout address.");
             return false;
@@ -12799,14 +14475,13 @@ bool CWallet::EnsurePowPayoutAddress(bilingual_str& error, bool* created, bool a
         return false;
     }
     if (!restored_payout.empty()) {
+        LOCK(cs_wallet);
+        if (cancellation_requested()) return false;
         if (relabel_dest && !SetAddressBook(*relabel_dest, POW_PAYOUT_LABEL, AddressPurpose::RECEIVE)) {
             error = _("Failed to update Gold Rush PoW payout address label.");
             return false;
         }
-        {
-            LOCK(cs_wallet);
-            m_pow_payout_quantum = restored_payout;
-        }
+        m_pow_payout_quantum = restored_payout;
         WalletLogPrintf("Gold Rush PoW miner restored payout address %s.\n", restored_payout);
         return true;
     }
@@ -12817,20 +14492,23 @@ bool CWallet::EnsurePowPayoutAddress(bilingual_str& error, bool* created, bool a
         return false;
     }
 
-    auto dest = GetNewQuantumDestination(POW_PAYOUT_LABEL);
-    if (!dest) {
-        error = util::ErrorString(dest);
-        return false;
-    }
-    const std::string encoded = EncodeDestination(*dest);
+    std::string encoded;
     {
+        // Acquire the wallet lock before the final cancellation checkpoint.
+        // GetNewQuantumDestination recursively takes it when storing the key;
+        // no lock wait can separate this checkpoint from key creation.
         LOCK(cs_wallet);
-        if (m_pow_payout_quantum.empty()) {
-            m_pow_payout_quantum = encoded;
+        if (cancellation_requested()) return false;
+        auto dest = GetNewQuantumDestination(POW_PAYOUT_LABEL);
+        if (!dest) {
+            error = util::ErrorString(dest);
+            return false;
         }
+        if (created) *created = true;
+        encoded = EncodeDestination(*dest);
+        if (m_pow_payout_quantum.empty()) m_pow_payout_quantum = encoded;
     }
     WalletLogPrintf("Gold Rush PoW miner created payout address %s. Back up the wallet.\n", encoded);
-    if (created) *created = true;
     return true;
 }
 
@@ -13621,10 +15299,299 @@ static WalletPowMiningState ShadowPowMiningStateForGate(
     return WalletPowMiningState::CLAIM_IN_FLIGHT;
 }
 
+WalletPowMiningGrindResult CWallet::RunShadowPowMiningBatch(
+    const ShadowPowWork& work, uint64_t start_nonce, uint64_t nonce_step,
+    uint64_t max_tries, uint64_t authority_generation,
+    std::vector<unsigned char>& proof, int worker_id,
+    std::chrono::steady_clock::time_point& next_error_log,
+    std::optional<uint64_t> tip_sequence)
+{
+    PowMinerWorkerIdentity identity{worker_id};
+    proof.clear();
+    if (!PublishPowMiningWorkerState(WalletPowMiningState::HASHING,
+                                    authority_generation)) {
+        return {};
+    }
+    const auto batch_start = std::chrono::steady_clock::now();
+    auto result = GrindShadowPowWorkInterruptibly(
+        *this, work, start_nonce, nonce_step, max_tries,
+        authority_generation, proof, tip_sequence);
+    const auto batch_elapsed = std::chrono::steady_clock::now() - batch_start;
+    // Only the search itself is charged to the search allowance.
+    if (g_pow_miner_search_time) *g_pow_miner_search_time += batch_elapsed;
+    result.elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        batch_elapsed);
+    if (result.status == WalletPowMiningGrindStatus::CANCELLED ||
+        !HasNormalPowMiningWalletAuthority(authority_generation)) {
+        proof.clear();
+        PublishPowMiningHashrate(0.0, authority_generation);
+        result.status = WalletPowMiningGrindStatus::CANCELLED;
+        return result;
+    }
+
+    if (result.successful_hashes > 0) {
+        {
+            LOCK(cs_wallet);
+            if (worker_id >= 0 && static_cast<size_t>(worker_id) < m_pow_worker_successful_hashes.size()) {
+                m_pow_worker_successful_hashes[worker_id] += result.successful_hashes;
+            }
+        }
+        const uint64_t total_tries = m_pow_total_tries.fetch_add(
+            result.successful_hashes) + result.successful_hashes;
+        const int64_t now_ms = GetTime<std::chrono::milliseconds>().count();
+        const int64_t start_ms = m_pow_hashrate_start_ms.load();
+        if (start_ms > 0 && now_ms > start_ms) {
+            PublishPowMiningHashrate(
+                (static_cast<double>(total_tries) * 1000.0) /
+                    static_cast<double>(now_ms - start_ms),
+                authority_generation);
+        }
+    }
+
+    if (result.status == WalletPowMiningGrindStatus::LOCAL_INTERNAL_ERROR ||
+        result.status == WalletPowMiningGrindStatus::INVALID_WORK) {
+        PublishPowMiningHashrate(0.0, authority_generation, /*local_error=*/true);
+        if (!PublishPowMiningWorkerState(WalletPowMiningState::RUNTIME_ERROR,
+                                         authority_generation)) {
+            result.status = WalletPowMiningGrindStatus::CANCELLED;
+            return result;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= next_error_log) {
+            WalletLogPrintf(
+                "Gold Rush PoW worker %d paused: %s; retrying after 1 second\n",
+                worker_id,
+                result.status == WalletPowMiningGrindStatus::LOCAL_INTERNAL_ERROR
+                    ? "local Argon2 proof evaluation failed"
+                    : "invalid proof work");
+            next_error_log = now + std::chrono::seconds{30};
+        }
+        // Independent of CPU target and measured batch duration: a fast local
+        // failure must not immediately repeat selection and Argon2 evaluation.
+        // A new tip does not shorten it either.
+        if (!SleepPowMiner(*this, std::chrono::seconds{1},
+                           /*allow_locked_wait=*/false,
+                           authority_generation,
+                           /*wake_on_tip=*/false)) {
+            result.status = WalletPowMiningGrindStatus::CANCELLED;
+        }
+        return result;
+    }
+    PublishPowMiningWorkerState(WalletPowMiningState::READY,
+                                authority_generation);
+    return result;
+}
+
+namespace {
+/** One line, stable key=value order. Fleet tooling parses this; new keys are
+ * only ever appended. */
+std::string FormatPowClaimTimingLine(const WalletPowClaimTiming& done)
+{
+    return strprintf(
+        "Gold Rush PoW claim timing: tip=%s height=%d block_time=%d "
+        "tip_seen_unix_ms=%d tip_seen_known=%d result=%s tip_changed=%d "
+        "gate_ready_ms=%d first_hash_ms=%d proof_found_ms=%d "
+        "mempool_accept_ms=%d hashes=%u batches=%u duty_sleep_ms=%d "
+        "first_inv_ms=%d inv_peers_1s=%u push_peers_1s=%u",
+        done.tip.ToString().substr(0, 16), done.height, done.block_time,
+        done.tip_seen_unix_ms, done.tip_seen_known ? 1 : 0, done.result,
+        done.tip_changed ? 1 : 0, done.gate_ready_ms, done.first_hash_ms,
+        done.proof_found_ms, done.mempool_accept_ms, done.hashes,
+        done.batches, done.duty_sleep_ms, done.first_inv_ms,
+        done.inv_peers_1s, done.push_peers_1s);
+}
+
+/** Copy the relay figures of a submitted claim into its timing record.
+ * Returns the time of the first announcement when there is one. An
+ * announcement from before this attempt's proof belongs to an earlier claim
+ * on the same input and is ignored. */
+std::optional<std::chrono::steady_clock::time_point> FillPowClaimRelayTiming(
+    WalletPowClaimTiming& timing, const COutPoint& claim_input,
+    std::chrono::steady_clock::time_point origin)
+{
+    const std::optional<ClaimRelayStats> stats =
+        GetClaimRelayTracker().Get(claim_input);
+    if (!stats || stats->peers_total == 0) return std::nullopt;
+    const int64_t first_inv_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            stats->first_announced - origin).count();
+    if (first_inv_ms < std::max<int64_t>(0, timing.proof_found_ms)) {
+        return std::nullopt;
+    }
+    timing.first_inv_ms = first_inv_ms;
+    timing.inv_peers_1s = stats->peers_1s;
+    timing.push_peers_1s = stats->pushed_1s;
+    return stats->first_announced;
+}
+} // namespace
+
+WalletPowClaimTiming CWallet::GetPowClaimTiming() const
+{
+    LOCK(m_pow_miner_mutex);
+    WalletPowClaimTiming timing = m_pow_last_claim_timing;
+    if (m_pow_claim_relay_pending.open && timing.valid &&
+        timing.result == "submitted" &&
+        timing.tip == m_pow_claim_relay_pending.timing.tip) {
+        // The line is still held: show the relay figures as they stand.
+        FillPowClaimRelayTiming(timing, m_pow_claim_relay_pending.claim_input,
+                                m_pow_claim_relay_pending.origin);
+    }
+    return timing;
+}
+
+std::string CWallet::FlushPowClaimRelayTimingLocked(bool force)
+{
+    AssertLockHeld(m_pow_miner_mutex);
+    PowClaimRelayPending& pending = m_pow_claim_relay_pending;
+    if (!pending.open) return {};
+    const auto now = std::chrono::steady_clock::now();
+    const auto first_announced = FillPowClaimRelayTiming(
+        pending.timing, pending.claim_input, pending.origin);
+    const bool settled = first_announced
+        ? now - *first_announced >= std::chrono::seconds{1}
+        : now - pending.accepted >= std::chrono::seconds{3};
+    if (!force && !settled) return {};
+    if (m_pow_last_claim_timing.valid &&
+        m_pow_last_claim_timing.result == "submitted" &&
+        m_pow_last_claim_timing.tip == pending.timing.tip) {
+        m_pow_last_claim_timing.first_inv_ms = pending.timing.first_inv_ms;
+        m_pow_last_claim_timing.inv_peers_1s = pending.timing.inv_peers_1s;
+        m_pow_last_claim_timing.push_peers_1s = pending.timing.push_peers_1s;
+    }
+    const std::string line = FormatPowClaimTimingLine(pending.timing);
+    pending = {};
+    return line;
+}
+
+std::string CWallet::BeginPowClaimAttemptLocked(
+    const uint256& tip, int height, int64_t block_time)
+{
+    AssertLockHeld(m_pow_miner_mutex);
+    std::string replaced;
+    if (m_pow_claim_attempt.open) {
+        if (m_pow_claim_attempt.timing.tip == tip) return replaced;
+        replaced = FinishPowClaimAttemptLocked("tip_changed", /*tip_changed=*/true);
+    }
+    if (m_pow_last_claim_timing.valid && m_pow_last_claim_timing.tip == tip &&
+        m_pow_last_claim_timing.result == "submitted") {
+        // The claim for this tip is already in the mempool. A sibling worker
+        // finishing its last batch must not open a second record for it.
+        return replaced;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    PowClaimAttempt attempt;
+    attempt.open = true;
+    attempt.timing.valid = true;
+    attempt.timing.tip = tip;
+    attempt.timing.height = height;
+    attempt.timing.block_time = block_time;
+    if (const auto seen = m_pow_tip_signal.TipInfo(tip)) {
+        attempt.timing.tip_seen_known = true;
+        attempt.timing.tip_seen_unix_ms = seen->seen_unix_ms;
+        attempt.origin = seen->seen;
+    } else {
+        attempt.timing.tip_seen_unix_ms =
+            TicksSinceEpoch<std::chrono::milliseconds>(SystemClock::now());
+        attempt.origin = now;
+    }
+    const auto gate_ready = m_pow_gate_ready_tip == tip ? m_pow_gate_ready_at : now;
+    attempt.timing.gate_ready_ms = std::max<int64_t>(
+        0, std::chrono::duration_cast<std::chrono::milliseconds>(
+               gate_ready - attempt.origin).count());
+    m_pow_claim_attempt = attempt;
+    return replaced;
+}
+
+std::string CWallet::FinishPowClaimAttemptLocked(
+    const std::string& result, bool tip_changed, const COutPoint* relay_key)
+{
+    AssertLockHeld(m_pow_miner_mutex);
+    if (!m_pow_claim_attempt.open) return {};
+    // A line still held for an earlier claim goes out first, with this one.
+    std::string held = FlushPowClaimRelayTimingLocked(/*force=*/true);
+    if (!held.empty()) held += "\n";
+    WalletPowClaimTiming& timing = m_pow_claim_attempt.timing;
+    const int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - m_pow_claim_attempt.origin).count();
+    if (result == "submitted") timing.mempool_accept_ms = now_ms;
+    timing.duty_sleep_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        m_pow_claim_attempt.duty_sleep).count();
+    timing.tip_changed = tip_changed;
+    timing.result = result;
+    m_pow_last_claim_timing = timing;
+    if (result == "submitted" && relay_key) {
+        PowClaimRelayPending pending;
+        pending.open = true;
+        pending.timing = timing;
+        pending.claim_input = *relay_key;
+        pending.origin = m_pow_claim_attempt.origin;
+        pending.accepted = std::chrono::steady_clock::now();
+        m_pow_claim_relay_pending = pending;
+        m_pow_claim_attempt = {};
+        if (!held.empty()) held.pop_back();
+        return held;
+    }
+    m_pow_claim_attempt = {};
+    return held + FormatPowClaimTimingLine(m_pow_last_claim_timing);
+}
+
+void CWallet::FinishPowClaimAttempt(
+    const uint256& tip, const std::string& result, bool tip_changed,
+    const COutPoint* relay_key)
+{
+    std::string line;
+    {
+        LOCK(m_pow_miner_mutex);
+        if (!m_pow_claim_attempt.open ||
+            m_pow_claim_attempt.timing.tip != tip) return;
+        line = FinishPowClaimAttemptLocked(result, tip_changed, relay_key);
+    }
+    if (!line.empty()) WalletLogPrintf("%s\n", line);
+}
+
+void CWallet::NotePowClaimAttemptFirstHash(const uint256& tip)
+{
+    LOCK(m_pow_miner_mutex);
+    if (!m_pow_claim_attempt.open || m_pow_claim_attempt.timing.tip != tip ||
+        m_pow_claim_attempt.timing.first_hash_ms >= 0) return;
+    m_pow_claim_attempt.timing.first_hash_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - m_pow_claim_attempt.origin).count();
+}
+
+void CWallet::NotePowClaimAttemptBatch(
+    const uint256& tip, uint64_t hashes, bool found)
+{
+    LOCK(m_pow_miner_mutex);
+    if (!m_pow_claim_attempt.open || m_pow_claim_attempt.timing.tip != tip) return;
+    m_pow_claim_attempt.timing.hashes += hashes;
+    ++m_pow_claim_attempt.timing.batches;
+    if (found && m_pow_claim_attempt.timing.proof_found_ms < 0) {
+        m_pow_claim_attempt.timing.proof_found_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - m_pow_claim_attempt.origin).count();
+    }
+}
+
+void CWallet::NotePowClaimAttemptDutySleep(
+    const uint256& tip, std::chrono::nanoseconds slept)
+{
+    LOCK(m_pow_miner_mutex);
+    if (!m_pow_claim_attempt.open || m_pow_claim_attempt.timing.tip != tip) return;
+    m_pow_claim_attempt.duty_sleep += slept;
+}
+
 void CWallet::ThreadShadowPoWMiner(int worker_id)
 {
+    PowMinerWorkerIdentity identity{worker_id};
     WalletLogPrintf("Gold Rush PoW worker %d started\n", worker_id);
+    std::chrono::steady_clock::time_point next_grind_error_log{};
+    PowMinerDutyState duty_state{PowMiningDutyLedger{
+        m_pow_cpu_percent.load(),
+        std::chrono::seconds{Params().GetConsensus().nTargetSpacing}}};
     while (!IsPowMiningClosing() && m_pow_mining_enabled.load()) {
+        PowMinerIterationBudget iteration_budget{*this, duty_state, worker_id};
+        m_pow_miner_iterations.fetch_add(1, std::memory_order_relaxed);
         bilingual_str error;
         const uint64_t loop_authority_generation =
             m_pow_wallet_authority_generation.load(std::memory_order_acquire);
@@ -13648,7 +15615,11 @@ void CWallet::ThreadShadowPoWMiner(int worker_id)
             PublishPowMiningHashrate(0.0);
             PublishPowMiningWorkerState(
                 WalletPowMiningState::CHAIN_UNAVAILABLE);
-            SleepPowMiner(*this, std::chrono::seconds{1});
+            // Not ready (syncing, reindexing, no chain): blocks arriving during
+            // this wait must not start an iteration. Only stop ends it early.
+            SleepPowMiner(*this, std::chrono::seconds{1},
+                          /*allow_locked_wait=*/false, std::nullopt,
+                          /*wake_on_tip=*/false);
             continue;
         }
         ShadowPowClaimMiningGate mining_gate;
@@ -13664,11 +15635,33 @@ void CWallet::ThreadShadowPoWMiner(int worker_id)
             int64_t current_relay_clock_effective_time{0};
             bool current_relay_clock_signing_safe{false};
             int64_t current_relay_clock_wall_time{0};
+            // Sample the chain first, under cs_main alone, as values; then the
+            // wallet under cs_wallet alone. The wallet is never waited for
+            // while cs_main is held, so a long cs_wallet hold (an RPC, a
+            // rescan step, a flush) cannot stall block processing through
+            // this poll. Lock order is unchanged: the two locks are not nested.
+            // The two samples are not atomic. That is safe: they only feed
+            // change detection and a coherence flag, a chain advance between
+            // them makes the wallet look one block behind or ahead (so the gate
+            // is refreshed once, which is the conservative direction), and the
+            // next poll re-reads both.
+            bool have_tip{false};
+            int tip_height{-1};
             {
-                LOCK2(::cs_main, cs_wallet);
+                LOCK(::cs_main);
                 const CBlockIndex* tip =
                     chain().chainman().ActiveChain().Tip();
-                if (tip) current_tip = tip->GetBlockHash();
+                if (tip) {
+                    have_tip = true;
+                    current_tip = tip->GetBlockHash();
+                    tip_height = tip->nHeight;
+                    current_relay_clock_median_time_past =
+                        tip->GetMedianTimePast();
+                }
+            }
+            {
+                LOCK(cs_wallet);
+                iteration_budget.ObserveTipUnderWalletLock();
                 current_wallet_generation =
                     GetDatabase().nUpdateCounter.load();
                 current_candidate_state =
@@ -13676,32 +15669,39 @@ void CWallet::ThreadShadowPoWMiner(int worker_id)
                 recovery_database_ambiguous =
                     m_shadow_pow_claim_recovery_db_ambiguous ||
                     m_locked_coins_db_ambiguous;
-                wallet_tip_matches = tip &&
+                wallet_tip_matches = have_tip &&
                     m_last_block_processed == current_tip &&
-                    m_last_block_processed_height == tip->nHeight;
+                    m_last_block_processed_height == tip_height;
                 current_relay_clock_high_water =
                     m_shadow_pow_claim_relay_clock_high_water;
                 current_legacy_relay_clock_high_water =
                     m_shadow_pow_claim_legacy_relay_clock_high_water;
-                current_relay_clock_median_time_past = tip
-                    ? tip->GetMedianTimePast()
-                    : 0;
                 const int64_t wall_time = GetTime();
                 current_relay_clock_wall_time = wall_time;
-                current_relay_clock_effective_time = tip
+                current_relay_clock_effective_time = have_tip
                     ? GetShadowPowClaimRelayEffectiveTimeLocked(
                           wall_time,
                           current_relay_clock_median_time_past)
                     : 0;
-                current_relay_clock_signing_safe = tip &&
+                current_relay_clock_signing_safe = have_tip &&
                     IsShadowPowClaimRelayClockSigningSafeLocked(
                         wall_time,
                         current_relay_clock_median_time_past);
             }
             bool refresh_gate{false};
             bool wallet_wide_tip_wait{false};
+            std::string stale_attempt_line;
+            std::string relay_timing_line;
             {
                 LOCK(m_pow_miner_mutex);
+                relay_timing_line = FlushPowClaimRelayTimingLocked(
+                    /*force=*/m_pow_claim_relay_pending.open &&
+                        m_pow_claim_relay_pending.timing.tip != current_tip);
+                if (m_pow_claim_attempt.open &&
+                    m_pow_claim_attempt.timing.tip != current_tip) {
+                    stale_attempt_line =
+                        FinishPowClaimAttemptLocked("tip_changed", /*tip_changed=*/true);
+                }
                 mining_gate = m_pow_mining_gate;
                 if (m_pow_wallet_wide_tip_wait &&
                     mining_gate.active_tip != current_tip) {
@@ -13747,6 +15747,8 @@ void CWallet::ThreadShadowPoWMiner(int worker_id)
                       current_relay_clock_effective_time >=
                           mining_gate.relay_expiry_time));
             }
+            if (!relay_timing_line.empty()) WalletLogPrintf("%s\n", relay_timing_line);
+            if (!stale_attempt_line.empty()) WalletLogPrintf("%s\n", stale_attempt_line);
             if (refresh_gate) {
                 if (mining_gate.ProofEvaluationPending()) {
                     // Publish the typed non-authorizing state before worker
@@ -13784,8 +15786,25 @@ void CWallet::ThreadShadowPoWMiner(int worker_id)
                     mining_gate.relay_txid.SetNull();
                     mining_gate.relay_expiry_time = 0;
                 }
-                LOCK(m_pow_miner_mutex);
-                m_pow_mining_gate = mining_gate;
+                bool gate_changed{false};
+                {
+                    LOCK(m_pow_miner_mutex);
+                    gate_changed =
+                        m_pow_mining_gate.action != mining_gate.action ||
+                        m_pow_mining_gate.active_tip != mining_gate.active_tip;
+                    m_pow_mining_gate = mining_gate;
+                    if (have_tip && mining_gate.active_tip == current_tip &&
+                        mining_gate.coherent &&
+                        !mining_gate.RelayClockPending() &&
+                        !mining_gate.ProofEvaluationPending() &&
+                        !mining_gate.ClaimOwnershipPending() &&
+                        m_pow_gate_ready_tip != current_tip) {
+                        m_pow_gate_ready_tip = current_tip;
+                        m_pow_gate_ready_at = std::chrono::steady_clock::now();
+                    }
+                }
+                // Sibling workers wait on the published gate, not on a poll.
+                if (gate_changed) m_pow_tip_signal.NotifyGate();
             }
         } else {
             LOCK(m_pow_miner_mutex);
@@ -13814,6 +15833,11 @@ void CWallet::ThreadShadowPoWMiner(int worker_id)
                 ? std::chrono::milliseconds{1000}
                 : (worker_id == 0 ? std::chrono::milliseconds{100}
                                   : std::chrono::milliseconds{1000});
+            // Worker zero is still settling the gate for this tip.
+            if (worker_id == 0 &&
+                retry_delay == std::chrono::milliseconds{100}) {
+                iteration_budget.SetWorkPending();
+            }
             SleepPowMiner(*this, retry_delay);
             continue;
         }
@@ -13821,6 +15845,7 @@ void CWallet::ThreadShadowPoWMiner(int worker_id)
             PublishPowMiningHashrate(0.0);
             PublishPowMiningWorkerState(
                 WalletPowMiningState::CLAIM_EVALUATION_PENDING);
+            if (worker_id == 0) iteration_budget.SetWorkPending();
             SleepPowMiner(
                 *this,
                 worker_id == 0 ? std::chrono::milliseconds{100}
@@ -13885,6 +15910,7 @@ void CWallet::ThreadShadowPoWMiner(int worker_id)
                 // concurrent stop holds while joining this worker.
                 ShadowPowClaimSubmissionGuard relay_guard(*this);
                 if (!relay_guard) {
+                    iteration_budget.SetWorkPending();
                     SleepPowMiner(*this, std::chrono::milliseconds{100});
                     continue;
                 }
@@ -14046,6 +16072,9 @@ void CWallet::ThreadShadowPoWMiner(int worker_id)
                 } else if (!retry_after_authority_change) {
                     m_pow_mining_enabled.store(false,
                                                std::memory_order_release);
+                    std::fill(m_pow_worker_states.begin(), m_pow_worker_states.end(), WalletPowMiningState::DISABLED);
+                    m_pow_workers_hashing = 0;
+                    m_pow_workers_error = 0;
                     m_pow_hashrate.store(0.0, std::memory_order_release);
                     m_pow_state.store(WalletPowMiningState::RUNTIME_ERROR,
                                       std::memory_order_release);
@@ -14162,6 +16191,7 @@ void CWallet::ThreadShadowPoWMiner(int worker_id)
                 // insufficient-funds result nor a family quarantine.
                 PublishPowMiningWorkerState(
                     WalletPowMiningState::READY);
+                iteration_budget.SetWorkPending();
                 SleepPowMiner(
                     *this, std::chrono::milliseconds{100});
                 continue;
@@ -14207,14 +16237,13 @@ void CWallet::ThreadShadowPoWMiner(int worker_id)
         }
 
         std::vector<unsigned char> proof;
-        uint64_t tries_done{0};
         bool proof_found{false};
         uint256 tip_hash;
-        auto batch_elapsed = std::chrono::milliseconds{0};
         auto loop_sleep = std::chrono::milliseconds{0};
         ShadowPowWork work;
         uint64_t nonce_start{0};
         bool should_grind{false};
+        std::string replaced_attempt_line;
         {
             ChainstateManager& chainman = chain().chainman();
             LOCK(cs_main);
@@ -14256,6 +16285,12 @@ void CWallet::ThreadShadowPoWMiner(int worker_id)
                             m_pow_wallet_wide_tip_wait = false;
                         }
                         claim_inflight = m_pow_claim_inflight;
+                        // No proof is being submitted: a mirror left by a
+                        // submission that failed must not stop this search.
+                        if (!claim_inflight) {
+                            m_pow_proof_found_tip_seq.store(
+                                0, std::memory_order_release);
+                        }
                     }
                     if (claim_inflight) {
                         PublishPowMiningWorkerState(
@@ -14271,6 +16306,11 @@ void CWallet::ThreadShadowPoWMiner(int worker_id)
                             selected_input.outpoint, tip,
                             chainman.ActiveChainstate().CoinsTip());
                         should_grind = work.valid;
+                        if (should_grind) {
+                            LOCK(m_pow_miner_mutex);
+                            replaced_attempt_line = BeginPowClaimAttemptLocked(
+                                tip_hash, tip->nHeight, tip->GetBlockTime());
+                        }
                         if (!should_grind) {
                             PublishPowMiningHashrate(0.0);
                             PublishPowMiningWorkerState(
@@ -14282,41 +16322,40 @@ void CWallet::ThreadShadowPoWMiner(int worker_id)
                 }
             }
         }
+        if (!replaced_attempt_line.empty()) {
+            WalletLogPrintf("%s\n", replaced_attempt_line);
+        }
         if (loop_sleep.count() > 0) {
             SleepPowMiner(*this, loop_sleep);
             continue;
         }
         if (should_grind) {
-            if (!PublishPowMiningWorkerState(
-                    WalletPowMiningState::HASHING,
-                    loop_authority_generation)) {
+            iteration_budget.SetAttemptTip(tip_hash);
+            NotePowClaimAttemptFirstHash(tip_hash);
+            const auto result = RunShadowPowMiningBatch(
+                work, nonce_start, 1, POW_MINER_BATCH_TRIES,
+                loop_authority_generation, proof, worker_id,
+                next_grind_error_log, iteration_budget.TipSequence());
+            NotePowClaimAttemptBatch(
+                tip_hash, result.successful_hashes,
+                result.status == WalletPowMiningGrindStatus::FOUND);
+            // The search goes on: carry the duty debt instead of sleeping
+            // between batches (bounded by the ledger's ceilings).
+            if (result.status == WalletPowMiningGrindStatus::EXHAUSTED) {
+                iteration_budget.SetWorkPending();
+            }
+            if (result.status == WalletPowMiningGrindStatus::CANCELLED ||
+                result.status == WalletPowMiningGrindStatus::LOCAL_INTERNAL_ERROR ||
+                result.status == WalletPowMiningGrindStatus::INVALID_WORK) {
                 continue;
             }
-            const auto batch_start = std::chrono::steady_clock::now();
-            proof_found = GrindShadowPowWorkInterruptibly(
-                *this, work, nonce_start, 1, POW_MINER_BATCH_TRIES,
-                loop_authority_generation, proof, &tries_done);
-            batch_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - batch_start);
-            PublishPowMiningWorkerState(WalletPowMiningState::READY,
-                                        loop_authority_generation);
+            proof_found = result.status == WalletPowMiningGrindStatus::FOUND;
         }
 
         if (!HasNormalPowMiningWalletAuthority(
                 loop_authority_generation)) {
             PublishPowMiningHashrate(0.0);
             continue;
-        }
-
-        if (tries_done > 0) {
-            const uint64_t total_tries = m_pow_total_tries.fetch_add(tries_done) + tries_done;
-            const int64_t now_ms = GetTime<std::chrono::milliseconds>().count();
-            const int64_t start_ms = m_pow_hashrate_start_ms.load();
-            if (start_ms > 0 && now_ms > start_ms) {
-                PublishPowMiningHashrate(
-                    (static_cast<double>(total_tries) * 1000.0) /
-                        static_cast<double>(now_ms - start_ms),
-                    loop_authority_generation);
-            }
         }
 
         if (proof_found) {
@@ -14328,12 +16367,19 @@ void CWallet::ThreadShadowPoWMiner(int worker_id)
                 const CBlockIndex* tip = chain().chainman().ActiveChain().Tip();
                 tip_still_current = tip && tip->GetBlockHash() == tip_hash;
             }
-            if (!tip_still_current) continue;
+            if (!tip_still_current) {
+                iteration_budget.SetWorkPending();
+                FinishPowClaimAttempt(tip_hash, "tip_changed", /*tip_changed=*/true);
+                continue;
+            }
             {
                 LOCK(m_pow_miner_mutex);
                 if (m_pow_claim_inflight) continue;
                 m_pow_wallet_wide_tip_wait = false;
                 m_pow_claim_inflight = true;
+                m_pow_proof_found_tip_seq.store(
+                    iteration_budget.TipSequence() + 1,
+                    std::memory_order_release);
             }
             MaybeDelayShadowPowClaimSubmissionForTest(selected_input.outpoint);
             // A stop request that arrives after the proof is found but before
@@ -14343,24 +16389,62 @@ void CWallet::ThreadShadowPoWMiner(int worker_id)
             if (IsPowMiningClosing() ||
                 !HasNormalPowMiningWalletAuthority(
                     loop_authority_generation)) {
-                LOCK(m_pow_miner_mutex);
-                m_pow_claim_inflight = false;
-                m_pow_wallet_wide_tip_wait = false;
+                {
+                    LOCK(m_pow_miner_mutex);
+                    m_pow_claim_inflight = false;
+                    m_pow_wallet_wide_tip_wait = false;
+                }
+                FinishPowClaimAttempt(tip_hash, "cancelled", /*tip_changed=*/false);
                 continue;
             }
             std::optional<ShadowPowClaimMiningGate>
                 submit_failure_reselection;
+            // This node created the claim: its first relay sends peers the
+            // whole transaction. The mark is used at most once and does not
+            // outlive the submission. It names the fee input, which every
+            // proof format spends, bound to it or not.
+            GetClaimRelayTracker().MarkLocalClaim(selected_input.outpoint);
             const ShadowPowClaimSubmitResult submit_result =
                 SubmitShadowPowClaim(
                     selected_input, work, proof,
                     loop_authority_generation, error,
                     &submit_failure_reselection);
+            GetClaimRelayTracker().UnmarkLocalClaim(selected_input.outpoint);
+            // Count the claim before anything else, as rc12 did: the wallet
+            // transaction is already visible, and a reader that sees it must
+            // not find the counter lagging behind the timing line below.
+            if (submit_result == ShadowPowClaimSubmitResult::SUBMITTED) {
+                ++m_pow_claims_submitted;
+            }
+            {
+                // One timing line per attempt, whatever its outcome.
+                const bool tip_moved = !m_pow_tip_signal.TipInfo(tip_hash) &&
+                    WITH_LOCK(m_pow_miner_mutex,
+                              return m_pow_claim_attempt.timing.tip_seen_known);
+                FinishPowClaimAttempt(
+                    tip_hash,
+                    submit_result == ShadowPowClaimSubmitResult::SUBMITTED
+                        ? "submitted"
+                    : submit_result == ShadowPowClaimSubmitResult::PERSISTED_PENDING
+                        ? "persisted_pending"
+                    : IsShadowPowClaimConflict(error) ? "conflict"
+                    : submit_result == ShadowPowClaimSubmitResult::INPUT_UNAVAILABLE
+                        ? "input_unavailable"
+                        : "failed",
+                    submit_result != ShadowPowClaimSubmitResult::SUBMITTED &&
+                        tip_moved,
+                    // The relay tracker knows the claim by its fee input;
+                    // the line then waits for the relay figures.
+                    &selected_input.outpoint);
+            }
             if (submit_result == ShadowPowClaimSubmitResult::SUBMITTED ||
                 submit_result ==
                     ShadowPowClaimSubmitResult::PERSISTED_PENDING) {
-                if (submit_result == ShadowPowClaimSubmitResult::SUBMITTED) {
-                    ++m_pow_claims_submitted;
-                } else {
+                if (submit_result != ShadowPowClaimSubmitResult::SUBMITTED) {
+                    // The retained claim is retried through the gate on this
+                    // tip: carry the debt (within the ceilings) rather than
+                    // sleeping it all before worker zero can relay again.
+                    iteration_budget.SetWorkPending();
                     WalletLogPrintf(
                         "Gold Rush PoW worker %d retained a claim after relay failure; re-entering the typed family gate: %s\n",
                         worker_id, error.original);
@@ -14424,6 +16508,8 @@ void CWallet::ThreadShadowPoWMiner(int worker_id)
                     }
                     PublishPowMiningWorkerState(
                         ShadowPowMiningStateForGate(refresh_reselection));
+                    // Same-anchor refresh continues on this tip.
+                    iteration_budget.SetWorkPending();
                     SleepPowMiner(*this, std::chrono::milliseconds{100});
                 } else if (wait_for_next_tip) {
                     ShadowPowClaimMiningGate wait_snapshot =
@@ -14484,11 +16570,36 @@ void CWallet::ThreadShadowPoWMiner(int worker_id)
             }
         }
 
-        const int cpu_percent = std::clamp(m_pow_cpu_percent.load(), 1, 100);
-        if (cpu_percent < 100 && tries_done > 0 && batch_elapsed.count() > 0) {
-            const auto throttle = std::chrono::milliseconds{std::max<int64_t>(1, batch_elapsed.count() * (100 - cpu_percent) / cpu_percent)};
-            SleepPowMiner(*this, throttle);
+    }
+    // An open duty period ends with the thread; it is never a completed one.
+    duty_state.Publish(*this, /*finished=*/false);
+    {
+        std::string stopped_attempt_line;
+        std::string held_relay_line;
+        if (IsPowMiningClosing() || !m_pow_mining_enabled.load()) {
+            LOCK(m_pow_miner_mutex);
+            held_relay_line = FlushPowClaimRelayTimingLocked(/*force=*/true);
+            stopped_attempt_line =
+                FinishPowClaimAttemptLocked("stopped", /*tip_changed=*/false);
         }
+        if (!held_relay_line.empty()) {
+            WalletLogPrintf("%s\n", held_relay_line);
+        }
+        if (!stopped_attempt_line.empty()) {
+            WalletLogPrintf("%s\n", stopped_attempt_line);
+        }
+    }
+    {
+        LOCK(cs_wallet);
+        if (worker_id >= 0 && static_cast<size_t>(worker_id) < m_pow_worker_states.size()) {
+            m_pow_worker_states[worker_id] = WalletPowMiningState::DISABLED;
+        }
+        if (!m_pow_mining_enabled.load()) {
+            std::fill(m_pow_worker_states.begin(), m_pow_worker_states.end(), WalletPowMiningState::DISABLED);
+            m_pow_hashrate = 0.0;
+        }
+        m_pow_workers_hashing = std::count(m_pow_worker_states.begin(), m_pow_worker_states.end(), WalletPowMiningState::HASHING);
+        m_pow_workers_error = std::count(m_pow_worker_states.begin(), m_pow_worker_states.end(), WalletPowMiningState::RUNTIME_ERROR);
     }
     WalletLogPrintf("Gold Rush PoW worker %d stopped\n", worker_id);
 }

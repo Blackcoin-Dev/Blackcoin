@@ -30,6 +30,7 @@
 #include <memory>
 #include <set>
 #include <stdexcept>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -55,6 +56,8 @@ bool LoadMempool(CTxMemPool& pool, const fs::path& load_path, Chainstate& active
     int64_t failed = 0;
     int64_t already_there = 0;
     int64_t unbroadcast = 0;
+    // Why transactions failed, by reason, for the one-line summary below.
+    std::map<std::string, int64_t> reject_reasons;
     const auto now{NodeClock::now()};
 
     try {
@@ -112,6 +115,11 @@ bool LoadMempool(CTxMemPool& pool, const fs::path& load_path, Chainstate& active
                         ++already_there;
                     } else {
                         ++failed;
+                        std::string reason{accepted.m_state.GetRejectReason()};
+                        if (reason.empty()) reason = accepted.m_state.ToString();
+                        if (reason.empty()) reason = "unknown";
+                        LogPrint(BCLog::MEMPOOL, "Mempool load: transaction %s rejected: %s\n", tx->GetHash().ToString(), accepted.m_state.ToString());
+                        ++reject_reasons[reason];
                     }
                 }
             } else {
@@ -144,6 +152,14 @@ bool LoadMempool(CTxMemPool& pool, const fs::path& load_path, Chainstate& active
         return false;
     }
 
+    if (!reject_reasons.empty()) {
+        std::string summary;
+        for (const auto& [reason, n] : reject_reasons) {
+            if (!summary.empty()) summary += ", ";
+            summary += strprintf("%s: %d", reason, n);
+        }
+        LogPrintf("Mempool load: %i transactions rejected (%s)\n", failed, summary);
+    }
     LogPrintf("Imported mempool transactions from disk: %i succeeded, %i failed, %i expired, %i already there, %i waiting for initial broadcast\n", count, failed, expired, already_there, unbroadcast);
     return true;
 }

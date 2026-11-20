@@ -281,6 +281,19 @@ void ShadowResourceDialog::requestShutdown()
     }
 }
 
+bool ShadowResourceDialog::shutdownReady()
+{
+    requestShutdown();
+    m_worker_thread.quit();
+    // A queued scan may have entered Core after the first abort probe.
+    try {
+        if (m_backend->scanProgress().active) m_backend->requestAbort();
+    } catch (...) {
+        // Global node interruption remains authoritative during shutdown.
+    }
+    return m_worker_thread.wait(0);
+}
+
 void ShadowResourceDialog::join()
 {
     requestShutdown();

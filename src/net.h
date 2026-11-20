@@ -9,6 +9,8 @@
 #ifndef BITCOIN_NET_H
 #define BITCOIN_NET_H
 
+#include <qq_policy.h>
+
 #include <bip324.h>
 #include <chainparams.h>
 #include <common/bloom.h>
@@ -31,9 +33,11 @@
 #include <sync.h>
 #include <uint256.h>
 #include <util/check.h>
+#include <util/fs.h>
 #include <util/sock.h>
 #include <util/threadinterrupt.h>
 
+#include <array>
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
@@ -44,9 +48,13 @@
 #include <memory>
 #include <optional>
 #include <queue>
+#include <set>
+#include <string_view>
 #include <thread>
 #include <unordered_set>
 #include <vector>
+
+namespace httpsseed { struct WorkerHooks; }
 
 class AddrMan;
 class BanMan;
@@ -59,6 +67,20 @@ struct bilingual_str;
 static const bool DEFAULT_WHITELISTRELAY = true;
 /** Default for -whitelistforcerelay. */
 static const bool DEFAULT_WHITELISTFORCERELAY = false;
+
+/**
+ * A P2P listen port inside the OS ephemeral range (Linux: 32768-60999) can be held
+ * for a moment as the local port of another process's outgoing connection when the
+ * network namespace is shared (VPN client, web viewer), so bind() fails with
+ * "address in use" although nothing listens there. Retry such a bind once per
+ * BIND_RETRY_INTERVAL for up to DEFAULT_BIND_RETRY_SECONDS before giving up.
+ */
+/** Number of classes of failed outbound dials counted by CConnman. */
+static constexpr size_t DIAL_FAIL_CLASSES{5};
+static constexpr int DEFAULT_BIND_RETRY_SECONDS{30};
+static constexpr std::chrono::seconds BIND_RETRY_INTERVAL{1};
+/** Granularity at which a shutdown request is noticed while waiting to retry a bind. */
+static constexpr std::chrono::milliseconds BIND_RETRY_POLL{100};
 
 /** Time after which to disconnect, after waiting for a ping response (or inactivity). */
 static constexpr std::chrono::minutes TIMEOUT_INTERVAL{20};
@@ -169,6 +191,87 @@ void RemoveLocal(const CService& addr);
 bool SeenLocal(const CService& addr);
 bool IsLocal(const CService& addr);
 CService GetLocalAddress(const CNode& peer);
+
+/**
+ * Runtime public endpoint (-publicendpointfile). An external process writes the
+ * node's currently reachable public IPv4 address and port into a small JSON
+ * file in the datadir; Core polls it, opens an extra listening socket on that
+ * port, and advertises exactly that pair. Everything fails closed: when the
+ * pair is missing, malformed, stale, or cannot be bound, nothing is advertised.
+ */
+namespace publicendpoint {
+inline constexpr size_t MAX_FILE_SIZE{256};
+inline constexpr int64_t MAX_FUTURE_SKEW{60};
+inline constexpr int64_t DEFAULT_MAX_AGE{180};
+inline constexpr int64_t DEFAULT_POLL_INTERVAL{15};
+inline constexpr const char* SCHEMA{"blackcoin.public-endpoint/1"};
+
+struct Tuple {
+    CNetAddr address;
+    uint16_t port{0};
+    int64_t observed_at{0};
+};
+
+/** A bare file name (no directory part) that resolves inside the datadir. */
+bool ValidFileName(const std::string& name);
+/** Strict parse of the file content. On failure returns nullopt and sets reason. */
+std::optional<Tuple> Parse(std::string_view text, std::string& reason);
+/** Read the file without following a symlink; regular file of at most MAX_FILE_SIZE bytes. */
+std::optional<std::string> ReadFile(const fs::path& datadir, const std::string& name, std::string& reason);
+
+/**
+ * Pure poll-to-poll state machine (poller thread only). A new pair is
+ * applied only after two consecutive polls read the same pair; anything
+ * invalid, stale or future-dated withdraws at once.
+ */
+class Tracker
+{
+public:
+    struct Decision {
+        std::optional<CService> wanted; //!< pair to advertise, nullopt = withdraw
+        int64_t observed_at{0};         //!< observed_at of the read that confirms `wanted`
+        std::string status;             //!< why `wanted` is empty or pending
+    };
+    Tracker(int64_t max_age, std::set<uint16_t> excluded_ports) : m_max_age{max_age}, m_excluded_ports{std::move(excluded_ports)} {}
+    /** `reading` is the parse of this poll's file (nullopt = no usable tuple, `reason` says why). */
+    Decision Observe(const std::optional<Tuple>& reading, const std::string& reason, int64_t now);
+
+private:
+    const int64_t m_max_age;
+    const std::set<uint16_t> m_excluded_ports;
+    std::optional<CService> m_candidate;
+    std::optional<CService> m_wanted;
+    int64_t m_wanted_observed_at{0};
+};
+
+struct Info {
+    bool enabled{false};
+    bool active{false};
+    bool listening{false};
+    std::string address;
+    uint16_t port{0};
+    std::string via; //!< "configured" (an existing listener serves the port) or "runtime" (extra socket), empty when inactive
+    int64_t observed_at{0};
+    int64_t age{0};
+    std::string status;
+};
+
+//! Shared state, one mutex. Poller writes the wanted pair, the socket handler thread applies it.
+void Reset();
+void SetEnabled(bool enabled);
+bool Enabled();
+//! Poller: publish the decision; bumps the generation when it changed or a retry is due.
+void Submit(const Tracker::Decision& decision);
+//! Socket handler: take new work if the generation moved past `applied_gen`.
+bool TakeWork(uint64_t& applied_gen, std::optional<CService>& wanted, int64_t& observed_at, std::string& status);
+//! Socket handler: record the result. Both bump nothing the poller reads except `active`.
+void Activate(const CService& pair, int64_t observed_at, bool via_configured_listener = false);
+void Withdraw(const std::string& reason);
+std::optional<CService> Active();
+//! Incremented every time a (new) pair becomes active; the message handler compares per peer.
+uint64_t ChangeSeq();
+Info GetInfo();
+} // namespace publicendpoint
 
 extern bool fDiscover;
 extern bool fListen;
@@ -680,6 +783,37 @@ struct CNodeOptions
 };
 
 /** Information about a peer */
+/** Why a connection ended, for the "Peer lost" log line. The first reason set on a node wins. */
+enum class DisconnectReason : uint8_t {
+    NONE = 0,              //!< not set; reported as local_other
+    REMOTE_CLOSED,         //!< recv() returned 0: the peer closed the socket
+    RECV_ERROR,            //!< recv() failed (errno kept)
+    SEND_ERROR,            //!< send() failed (errno kept)
+    TRANSPORT_ERROR,       //!< bad transport data (v2 handshake, bad magic, oversized message)
+    TIMEOUT_NO_MESSAGE,    //!< nothing sent or received in the first -peertimeout seconds
+    TIMEOUT_SEND,          //!< no send for TIMEOUT_INTERVAL
+    TIMEOUT_RECV,          //!< no receive for TIMEOUT_INTERVAL
+    TIMEOUT_HANDSHAKE,     //!< version handshake did not complete
+    TIMEOUT_PING,          //!< ping not answered
+    TIMEOUT_BLOCK_STALL,   //!< stalling block download
+    TIMEOUT_BLOCK_DOWNLOAD,//!< block download timeout
+    TIMEOUT_HEADERS,       //!< headers download timeout
+    LOCAL_MISBEHAVIOR,     //!< discouraged or disconnected for misbehavior
+    LOCAL_PROTOCOL,        //!< protocol violation or unusable peer (version, services, insufficient work)
+    LOCAL_EVICTION,        //!< inbound eviction, extra outbound or block-relay-only peer, QQ replacement
+    LOCAL_STALE_TIP,       //!< outbound peer on an old chain while our tip is stale
+    LOCAL_NETWORK_INACTIVE,//!< setnetworkactive false
+    LOCAL_SHUTDOWN,        //!< node shutting down
+    LOCAL_RPC,             //!< disconnectnode RPC
+    LOCAL_BANNED,          //!< setban RPC
+    LOCAL_TASK_DONE,       //!< feeler or addr-fetch connection finished its job
+    LOCAL_PROBE_EXPIRED,   //!< QQ probe expired or rejected
+    LOCAL_OTHER,           //!< a local decision that is not individually classified
+};
+
+/** Stable lowercase token for a reason; recv_error and send_error append ":<errno text>". */
+std::string DisconnectReasonToString(DisconnectReason reason, int err = 0);
+
 class CNode
 {
 public:
@@ -738,11 +872,39 @@ public:
     }
     /** fSuccessfullyConnected is set to true on receiving VERACK from the peer. */
     std::atomic_bool fSuccessfullyConnected{false};
+    /** Accepted VERSION only; addr services remain an untrusted selection hint. */
+    std::atomic<ServiceFlags> m_accepted_services{NODE_NONE};
+    std::atomic_bool m_qq_pong{false};
+    std::atomic_bool m_qq_eligible{false};
+    /** Set before publication, immutable across this node's lifetime. */
+    std::shared_ptr<qq::Probe> m_qq_probe;
+    bool IsQQProbe() const { return m_qq_probe && !m_qq_probe->promoted; }
     // Setting fDisconnect to true will cause the node to be disconnected the
     // next time DisconnectNodes() runs
     std::atomic_bool fDisconnect{false};
+    /** Record why the connection ended. The first call wins; thread safe. Does not set fDisconnect. */
+    void SetDisconnectReason(DisconnectReason reason, int err = 0)
+    {
+        uint64_t expected{0};
+        m_disconnect_state.compare_exchange_strong(expected, (uint64_t{static_cast<uint8_t>(reason)} << 32) | static_cast<uint32_t>(err));
+    }
+    /** Record the reason and set fDisconnect. */
+    void Disconnect(DisconnectReason reason, int err = 0)
+    {
+        SetDisconnectReason(reason, err);
+        fDisconnect = true;
+    }
+    /** The recorded reason as a log token; local_other when none was recorded. */
+    std::string GetDisconnectReasonString() const
+    {
+        const uint64_t state{m_disconnect_state.load()};
+        return DisconnectReasonToString(static_cast<DisconnectReason>(state >> 32), static_cast<int>(state & 0xffffffffU));
+    }
+    DisconnectReason GetDisconnectReason() const { return static_cast<DisconnectReason>(m_disconnect_state.load() >> 32); }
     CSemaphoreGrant grantOutbound;
     std::atomic<int> nRefCount{0};
+    /** DisconnectReason in the high 32 bits, errno in the low 32; 0 until set. */
+    std::atomic<uint64_t> m_disconnect_state{0};
 
     const uint64_t nKeyedNetGroup;
     std::atomic_bool fPauseRecv{false};
@@ -1047,6 +1209,7 @@ public:
         ServiceFlags nLocalServices = NODE_NONE;
         int nMaxConnections = 0;
         int m_max_outbound_full_relay = 0;
+        int m_qq_outbound_target{-1};
         int m_max_outbound_block_relay = 0;
         int nMaxAddnode = 0;
         int nMaxFeeler = 0;
@@ -1066,9 +1229,19 @@ public:
         /// we should bind on `0.0.0.0` (IPv4) and `::` (IPv6).
         bool bind_on_any;
         bool m_use_addrman_outgoing = true;
+        bool m_https_seed{true};
         std::vector<std::string> m_specified_outgoing;
         std::vector<std::string> m_added_nodes;
         bool m_i2p_accept_incoming;
+        /// -publicendpointfile (empty = feature off or inert) and its limits.
+        std::string m_public_endpoint_file;
+        int64_t m_public_endpoint_max_age{publicendpoint::DEFAULT_MAX_AGE};
+        int64_t m_public_endpoint_poll_interval{publicendpoint::DEFAULT_POLL_INTERVAL};
+        std::set<uint16_t> m_public_endpoint_excluded_ports;
+        /// Seconds to keep retrying a P2P listen bind that fails with "address in use".
+        int m_bind_retry_seconds{DEFAULT_BIND_RETRY_SECONDS};
+        /// Polled while waiting to retry a bind, so a shutdown request ends the wait.
+        std::function<bool()> m_shutdown_requested;
     };
 
     void Init(const Options& connOptions) EXCLUSIVE_LOCKS_REQUIRED(!m_added_nodes_mutex, !m_total_bytes_sent_mutex)
@@ -1076,10 +1249,16 @@ public:
         AssertLockNotHeld(m_total_bytes_sent_mutex);
 
         nLocalServices = connOptions.nLocalServices;
+        m_bind_retry_seconds = connOptions.m_bind_retry_seconds;
+        m_shutdown_requested = connOptions.m_shutdown_requested;
         nMaxConnections = connOptions.nMaxConnections;
         m_max_outbound_full_relay = std::min(connOptions.m_max_outbound_full_relay, connOptions.nMaxConnections);
         m_max_outbound_block_relay = connOptions.m_max_outbound_block_relay;
+        m_qq_requested_target = connOptions.m_qq_outbound_target;
+        m_qq_target = qq::EffectiveTarget(m_qq_requested_target, m_max_outbound_full_relay);
+        PublishQQStatus(0, 0, false, "initializing");
         m_use_addrman_outgoing = connOptions.m_use_addrman_outgoing;
+        m_https_seed_enabled = connOptions.m_https_seed;
         nMaxAddnode = connOptions.nMaxAddnode;
         nMaxFeeler = connOptions.nMaxFeeler;
         m_max_outbound = m_max_outbound_full_relay + m_max_outbound_block_relay + nMaxFeeler;
@@ -1104,6 +1283,10 @@ public:
             }
         }
         m_onion_binds = connOptions.onion_binds;
+        m_public_endpoint_file = connOptions.m_public_endpoint_file;
+        m_public_endpoint_max_age = connOptions.m_public_endpoint_max_age;
+        m_public_endpoint_poll_interval = connOptions.m_public_endpoint_poll_interval;
+        m_public_endpoint_excluded_ports = connOptions.m_public_endpoint_excluded_ports;
     }
 
     CConnman(uint64_t seed0, uint64_t seed1, AddrMan& addrman, const NetGroupManager& netgroupman,
@@ -1125,11 +1308,12 @@ public:
     bool GetNetworkActive() const { return fNetworkActive; };
     bool GetUseAddrmanOutgoing() const { return m_use_addrman_outgoing; };
     void SetNetworkActive(bool active);
-    void OpenNetworkConnection(const CAddress& addrConnect, bool fCountFailure, CSemaphoreGrant&& grant_outbound, const char* strDest, ConnectionType conn_type, bool use_v2transport) EXCLUSIVE_LOCKS_REQUIRED(!m_unused_i2p_sessions_mutex);
+    // attempted reports direct TCP or a complete SOCKS or I2P destination CONNECT.
+    void OpenNetworkConnection(const CAddress& addrConnect, bool fCountFailure, CSemaphoreGrant&& grant_outbound, const char* strDest, ConnectionType conn_type, bool use_v2transport, std::shared_ptr<qq::Probe> qq_probe = {}, bool* attempted = nullptr) EXCLUSIVE_LOCKS_REQUIRED(!m_unused_i2p_sessions_mutex);
     bool CheckIncomingNonce(uint64_t nonce);
 
-    // alias for thread safety annotations only, not defined
-    RecursiveMutex& GetNodesMutex() const LOCK_RETURNED(m_nodes_mutex);
+    // Shared transaction lock for qualification/replacement and eviction.
+    RecursiveMutex& GetNodesMutex() const LOCK_RETURNED(m_nodes_mutex) { return m_nodes_mutex; }
 
     bool ForNode(NodeId id, std::function<bool(CNode* pnode)> func);
 
@@ -1185,8 +1369,99 @@ public:
     // in cases where some outbound connections are not yet fully connected, or
     // not yet fully disconnected.
     int GetExtraFullOutboundCount() const;
+    int GetFullOutboundCount() const;
     // Count the number of block-relay-only peers we have over our limit.
     int GetExtraBlockRelayCount() const;
+
+    struct QQStatus {
+        int requested{-1};
+        int target{0};
+        int confirmed{0};
+        int eligible{0};
+        int deficit{0};
+        bool pending{false};
+        uint64_t generation{0};
+        std::string constraint;
+        uint64_t candidate_draws{0};
+        uint64_t no_hint_rounds{0};
+        uint64_t connect_attempts{0};
+        uint64_t connect_failures{0};
+        uint64_t dns_rounds{0};
+    };
+    int GetQQTarget() const { return m_qq_target; }
+    int GetFullOutboundTarget() const { return m_max_outbound_full_relay; }
+    QQStatus GetQQStatus() const
+    {
+        LOCK(m_qq_status_mutex);
+        auto status = m_qq_status;
+        const auto lease = m_qq_probe_lease.lock();
+        status.pending = lease && lease->active;
+        return status;
+    }
+    bool HasQQProbeHeadroom() const { return nMaxConnections > m_max_outbound_full_relay + m_max_outbound_block_relay; }
+    void TrackQQProbe(const std::shared_ptr<qq::Probe>& lease) { LOCK(m_qq_status_mutex); m_qq_probe_lease = lease; }
+    void PublishQQStatus(int confirmed, int eligible, bool pending, const std::string& constraint)
+    {
+        LOCK(m_qq_status_mutex);
+        m_qq_status.requested = m_qq_requested_target;
+        m_qq_status.target = m_qq_target;
+        m_qq_status.confirmed = confirmed;
+        m_qq_status.eligible = eligible;
+        m_qq_status.deficit = std::max(0, m_qq_target - eligible);
+        m_qq_status.pending = pending;
+        ++m_qq_status.generation;
+        m_qq_status.constraint = constraint;
+    }
+    void RecordQQSelection(int draws, bool matched)
+    {
+        LOCK(m_qq_status_mutex);
+        m_qq_status.candidate_draws += std::min(draws, qq::MAX_CANDIDATE_DRAWS);
+        if (!matched) ++m_qq_status.no_hint_rounds;
+    }
+    void RecordQQConnect(bool failed)
+    {
+        LOCK(m_qq_status_mutex);
+        ++m_qq_status.connect_attempts;
+        if (failed) ++m_qq_status.connect_failures;
+    }
+    void RecordQQDNSRound() { LOCK(m_qq_status_mutex); ++m_qq_status.dns_rounds; }
+    /** Record a completed handshake with a QQ-capable outbound full-relay peer. */
+    void NoteQQHandshake(qq::Clock::time_point when = qq::Clock::now())
+    {
+        m_last_qq_handshake.store(when.time_since_epoch().count(), std::memory_order_relaxed);
+    }
+    /** True if a QQ-capable peer completed a handshake within qq::EVIDENCE_WINDOW of now. */
+    bool HasRecentQQHandshake(qq::Clock::time_point now = qq::Clock::now()) const
+    {
+        const auto last = m_last_qq_handshake.load(std::memory_order_relaxed);
+        if (last == 0) return false;
+        return now - qq::Clock::time_point{qq::Clock::duration{last}} <= qq::EVIDENCE_WINDOW;
+    }
+    /**
+     * Record an accepted HTTPS seed round with at least one hint. The publisher
+     * lists a node only after an outside handshake succeeded, so a fresh round
+     * counts as evidence that QQ peers are reachable. Not reported by getnetworkinfo.
+     */
+    void NoteQQSeedHints(size_t hints, qq::Clock::time_point when = qq::Clock::now())
+    {
+        m_last_qq_seed_hints_count.store(hints, std::memory_order_relaxed);
+        if (hints > 0) m_last_qq_seed_hints.store(when.time_since_epoch().count(), std::memory_order_relaxed);
+    }
+    /** True if an accepted HTTPS seed round carried hints within qq::EVIDENCE_WINDOW of now. */
+    bool HasRecentQQSeedHints(qq::Clock::time_point now = qq::Clock::now()) const
+    {
+        const auto last = m_last_qq_seed_hints.load(std::memory_order_relaxed);
+        if (last == 0) return false;
+        return now - qq::Clock::time_point{qq::Clock::duration{last}} <= qq::EVIDENCE_WINDOW;
+    }
+    /** QQ evidence for legacy-first: a recent QQ handshake or a recent seed round with hints. */
+    bool HasQQEvidence(qq::Clock::time_point now = qq::Clock::now()) const
+    {
+        return HasRecentQQHandshake(now) || HasRecentQQSeedHints(now);
+    }
+    /** Includes disconnecting nodes until their socket/grant has retired. */
+    bool HasNode(NodeId id) const { LOCK(m_nodes_mutex); for (const auto* node : m_nodes) if (node->GetId() == id) return true; return false; }
+
 
     bool AddNode(const AddedNodeParams& add) EXCLUSIVE_LOCKS_REQUIRED(!m_added_nodes_mutex);
     bool RemoveAddedNode(const std::string& node) EXCLUSIVE_LOCKS_REQUIRED(!m_added_nodes_mutex);
@@ -1210,10 +1485,10 @@ public:
     size_t GetNodeCount(ConnectionDirection) const;
     uint32_t GetMappedAS(const CNetAddr& addr) const;
     void GetNodeStats(std::vector<CNodeStats>& vstats) const;
-    bool DisconnectNode(const std::string& node);
-    bool DisconnectNode(const CSubNet& subnet);
-    bool DisconnectNode(const CNetAddr& addr);
-    bool DisconnectNode(NodeId id);
+    bool DisconnectNode(const std::string& node, DisconnectReason reason = DisconnectReason::LOCAL_RPC);
+    bool DisconnectNode(const CSubNet& subnet, DisconnectReason reason = DisconnectReason::LOCAL_RPC);
+    bool DisconnectNode(const CNetAddr& addr, DisconnectReason reason = DisconnectReason::LOCAL_RPC);
+    bool DisconnectNode(NodeId id, DisconnectReason reason = DisconnectReason::LOCAL_RPC);
 
     //! Used to convey which local services we are offering peers during node
     //! connection.
@@ -1255,12 +1530,15 @@ private:
     public:
         std::shared_ptr<Sock> sock;
         inline void AddSocketPermissionFlags(NetPermissionFlags& flags) const { NetPermissions::AddFlag(flags, m_permissions); }
-        ListenSocket(std::shared_ptr<Sock> sock_, NetPermissionFlags permissions_)
-            : sock{sock_}, m_permissions{permissions_}
+        ListenSocket(std::shared_ptr<Sock> sock_, NetPermissionFlags permissions_, CService bind_ = CService{})
+            : sock{sock_}, m_bind{std::move(bind_)}, m_permissions{permissions_}
         {
         }
+        //! The address this socket was actually bound to.
+        const CService& BindAddress() const { return m_bind; }
 
     private:
+        CService m_bind;
         NetPermissionFlags m_permissions;
     };
 
@@ -1269,6 +1547,15 @@ private:
     std::chrono::seconds GetMaxOutboundTimeLeftInCycle_() const EXCLUSIVE_LOCKS_REQUIRED(m_total_bytes_sent_mutex);
 
     bool BindListenPort(const CService& bindAddr, bilingual_str& strError, NetPermissionFlags permissions);
+    /** Create, bind and listen on a socket without registering it. `quiet` suppresses the log lines. */
+    /** If addr_in_use is given and the bind fails with "address in use", it is set to true and the error is not logged (the caller decides). */
+    bool BindListenSocket(const CService& bindAddr, bilingual_str& strError, std::shared_ptr<Sock>& out, bool quiet, bool* addr_in_use = nullptr);
+    /** Poller thread for -publicendpointfile. */
+    void ThreadPublicEndpoint();
+    /** Socket handler thread only: apply the wanted public endpoint (open/close the runtime listener, AddLocal). */
+    void ApplyPublicEndpoint();
+    /** Socket handler thread only: a configured listener already accepts IPv4 on every address at this port. */
+    bool ConfiguredListenerCoversIPv4(uint16_t port) const;
     bool Bind(const CService& addr, unsigned int flags, NetPermissionFlags permissions);
     bool InitBinds(const Options& options);
 
@@ -1296,7 +1583,7 @@ private:
     void DisconnectNodes() EXCLUSIVE_LOCKS_REQUIRED(!m_reconnections_mutex, !m_nodes_mutex);
     void NotifyNumConnectionsChanged();
     /** Return true if the peer is inactive and should be disconnected. */
-    bool InactivityCheck(const CNode& node) const;
+    bool InactivityCheck(const CNode& node, DisconnectReason* reason = nullptr) const;
 
     /**
      * Generate a collection of sockets to check for IO readiness.
@@ -1326,6 +1613,7 @@ private:
     void SocketHandlerListening(const Sock::EventsPerSock& events_per_sock);
 
     void ThreadSocketHandler() EXCLUSIVE_LOCKS_REQUIRED(!m_total_bytes_sent_mutex, !mutexMsgProc, !m_nodes_mutex, !m_reconnections_mutex);
+    void ThreadHTTPSAddressSeed() EXCLUSIVE_LOCKS_REQUIRED(!m_nodes_mutex, !m_https_seed_mutex);
     void ThreadDNSAddressSeed() EXCLUSIVE_LOCKS_REQUIRED(!m_addr_fetches_mutex, !m_nodes_mutex);
 
     uint64_t CalculateKeyedNetGroup(const CAddress& ad) const;
@@ -1341,7 +1629,7 @@ private:
     bool AlreadyConnectedToAddress(const CAddress& addr);
 
     bool AttemptToEvictConnection();
-    CNode* ConnectNode(CAddress addrConnect, const char *pszDest, bool fCountFailure, ConnectionType conn_type, bool use_v2transport) EXCLUSIVE_LOCKS_REQUIRED(!m_unused_i2p_sessions_mutex);
+    CNode* ConnectNode(CAddress addrConnect, const char *pszDest, bool fCountFailure, ConnectionType conn_type, bool use_v2transport, bool& attempted) EXCLUSIVE_LOCKS_REQUIRED(!m_unused_i2p_sessions_mutex);
     void AddWhitelistPermissionFlags(NetPermissionFlags& flags, const CNetAddr &addr) const;
 
     void DeleteNode(CNode* pnode);
@@ -1472,6 +1760,26 @@ private:
 
     // How many full-relay (tx, block, addr) outbound peers we want
     int m_max_outbound_full_relay;
+    std::atomic<qq::Clock::rep> m_last_qq_handshake{0};
+    std::atomic<qq::Clock::rep> m_last_qq_seed_hints{0};
+    std::atomic<size_t> m_last_qq_seed_hints_count{0};
+    std::atomic<uint64_t> m_dial_attempts{0};
+    std::atomic<uint64_t> m_qq_dial_attempts{0};
+    std::atomic<uint64_t> m_dial_failures{0};
+    /** Dial failures by class, indexed by the DialFailClass enum in net.cpp; the sum equals m_dial_failures. */
+    std::array<std::atomic<uint64_t>, DIAL_FAIL_CLASSES> m_dial_fail_by_class{};
+    std::atomic<uint8_t> m_last_dial_fail_class{DIAL_FAIL_CLASSES};
+    /** Outbound connections that connected at TCP level and ended before verack because the remote closed or reset. */
+    std::atomic<uint64_t> m_handshake_failures{0};
+    /** Times at which peers that completed the handshake were lost, for the lost_together count. */
+    Mutex m_lost_peers_mutex;
+    std::deque<std::chrono::steady_clock::time_point> m_lost_peer_times GUARDED_BY(m_lost_peers_mutex);
+    int m_qq_requested_target{-1};
+    int m_qq_target{0};
+    mutable Mutex m_qq_status_mutex;
+    QQStatus m_qq_status GUARDED_BY(m_qq_status_mutex);
+    std::weak_ptr<qq::Probe> m_qq_probe_lease GUARDED_BY(m_qq_status_mutex);
+
 
     // How many block-relay only outbound peers we want
     // We do not relay tx or addr messages with these peers
@@ -1510,6 +1818,13 @@ private:
      */
     CThreadInterrupt interruptNet;
 
+    /// P2P listen bind retry state, see BindListenPort(). The deadline is shared by all
+    /// binds of one InitBinds() call so that the total wait stays bounded.
+    int m_bind_retry_seconds{DEFAULT_BIND_RETRY_SECONDS};
+    std::function<bool()> m_shutdown_requested;
+    std::optional<SteadyClock::time_point> m_bind_retry_deadline;
+    bool m_bind_aborted{false};
+
     /**
      * I2P SAM session.
      * Used to accept incoming and make outgoing I2P connections from a persistent
@@ -1517,6 +1832,23 @@ private:
      */
     std::unique_ptr<i2p::sam::Session> m_i2p_sam_session;
 
+    // Serialize network disable with final directory admission; never held during I/O.
+    Mutex m_https_seed_mutex;
+    std::atomic<uint64_t> m_https_seed_generation{0};
+    bool m_https_seed_enabled{false};
+    std::thread threadHTTPSAddressSeed;
+    std::thread threadPublicEndpoint;
+    /// Runtime listening socket for the public endpoint port. Touched only by the
+    /// socket handler thread while threads run (and by Start/StopNodes outside them).
+    std::unique_ptr<ListenSocket> m_pe_listen_socket;
+    uint16_t m_pe_listen_port{0};
+    uint64_t m_pe_applied_gen{0};
+    std::string m_pe_last_logged_failure;
+    // Set in Init() before any thread starts, read-only afterwards.
+    std::string m_public_endpoint_file;
+    int64_t m_public_endpoint_max_age{publicendpoint::DEFAULT_MAX_AGE};
+    int64_t m_public_endpoint_poll_interval{publicendpoint::DEFAULT_POLL_INTERVAL};
+    std::set<uint16_t> m_public_endpoint_excluded_ports;
     std::thread threadDNSAddressSeed;
     std::thread threadSocketHandler;
     std::thread threadOpenAddedConnections;
@@ -1568,6 +1900,7 @@ private:
         std::string destination;
         ConnectionType conn_type;
         bool use_v2transport;
+        std::shared_ptr<qq::Probe> qq_probe;
     };
 
     /**
@@ -1622,6 +1955,10 @@ private:
     };
 
     const CChainParams& m_params;
+
+    // Test fixture is the sole installer; production always leaves this null.
+    const httpsseed::WorkerHooks* m_https_seed_test_hooks{nullptr};
+    const httpsseed::WorkerHooks* m_dns_seed_test_hooks{nullptr};
 
     friend struct ConnmanTestMsg;
 };

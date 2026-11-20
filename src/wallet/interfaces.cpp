@@ -36,6 +36,7 @@
 #include <util/ui_change_type.h>
 #include <wallet/coincontrol.h>
 #include <wallet/context.h>
+#include <wallet/display_balance.h>
 #include <wallet/fees.h>
 #include <wallet/types.h>
 #include <wallet/load.h>
@@ -48,6 +49,8 @@
 #include <wallet/wallet.h>
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <limits>
 #include <map>
 #include <memory>
@@ -64,6 +67,8 @@ using interfaces::MakeSignalHandler;
 using interfaces::Wallet;
 using interfaces::WalletAddress;
 using interfaces::WalletBalances;
+using interfaces::WalletDisplayBalances;
+using interfaces::WalletDisplayCoinFamily;
 using interfaces::WalletLoader;
 using interfaces::WalletMigrationResult;
 using interfaces::WalletMigrationStatus;
@@ -978,20 +983,28 @@ OperatorBondOutputs ScanOperatorBondOutputs(
     return outputs;
 }
 
-std::vector<WalletQuantumStakeOutputInfo> ListTieredStakeOutputs(
+static std::vector<WalletQuantumStakeOutputInfo> ListTieredStakeOutputsWithStatus(
     const CWallet& wallet,
     const std::string& address,
-    bool require_operator_lock)
+    bool require_operator_lock,
+    bool* available)
 {
+    if (available) *available = true;
     std::vector<WalletQuantumStakeOutputInfo> result;
     CTxDestination dest;
     const auto tier = DecodeTieredStakeAddress(address, dest, require_operator_lock);
     if (!tier) return result;
 
     TRY_LOCK(::cs_main, main_lock);
-    if (!main_lock) return result;
+    if (!main_lock) {
+        if (available) *available = false;
+        return result;
+    }
     TRY_LOCK(wallet.cs_wallet, wallet_lock);
-    if (!wallet_lock) return result;
+    if (!wallet_lock) {
+        if (available) *available = false;
+        return result;
+    }
     const auto key_info = wallet.GetQuantumKeyInfo(dest);
     if (!key_info) return result;
 
@@ -1018,6 +1031,12 @@ std::vector<WalletQuantumStakeOutputInfo> ListTieredStakeOutputs(
         result.push_back(std::move(info));
     }
     return result;
+}
+
+std::vector<WalletQuantumStakeOutputInfo> ListTieredStakeOutputs(
+    const CWallet& wallet, const std::string& address, bool require_operator_lock)
+{
+    return ListTieredStakeOutputsWithStatus(wallet, address, require_operator_lock, nullptr);
 }
 
 std::vector<LocalOperatorBondCandidate> FindWalletOperatorBondCandidates(const CWallet& wallet)
@@ -1500,8 +1519,8 @@ util::Result<WalletQuantumOperatorBondTx> FundColdStakeDelegationAddress(
         }
 
         const CCoinsViewCache& view = wallet.chain().chainman().ActiveChainstate().CoinsTip();
-        const node::QuantumPoolShare share = node::ComputeQuantumPoolShare(
-            view,
+        const node::QuantumPoolShareCalculator pool_shares{view};
+        const node::QuantumPoolShare share = pool_shares.ComputeShare(
             delegation->staker_pubkey_hash,
             node::GetQuantumPoolClaims(delegation->staker_pubkey_hash));
         const bool would_exceed_cap = node::WouldQuantumPoolExceedCap(
@@ -1509,7 +1528,7 @@ util::Result<WalletQuantumOperatorBondTx> FundColdStakeDelegationAddress(
             share.operator_share.verified_value,
             amount);
         const bool cap_filter_unlocked = would_exceed_cap &&
-            !node::HasQuantumPoolUnderCapCandidate(view, amount, {delegation->staker_pubkey_hash});
+            !pool_shares.HasUnderCapCandidate(amount, {delegation->staker_pubkey_hash});
         if (would_exceed_cap && !cap_filter_unlocked) {
             return util::Error{strprintf(
                 _("Error: This delegation would push the selected cold-staking node above the 20%% wallet-policy cap. Select an under-cap verified node or retry only if every verified node is over cap. Current selected node share: %d bps."),
@@ -1711,10 +1730,11 @@ util::Result<WalletQuantumOperatorBondTx> WithdrawColdStakeDelegationAddress(
 
 namespace {
 
-std::vector<WalletRGBAssetInfo> ListWalletRGBAssets(CWallet& wallet, bool include_spent)
+std::vector<WalletRGBAssetInfo> ListWalletRGBAssets(CWallet& wallet, bool include_spent, bool* available)
 {
     std::vector<WalletRGBAssetInfo> result;
     TRY_LOCK(wallet.cs_wallet, wallet_lock);
+    if (available) *available = bool(wallet_lock);
     if (!wallet_lock) return result;
 
     const auto contracts = wallet.ListRGBContracts();
@@ -1762,8 +1782,9 @@ std::vector<WalletRGBAssetInfo> ListWalletRGBAssets(CWallet& wallet, bool includ
     return result;
 }
 
-std::vector<WalletEUTXOStateInfo> ListWalletEUTXOStates(CWallet& wallet, bool include_spent)
+std::vector<WalletEUTXOStateInfo> ListWalletEUTXOStates(CWallet& wallet, bool include_spent, bool* available)
 {
+    if (available) *available = false;
     std::vector<std::pair<COutPoint, EUTXOStateRecord>> states;
     {
         TRY_LOCK(wallet.cs_wallet, wallet_lock);
@@ -1778,6 +1799,7 @@ std::vector<WalletEUTXOStateInfo> ListWalletEUTXOStates(CWallet& wallet, bool in
     TRY_LOCK(::cs_main, main_lock);
     if (!main_lock) return {};
     wallet.chain().findCoins(coins);
+    if (available) *available = true;
 
     std::vector<WalletEUTXOStateInfo> result;
     for (const auto& [outpoint, record] : states) {
@@ -2312,8 +2334,8 @@ util::Result<WalletQuantumActionTx> CreateWalletDemurrageSweep(CWallet& wallet, 
     return result;
 }
 
-//! Construct wallet tx struct.
-WalletTx MakeWalletTx(CWallet& wallet, const CWalletTx& wtx)
+//! Construct wallet tx struct. With value_keys, only those value_map entries are copied.
+WalletTx MakeWalletTx(CWallet& wallet, const CWalletTx& wtx, const std::vector<std::string>* value_keys = nullptr)
 {
     LOCK(wallet.cs_wallet);
     WalletTx result;
@@ -2339,7 +2361,14 @@ WalletTx MakeWalletTx(CWallet& wallet, const CWalletTx& wtx)
     result.debit = CachedTxGetDebit(wallet, wtx, ISMINE_ALL);
     result.change = CachedTxGetChange(wallet, wtx);
     result.time = wtx.GetTxTime();
-    result.value_map = wtx.mapValue;
+    if (value_keys) {
+        for (const std::string& key : *value_keys) {
+            const auto found = wtx.mapValue.find(key);
+            if (found != wtx.mapValue.end()) result.value_map.emplace(*found);
+        }
+    } else {
+        result.value_map = wtx.mapValue.ToMap();
+    }
     result.is_coinbase = wtx.IsCoinBase();
     result.is_coinstake = wtx.IsCoinStake();
     return result;
@@ -2397,6 +2426,7 @@ class WalletImpl : public Wallet
 {
 public:
     explicit WalletImpl(WalletContext& context, const std::shared_ptr<CWallet>& wallet) : m_context(context), m_wallet(wallet) {}
+    ~WalletImpl() override { releaseDisplay(); }
 
     bool encryptWallet(const SecureString& wallet_passphrase) override
     {
@@ -2405,6 +2435,10 @@ public:
     bool hasPrivateKeys() override { return m_wallet->HasPrivateKeys(); }
     bool isCrypted() override { return m_wallet->IsCrypted(); }
     bool lock() override { return m_wallet->Lock(); }
+    bool tryRestoreGuiUnlockState(bool relock, bool staking_only) override
+    {
+        return m_wallet->TryRestoreGuiUnlockState(relock, staking_only);
+    }
     bool unlock(const SecureString& wallet_passphrase,
                 std::optional<bool> staking_only) override
     {
@@ -2501,6 +2535,13 @@ public:
         }
         return true;
     }
+    std::optional<std::string> tryGetAddressLabel(const CTxDestination& dest) override
+    {
+        TRY_LOCK(m_wallet->cs_wallet, locked_wallet);
+        if (!locked_wallet) return std::nullopt;
+        const auto* entry = m_wallet->FindAddressBookEntry(dest, /*allow_change=*/false);
+        return entry ? entry->GetLabel() : std::string{};
+    }
     std::vector<WalletAddress> getAddresses() const override
     {
         LOCK(m_wallet->cs_wallet);
@@ -2512,6 +2553,27 @@ public:
             result.emplace_back(dest, is_mine, purpose.value_or(is_mine ? AddressPurpose::RECEIVE : AddressPurpose::SEND), label);
         });
         return result;
+    }
+    bool tryGetAddresses(std::vector<WalletAddress>& addresses,
+                         const std::function<bool()>& interrupt) const override
+    {
+        if (interrupt && interrupt()) return false;
+        TRY_LOCK(m_wallet->cs_wallet, locked_wallet);
+        if (!locked_wallet) return false;
+        struct Cancelled {};
+        std::vector<WalletAddress> result;
+        size_t visited{0};
+        try {
+            m_wallet->ForEachAddrBookEntry([&](const CTxDestination& dest, const std::string& label, bool is_change, const std::optional<AddressPurpose>& purpose) EXCLUSIVE_LOCKS_REQUIRED(m_wallet->cs_wallet) {
+                if (interrupt && visited++ % 64 == 0 && interrupt()) throw Cancelled{};
+                if (is_change) return;
+                const isminetype is_mine = m_wallet->IsMine(dest);
+                result.emplace_back(dest, is_mine, purpose.value_or(is_mine ? AddressPurpose::RECEIVE : AddressPurpose::SEND), label);
+            });
+        } catch (const Cancelled&) { return false; }
+        if (interrupt && interrupt()) return false;
+        addresses = std::move(result);
+        return true;
     }
     std::vector<std::string> getAddressReceiveRequests() override {
         LOCK(m_wallet->cs_wallet);
@@ -2606,23 +2668,104 @@ public:
         }
         return {};
     }
-    WalletTx getWalletTx(const uint256& txid) override
+    bool tryGetWalletTx(const uint256& txid, WalletTx& tx) override
     {
-        LOCK(m_wallet->cs_wallet);
-        auto mi = m_wallet->mapWallet.find(txid);
-        if (mi != m_wallet->mapWallet.end()) {
-            return MakeWalletTx(*m_wallet, mi->second);
+        TRY_LOCK(m_wallet->cs_wallet, locked_wallet);
+        if (!locked_wallet) {
+            return false;
         }
-        return {};
+        const auto it = m_wallet->mapWallet.find(txid);
+        tx = it != m_wallet->mapWallet.end() ? MakeWalletTx(*m_wallet, it->second) : WalletTx{};
+        return true;
     }
-    std::set<WalletTx> getWalletTxs() override
+    std::vector<WalletTx> getWalletTxsLocked()
+    {
+        AssertLockHeld(m_wallet->cs_wallet);
+        std::vector<WalletTx> transactions;
+        transactions.reserve(m_wallet->mapWallet.size());
+        for (const auto& entry : m_wallet->mapWallet) {
+            transactions.push_back(MakeWalletTx(*m_wallet, entry.second));
+        }
+        return transactions;
+    }
+    std::vector<WalletTx> getWalletTxs() override
     {
         LOCK(m_wallet->cs_wallet);
-        std::set<WalletTx> result;
+        return getWalletTxsLocked();
+    }
+    bool tryGetWalletTxs(std::vector<WalletTx>& transactions,
+                         const std::function<bool()>& interrupt = {}) override
+    {
+        if (interrupt && interrupt()) return false;
+        TRY_LOCK(m_wallet->cs_wallet, locked_wallet);
+        if (!locked_wallet || m_wallet->IsScanning()) return false;
+        std::vector<WalletTx> captured;
+        captured.reserve(m_wallet->mapWallet.size());
+        size_t visited{0};
         for (const auto& entry : m_wallet->mapWallet) {
-            result.emplace(MakeWalletTx(*m_wallet, entry.second));
+            if (interrupt && visited++ % 64 == 0 && interrupt()) return false;
+            captured.push_back(MakeWalletTx(*m_wallet, entry.second));
         }
-        return result;
+        if (interrupt && interrupt()) return false;
+        transactions = std::move(captured);
+        return true;
+    }
+    bool tryGetWalletTxHashes(std::vector<uint256>& hashes) override
+    {
+        TRY_LOCK(m_wallet->cs_wallet, locked_wallet);
+        if (!locked_wallet || m_wallet->IsScanning()) return false;
+        std::vector<uint256> captured;
+        captured.reserve(m_wallet->mapWallet.size());
+        for (const auto& entry : m_wallet->mapWallet) captured.push_back(entry.first);
+        hashes = std::move(captured);
+        return true;
+    }
+    bool tryGetWalletTxChunk(const std::vector<uint256>& hashes,
+                             size_t& pos,
+                             size_t max_txs,
+                             std::chrono::milliseconds budget,
+                             const std::vector<std::string>& value_keys,
+                             std::vector<WalletTx>& out) override
+    {
+        TRY_LOCK(m_wallet->cs_wallet, locked_wallet);
+        if (!locked_wallet || m_wallet->IsScanning()) return false;
+        const auto deadline = std::chrono::steady_clock::now() + budget;
+        size_t handled{0};
+        size_t next = pos;
+        while (next < hashes.size() && handled < max_txs) {
+            // Always make progress, then honour the lock budget every few transactions.
+            if (handled > 0 && handled % 16 == 0 && std::chrono::steady_clock::now() >= deadline) break;
+            const auto it = m_wallet->mapWallet.find(hashes[next]);
+            if (it != m_wallet->mapWallet.end()) out.push_back(MakeWalletTx(*m_wallet, it->second, &value_keys));
+            ++next;
+            ++handled;
+        }
+        pos = next;
+        return true;
+    }
+    bool tryGetTxStatuses(const std::vector<uint256>& txids,
+        std::vector<std::optional<WalletTxStatus>>& out,
+        int& num_blocks,
+        int64_t& block_time) override
+    {
+        TRY_LOCK(::cs_main, locked_main);
+        if (!locked_main) return false;
+        TRY_LOCK(m_wallet->cs_wallet, locked_wallet);
+        if (!locked_wallet) return false;
+        num_blocks = m_wallet->GetLastBlockHeight();
+        block_time = -1;
+        CHECK_NONFATAL(m_wallet->chain().findBlock(m_wallet->GetLastBlockHash(), FoundBlock().time(block_time)));
+        out.clear();
+        out.reserve(txids.size());
+        for (const uint256& txid : txids) {
+            const auto mi = m_wallet->mapWallet.find(txid);
+            if (mi == m_wallet->mapWallet.end()) {
+                out.emplace_back();
+            } else {
+                out.emplace_back(MakeWalletTxStatus(*m_wallet, mi->second));
+            }
+        }
+        return true;
     }
     bool tryGetTxStatus(const uint256& txid,
         interfaces::WalletTxStatus& tx_status,
@@ -2696,6 +2839,18 @@ public:
             result.have_watch_only = haveWatchOnly();
             return result;
         }
+        return makeBalances(bal, lifecycle);
+    }
+    WalletBalances makeBalances(const Balance& bal, const WalletLifecycleSummary& lifecycle)
+        EXCLUSIVE_LOCKS_REQUIRED(m_wallet->cs_wallet)
+    {
+        return makeBalances(bal, lifecycle, haveWatchOnly());
+    }
+    //! The display balances of a finished lifecycle-adjusted balance. Shared
+    //! by the single-lock path and the display worker's snapshots.
+    static WalletBalances makeBalances(const Balance& bal, const WalletLifecycleSummary& lifecycle, bool have_watch_only)
+    {
+        WalletBalances result;
         result.balance = bal.m_mine_trusted;
         result.legacy_balance = lifecycle.mine.spendable_legacy;
         result.quantum_balance = lifecycle.mine.spendable_quantum;
@@ -2720,7 +2875,7 @@ public:
         result.unconfirmed_balance = bal.m_mine_untrusted_pending;
         result.immature_balance = bal.m_mine_immature;
         result.stake = bal.m_mine_stake;
-        result.have_watch_only = haveWatchOnly();
+        result.have_watch_only = have_watch_only;
         if (result.have_watch_only) {
             result.watch_only_balance = bal.m_watchonly_trusted;
             result.unconfirmed_watch_only_balance = bal.m_watchonly_untrusted_pending;
@@ -2740,20 +2895,110 @@ public:
     }
     bool tryGetBalances(WalletBalances& balances, uint256& block_hash) override
     {
-        TRY_LOCK(::cs_main, locked_main);
-        if (!locked_main) {
-            return false;
-        }
-        TRY_LOCK(m_wallet->cs_wallet, locked_wallet);
-        if (!locked_wallet) {
-            return false;
-        }
-        // Notification delivery can lag a newly connected block. Returning
-        // false keeps the GUI's last valid balance until both views catch up.
-        if (!WalletLifecycleViewIsSynchronized(*m_wallet)) return false;
-        block_hash = m_wallet->GetLastBlockHash();
-        balances = getBalancesLocked();
+        WalletDisplayBalances result;
+        if (!tryGetDisplayBalances(result, std::nullopt, std::nullopt)) return false;
+        balances = result.balances;
+        block_hash = result.block_hash;
         return true;
+    }
+    //! How long a synchronous display request waits for the display worker.
+    static constexpr std::chrono::seconds DISPLAY_SYNC_TIMEOUT{10};
+    //! The display state of this wallet on the process-wide worker, acquired
+    //! on first use. Null once the wallet has been removed.
+    std::shared_ptr<WalletDisplayBalance> display()
+    {
+        std::lock_guard<std::mutex> lock(m_display_mutex);
+        if (!m_display && !m_display_released) m_display = DisplayBalanceWorker::Global().Acquire(*m_wallet);
+        return m_display;
+    }
+    //! Take the wallet off the display worker. Returns once the worker is not
+    //! in a slice of it; the worker does not touch the wallet afterwards.
+    void releaseDisplay()
+    {
+        {
+            std::lock_guard<std::mutex> lock(m_display_mutex);
+            m_display_released = true;
+            if (!m_display) return;
+            m_display.reset();
+        }
+        // Outside the mutex: this waits for the slice in progress, whose
+        // announcement may be read by a caller of display().
+        DisplayBalanceWorker::Global().Release(*m_wallet);
+    }
+    static std::optional<bool> DisplayFamilyIsQuantum(std::optional<WalletDisplayCoinFamily> family)
+    {
+        if (!family) return std::nullopt;
+        return *family == WalletDisplayCoinFamily::DIRECT_QUANTUM;
+    }
+    static void FillDisplayBalances(WalletDisplayBalances& result, const WalletDisplayBalance& state,
+                                    const DisplayBalanceSnapshot& snapshot)
+    {
+        result.available = true;
+        result.balances = makeBalances(snapshot.balance, snapshot.lifecycle, snapshot.have_watch_only);
+        result.block_hash = snapshot.tip_hash;
+        result.block_height = snapshot.tip_height;
+        result.exact = state.IsCurrent(snapshot);
+        result.sequence = snapshot.sequence;
+        result.send_family.reset();
+        result.send_family_balance.reset();
+        if (snapshot.send_family_quantum && snapshot.send_family_balance) {
+            result.send_family = *snapshot.send_family_quantum
+                ? WalletDisplayCoinFamily::DIRECT_QUANTUM : WalletDisplayCoinFamily::LEGACY;
+            result.send_family_balance = snapshot.send_family_balance;
+        }
+    }
+    WalletDisplayBalances getDisplaySnapshot() override
+    {
+        // Neither cs_main nor cs_wallet: the published snapshot behind its
+        // leaf mutex, and one atomic read of the wallet change marker.
+        WalletDisplayBalances result;
+        const std::shared_ptr<WalletDisplayBalance> state = display();
+        if (!state) return result;
+        result.failed = state->Failed();
+        if (const auto snapshot = state->Snapshot()) FillDisplayBalances(result, *state, *snapshot);
+        return result;
+    }
+    void requestDisplayBalances(bool foreground, std::optional<WalletDisplayCoinFamily> send_family, bool retry_send) override
+    {
+        const std::shared_ptr<WalletDisplayBalance> state = display();
+        if (!state) return;
+        if (state->SetInterest(foreground, DisplayFamilyIsQuantum(send_family), retry_send)) {
+            DisplayBalanceWorker::Global().Wake();
+        }
+    }
+    std::unique_ptr<Handler> handleDisplayBalancesChanged(DisplayBalancesChangedFn fn) override
+    {
+        const std::shared_ptr<WalletDisplayBalance> state = display();
+        if (!state) return MakeSignalHandler(boost::signals2::connection{});
+        return MakeSignalHandler(state->NotifyChanged.connect(fn));
+    }
+    bool tryGetDisplayBalances(WalletDisplayBalances& result,
+        const std::optional<uint256>& unchanged_tip, std::optional<WalletDisplayCoinFamily> send_family) override
+    {
+        // The caller waits for the display worker: a pass that starts after
+        // this call either confirms the published snapshot or replaces it.
+        // No wallet or chain lock is taken on this thread.
+        const std::shared_ptr<WalletDisplayBalance> state = display();
+        if (!state) return false;
+        const std::optional<bool> quantum = DisplayFamilyIsQuantum(send_family);
+        const auto deadline = std::chrono::steady_clock::now() + DISPLAY_SYNC_TIMEOUT;
+        for (int round = 0;; ++round) {
+            const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now());
+            if (remaining.count() <= 0) return false;
+            const DisplayBalanceOutcome outcome = state->RequestAndWait(
+                quantum, remaining, [] { DisplayBalanceWorker::Global().Wake(); });
+            if (outcome.exception) std::rethrow_exception(outcome.exception);
+            if (!outcome.ok || !outcome.snapshot) return false;
+            const DisplayBalanceSnapshot& snapshot = *outcome.snapshot;
+            // A send-family balance can miss its turn when a lock was busy.
+            if (quantum && round < 3 &&
+                !(snapshot.send_family_quantum == quantum && snapshot.send_family_balance)) continue;
+            // Nothing new to show.
+            if (unchanged_tip && *unchanged_tip == snapshot.tip_hash) return false;
+            FillDisplayBalances(result, *state, snapshot);
+            if (quantum && result.send_family != send_family) result.send_family_balance.reset();
+            return true;
+        }
     }
     CAmount getBalance() override
     {
@@ -2775,6 +3020,12 @@ public:
     CAmount getAvailableBalance(const CCoinControl& coin_control) override
     {
         LOCK2(::cs_main, m_wallet->cs_wallet);
+        return getAvailableBalanceLocked(coin_control);
+    }
+    CAmount getAvailableBalanceLocked(const CCoinControl& coin_control)
+    {
+        AssertLockHeld(::cs_main);
+        AssertLockHeld(m_wallet->cs_wallet);
         CAmount total_amount = 0;
         // Fetch selected coins total amount
         if (coin_control.HasSelected()) {
@@ -2816,10 +3067,28 @@ public:
     CoinsList listCoins() override
     {
         LOCK2(::cs_main, m_wallet->cs_wallet);
+        return *makeCoinsList(/*interrupt=*/{});
+    }
+    std::optional<CoinsList> tryListCoins(const std::function<bool()>& interrupt) override
+    {
+        if (interrupt && interrupt()) return std::nullopt;
+        TRY_LOCK(::cs_main, main_lock);
+        if (!main_lock) return std::nullopt;
+        TRY_LOCK(m_wallet->cs_wallet, wallet_lock);
+        if (!wallet_lock) return std::nullopt;
+        return makeCoinsList(interrupt);
+    }
+    std::optional<CoinsList> makeCoinsList(const std::function<bool()>& interrupt)
+        EXCLUSIVE_LOCKS_REQUIRED(::cs_main, m_wallet->cs_wallet)
+    {
+        const auto listed = ListCoins(*m_wallet, interrupt);
+        if (!listed) return std::nullopt;
         CoinsList result;
-        for (const auto& entry : ListCoins(*m_wallet)) {
+        size_t copied{0};
+        for (const auto& entry : *listed) {
             auto& group = result[entry.first];
             for (const auto& coin : entry.second) {
+                if (interrupt && copied++ % CoinFilterParams::INTERRUPT_CHECK_INTERVAL == 0 && interrupt()) return std::nullopt;
                 group.emplace_back(coin.outpoint,
                     MakeWalletTxOut(*m_wallet, coin));
             }
@@ -2853,6 +3122,7 @@ public:
     }
     bool hdEnabled() override { return m_wallet->IsHDEnabled(); }
     bool canGetAddresses() override { return m_wallet->CanGetAddresses(); }
+    bool tryCanGetAddresses(bool& result) override { return m_wallet->TryCanGetAddresses(result); }
     bool hasExternalSigner() override { return m_wallet->IsWalletFlagSet(WALLET_FLAG_EXTERNAL_SIGNER); }
     bool privateKeysDisabled() override { return m_wallet->IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS); }
     bool taprootEnabled() override {
@@ -2864,6 +3134,7 @@ public:
     CAmount getDefaultMaxTxFee() override { return m_wallet->m_default_max_tx_fee; }
     void remove() override
     {
+        releaseDisplay();
         RemoveWallet(m_context, m_wallet, /*load_on_start=*/false);
     }
     unsigned int getQQDevelopmentDonationPercentage() override
@@ -2929,6 +3200,11 @@ public:
     {
         return m_wallet->m_enabled_staking;
     }
+    bool isStakingOrPowMiningRequested() override
+    {
+        return m_wallet->m_enabled_staking.load(std::memory_order_relaxed) ||
+               m_wallet->m_pow_mining_enabled.load(std::memory_order_relaxed);
+    }
     interfaces::WalletStakingInfo getStakingInfo() override
     {
         const StakingTelemetrySnapshot snapshot =
@@ -2972,12 +3248,13 @@ public:
         return info;
     }
     bool setPowMining(bool enabled, int threads, int cpu_percent, std::string& error,
-                      bool allow_new_payout_key, bool* created_payout_key) override
+                      bool allow_new_payout_key, bool* created_payout_key,
+                      const std::function<bool()>& cancelled) override
     {
         bilingual_str werror;
         const bool ok = m_wallet->SetPowMining(
             enabled, threads, cpu_percent, werror, created_payout_key,
-            allow_new_payout_key);
+            allow_new_payout_key, /*wait_for_normal_unlock=*/false, cancelled);
         if (!ok) {
             error = werror.original;
             m_wallet->WalletLogPrintf("Gold Rush PoW miner configuration failed: %s\n", werror.original);
@@ -2996,6 +3273,8 @@ public:
         info.state = m_wallet->m_pow_state;
         info.threads = m_wallet->m_pow_threads;
         info.cpu_percent = m_wallet->m_pow_cpu_percent;
+        info.workers_hashing = m_wallet->m_pow_workers_hashing;
+        info.workers_error = m_wallet->m_pow_workers_error;
         info.hashrate = m_wallet->m_pow_hashrate;
         info.claims_submitted = m_wallet->m_pow_claims_submitted;
         info.shadow_whitelist_height = SHADOW_WHITELIST_HEIGHT;
@@ -3261,10 +3540,11 @@ public:
         if (!info) return util::Error{_("Error: Created quantum staking address is not wallet-backed")};
         return MakeWalletQuantumAddressInfo(*m_wallet, *info);
     }
-    std::vector<WalletQuantumAddressInfo> listQuantumAddresses() override
+    std::vector<WalletQuantumAddressInfo> listQuantumAddresses(bool* available = nullptr) override
     {
         std::vector<WalletQuantumAddressInfo> result;
         TRY_LOCK(m_wallet->cs_wallet, wallet_lock);
+        if (available) *available = bool(wallet_lock);
         if (!wallet_lock) return result;
         const auto infos = m_wallet->ListQuantumKeyInfos();
         result.reserve(infos.size());
@@ -3273,10 +3553,11 @@ public:
         }
         return result;
     }
-    std::vector<WalletQuantumColdStakeInfo> listQuantumColdStakeDelegations() override
+    std::vector<WalletQuantumColdStakeInfo> listQuantumColdStakeDelegations(bool* available = nullptr) override
     {
         std::vector<WalletQuantumColdStakeInfo> result;
         TRY_LOCK(m_wallet->cs_wallet, wallet_lock);
+        if (available) *available = bool(wallet_lock);
         if (!wallet_lock) return result;
         const auto infos = m_wallet->ListQuantumColdStakeDelegationInfos();
         result.reserve(infos.size());
@@ -3306,7 +3587,8 @@ public:
 
         ChainstateManager& chainman = m_wallet->chain().chainman();
         const CCoinsViewCache& view = chainman.ActiveChainstate().CoinsTip();
-        result.total_coldstake = node::ComputeQuantumColdStakeTotal(view);
+        const node::QuantumPoolShareCalculator pool_shares{view};
+        result.total_coldstake = pool_shares.TotalColdStake();
         result.cap_bps = node::QUANTUM_POOL_CAP_BPS;
 
         for (const auto& [staker_hash, claims] : local_claims) {
@@ -3329,7 +3611,7 @@ public:
         const std::vector<uint256> operators = node::ListQuantumPoolOperators();
         result.operators.reserve(operators.size());
         for (const uint256& staker_hash : operators) {
-            const node::QuantumPoolShare share = node::ComputeQuantumPoolShare(view, staker_hash, node::GetQuantumPoolClaims(staker_hash));
+            const node::QuantumPoolShare share = pool_shares.ComputeShare(staker_hash, node::GetQuantumPoolClaims(staker_hash));
 
             WalletQuantumPoolOperatorInfo entry;
             entry.staking_pubkey_hash = share.operator_share.staker_pubkey_hash.GetHex();
@@ -3378,9 +3660,9 @@ public:
     {
         return MakeWalletTieredStakeBondInfo(*m_wallet, stake_address, /*require_operator_lock=*/false);
     }
-    std::vector<WalletQuantumStakeOutputInfo> listQuantumStakeOutputs(const std::string& stake_address) override
+    std::vector<WalletQuantumStakeOutputInfo> listQuantumStakeOutputs(const std::string& stake_address, bool* available = nullptr) override
     {
-        return ListTieredStakeOutputs(*m_wallet, stake_address, /*require_operator_lock=*/false);
+        return ListTieredStakeOutputsWithStatus(*m_wallet, stake_address, /*require_operator_lock=*/false, available);
     }
     util::Result<WalletQuantumOperatorBondTx> fundQuantumStakeAddress(const std::string& stake_address, CAmount amount, bool allow_new_quantum_key) override
     {
@@ -3448,6 +3730,65 @@ public:
     WalletQuantumColdStakeBalanceInfo getQuantumColdStakeBalanceInfo(const std::string& coldstake_address) override
     {
         return MakeWalletColdStakeBalanceInfo(*m_wallet, coldstake_address);
+    }
+    std::map<std::string, WalletQuantumColdStakeBalanceInfo> getQuantumColdStakeBalances(
+        const std::vector<std::string>& addresses) override
+    {
+        std::map<std::string, WalletQuantumColdStakeBalanceInfo> result;
+        if (addresses.empty()) return result;
+        for (const auto& address : addresses) result.try_emplace(address);
+
+        TRY_LOCK(::cs_main, main_lock);
+        if (!main_lock) {
+            for (auto& entry : result) entry.second.available = false;
+            return result;
+        }
+        TRY_LOCK(m_wallet->cs_wallet, wallet_lock);
+        if (!wallet_lock) {
+            for (auto& entry : result) entry.second.available = false;
+            return result;
+        }
+
+        std::map<CScript, WalletQuantumColdStakeBalanceInfo> by_script;
+        std::map<std::string, CScript> valid_addresses;
+        for (const auto& entry : result) {
+            CTxDestination dest;
+            if (!DecodeWalletColdStakeDelegationAddress(*m_wallet, entry.first, dest)) continue;
+            auto script = GetScriptForDestination(dest);
+            auto& balance = by_script[script];
+            balance.valid_delegation_address = true;
+            balance.current_height = m_wallet->GetLastBlockHeight();
+            valid_addresses.emplace(entry.first, std::move(script));
+        }
+        if (by_script.empty()) return result;
+
+        // Same list-unspent policy as the single-address display read.
+        CoinFilterParams filter;
+        filter.only_spendable = false;
+        filter.skip_locked = false;
+        filter.include_immature_coinbase = false;
+        filter.include_locked_quantum_stake_outputs = true;
+        for (const COutput& out : AvailableCoinsListUnspent(*m_wallet, nullptr, filter).All()) {
+            if (out.txout.nValue <= 0) continue;
+            const auto found = by_script.find(out.txout.scriptPubKey);
+            if (found == by_script.end()) continue;
+            auto& balance = found->second;
+            balance.amount += out.txout.nValue;
+            ++balance.outputs;
+            if (out.depth > 0) {
+                balance.confirmed_amount += out.txout.nValue;
+                ++balance.confirmed_outputs;
+            } else {
+                balance.unconfirmed_amount += out.txout.nValue;
+                ++balance.unconfirmed_outputs;
+            }
+            if (out.spendable) {
+                balance.spendable_amount += out.txout.nValue;
+                ++balance.spendable_outputs;
+            }
+        }
+        for (const auto& entry : valid_addresses) result.at(entry.first) = by_script.at(entry.second);
+        return result;
     }
     util::Result<WalletQuantumOperatorBondTx> fundQuantumColdStakeAddress(const std::string& coldstake_address, CAmount amount, bool allow_new_quantum_key) override
     {
@@ -3645,13 +3986,13 @@ public:
     {
         return CreateQuantumMigrationSweep(*m_wallet, /*goldrush_rewards_only=*/true, /*allow_goldrush_epoch=*/true, /*destination_label=*/"", /*comment_override=*/"", allow_new_quantum_key);
     }
-    std::vector<WalletRGBAssetInfo> listRGBAssets(bool include_spent = false) override
+    std::vector<WalletRGBAssetInfo> listRGBAssets(bool include_spent = false, bool* available = nullptr) override
     {
-        return ListWalletRGBAssets(*m_wallet, include_spent);
+        return ListWalletRGBAssets(*m_wallet, include_spent, available);
     }
-    std::vector<WalletEUTXOStateInfo> listEUTXOStates(bool include_spent = false) override
+    std::vector<WalletEUTXOStateInfo> listEUTXOStates(bool include_spent = false, bool* available = nullptr) override
     {
-        return ListWalletEUTXOStates(*m_wallet, include_spent);
+        return ListWalletEUTXOStates(*m_wallet, include_spent, available);
     }
     WalletDemurrageInfo getDemurrageInfo() override
     {
@@ -3701,6 +4042,9 @@ public:
 
     WalletContext& m_context;
     std::shared_ptr<CWallet> m_wallet;
+    std::mutex m_display_mutex;
+    std::shared_ptr<WalletDisplayBalance> m_display;
+    bool m_display_released{false};
 };
 
 class WalletLoaderImpl : public WalletLoader

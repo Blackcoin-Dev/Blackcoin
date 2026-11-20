@@ -133,11 +133,36 @@ bool VerifyQuantumPoolOperatorCommitment(const CCoinsView& view, const std::vect
 
 QuantumPoolShare ComputeQuantumPoolShare(const CCoinsView& view, const uint256& staker_pubkey_hash, const std::vector<QuantumPoolClaim>& claims)
 {
+    return QuantumPoolShareCalculator{view}.ComputeShare(staker_pubkey_hash, claims);
+}
+
+CAmount QuantumPoolShareCalculator::TotalColdStake() const
+{
+    if (!m_total_coldstake) m_total_coldstake = ComputeQuantumColdStakeTotal(m_view);
+    return *m_total_coldstake;
+}
+
+QuantumPoolShare QuantumPoolShareCalculator::ComputeShare(const uint256& staker_pubkey_hash, const std::vector<QuantumPoolClaim>& claims) const
+{
     QuantumPoolShare share;
-    share.total_coldstake = ComputeQuantumColdStakeTotal(view);
+    share.total_coldstake = TotalColdStake();
     share.operator_share.staker_pubkey_hash = staker_pubkey_hash;
-    share.operator_share.staker_pubkey = GetQuantumPoolOperatorPubKey(staker_pubkey_hash);
-    share.operator_share.operator_commitment_verified = IsQuantumPoolOperatorCommitmentVerified(staker_pubkey_hash);
+    bool commitment_registered{false};
+    {
+        LOCK(g_quantum_pool_mutex);
+        const auto it = g_quantum_pool_registry.find(staker_pubkey_hash);
+        if (it != g_quantum_pool_registry.end()) {
+            share.operator_share.staker_pubkey = it->second.staker_pubkey;
+            share.operator_share.operator_commitment_outpoint = it->second.operator_commitment_outpoint;
+            commitment_registered = it->second.operator_commitment_verified;
+        }
+    }
+    // Registration preserves the proof reference across spends and reorgs.
+    // Eligibility must follow the caller's current coins view without mutating
+    // that reference, so restoring a commitment also restores its eligibility.
+    share.operator_share.operator_commitment_verified = commitment_registered &&
+        VerifyQuantumPoolOperatorCommitment(m_view, share.operator_share.staker_pubkey,
+                                            share.operator_share.operator_commitment_outpoint);
 
     std::set<COutPoint> seen;
     for (const QuantumPoolClaim& claim : claims) {
@@ -145,7 +170,7 @@ QuantumPoolShare ComputeQuantumPoolShare(const CCoinsView& view, const uint256& 
             ++share.operator_share.invalid_claims;
             continue;
         }
-        const QuantumPoolClaimResult verified = VerifyQuantumPoolClaim(view, claim);
+        const QuantumPoolClaimResult verified = VerifyQuantumPoolClaim(m_view, claim);
         if (!verified.valid) {
             ++share.operator_share.invalid_claims;
             continue;
@@ -185,11 +210,16 @@ bool WouldQuantumPoolExceedCap(CAmount total_coldstake, CAmount operator_value, 
 
 bool HasQuantumPoolUnderCapCandidate(const CCoinsView& view, CAmount inflow, const std::vector<uint256>& excluded_staker_hashes)
 {
+    return QuantumPoolShareCalculator{view}.HasUnderCapCandidate(inflow, excluded_staker_hashes);
+}
+
+bool QuantumPoolShareCalculator::HasUnderCapCandidate(CAmount inflow, const std::vector<uint256>& excluded_staker_hashes) const
+{
     for (const uint256& staker_hash : ListQuantumPoolOperators()) {
         if (std::find(excluded_staker_hashes.begin(), excluded_staker_hashes.end(), staker_hash) != excluded_staker_hashes.end()) {
             continue;
         }
-        const QuantumPoolShare share = ComputeQuantumPoolShare(view, staker_hash, GetQuantumPoolClaims(staker_hash));
+        const QuantumPoolShare share = ComputeShare(staker_hash, GetQuantumPoolClaims(staker_hash));
         if (!share.operator_share.operator_commitment_verified || share.operator_share.staker_pubkey.empty()) {
             continue;
         }
@@ -238,22 +268,6 @@ std::vector<QuantumPoolClaim> GetQuantumPoolClaims(const uint256& staker_pubkey_
     const auto it = g_quantum_pool_registry.find(staker_pubkey_hash);
     if (it == g_quantum_pool_registry.end()) return {};
     return it->second.claims;
-}
-
-std::vector<unsigned char> GetQuantumPoolOperatorPubKey(const uint256& staker_pubkey_hash)
-{
-    LOCK(g_quantum_pool_mutex);
-    const auto it = g_quantum_pool_registry.find(staker_pubkey_hash);
-    if (it == g_quantum_pool_registry.end()) return {};
-    return it->second.staker_pubkey;
-}
-
-bool IsQuantumPoolOperatorCommitmentVerified(const uint256& staker_pubkey_hash)
-{
-    LOCK(g_quantum_pool_mutex);
-    const auto it = g_quantum_pool_registry.find(staker_pubkey_hash);
-    if (it == g_quantum_pool_registry.end()) return false;
-    return it->second.operator_commitment_verified;
 }
 
 std::vector<uint256> ListQuantumPoolOperators()

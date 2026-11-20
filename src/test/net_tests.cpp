@@ -5,19 +5,25 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
+#include <banman.h>
+#include <blockencodings.h>
 #include <chainparams.h>
 #include <clientversion.h>
 #include <common/args.h>
 #include <compat/compat.h>
+#include <consensus/validation.h>
 #include <cstdint>
 #include <net.h>
 #include <net_processing.h>
 #include <netaddress.h>
 #include <netbase.h>
+#include <net_https_seed.h>
 #include <netmessagemaker.h>
+#include <node/blockstorage.h>
 #include <serialize.h>
 #include <span.h>
 #include <streams.h>
+#include <test/util/net.h>
 #include <test/util/random.h>
 #include <test/util/setup_common.h>
 #include <test/util/validation.h>
@@ -30,14 +36,112 @@
 #include <boost/test/unit_test.hpp>
 
 #include <algorithm>
+#include <condition_variable>
+#include <fstream>
 #include <ios>
 #include <memory>
+#include <mutex>
 #include <optional>
+#include <stdexcept>
 #include <string>
+
+#ifndef WIN32
+#include <sys/stat.h>
+#endif
 
 using namespace std::literals;
 
 BOOST_FIXTURE_TEST_SUITE(net_tests, RegTestingSetup)
+
+BOOST_AUTO_TEST_CASE(qq_capacity_policy)
+{
+    for (const int capacity : {0, 1, 2, 8, 16}) {
+        ConnmanTestMsg connman{0, 0, *m_node.addrman, *m_node.netgroupman, Params()};
+        CConnman::Options options;
+        options.nMaxConnections = capacity;
+        options.m_max_outbound_full_relay = MAX_OUTBOUND_FULL_RELAY_CONNECTIONS;
+        connman.Init(options);
+        BOOST_CHECK_EQUAL(connman.GetQQTarget(), capacity / 2);
+        options.m_qq_outbound_target = 100;
+        connman.Init(options);
+        BOOST_CHECK_EQUAL(connman.GetQQTarget(), std::max(0, capacity - 1));
+        options.m_qq_outbound_target = 0;
+        connman.Init(options);
+        BOOST_CHECK_EQUAL(connman.GetQQTarget(), 0);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(qq_probe_fallback_deadline)
+{
+    const auto start = qq::Clock::time_point{};
+    auto lease = std::make_shared<qq::Probe>(start);
+    std::weak_ptr<qq::Probe> outstanding{lease};
+    auto fallback = lease;
+    lease.reset();
+    BOOST_CHECK(!outstanding.expired());
+    BOOST_CHECK(!fallback->Expired(start + 119s));
+    BOOST_CHECK(fallback->Expired(start + 120s));
+    BOOST_CHECK(fallback->Expired(start + 24h)); // Resume coalesces elapsed deadlines.
+    fallback.reset();
+    BOOST_CHECK(outstanding.expired());
+}
+
+BOOST_AUTO_TEST_CASE(qq_queued_fallback_expiration_and_batch)
+{
+    ConnmanTestMsg connman{0, 0, *m_node.addrman, *m_node.netgroupman, Params()};
+    connman.InitReconnectionTest();
+    struct SocketFactoryGuard {
+        decltype(CreateSock) original{CreateSock};
+        ~SocketFactoryGuard() { CreateSock = std::move(original); }
+    } socket_factory_guard;
+    unsigned int attempted{0};
+    CreateSock = [&](const CService&) -> std::unique_ptr<Sock> { ++attempted; return nullptr; };
+    auto expired = std::make_shared<qq::Probe>(qq::Clock::now() - qq::PROBE_RESIDENCE);
+    std::weak_ptr<qq::Probe> token = expired;
+    connman.QueueReconnection(connman.AcquireOutboundPermit(), std::move(expired));
+    BOOST_CHECK(!token.expired());
+    connman.PerformReconnections();
+    BOOST_CHECK(token.expired());
+    BOOST_CHECK_EQUAL(attempted, 0U);
+    // Expiration returns the actual semaphore permit exactly once.
+    auto returned = connman.AcquireOutboundPermit();
+    BOOST_CHECK(returned);
+    returned.Release();
+    connman.QueueReconnection({});
+    connman.QueueReconnection({});
+    connman.PerformReconnections();
+    BOOST_CHECK_EQUAL(attempted, 1U);
+    BOOST_CHECK_EQUAL(connman.GetReconnectionCount(), 1U);
+    connman.PerformReconnections();
+    BOOST_CHECK_EQUAL(attempted, 2U);
+}
+
+BOOST_AUTO_TEST_CASE(qq_transient_fairness)
+{
+    qq::Arbiter arbiter;
+    std::array<bool, qq::Arbiter::CLASSES> due;
+    due.fill(true);
+    for (int cycle = 0; cycle < 100; ++cycle) {
+        std::set<int> served;
+        for (size_t turn = 0; turn < due.size(); ++turn) served.insert(arbiter.Pick(due));
+        BOOST_CHECK_EQUAL(served.size(), due.size());
+    }
+    due.fill(false);
+    BOOST_CHECK_EQUAL(arbiter.Pick(due), -1);
+    due[1] = due[5] = true; // Continuous address discovery cannot starve QQ, or vice versa.
+    for (int turn = 0; turn < 100; ++turn) BOOST_CHECK_EQUAL(arbiter.Pick(due), turn % 2 ? 5 : 1);
+}
+
+BOOST_AUTO_TEST_CASE(addr_fetch_bounded_and_canonical)
+{
+    ConnmanTestMsg connman{0, 0, *m_node.addrman, *m_node.netgroupman, Params()};
+    connman.AddAddrFetch("EXAMPLE.TEST.");
+    connman.AddAddrFetch("example.test");
+    BOOST_CHECK_EQUAL(connman.GetAddrFetchCount(), 1U);
+    BOOST_CHECK_EQUAL(connman.GetAddrFetchFront(), "EXAMPLE.TEST.");
+    for (size_t i = 0; i < qq::MAX_ADDR_FETCHES * 2; ++i) connman.AddAddrFetch(strprintf("seed%u.test", i));
+    BOOST_CHECK_EQUAL(connman.GetAddrFetchCount(), qq::MAX_ADDR_FETCHES);
+}
 
 BOOST_AUTO_TEST_CASE(cnode_listen_port)
 {
@@ -49,6 +153,407 @@ BOOST_AUTO_TEST_CASE(cnode_listen_port)
     BOOST_CHECK(gArgs.SoftSetArg("-port", ToString(altPort)));
     port = GetListenPort();
     BOOST_CHECK(port == altPort);
+}
+
+BOOST_AUTO_TEST_CASE(addr_fetch_retains_pending_work)
+{
+    ConnmanTestMsg connman{0, 0, *m_node.addrman, *m_node.netgroupman, Params()};
+    connman.InitAddrFetchTest();
+
+    // Count attempted destinations without creating sockets or using the network.
+    struct SocketFactoryGuard {
+        decltype(CreateSock) original{CreateSock};
+        ~SocketFactoryGuard() { CreateSock = std::move(original); }
+    } socket_factory_guard;
+    std::vector<CService> attempted;
+    CreateSock = [&attempted](const CService& address) -> std::unique_ptr<Sock> {
+        attempted.push_back(address);
+        return nullptr;
+    };
+
+    connman.AddAddrFetch("8.8.8.8:15714");
+    connman.AddAddrFetch("9.9.9.9:15714");
+    auto occupied{connman.AcquireOutboundPermit()};
+    connman.ProcessAddrFetch();
+    BOOST_CHECK_EQUAL(connman.GetAddrFetchCount(), 2U);
+    BOOST_CHECK(attempted.empty());
+
+    connman.SetNetworkActive(false);
+    occupied.Release();
+    connman.ProcessAddrFetch();
+    BOOST_CHECK_EQUAL(connman.GetAddrFetchCount(), 2U);
+    BOOST_CHECK(attempted.empty());
+
+    connman.SetNetworkActive(true);
+    connman.ProcessAddrFetch();
+    BOOST_CHECK_EQUAL(connman.GetAddrFetchCount(), 1U);
+    BOOST_REQUIRE_EQUAL(attempted.size(), 1U);
+    BOOST_CHECK(attempted[0] == LookupNumeric("8.8.8.8:15714"));
+
+    connman.ProcessAddrFetch();
+    BOOST_CHECK_EQUAL(connman.GetAddrFetchCount(), 0U);
+    BOOST_REQUIRE_EQUAL(attempted.size(), 2U);
+    BOOST_CHECK(attempted[1] == LookupNumeric("9.9.9.9:15714"));
+
+    connman.ProcessAddrFetch();
+    BOOST_CHECK_EQUAL(attempted.size(), 2U);
+}
+
+BOOST_AUTO_TEST_CASE(reconnections_with_exhausted_permits)
+{
+    // Exercise each real worker independently: either one must be able to
+    // consume a fallback while both permit pools remain exhausted.
+    for (const bool addnode : {false, true}) {
+        ConnmanTestMsg connman{0, 0, *m_node.addrman, *m_node.netgroupman, Params()};
+        connman.InitReconnectionTest();
+        auto outbound{connman.AcquireOutboundPermit()};
+        auto manual{connman.AcquireAddnodePermit()};
+
+        struct SocketFactoryGuard {
+            decltype(CreateSock) original{CreateSock};
+            ~SocketFactoryGuard() { CreateSock = std::move(original); }
+        } socket_factory_guard;
+        std::mutex mutex;
+        std::condition_variable attempted_cv;
+        unsigned int attempted{0};
+        CreateSock = [&](const CService&) -> std::unique_ptr<Sock> {
+            {
+                std::lock_guard<std::mutex> lock{mutex};
+                ++attempted;
+            }
+            attempted_cv.notify_one();
+            return nullptr;
+        };
+
+        connman.StartConnectionWorker(addnode);
+        // Let the worker reach its first exhausted-permit acquisition before
+        // queueing. No unrelated node or test grant is released to wake it.
+        std::this_thread::sleep_for(750ms);
+        connman.QueueReconnection(addnode ? std::move(manual) : std::move(outbound));
+        bool retried;
+        {
+            std::unique_lock<std::mutex> lock{mutex};
+            retried = attempted_cv.wait_for(lock, 5s, [&] { return attempted != 0; });
+        }
+        connman.Interrupt();
+        connman.StopThreads();
+        BOOST_CHECK_MESSAGE(retried, (addnode ? "addnode fallback stalled" : "automatic fallback stalled"));
+        BOOST_CHECK_EQUAL(attempted, 1U);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(reconnections_respect_networkactive_and_interrupt)
+{
+    ConnmanTestMsg connman{0, 0, *m_node.addrman, *m_node.netgroupman, Params()};
+    connman.InitReconnectionTest();
+    struct SocketFactoryGuard {
+        decltype(CreateSock) original{CreateSock};
+        ~SocketFactoryGuard() { CreateSock = std::move(original); }
+    } socket_factory_guard;
+    unsigned int attempted{0};
+    CreateSock = [&](const CService&) -> std::unique_ptr<Sock> {
+        ++attempted;
+        return nullptr;
+    };
+
+    connman.SetNetworkActive(false);
+    connman.QueueReconnection(connman.AcquireOutboundPermit());
+    connman.PerformReconnections();
+    BOOST_CHECK_EQUAL(attempted, 0U);
+
+    connman.SetNetworkActive(true);
+    connman.PerformReconnections();
+    BOOST_CHECK_EQUAL(attempted, 1U);
+
+    connman.Interrupt();
+    connman.QueueReconnection(connman.AcquireOutboundPermit());
+    connman.PerformReconnections();
+    BOOST_CHECK_EQUAL(attempted, 1U);
+}
+
+BOOST_AUTO_TEST_CASE(header_replay_filter_at_capacity)
+{
+    const int capacity{static_cast<int>(DEFAULT_HEADER_SPAM_FILTER_MAX_SIZE)};
+    CBlockIndex first, last;
+    first.nHeight = 0;
+    last.nHeight = capacity - 1;
+    CNodeHeaders full_filter;
+    BOOST_REQUIRE(full_filter.addHeaders(&first, &last));
+    BlockValidationState initial_state;
+    BOOST_REQUIRE(full_filter.updateState(0, initial_state, true));
+
+    // Repeating the lowest retained height must reach the same existing spam
+    // threshold as repeating another retained height, without evicting it.
+    unsigned int reference_replays{0};
+    for (const int height : {capacity - 1, capacity / 2, 0}) {
+        CNodeHeaders filter{full_filter};
+        CBlockIndex repeated;
+        repeated.nHeight = height;
+        unsigned int replays{0};
+        BlockValidationState state;
+        while (replays < DEFAULT_HEADER_SPAM_FILTER_MAX_SIZE * 5) {
+            BOOST_REQUIRE(filter.addHeaders(&repeated, &repeated));
+            ++replays;
+            if (!filter.updateState(0, state, true)) break;
+        }
+        BOOST_CHECK(state.GetResult() == BlockValidationResult::BLOCK_HEADER_SPAM);
+        if (reference_replays == 0) reference_replays = replays;
+        BOOST_CHECK_EQUAL(replays, reference_replays);
+    }
+
+    // New distinct heights still evict old entries. Without the bound this
+    // many fresh heights alone would exceed the unchanged total-count limit.
+    CNodeHeaders filter{full_filter};
+    first.nHeight = capacity;
+    last.nHeight = capacity * 6;
+    BOOST_REQUIRE(filter.addHeaders(&first, &last));
+    BlockValidationState bounded_state;
+    BOOST_CHECK(filter.updateState(0, bounded_state, true));
+}
+
+BOOST_AUTO_TEST_CASE(header_replay_compact_counter_equivalence)
+{
+    // Compare the compact production counter with an independent ordered-map
+    // reference over overlapping ranges, retained replays, and new low heights.
+    constexpr size_t capacity{17};
+    CNodeHeaders compact{capacity, 1000000};
+    std::map<int, uint32_t> reference;
+    uint32_t sequence{0x6d2b79f5};
+    for (int turn = 0; turn < 3000; ++turn) {
+        sequence = static_cast<uint32_t>(
+            uint64_t{sequence} * 1664525U + 1013904223U);
+        const int first_height = (sequence >> 16) % 73;
+        const int last_height = first_height + (sequence % 5);
+        CBlockIndex first, last;
+        first.nHeight = first_height;
+        last.nHeight = last_height;
+        BOOST_REQUIRE(compact.addHeaders(&first, &last));
+        for (int height = first_height; height <= last_height; ++height) {
+            auto known = reference.find(height);
+            if (known != reference.end()) ++known->second;
+            else {
+                if (reference.size() == capacity) reference.erase(reference.begin());
+                reference.emplace(height, 1);
+            }
+        }
+        BOOST_CHECK_EQUAL(compact.HeightCount(), reference.size());
+        for (int height = 0; height < 80; ++height) {
+            const auto known = reference.find(height);
+            BOOST_CHECK_EQUAL(compact.CountAtHeight(height), known == reference.end() ? 0U : known->second);
+        }
+    }
+    BOOST_CHECK_THROW(CNodeHeaders(MAX_HEADER_SPAM_FILTER_POINTS + 1, 10), std::invalid_argument);
+}
+
+BOOST_AUTO_TEST_CASE(header_replay_identity_reserve_and_churn)
+{
+    CServiceHeaderTracker tracker;
+    const auto start = CServiceHeaderTracker::Clock::time_point{};
+    const auto address = [](unsigned int value) {
+        return LookupNumeric(strprintf("23.%u.%u.1", value / 256, value % 256), 15714);
+    };
+    constexpr size_t general = CServiceHeaderTracker::MAX_SERVICES - CServiceHeaderTracker::INITIATED_RESERVE;
+    CBlockIndex repeated;
+    repeated.nHeight = 0;
+    for (size_t i = 0; i < general; ++i) {
+        const auto service = address(i);
+        auto* headers = tracker.GetOrCreate(service, false, 1, start + (i == 0 ? 0s : 60s));
+        BOOST_REQUIRE(headers);
+        if (i == 0) {
+            for (int replay = 0; replay < 3; ++replay) BOOST_REQUIRE(headers->addHeaders(&repeated, &repeated));
+        }
+        tracker.Disconnected(service, start + (i == 0 ? 0s : 60s));
+    }
+    BOOST_CHECK_EQUAL(tracker.GeneralSize(), general);
+    BOOST_CHECK(!tracker.GetOrCreate(address(general), false, 1, start));
+    for (size_t i = general; i < CServiceHeaderTracker::MAX_SERVICES; ++i) {
+        const auto service = address(i);
+        BOOST_REQUIRE(tracker.GetOrCreate(service, true, 1, start + 60s));
+        tracker.Disconnected(service, start + 60s);
+    }
+    // Unknown identities cannot grow storage, evict existing evidence, or
+    // consume unbounded expiry metadata, even under sustained churn.
+    for (unsigned int i = 2000; i < 12000; ++i) {
+        BOOST_CHECK(!tracker.GetOrCreate(address(i), i % 2, 1, start + 30min));
+    }
+    BOOST_CHECK_EQUAL(tracker.Size(), CServiceHeaderTracker::MAX_SERVICES);
+    auto* retained = tracker.GetOrCreate(address(0), false, 0, start + 30min);
+    BOOST_REQUIRE(retained);
+    BOOST_CHECK_EQUAL(retained->CountAtHeight(0), 3U);
+    BOOST_REQUIRE(retained->addHeaders(&repeated, &repeated));
+    BOOST_CHECK_EQUAL(retained->CountAtHeight(0), 4U);
+    // Only one record has expired at this boundary. Exactly one admission
+    // succeeds and every other unexpired identity still occupies its slot.
+    BOOST_REQUIRE(tracker.GetOrCreate(address(12000), false, 1, start + 1h));
+    BOOST_CHECK_EQUAL(tracker.Size(), CServiceHeaderTracker::MAX_SERVICES);
+    BOOST_CHECK_EQUAL(tracker.GeneralSize(), general);
+    BOOST_CHECK(!tracker.GetOrCreate(address(12001), false, 1, start + 1h));
+    BOOST_REQUIRE(tracker.GetOrCreate(address(12001), false, 1, start + 1h + 60s));
+    BOOST_CHECK_EQUAL(tracker.Size(), 2U);
+    BOOST_CHECK_EQUAL(tracker.GeneralSize(), 2U);
+}
+
+BOOST_AUTO_TEST_CASE(header_replay_lifecycle_normalization_and_expiry)
+{
+    CServiceHeaderTracker tracker;
+    const auto start = CServiceHeaderTracker::Clock::time_point{};
+    const auto first = LookupNumeric("23.1.1.1", 15714);
+    const auto second = LookupNumeric("23.1.1.1", 25714);
+    const auto key = CServiceHeaderTracker::Normalize(first, true);
+    BOOST_CHECK(key == CServiceHeaderTracker::Normalize(second, true));
+    BOOST_CHECK(CServiceHeaderTracker::Normalize(first, false) != CServiceHeaderTracker::Normalize(second, false));
+    // Lazy admission sees both already-live connections to the same key.
+    auto* headers = tracker.GetOrCreate(key, true, 2, start);
+    BOOST_REQUIRE(headers);
+    CBlockIndex repeated;
+    repeated.nHeight = 0;
+    BOOST_REQUIRE(headers->addHeaders(&repeated, &repeated));
+    tracker.Disconnected(key, start + 1min);
+    BOOST_REQUIRE(tracker.GetOrCreate(key, false, 1, start + 2h));
+    BOOST_CHECK_EQUAL(tracker.GetOrCreate(key, false, 1, start + 2h)->CountAtHeight(0), 1U);
+    tracker.Disconnected(key, start + 2h);
+    tracker.Connected(key, start + 2h + 59min);
+    headers = tracker.GetOrCreate(key, false, 1, start + 2h + 59min);
+    BOOST_REQUIRE(headers);
+    BOOST_CHECK_EQUAL(headers->CountAtHeight(0), 1U);
+    tracker.Disconnected(key, start + 3h);
+    // Reconnection before expiry resets the disconnected retention deadline.
+    BOOST_CHECK_EQUAL(tracker.GetOrCreate(key, false, 0, start + 3h + 59min)->CountAtHeight(0), 1U);
+    // Connected() removes an expired disconnected record before pinning; the
+    // new lazy admission starts with fresh counters at the retention boundary.
+    tracker.Connected(key, start + 4h);
+    headers = tracker.GetOrCreate(key, false, 1, start + 4h);
+    BOOST_REQUIRE(headers);
+    BOOST_CHECK_EQUAL(headers->CountAtHeight(0), 0U);
+}
+
+BOOST_AUTO_TEST_CASE(header_replay_threshold_survives_reconnect)
+{
+    CServiceHeaderTracker tracker;
+    const auto start = CServiceHeaderTracker::Clock::time_point{};
+    const auto service = LookupNumeric("23.2.1.1", 15714);
+    auto* headers = tracker.GetOrCreate(service, true, 1, start);
+    BOOST_REQUIRE(headers);
+    CBlockIndex first, last;
+    first.nHeight = 0;
+    last.nHeight = DEFAULT_HEADER_SPAM_FILTER_MAX_SIZE - 1;
+    BOOST_REQUIRE(headers->addHeaders(&first, &last));
+    BlockValidationState state;
+    for (unsigned int i = 0; i < DEFAULT_HEADER_SPAM_FILTER_MAX_SIZE * 5 && !state.IsInvalid(); ++i) {
+        BOOST_REQUIRE(headers->addHeaders(&first, &first));
+        headers->updateState(0, state, true);
+    }
+    BOOST_REQUIRE(state.GetResult() == BlockValidationResult::BLOCK_HEADER_SPAM);
+    const uint32_t evidence = headers->CountAtHeight(0);
+    BOOST_CHECK_GT(evidence, 1U);
+    tracker.Disconnected(service, start);
+    tracker.Connected(service, start + 59min);
+    headers = tracker.GetOrCreate(service, true, 1, start + 59min);
+    BOOST_REQUIRE(headers);
+    BOOST_CHECK_EQUAL(headers->CountAtHeight(0), evidence);
+    BlockValidationState reconnect_state;
+    BOOST_CHECK(!headers->updateState(1, reconnect_state, true));
+    BOOST_CHECK(reconnect_state.GetResult() == BlockValidationResult::BLOCK_HEADER_SPAM);
+    tracker.Disconnected(service, start + 59min);
+    tracker.Connected(service, start + 2h);
+    headers = tracker.GetOrCreate(service, true, 1, start + 2h);
+    BOOST_REQUIRE(headers);
+    BOOST_CHECK_EQUAL(headers->HeightCount(), 0U);
+    BlockValidationState fresh;
+    BOOST_CHECK(headers->updateState(2, fresh, true));
+}
+
+BOOST_FIXTURE_TEST_CASE(header_replay_capacity_message_paths, TestChain100Setup)
+{
+    LOCK(NetEventsInterface::g_msgproc_mutex);
+    if (m_node.chainman->IsInitialBlockDownload()) {
+        static_cast<TestChainstateManager&>(*m_node.chainman).JumpOutOfIbd();
+    }
+    auto banman = std::make_unique<BanMan>(m_args.GetDataDirBase() / "header-capacity-banlist", nullptr, DEFAULT_MISBEHAVING_BANTIME);
+    ConnmanTestMsg connman{0, 0, *m_node.addrman, *m_node.netgroupman, Params()};
+    auto peerman = PeerManager::make(connman, *m_node.addrman, banman.get(), *m_node.chainman, *m_node.mempool, {});
+    CConnman::Options options;
+    options.m_msgproc = peerman.get();
+    connman.Init(options);
+    NodeId next_id{0};
+    const auto address = [](unsigned int value) {
+        return LookupNumeric(strprintf("24.%u.%u.1", value / 256, value % 256), 15714);
+    };
+    const auto make_peer = [&](unsigned int value, uint16_t port = 15714) {
+        const CService endpoint{address(value), port};
+        auto node = std::make_unique<CNode>(next_id++, nullptr, CAddress{endpoint, NODE_NETWORK},
+            0, 0, CAddress{}, "", ConnectionType::INBOUND, false);
+        peerman->InitializeNode(*node, NODE_NETWORK);
+        node->nVersion = PROTOCOL_VERSION;
+        node->SetCommonVersion(PROTOCOL_VERSION);
+        node->fSuccessfullyConnected = true;
+        return node;
+    };
+    std::atomic<bool> interrupt{false};
+    const CNetMsgMaker maker{PROTOCOL_VERSION};
+    const auto deliver = [&](CNode& node, CSerializedNetMsg message) {
+        CDataStream stream{message.data, SER_NETWORK};
+        peerman->ProcessMessage(node, message.m_type, stream, 0us, interrupt);
+    };
+    const CBlockHeader known{WITH_LOCK(cs_main, return m_node.chainman->ActiveChain().Tip()->GetBlockHeader())};
+    CBlock header_only;
+    static_cast<CBlockHeader&>(header_only) = known;
+    const auto header_message = [&] { return maker.Make(NetMsgType::HEADERS, TX_WITH_WITNESS(std::vector<CBlock>{header_only})); };
+    // Both connections predate lazy record admission. Filtering is initially
+    // disabled; enabling it must count the second, still-dormant connection.
+    // Neither finalization may underflow or free the other's retained state.
+    const bool original_filter = m_node.args->GetBoolArg("-headerspamfilter", DEFAULT_HEADER_SPAM_FILTER);
+    struct FilterGuard {
+        ArgsManager& args;
+        bool original;
+        ~FilterGuard() { args.ForceSetArg("-headerspamfilter", original ? "1" : "0"); }
+    } filter_guard{*m_node.args, original_filter};
+    m_node.args->ForceSetArg("-headerspamfilter", "0");
+    auto dormant = make_peer(0);
+    auto active = make_peer(0, 25714);
+    deliver(*active, header_message());
+    BOOST_REQUIRE(!active->fDisconnect);
+    m_node.args->ForceSetArg("-headerspamfilter", "1");
+    deliver(*active, header_message());
+    BOOST_REQUIRE(!active->fDisconnect);
+    peerman->FinalizeNode(*active);
+    deliver(*dormant, header_message());
+    BOOST_REQUIRE(!dormant->fDisconnect);
+    peerman->FinalizeNode(*dormant);
+    // Populate actual PeerManager accounting through accepted HEADERS, then
+    // disconnect. No test hook injects records or overrides the capacity.
+    for (size_t i = 0; i < CServiceHeaderTracker::MAX_SERVICES - CServiceHeaderTracker::INITIATED_RESERVE; ++i) {
+        auto node = make_peer(i);
+        deliver(*node, header_message());
+        BOOST_REQUIRE(!node->fDisconnect);
+        peerman->FinalizeNode(*node);
+    }
+    const CBlock candidate = CreateBlock({}, CScript{} << OP_TRUE, m_node.chainman->ActiveChainstate());
+    for (const auto& type : {NetMsgType::HEADERS, NetMsgType::CMPCTBLOCK, NetMsgType::BLOCK}) {
+        auto node = make_peer(10000 + next_id);
+        if (type == NetMsgType::HEADERS) {
+            CBlock header;
+            static_cast<CBlockHeader&>(header) = candidate.GetBlockHeader();
+            deliver(*node, maker.Make(type, TX_WITH_WITNESS(std::vector<CBlock>{header})));
+        } else if (type == NetMsgType::CMPCTBLOCK) {
+            deliver(*node, maker.Make(type, CBlockHeaderAndShortTxIDs{candidate}));
+        } else {
+            deliver(*node, maker.Make(type, TX_WITH_WITNESS(candidate)));
+        }
+        BOOST_CHECK(node->fDisconnect);
+        BOOST_CHECK(!banman->IsDiscouraged(node->addr));
+        BOOST_CHECK(!banman->IsBanned(node->addr));
+        // Resource refusal precedes validation. No caller may fall through to
+        // header/block acceptance, mark a valid block invalid, or dereference
+        // an absent returned block index.
+        BOOST_CHECK(WITH_LOCK(cs_main, return m_node.chainman->m_blockman.LookupBlockIndex(candidate.GetHash()) == nullptr));
+        peerman->FinalizeNode(*node);
+    }
+    auto retained = make_peer(0);
+    deliver(*retained, maker.Make(NetMsgType::BLOCK, TX_WITH_WITNESS(candidate)));
+    BOOST_CHECK(!retained->fDisconnect);
+    BOOST_CHECK(WITH_LOCK(cs_main, return m_node.chainman->ActiveChain().Tip()->GetBlockHash() == candidate.GetHash()));
+    peerman->FinalizeNode(*retained);
 }
 
 BOOST_AUTO_TEST_CASE(cnode_simple_test)
@@ -1566,6 +2071,384 @@ BOOST_AUTO_TEST_CASE(v2transport_test)
         auto ret = tester.Interact();
         BOOST_CHECK(!ret);
     }
+}
+
+// Runtime public endpoint (-publicendpointfile)
+
+namespace {
+std::string Json(const std::string& address = "8.8.4.4", const std::string& port = "44822", const std::string& observed = "1794480000")
+{
+    return "{\"schema\":\"blackcoin.public-endpoint/1\",\"address\":\"" + address + "\",\"port\":" + port + ",\"observed_at\":" + observed + "}";
+}
+bool Rejects(const std::string& text, const std::string& expect_reason_part = "")
+{
+    std::string reason;
+    const auto tuple = publicendpoint::Parse(text, reason);
+    if (tuple) return false;
+    return expect_reason_part.empty() || reason.find(expect_reason_part) != std::string::npos;
+}
+std::unique_ptr<CNode> MakePeer(const CService& peer_addr, ConnectionType type = ConnectionType::OUTBOUND_FULL_RELAY)
+{
+    return std::make_unique<CNode>(/*id=*/0, /*sock=*/nullptr, CAddress{peer_addr, NODE_NETWORK},
+                                   /*nKeyedNetGroupIn=*/0, /*nLocalHostNonceIn=*/0, CAddress{},
+                                   /*pszDest=*/std::string{}, type, /*inbound_onion=*/false);
+}
+struct PublicEndpointReset {
+    PublicEndpointReset() { publicendpoint::Reset(); }
+    ~PublicEndpointReset() { publicendpoint::Reset(); }
+};
+} // namespace
+
+BOOST_AUTO_TEST_CASE(pe_parse_valid)
+{
+    std::string reason;
+    const auto tuple = publicendpoint::Parse(Json(), reason);
+    BOOST_REQUIRE_MESSAGE(tuple.has_value(), reason);
+    BOOST_CHECK_EQUAL(tuple->address.ToStringAddr(), "8.8.4.4");
+    BOOST_CHECK_EQUAL(tuple->port, 44822);
+    BOOST_CHECK_EQUAL(tuple->observed_at, 1794480000);
+    // key order, whitespace and a trailing newline are fine
+    BOOST_CHECK(publicendpoint::Parse("{ \"observed_at\": 1794480000,\n \"port\": 1, \"address\": \"8.8.4.4\", \"schema\": \"blackcoin.public-endpoint/1\" }\n", reason));
+    BOOST_CHECK(publicendpoint::Parse(Json("8.8.4.4", "65535"), reason));
+    BOOST_CHECK(publicendpoint::Parse(Json("8.8.4.4", "1"), reason));
+}
+
+BOOST_AUTO_TEST_CASE(pe_parse_invalid)
+{
+    BOOST_CHECK(Rejects("", "empty"));
+    BOOST_CHECK(Rejects("not json"));
+    BOOST_CHECK(Rejects("[]"));
+    BOOST_CHECK(Rejects("\"x\""));
+    BOOST_CHECK(Rejects("{}", "unexpected keys"));
+    // unknown schema or version
+    BOOST_CHECK(Rejects(R"({"schema":"blackcoin.public-endpoint/2","address":"8.8.4.4","port":1,"observed_at":1794480000})", "schema"));
+    BOOST_CHECK(Rejects(R"({"schema":1,"address":"8.8.4.4","port":1,"observed_at":1794480000})", "schema"));
+    // extra key, missing key, duplicate key
+    BOOST_CHECK(Rejects(R"({"schema":"blackcoin.public-endpoint/1","address":"8.8.4.4","port":1,"observed_at":1794480000,"x":1})", "unexpected keys"));
+    BOOST_CHECK(Rejects(R"({"schema":"blackcoin.public-endpoint/1","address":"8.8.4.4","port":1})", "unexpected keys"));
+    BOOST_CHECK(Rejects(R"({"schema":"blackcoin.public-endpoint/1","address":"8.8.4.4","port":1,"port":2})", "unexpected keys"));
+    BOOST_CHECK(Rejects(R"({"schema":"blackcoin.public-endpoint/1","schema":"blackcoin.public-endpoint/1","address":"8.8.4.4","port":1})", "unexpected keys"));
+    // wrong types
+    BOOST_CHECK(Rejects(Json("8.8.4.4", "\"44822\""), "wrong value type"));
+    BOOST_CHECK(Rejects(Json("8.8.4.4", "44822", "\"1794480000\""), "wrong value type"));
+    BOOST_CHECK(Rejects(Json("8.8.4.4", "true"), "wrong value type"));
+    BOOST_CHECK(Rejects(Json("8.8.4.4", "null"), "wrong value type"));
+    BOOST_CHECK(Rejects(R"({"schema":"blackcoin.public-endpoint/1","address":4,"port":1,"observed_at":1794480000})", "wrong value type"));
+    // port forms and range
+    BOOST_CHECK(Rejects(Json("8.8.4.4", "0")));
+    BOOST_CHECK(Rejects(Json("8.8.4.4", "65536"), "port"));
+    BOOST_CHECK(Rejects(Json("8.8.4.4", "-1"), "port"));
+    BOOST_CHECK(Rejects(Json("8.8.4.4", "44822.0"), "port"));
+    BOOST_CHECK(Rejects(Json("8.8.4.4", "4.4822e4"), "port"));
+    BOOST_CHECK(Rejects(Json("8.8.4.4", "099999")));
+    BOOST_CHECK(Rejects(Json("8.8.4.4", "123456"), "port"));
+    // observed_at forms
+    BOOST_CHECK(Rejects(Json("8.8.4.4", "1", "-5"), "observed_at"));
+    BOOST_CHECK(Rejects(Json("8.8.4.4", "1", "0"), "observed_at"));
+    BOOST_CHECK(Rejects(Json("8.8.4.4", "1", "1794480000.5"), "observed_at"));
+    BOOST_CHECK(Rejects(Json("8.8.4.4", "1", "1e9"), "observed_at"));
+    BOOST_CHECK(Rejects(Json("8.8.4.4", "1", "99999999999999999999"), "observed_at"));
+    // addresses: private, loopback, documentation, shared, multicast, IPv6, names, non-canonical
+    for (const std::string a : {"10.1.2.3", "127.0.0.1", "192.168.1.1", "172.16.0.1", "169.254.1.1", "100.64.0.1", "0.0.0.0",
+                                "203.0.113.7", "198.51.100.1", "224.0.0.1", "255.255.255.255", "2001:4860:4860::8888",
+                                "localhost", "example.com", "", " 8.8.4.4", "8.8.4.4 ", "08.8.4.4", "8.8.4.04", "8.8.4", "8.8.4.4.4",
+                                "0x8.8.4.4", "::ffff:8.8.4.4", "8.8.4.4:44822", "8.8.4.4/32", "8.8.4.4%eth0"}) {
+        BOOST_CHECK_MESSAGE(Rejects(Json(a), "address"), "address accepted: " + a);
+    }
+    // oversize and not plain text
+    std::string padded = Json();
+    padded.insert(padded.size() - 1, std::string(300, ' '));
+    BOOST_CHECK(Rejects(padded, "256"));
+    BOOST_CHECK(Rejects(Json() + " trailing"));
+    BOOST_CHECK(Rejects(Json() + "{}"));
+    {
+        // The text holds a NUL byte, so take its length from the array.
+        static constexpr char with_nul[] = "{\"schema\":\"blackcoin.public-endpoint/1\",\"address\":\"8.8.4.4\",\"port\":1,\"observed_at\":1794480000,\0}";
+        BOOST_CHECK(Rejects(std::string(with_nul, sizeof(with_nul) - 1), ""));
+    }
+    BOOST_CHECK(Rejects("\xff\xfe{}", "ASCII"));
+    BOOST_CHECK(Rejects(R"({"schema":"blackcoin.public-endpoint/1","address":"8.8.4.4","port":1,"observed_at":1794480000})" "\x01", "ASCII"));
+    // exactly 256 bytes of valid content is accepted
+    std::string exact = Json();
+    exact.insert(exact.size() - 1, std::string(256 - exact.size(), ' '));
+    BOOST_CHECK_EQUAL(exact.size(), 256U);
+    std::string reason;
+    BOOST_CHECK_MESSAGE(publicendpoint::Parse(exact, reason).has_value(), reason);
+    exact += " ";
+    BOOST_CHECK(Rejects(exact, "256"));
+}
+
+BOOST_AUTO_TEST_CASE(pe_file_names)
+{
+    BOOST_CHECK(publicendpoint::ValidFileName("public-endpoint.json"));
+    BOOST_CHECK(publicendpoint::ValidFileName(".hidden"));
+    for (const std::string n : {std::string{}, std::string{"."}, std::string{".."}, std::string{"a/b"}, std::string{"../x"}, std::string{"/abs"}, std::string{"a\\b"}, std::string{"x\n"}, std::string{"c:file"}, std::string("a\0b", 3), std::string(256, 'a')}) {
+        BOOST_CHECK_MESSAGE(!publicendpoint::ValidFileName(n), "name accepted: " + n);
+    }
+    std::string reason;
+    BOOST_CHECK(!publicendpoint::ReadFile(m_path_root, "../escape", reason));
+    BOOST_CHECK_EQUAL(reason, "invalid file name");
+}
+
+#ifndef WIN32
+BOOST_AUTO_TEST_CASE(pe_read_file)
+{
+    const fs::path dir{m_path_root / "pe_read"};
+    fs::create_directories(dir);
+    std::string reason;
+
+    BOOST_CHECK(!publicendpoint::ReadFile(dir, "missing.json", reason));
+    BOOST_CHECK_EQUAL(reason, "file not found");
+
+    {
+        std::ofstream f{dir / "ok.json", std::ios::binary};
+        f << Json();
+    }
+    const auto content = publicendpoint::ReadFile(dir, "ok.json", reason);
+    BOOST_REQUIRE(content.has_value());
+    BOOST_CHECK_EQUAL(*content, Json());
+
+    // a symbolic link is never followed, whatever it points to
+    fs::create_symlink(dir / "ok.json", dir / "link.json");
+    BOOST_CHECK(!publicendpoint::ReadFile(dir, "link.json", reason));
+    BOOST_CHECK_EQUAL(reason, "file is a symbolic link");
+    fs::create_symlink("/etc/hosts", dir / "link2.json");
+    BOOST_CHECK(!publicendpoint::ReadFile(dir, "link2.json", reason));
+    BOOST_CHECK_EQUAL(reason, "file is a symbolic link");
+    fs::create_symlink(dir / "nowhere", dir / "dangling.json");
+    BOOST_CHECK(!publicendpoint::ReadFile(dir, "dangling.json", reason));
+    BOOST_CHECK_EQUAL(reason, "file is a symbolic link");
+
+    // a directory and a fifo are not regular files (and reading a fifo does not block)
+    fs::create_directories(dir / "subdir.json");
+    BOOST_CHECK(!publicendpoint::ReadFile(dir, "subdir.json", reason));
+    BOOST_CHECK_EQUAL(reason, "not a regular file");
+    BOOST_REQUIRE_EQUAL(mkfifo((dir / "fifo.json").c_str(), 0600), 0);
+    BOOST_CHECK(!publicendpoint::ReadFile(dir, "fifo.json", reason));
+    BOOST_CHECK_EQUAL(reason, "not a regular file");
+
+    // oversize: 257 bytes is refused, 256 is read
+    {
+        std::ofstream f{dir / "big.json", std::ios::binary};
+        f << std::string(257, ' ');
+    }
+    BOOST_CHECK(!publicendpoint::ReadFile(dir, "big.json", reason));
+    BOOST_CHECK_EQUAL(reason, "file larger than 256 bytes");
+    {
+        std::ofstream f{dir / "max.json", std::ios::binary};
+        f << std::string(256, ' ');
+    }
+    BOOST_CHECK(publicendpoint::ReadFile(dir, "max.json", reason).has_value());
+    {
+        std::ofstream f{dir / "huge.json", std::ios::binary};
+        f << std::string(100000, 'x');
+    }
+    BOOST_CHECK(!publicendpoint::ReadFile(dir, "huge.json", reason));
+    BOOST_CHECK_EQUAL(reason, "file larger than 256 bytes");
+}
+#endif
+
+BOOST_AUTO_TEST_CASE(pe_tracker_two_reads)
+{
+    publicendpoint::Tracker tracker{180, {}};
+    const int64_t now{1794480000};
+    const auto read = [&](const std::string& addr, uint16_t port, int64_t observed) {
+        publicendpoint::Tuple t;
+        BOOST_REQUIRE(httpsseed::ParsePublicAddress(addr, t.address));
+        t.port = port;
+        t.observed_at = observed;
+        return t;
+    };
+    // first read: nothing yet
+    auto d = tracker.Observe(read("8.8.4.4", 5000, now), "", now);
+    BOOST_CHECK(!d.wanted);
+    // second identical read: applied (observed_at may differ, the pair is what must match)
+    d = tracker.Observe(read("8.8.4.4", 5000, now + 15), "", now + 15);
+    BOOST_REQUIRE(d.wanted);
+    BOOST_CHECK_EQUAL(d.wanted->ToStringAddrPort(), "8.8.4.4:5000");
+    BOOST_CHECK_EQUAL(d.observed_at, now + 15);
+    // refreshed read keeps it
+    d = tracker.Observe(read("8.8.4.4", 5000, now + 30), "", now + 30);
+    BOOST_REQUIRE(d.wanted);
+    BOOST_CHECK_EQUAL(d.observed_at, now + 30);
+    // a different pair: the old one stays until the new one is confirmed
+    d = tracker.Observe(read("8.8.4.4", 6000, now + 45), "", now + 45);
+    BOOST_REQUIRE(d.wanted);
+    BOOST_CHECK_EQUAL(d.wanted->GetPort(), 5000);
+    d = tracker.Observe(read("8.8.4.4", 6000, now + 60), "", now + 60);
+    BOOST_REQUIRE(d.wanted);
+    BOOST_CHECK_EQUAL(d.wanted->GetPort(), 6000);
+    // a flapping pair (A, B, A) never applies B and A needs two consecutive reads again
+    d = tracker.Observe(read("8.8.4.4", 7000, now + 75), "", now + 75);
+    d = tracker.Observe(read("8.8.4.4", 6000, now + 90), "", now + 90);
+    BOOST_REQUIRE(d.wanted);
+    BOOST_CHECK_EQUAL(d.wanted->GetPort(), 6000);
+    // an unusable read withdraws at once and the next good pair needs two reads
+    d = tracker.Observe(std::nullopt, "file not found", now + 105);
+    BOOST_CHECK(!d.wanted);
+    BOOST_CHECK_EQUAL(d.status, "file not found");
+    d = tracker.Observe(read("8.8.4.4", 6000, now + 120), "", now + 120);
+    BOOST_CHECK(!d.wanted);
+    d = tracker.Observe(read("8.8.4.4", 6000, now + 135), "", now + 135);
+    BOOST_CHECK(d.wanted);
+    // a bad read between two good ones breaks the run
+    tracker.Observe(std::nullopt, "malformed", now + 150);
+    d = tracker.Observe(read("8.8.4.4", 6000, now + 165), "", now + 165);
+    BOOST_CHECK(!d.wanted);
+}
+
+BOOST_AUTO_TEST_CASE(pe_tracker_age_future_ports)
+{
+    const int64_t now{1794480000};
+    publicendpoint::Tracker tracker{180, {8332, 8334}};
+    const auto read = [&](uint16_t port, int64_t observed) {
+        publicendpoint::Tuple t;
+        BOOST_REQUIRE(httpsseed::ParsePublicAddress("8.8.4.4", t.address));
+        t.port = port;
+        t.observed_at = observed;
+        return t;
+    };
+    // stale: older than the maximum age is refused, exactly the maximum age is fine
+    for (int i = 0; i < 2; ++i) BOOST_CHECK(!tracker.Observe(read(5000, now - 181), "", now).wanted);
+    tracker.Observe(read(5000, now - 180), "", now);
+    BOOST_CHECK(tracker.Observe(read(5000, now - 180), "", now).wanted);
+    // an applied pair goes stale: withdrawn on the first stale read
+    BOOST_CHECK(!tracker.Observe(read(5000, now - 180), "", now + 1).wanted);
+    // future: up to 60 s tolerated, beyond that refused
+    publicendpoint::Tracker t2{180, {}};
+    t2.Observe(read(5000, now + 60), "", now);
+    BOOST_CHECK(t2.Observe(read(5000, now + 60), "", now).wanted);
+    publicendpoint::Tracker t3{180, {}};
+    t3.Observe(read(5000, now + 61), "", now);
+    const auto future = t3.Observe(read(5000, now + 61), "", now);
+    BOOST_CHECK(!future.wanted);
+    BOOST_CHECK_EQUAL(future.status, "observed_at is in the future");
+    // reserved ports (RPC, onion target) are never a public pair
+    publicendpoint::Tracker t4{180, {8332, 8334}};
+    t4.Observe(read(8332, now), "", now);
+    BOOST_CHECK(!t4.Observe(read(8332, now), "", now).wanted);
+    t4.Observe(read(8334, now), "", now);
+    BOOST_CHECK(!t4.Observe(read(8334, now), "", now).wanted);
+    // a one-second maximum age
+    publicendpoint::Tracker t5{1, {}};
+    t5.Observe(read(5000, now - 1), "", now);
+    BOOST_CHECK(t5.Observe(read(5000, now - 1), "", now).wanted);
+    BOOST_CHECK(!t5.Observe(read(5000, now - 1), "", now + 1).wanted);
+}
+
+BOOST_AUTO_TEST_CASE(pe_state_generation_and_retry)
+{
+    PublicEndpointReset guard;
+    uint64_t applied{0};
+    std::optional<CService> wanted;
+    int64_t observed{0};
+    std::string status;
+    BOOST_CHECK(!publicendpoint::Enabled());
+    publicendpoint::SetEnabled(true);
+    BOOST_CHECK(publicendpoint::Enabled());
+    BOOST_CHECK(!publicendpoint::TakeWork(applied, wanted, observed, status));
+
+    const CService pair{LookupNumeric("8.8.4.4", 5000)};
+    publicendpoint::Tracker::Decision d;
+    d.wanted = pair;
+    d.observed_at = 100;
+    publicendpoint::Submit(d);
+    BOOST_REQUIRE(publicendpoint::TakeWork(applied, wanted, observed, status));
+    BOOST_CHECK(wanted == pair);
+    BOOST_CHECK_EQUAL(observed, 100);
+    BOOST_CHECK(!publicendpoint::TakeWork(applied, wanted, observed, status)); // nothing new
+
+    // bind failed (not active): the same wanted pair is retried on the next poll
+    publicendpoint::Withdraw("cannot listen");
+    publicendpoint::Submit(d);
+    BOOST_CHECK(publicendpoint::TakeWork(applied, wanted, observed, status));
+    BOOST_CHECK_EQUAL(publicendpoint::GetInfo().status, "cannot listen");
+    BOOST_CHECK(!publicendpoint::GetInfo().active);
+
+    // success: no more retries, seq moves once
+    const uint64_t seq0{publicendpoint::ChangeSeq()};
+    publicendpoint::Activate(pair, 100);
+    BOOST_CHECK_EQUAL(publicendpoint::ChangeSeq(), seq0 + 1);
+    publicendpoint::Activate(pair, 115);
+    BOOST_CHECK_EQUAL(publicendpoint::ChangeSeq(), seq0 + 1);
+    publicendpoint::Submit(d);
+    BOOST_CHECK(!publicendpoint::TakeWork(applied, wanted, observed, status));
+    BOOST_CHECK(publicendpoint::GetInfo().active);
+    BOOST_CHECK_EQUAL(publicendpoint::GetInfo().status, "active");
+    BOOST_CHECK_EQUAL(publicendpoint::GetInfo().address, "8.8.4.4");
+    BOOST_CHECK_EQUAL(publicendpoint::GetInfo().port, 5000);
+    BOOST_CHECK_EQUAL(publicendpoint::GetInfo().via, "runtime");
+    publicendpoint::Activate(pair, 116, /*via_configured_listener=*/true);
+    BOOST_CHECK_EQUAL(publicendpoint::GetInfo().via, "configured");
+    BOOST_CHECK_EQUAL(publicendpoint::ChangeSeq(), seq0 + 1); // same pair, no re-announcement
+    publicendpoint::Withdraw("x");
+    BOOST_CHECK(publicendpoint::GetInfo().via.empty());
+    publicendpoint::Activate(pair, 117);
+
+    // withdrawal request from the poller
+    publicendpoint::Tracker::Decision gone;
+    gone.status = "stale";
+    publicendpoint::Submit(gone);
+    BOOST_REQUIRE(publicendpoint::TakeWork(applied, wanted, observed, status));
+    BOOST_CHECK(!wanted);
+    BOOST_CHECK_EQUAL(status, "stale");
+    publicendpoint::Withdraw(status);
+    BOOST_CHECK(!publicendpoint::Active());
+    BOOST_CHECK_EQUAL(publicendpoint::GetInfo().status, "stale");
+}
+
+BOOST_AUTO_TEST_CASE(pe_advertisement_is_exactly_the_pair)
+{
+    PublicEndpointReset guard;
+    const bool old_listen{fListen};
+    const bool old_discover{fDiscover};
+    fListen = true;
+    g_reachable_nets.Add(NET_IPV4);
+    const CService internal{LookupNumeric("9.9.9.9", 7777)};
+    const CService external_old{LookupNumeric("1.2.3.4", 7777)};
+    auto peer = MakePeer(LookupNumeric("5.6.7.8", 8333));
+    // the peer reports an address and port it sees for us: must never be echoed back while the feature is on
+    peer->SetAddrLocal(CService{LookupNumeric("1.2.3.4", 7777)});
+
+    // feature off: legacy behaviour (a configured local address is advertised)
+    fDiscover = true;
+    BOOST_CHECK(AddLocal(external_old, LOCAL_MANUAL));
+    const auto before = GetLocalAddrForPeer(*peer);
+    BOOST_REQUIRE(before.has_value());
+    BOOST_CHECK_EQUAL(before->GetPort(), 7777);
+
+    // feature on, no active pair: nothing at all, not the configured address, not the observed one
+    publicendpoint::SetEnabled(true);
+    BOOST_CHECK(!GetLocalAddrForPeer(*peer).has_value());
+
+    // active pair: exactly that pair, whatever the peer sees and whatever else is in the local map
+    const CService pair{LookupNumeric("8.8.4.4", 5000)};
+    publicendpoint::Activate(pair, 100);
+    for (int i = 0; i < 50; ++i) {
+        const auto adv = GetLocalAddrForPeer(*peer);
+        BOOST_REQUIRE(adv.has_value());
+        BOOST_CHECK_EQUAL(adv->ToStringAddrPort(), "8.8.4.4:5000");
+    }
+    // inbound peer that observed the old pair: still the active pair
+    auto inbound = MakePeer(LookupNumeric("5.6.7.9", 50000), ConnectionType::INBOUND);
+    inbound->SetAddrLocal(CService{LookupNumeric("1.2.3.4", 7777)});
+    for (int i = 0; i < 50; ++i) {
+        const auto adv = GetLocalAddrForPeer(*inbound);
+        BOOST_REQUIRE(adv.has_value());
+        BOOST_CHECK_EQUAL(adv->ToStringAddrPort(), "8.8.4.4:5000");
+    }
+    // withdrawn again: nothing
+    publicendpoint::Withdraw("stale");
+    BOOST_CHECK(!GetLocalAddrForPeer(*peer).has_value());
+    BOOST_CHECK(!GetLocalAddrForPeer(*inbound).has_value());
+    // not listening: nothing even with an active pair
+    publicendpoint::Activate(pair, 100);
+    fListen = false;
+    BOOST_CHECK(!GetLocalAddrForPeer(*peer).has_value());
+
+    RemoveLocal(external_old);
+    fListen = old_listen;
+    fDiscover = old_discover;
 }
 
 BOOST_AUTO_TEST_SUITE_END()

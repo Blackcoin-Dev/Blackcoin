@@ -221,6 +221,10 @@ class GoldRushInfoTest(BitcoinTestFramework):
         assert_equal(gate["mining_gate_coherent"], True)
         assert_equal(gate["mining_gate_database_ambiguous"], False)
         assert_equal(gate["mining_gate_unsafe_claims"], 0)
+        enumeration = gate["claim_input_enumeration"]
+        assert_equal(enumeration["legacy_source_output_limit"], 65536)
+        assert_equal(enumeration["legacy_source_outputs_near_limit"], False)
+        assert enumeration["legacy_source_outputs"] < enumeration["legacy_source_output_limit"]
         assert_equal(gate["mining_gate_unsafe_components"], 0)
         assert_equal(gate["mining_gate_action"], "refresh_same_anchor")
         assert_equal(gate["mining_gate_can_submit"], True)
@@ -640,6 +644,21 @@ class GoldRushInfoTest(BitcoinTestFramework):
         assert_equal(pow_info["shadow_reward_next_height"], node.getblockcount() + 1)
         assert pow_info["shadow_reward_start_height"] <= pow_info["shadow_reward_next_height"]
         assert pow_info["shadow_reward_next_height"] <= pow_info["shadow_reward_end_height"]
+        # The per-claim timing record is always present; it is empty until
+        # the built-in miner has finished an attempt.
+        timing = pow_info["last_claim_timing"]
+        assert_equal(sorted(timing), sorted([
+            "valid", "tip", "height", "block_time", "tip_seen_unix_ms",
+            "tip_seen_known", "result", "tip_changed", "gate_ready_ms",
+            "first_hash_ms", "proof_found_ms", "mempool_accept_ms", "hashes",
+            "batches", "duty_sleep_ms", "first_inv_ms", "inv_peers_1s", "push_peers_1s"]))
+        assert_equal(timing["valid"], False)
+        assert_equal(timing["result"], "")
+        assert_equal(timing["mempool_accept_ms"], -1)
+        assert_equal(timing["first_inv_ms"], -1)
+        assert_equal(timing["inv_peers_1s"], 0)
+        assert_equal(timing["push_peers_1s"], 0)
+        assert "last_claim_timing" in wallet.help("getpowmininginfo")
         pow_help = wallet.help("setpowmining")
         assert "allow_new_payout_key" in pow_help
         assert "Back up the wallet immediately" in pow_help

@@ -1,0 +1,29 @@
+{
+  "checked_utc": "2026-11-03",
+  "curl": {
+    "version": "8.23.0",
+    "source": "https://curl.se/download/curl-8.23.0.tar.xz",
+    "sha256": "8dadd7d2536a314f982ad05a651b713f426bf7d02cc2c76cffb9796f2218e6c5",
+    "hash_crosscheck": "https://raw.githubusercontent.com/curl/curl-for-win/main/_versions.sh",
+    "license": "curl",
+    "security_review": "https://curl.se/docs/security.html"
+  },
+  "openssl": {
+    "version": "3.5.9",
+    "source": "https://github.com/openssl/openssl/releases/download/openssl-3.5.9/openssl-3.5.9.tar.gz",
+    "sha256": "603f5602e2eef00d77fbd429d34dcd5822bb301757a1bc9cdb24c670f1eb859a",
+    "checksum": "https://github.com/openssl/openssl/releases/download/openssl-3.5.9/openssl-3.5.9.tar.gz.sha256",
+    "license": "Apache-2.0",
+    "security_review": "https://openssl-library.org/news/vulnerabilities/",
+    "support": "3.5 LTS, upstream support through 2030-04-08"
+  },
+  "ca_bundle": {
+    "snapshot": "2026-10-20",
+    "source": "https://curl.se/ca/cacert-2026-10-20.pem",
+    "sha256": "796f1389bfea13c0ed78f663b765baaff54a508e5483786bd6ece73c5e3e3cbe",
+    "checksum": "https://curl.se/ca/cacert-2026-10-20.pem.sha256",
+    "certificates": 118,
+    "license": "MPL-2.0",
+    "provenance": "https://curl.se/docs/caextract.html"
+  }
+}

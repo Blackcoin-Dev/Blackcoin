@@ -20,6 +20,7 @@
 class ClientModel;
 class PlatformStyle;
 class BitcoinAmountField;
+class VisibilityController;
 
 QT_BEGIN_NAMESPACE
 class QCheckBox;
@@ -48,6 +49,7 @@ QT_END_NAMESPACE
 class StakingMiningPage : public QWidget
 {
     Q_OBJECT
+    friend class WalletTests; // Deterministic snapshot contention/lifecycle fixture.
 
 public:
     explicit StakingMiningPage(const PlatformStyle* platformStyle, QWidget* parent = nullptr);
@@ -103,6 +105,7 @@ private Q_SLOTS:
     void onPowClaimRecoveryAdopt();
     void updateStatus();
     void onStakingMiningSnapshotReady(quint64 request_id, quint64 generation);
+    void onPowMiningControlReady(quint64 request_id, quint64 generation);
     void onPowClaimRecoveryPolicyReady(quint64 request_id, quint64 generation);
     void onPowClaimRecoveryOperationReady(quint64 request_id, quint64 generation);
 
@@ -111,8 +114,12 @@ private:
     ClientModel* m_client_model{nullptr};
     QPointer<WalletModel> m_wallet_model;
     QTimer* m_timer{nullptr};
+    QTimer* m_detail_retry_timer{nullptr};
+    std::unique_ptr<VisibilityController> m_detail_visibility;
     bool m_updating{false}; // guard against re-entrant control->slot->control loops
     bool m_pow_apply_pending{false};
+    uint64_t m_pow_control_request{0};
+    std::shared_ptr<std::atomic<bool>> m_pow_control_current;
     bool m_pow_pending_enabled{false};
     bool m_pow_settings_dirty{false};
     bool m_operator_registry_loaded{false};
@@ -129,6 +136,11 @@ private:
     uint64_t m_wallet_generation{0};
     uint64_t m_detail_request_sequence{0};
     uint64_t m_detail_request_in_flight{0};
+    uint64_t m_detail_refresh_epoch{0};
+    uint64_t m_detail_request_epoch{0};
+    unsigned int m_detail_retries{0};
+    bool detailRefreshAllowed() const;
+    void cancelFullDetailRefresh();
     bool m_selfstake_withdraw_available{false};
     bool m_operator_withdraw_available{false};
     bool m_coldstake_fund_available{false};

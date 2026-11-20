@@ -33,10 +33,12 @@
 #include <qt/platformstyle.h>
 #include <qt/splashscreen.h>
 #include <qt/utilitydialog.h>
+#include <qt/uiperf.h>
 #include <qt/winshutdownmonitor.h>
 #include <uint256.h>
 #include <util/exception.h>
 #include <util/string.h>
+#include <util/thread_qos.h>
 #include <util/threadnames.h>
 #include <util/translation.h>
 #include <validation.h>
@@ -323,6 +325,11 @@ BitcoinApplication::BitcoinApplication()
     // Qt runs setlocale(LC_ALL, "") on initialization.
     RegisterMetaTypes();
     setQuitOnLastWindowClosed(false);
+    // The wallet load log lines report whether the application was frontmost.
+    util::SetApplicationActiveHint(applicationState() == Qt::ApplicationActive);
+    connect(this, &QGuiApplication::applicationStateChanged, this, [](Qt::ApplicationState state) {
+        util::SetApplicationActiveHint(state == Qt::ApplicationActive);
+    });
 }
 
 void BitcoinApplication::setupPlatformStyle()
@@ -465,6 +472,15 @@ void BitcoinApplication::parameterSetup()
 void BitcoinApplication::requestInitialize()
 {
     qDebug() << __func__ << ": Requesting initialize";
+#ifdef Q_OS_MACOS
+    // Loading wallets and the chainstate can take minutes; without an
+    // activity macOS App Nap may run the init thread on the efficiency cores
+    // whenever the window is not frontmost. The window's own inhibitor takes
+    // over once init has finished.
+    if (!m_init_app_nap) m_init_app_nap = std::make_unique<CAppNapInhibitor>();
+    m_init_app_nap->disableAppNap();
+    LogPrintf("macOS App Nap activity held for init: %s\n", m_init_app_nap->isAppNapDisabled() ? "yes" : "no");
+#endif
     startThread();
     Q_EMIT requestedInitialize();
 }
@@ -473,6 +489,10 @@ void BitcoinApplication::requestShutdown()
 {
     if (m_shutdown_in_progress) return;
     m_shutdown_in_progress = true;
+#ifdef Q_OS_MACOS
+    // Shutdown flushes every wallet database; keep it out of App Nap.
+    if (m_init_app_nap) m_init_app_nap->disableAppNap();
+#endif
 
     // Relaunch only after the durable COMMIT_READY transition. An interrupted
     // BUILDING journal exits without spawning a verifier and is recovered by
@@ -497,13 +517,24 @@ void BitcoinApplication::requestShutdown()
 
     qDebug() << __func__ << ": Requesting shutdown";
 
-    // Must disconnect node signals otherwise current thread can deadlock since
-    // no event loop is running.
+    // Stop node-to-window callbacks before starting the asynchronous drain.
     window->unsubscribeFromCoreSignals();
-    window->join();
-    // Request node shutdown, which can interrupt long operations, like
-    // rescanning a wallet.
+    window->beginShutdown();
+    // Interrupt Core before waiting for wallet, RPC or diagnostic work. Keep
+    // all dependent objects alive and the shutdown window responsive while
+    // those operations cooperatively finish.
     node().startShutdown();
+    if (clientModel) clientModel->beginShutdown();
+    pollShutdownTimer->stop();
+    QTimer::singleShot(0, this, &BitcoinApplication::finishShutdown);
+}
+
+void BitcoinApplication::finishShutdown()
+{
+    if (!window->shutdownReady() || (clientModel && !clientModel->shutdownReady())) {
+        QTimer::singleShot(25, this, &BitcoinApplication::finishShutdown);
+        return;
+    }
     // Unsetting the client model can cause the current thread to wait for node
     // to complete an operation, like wait for a RPC execution to complete.
     window->setClientModel(nullptr);
@@ -605,6 +636,10 @@ void BitcoinApplication::initializeResult(interfaces::AppInitResult result, inte
         }
 #endif
         pollShutdownTimer->start(SHUTDOWN_POLLING_DELAY);
+#ifdef Q_OS_MACOS
+        // The window now owns the policy (syncing, or a wallet staking or mining).
+        if (m_init_app_nap && !m_shutdown_in_progress) m_init_app_nap->enableAppNap();
+#endif
     }
 }
 
@@ -635,6 +670,15 @@ WId BitcoinApplication::getMainWinId() const
     return window->winId();
 }
 
+bool BitcoinApplication::notify(QObject* receiver, QEvent* event)
+{
+    // The observer is thread-local and null unless explicitly enabled. The
+    // original dispatch is called once, including when it throws.
+    if (!UiPaintProbe::current()) return QApplication::notify(receiver, event);
+    UiPaintProbe::NotifyScope measurement(receiver, event);
+    return QApplication::notify(receiver, event);
+}
+
 bool BitcoinApplication::event(QEvent* e)
 {
     if (e->type() == QEvent::Quit) {
@@ -650,6 +694,9 @@ static void SetupUIArgs(ArgsManager& argsman)
     argsman.AddArg("-choosedatadir", strprintf("Choose data directory on startup (default: %u)", DEFAULT_CHOOSE_DATADIR), ArgsManager::ALLOW_ANY, OptionsCategory::GUI);
     argsman.AddArg("-lang=<lang>", "Set language, for example \"de_DE\" (default: system locale)", ArgsManager::ALLOW_ANY, OptionsCategory::GUI);
     argsman.AddArg("-min", "Start minimized", ArgsManager::ALLOW_ANY, OptionsCategory::GUI);
+    argsman.AddArg("-uiperflog=<path>", "Write an opt-in GUI timer-lateness trace to a new absolute private file after clean event-loop exit (POSIX only)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::GUI);
+    argsman.AddArg("-uipaintlog=<path>", "Write opt-in delivered Qt event to relevant paint-handler completion records after clean exit; not physical/display latency (new absolute private POSIX file)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::GUI);
+    argsman.AddArg("-uipaintcalibrate", "Show the synthetic, manual developer paint calibration scene; requires -uipaintlog (default: 0)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::GUI);
     argsman.AddArg("-resetguisettings", "Reset all settings changed in the GUI", ArgsManager::ALLOW_ANY, OptionsCategory::GUI);
     argsman.AddArg("-splash", strprintf("Show splash screen on startup (default: %u)", DEFAULT_SPLASHSCREEN), ArgsManager::ALLOW_ANY, OptionsCategory::GUI);
     argsman.AddArg("-uiplatform", strprintf("Select platform to customize UI for (one of windows, macosx, other; default: %s)", BitcoinGUI::DEFAULT_UIPLATFORM), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::GUI);
@@ -871,11 +918,38 @@ int GuiMain(int argc, char* argv[])
         // This is acceptable because this function only contains steps that are quick to execute,
         // so the GUI thread won't be held up.
         if (app.baseInitialize()) {
+            UiPerfProbe perf_probe;
+            QString perf_error;
+            if (gArgs.IsArgSet("-uiperflog") &&
+                !perf_probe.start(QString::fromStdString(gArgs.GetArg("-uiperflog", "")), perf_error)) {
+                QMessageBox::critical(nullptr, PACKAGE_NAME, perf_error);
+                return EXIT_FAILURE;
+            }
+            UiPaintProbe paint_probe;
+            const bool calibrate_paint = gArgs.GetBoolArg("-uipaintcalibrate", false);
+            if ((calibrate_paint && !gArgs.IsArgSet("-uipaintlog")) ||
+                (gArgs.IsArgSet("-uipaintlog") && !paint_probe.start(QString::fromStdString(gArgs.GetArg("-uipaintlog", "")), perf_error))) {
+                QMessageBox::critical(nullptr, PACKAGE_NAME, perf_error.isEmpty() ? QStringLiteral("Paint calibration requires -uipaintlog") : perf_error);
+                return EXIT_FAILURE;
+            }
+            if (calibrate_paint) {
+                QObject::connect(&app, &BitcoinApplication::windowShown, &app, [](BitcoinGUI* window) {
+                    UiPaintCalibration::attachToMainWindow(window);
+                });
+            }
             app.requestInitialize();
 #if defined(Q_OS_WIN)
             WinShutdownMonitor::registerShutdownBlockReason(QObject::tr("%1 didn't yet exit safely…").arg(PACKAGE_NAME), (HWND)app.getMainWinId());
 #endif
             app.exec();
+            paint_probe.seal();
+            const bool perf_finished = perf_probe.finish(perf_error);
+            QString paint_error;
+            const bool paint_finished = paint_probe.finish(paint_error);
+            if (!perf_finished || !paint_finished) {
+                LogPrintf("%s\n", (!perf_finished ? perf_error : paint_error).toStdString());
+                return EXIT_FAILURE;
+            }
         } else {
             // A dialog with detailed error will have been shown by InitError()
             return EXIT_FAILURE;

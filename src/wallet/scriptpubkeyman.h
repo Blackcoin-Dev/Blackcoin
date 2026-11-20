@@ -217,6 +217,9 @@ public:
     /* Returns true if the wallet can give out new addresses. This means it has keys in the keypool or can generate new keys */
     virtual bool CanGetAddresses(bool internal = false) const { return false; }
 
+    /** False means unavailable, not incapable; result is untouched on failure. */
+    virtual bool TryCanGetAddresses(bool& result, bool internal = false) const { result = false; return true; }
+
     /** Upgrades the wallet to the specified version */
     virtual bool Upgrade(int prev_version, int new_version, bilingual_str& error) { return true; }
 
@@ -421,6 +424,7 @@ public:
     std::unique_ptr<CKeyMetadata> GetMetadata(const CTxDestination& dest) const override;
 
     bool CanGetAddresses(bool internal = false) const override;
+    bool TryCanGetAddresses(bool& result, bool internal = false) const override;
 
     std::unique_ptr<SigningProvider> GetSolvingProvider(const CScript& script) const override;
 
@@ -577,6 +581,8 @@ private:
     ScriptPubKeyMap m_map_script_pub_keys GUARDED_BY(cs_desc_man);
     PubKeyMap m_map_pubkeys GUARDED_BY(cs_desc_man);
     int32_t m_max_cached_index = -1;
+    //! True when next_index was advanced in memory and TopUp must still write the descriptor.
+    bool m_descriptor_write_pending GUARDED_BY(cs_desc_man){false};
 
     KeyMap m_map_keys GUARDED_BY(cs_desc_man);
     CryptedKeyMap m_map_crypted_keys GUARDED_BY(cs_desc_man);
@@ -653,6 +659,7 @@ public:
     std::unique_ptr<CKeyMetadata> GetMetadata(const CTxDestination& dest) const override;
 
     bool CanGetAddresses(bool internal = false) const override;
+    bool TryCanGetAddresses(bool& result, bool internal = false) const override;
 
     std::unique_ptr<SigningProvider> GetSolvingProvider(const CScript& script) const override;
     std::unique_ptr<FlatSigningProvider> GetSigningProviderForScript(const CScript& script) const;

@@ -56,7 +56,7 @@ bool SafeGraphForAdoption(
     const ShadowPowClaimRecoveryComponent& component,
     std::string& reason_code, std::string& reason);
 
-bool ConsumeShadowPowClaimMetadataBudget(const mapValue_t& values,
+bool ConsumeShadowPowClaimMetadataBudget(const WalletTxValueMap& values,
                                          size_t& aggregate_entries,
                                          size_t& aggregate_bytes)
 {
@@ -99,7 +99,7 @@ bool ConsumeShadowPowClaimMetadataBudget(const mapValue_t& values,
     return true;
 }
 
-bool MetadataFlag(const mapValue_t& values, const char* key)
+bool MetadataFlag(const WalletTxValueMap& values, const char* key)
 {
     const auto it = values.find(key);
     return it != values.end() && it->second == "1";
@@ -117,7 +117,7 @@ bool IsRepairableShadowPowRelayFeePolicyRejection(
            reason == "min relay fee not met";
 }
 
-bool ParseCanonicalMetadataBool(const mapValue_t& values, const char* key,
+bool ParseCanonicalMetadataBool(const WalletTxValueMap& values, const char* key,
                                 bool& value)
 {
     const auto it = values.find(key);
@@ -136,7 +136,7 @@ bool ParseCanonicalMetadataBool(const mapValue_t& values, const char* key,
     return false;
 }
 
-bool ParseMetadataHeight(const mapValue_t& values, const char* key, int& value)
+bool ParseMetadataHeight(const WalletTxValueMap& values, const char* key, int& value)
 {
     const auto it = values.find(key);
     int32_t parsed{-1};
@@ -149,7 +149,7 @@ bool ParseMetadataHeight(const mapValue_t& values, const char* key, int& value)
     return true;
 }
 
-bool ParseMetadataHash(const mapValue_t& values, const char* key, uint256& value)
+bool ParseMetadataHash(const WalletTxValueMap& values, const char* key, uint256& value)
 {
     const auto it = values.find(key);
     if (it == values.end() || it->second.size() != uint256::size() * 2 ||
@@ -160,7 +160,7 @@ bool ParseMetadataHash(const mapValue_t& values, const char* key, uint256& value
     return !value.IsNull();
 }
 
-bool ParseMetadataVout(const mapValue_t& values, const char* key, uint32_t& value)
+bool ParseMetadataVout(const WalletTxValueMap& values, const char* key, uint32_t& value)
 {
     const auto it = values.find(key);
     return it != values.end() &&
@@ -169,7 +169,7 @@ bool ParseMetadataVout(const mapValue_t& values, const char* key, uint32_t& valu
         ParseUInt32(it->second, &value);
 }
 
-bool ParseMetadataOrdinal(const mapValue_t& values, const char* key,
+bool ParseMetadataOrdinal(const WalletTxValueMap& values, const char* key,
                           uint32_t& value)
 {
     const auto it = values.find(key);
@@ -179,7 +179,7 @@ bool ParseMetadataOrdinal(const mapValue_t& values, const char* key,
         ParseUInt32(it->second, &value);
 }
 
-bool ParsePositiveMetadataTime(const mapValue_t& values, const char* key,
+bool ParsePositiveMetadataTime(const WalletTxValueMap& values, const char* key,
                                int64_t& value)
 {
     const auto it = values.find(key);
@@ -194,7 +194,7 @@ bool ParsePositiveMetadataTime(const mapValue_t& values, const char* key,
 }
 
 bool ParseShadowPowClaimRelayClockMetadata(
-    const mapValue_t& values, const uint256& txid, bool& present,
+    const WalletTxValueMap& values, const uint256& txid, bool& present,
     int64_t& birth_time)
 {
     const auto schema = values.find(
@@ -223,7 +223,7 @@ bool ParseShadowPowClaimRelayClockMetadata(
     return true;
 }
 
-bool HasActiveBranchObservation(const mapValue_t& values,
+bool HasActiveBranchObservation(const WalletTxValueMap& values,
                                 const char* height_key,
                                 const char* tip_key,
                                 const CChain& active_chain)
@@ -286,7 +286,7 @@ void ParseClaimLineage(const CWalletTx& wtx,
                        const uint256& generation_fingerprint,
                        ShadowPowClaimRecoveryNode& node)
 {
-    const mapValue_t& values = wtx.mapValue;
+    const WalletTxValueMap& values = wtx.mapValue;
     node.lineage_metadata_present =
         values.count(SHADOW_POW_CLAIM_LINEAGE_SCHEMA_KEY) != 0 ||
         values.count(SHADOW_POW_CLAIM_LINEAGE_FAMILY_KEY) != 0 ||
@@ -1361,30 +1361,84 @@ void CWallet::InvalidateShadowPowClaimImplicitOwnershipEntryLocked(
     MarkShadowPowClaimCandidateStateChangedLocked();
 }
 
+// The anchors a proof record indexed from its own inputs references: each
+// distinct non-null prevout once, in input order.
+template <typename Fn>
+static void ForEachDistinctShadowPowProofInput(const CTransaction& tx, Fn&& fn)
+{
+    if (tx.vin.size() == 1) {
+        if (!tx.vin[0].prevout.IsNull()) fn(tx.vin[0].prevout);
+        return;
+    }
+    std::set<COutPoint> seen;
+    for (const CTxIn& input : tx.vin) {
+        if (input.prevout.IsNull() || !seen.insert(input.prevout).second) {
+            continue;
+        }
+        fn(input.prevout);
+    }
+}
+
 void CWallet::ClearShadowPowProofPresenceIndexLocked(const uint256& txid)
 {
     AssertLockHeld(cs_wallet);
-    const auto erase_reverse = [](const uint256& id, auto& reverse,
-                                  auto& refcounts) {
+    // Every reference taken by SetShadowPowProofPresenceIndexLocked is
+    // recorded exactly once, as a stored input vector or as the record's
+    // proof_inputs_from_vin bit, so each is released exactly once here.
+    const auto release = [](auto& refcounts, const COutPoint& input) {
+        const auto anchor = refcounts.find(input);
+        if (anchor == refcounts.end()) return;
+        if (anchor->second <= 1) {
+            refcounts.erase(anchor);
+        } else {
+            --anchor->second;
+        }
+    };
+    const auto erase_reverse = [&](const uint256& id, auto& reverse,
+                                   auto& refcounts) {
         const auto reverse_it = reverse.find(id);
         if (reverse_it == reverse.end()) return;
         for (const COutPoint& input : reverse_it->second) {
-            const auto anchors = refcounts.find(input);
-            if (anchors == refcounts.end()) continue;
-            anchors->second.erase(id);
-            if (anchors->second.empty()) refcounts.erase(anchors);
+            release(refcounts, input);
         }
         reverse.erase(reverse_it);
     };
+    const auto indexed_record = mapWallet.find(txid);
+    if (indexed_record != mapWallet.end() &&
+        indexed_record->second.m_shadow_pow_index.proof_inputs_from_vin) {
+        indexed_record->second.m_shadow_pow_index.proof_inputs_from_vin =
+            false;
+        if (Assume(indexed_record->second.tx)) {
+            ForEachDistinctShadowPowProofInput(
+                *indexed_record->second.tx, [&](const COutPoint& input) {
+                    release(m_shadow_pow_proof_anchor_txids, input);
+                });
+        }
+    }
     erase_reverse(txid, m_shadow_pow_proof_inputs_by_txid,
                   m_shadow_pow_proof_anchor_txids);
     erase_reverse(txid, m_shadow_pow_unknown_inputs_by_txid,
                   m_shadow_pow_unknown_anchor_txids);
-    m_shadow_pow_all_proof_txids.erase(txid);
+    SetShadowPowProofIndexedLocked(txid, false);
     m_shadow_pow_unknown_proof_presence_txids.erase(txid);
     m_shadow_pow_known_oversized_proof_txids.erase(txid);
     m_shadow_pow_proof_input_index_pending_txids.erase(txid);
     m_shadow_pow_proof_input_index_capacity_txids.erase(txid);
+    m_shadow_pow_nonconfirmed_proof_txids.erase(txid);
+}
+
+void CWallet::UpdateShadowPowNonConfirmedProofIndexLocked(const CWalletTx& wtx)
+{
+    AssertLockHeld(cs_wallet);
+    const uint256 txid = wtx.GetHash();
+    const bool tracked =
+        IsIndexedShadowPowClaimLocked(txid) ||
+        m_shadow_pow_unknown_proof_presence_txids.count(txid) != 0;
+    if (tracked && !wtx.isConfirmed()) {
+        m_shadow_pow_nonconfirmed_proof_txids.insert(txid);
+    } else {
+        m_shadow_pow_nonconfirmed_proof_txids.erase(txid);
+    }
 }
 
 void CWallet::SetShadowPowProofPresenceIndexLocked(
@@ -1398,7 +1452,7 @@ void CWallet::SetShadowPowProofPresenceIndexLocked(
     if (!wtx.tx || (!exact_proof && !unknown)) return;
 
     if (exact_proof) {
-        m_shadow_pow_all_proof_txids.insert(txid);
+        SetShadowPowProofIndexedLocked(txid, true);
         if (wtx.tx->GetTotalSize() >
             SHADOW_POW_CLAIM_RECORD_BYTE_CAPACITY) {
             m_shadow_pow_known_oversized_proof_txids.insert(txid);
@@ -1406,6 +1460,7 @@ void CWallet::SetShadowPowProofPresenceIndexLocked(
     } else {
         m_shadow_pow_unknown_proof_presence_txids.insert(txid);
     }
+    UpdateShadowPowNonConfirmedProofIndexLocked(wtx);
 
     // Unknown/oversized callbacks can run beneath cs_main. Publish only a
     // pending scalar there; the existing outside-lock classifier supplies a
@@ -1427,6 +1482,22 @@ void CWallet::SetShadowPowProofPresenceIndexLocked(
     auto& refcounts = exact_proof
         ? m_shadow_pow_proof_anchor_txids
         : m_shadow_pow_unknown_anchor_txids;
+    if (!prevalidated_inputs && exact_proof) {
+        // The common case, every ordinary claim: the referenced anchors are
+        // the transaction's own distinct non-null inputs. They are a function
+        // of the txid, so the wallet's record of txid reproduces them when
+        // the references are released and no copy is stored.
+        const auto indexed_record = mapWallet.find(txid);
+        if (Assume(indexed_record != mapWallet.end())) {
+            ForEachDistinctShadowPowProofInput(
+                *wtx.tx, [&](const COutPoint& outpoint) {
+                    ++refcounts[outpoint];
+                });
+            indexed_record->second.m_shadow_pow_index.proof_inputs_from_vin =
+                true;
+            return;
+        }
+    }
     std::vector<COutPoint> inputs;
     inputs.reserve(input_count);
     std::set<COutPoint> unique_inputs;
@@ -1436,7 +1507,7 @@ void CWallet::SetShadowPowProofPresenceIndexLocked(
             return;
         }
         inputs.push_back(outpoint);
-        refcounts[outpoint].insert(txid);
+        ++refcounts[outpoint];
     };
     if (prevalidated_inputs) {
         for (const COutPoint& input : *prevalidated_inputs) {
@@ -1450,10 +1521,117 @@ void CWallet::SetShadowPowProofPresenceIndexLocked(
     reverse.emplace(txid, std::move(inputs));
 }
 
+bool CWallet::CheckShadowPowClaimIndexConsistencyLocked(
+    std::string* failure) const
+{
+    AssertLockHeld(cs_wallet);
+    const auto fail = [&](const uint256& txid, const char* what) {
+        if (failure) *failure = strprintf("%s: %s", txid.GetHex(), what);
+        return false;
+    };
+    std::map<COutPoint, uint32_t> expected_anchors;
+    size_t schema_frontiers{0};
+    size_t legacy_frontiers{0};
+    for (const auto& [txid, wtx] : mapWallet) {
+        if (!wtx.tx) continue;
+        const CWalletTx::ShadowPowIndexState& state = wtx.m_shadow_pow_index;
+        const bool oversized = wtx.tx->GetTotalSize() >
+            SHADOW_POW_CLAIM_RECORD_BYTE_CAPACITY;
+        const bool unknown =
+            m_shadow_pow_unknown_proof_presence_txids.count(txid) != 0;
+        if (!oversized &&
+            state.proof != TransactionHasShadowProof(*wtx.tx)) {
+            return fail(txid, "proof bit differs from the transaction bytes");
+        }
+        if (state.proof && unknown) {
+            return fail(txid, "record is both a known proof and of unknown proof presence");
+        }
+        if (state.claim && !state.proof) {
+            return fail(txid, "local claim bit on a record without the proof bit");
+        }
+        const bool stored_inputs =
+            m_shadow_pow_proof_inputs_by_txid.count(txid) != 0;
+        if (state.proof_inputs_from_vin && (!state.proof || stored_inputs)) {
+            return fail(txid, "inputs referenced from vin without a proof bit, or twice");
+        }
+        if (!state.proof && stored_inputs) {
+            return fail(txid, "stored proof inputs for a record without the proof bit");
+        }
+        if (state.proof && !state.proof_inputs_from_vin && !stored_inputs &&
+            m_shadow_pow_proof_input_index_capacity_txids.count(txid) == 0) {
+            return fail(txid, "proof record holds no anchor references");
+        }
+        if (state.proof_inputs_from_vin) {
+            ForEachDistinctShadowPowProofInput(
+                *wtx.tx, [&](const COutPoint& input) {
+                    ++expected_anchors[input];
+                });
+        }
+        if (state.has_relay_frontier) {
+            if (!state.proof || oversized) {
+                return fail(txid, "relay frontier on a record that is not an indexed proof");
+            }
+            const std::pair<int64_t, uint256> entry{
+                wtx.m_shadow_pow_relay_frontier.value, txid};
+            const bool in_schema =
+                m_shadow_pow_schema_relay_frontiers.count(entry) != 0;
+            const bool in_legacy =
+                m_shadow_pow_legacy_relay_frontiers.count(entry) != 0;
+            if (in_schema == state.legacy_relay_frontier ||
+                in_legacy != state.legacy_relay_frontier) {
+                return fail(txid, "relay frontier is not in exactly the set its record names");
+            }
+            ++(state.legacy_relay_frontier ? legacy_frontiers
+                                           : schema_frontiers);
+        } else if (state.legacy_relay_frontier ||
+                   wtx.m_shadow_pow_relay_frontier.value != 0) {
+            return fail(txid, "relay frontier fields set without a frontier");
+        }
+    }
+    for (const auto& [txid, inputs] : m_shadow_pow_proof_inputs_by_txid) {
+        if (mapWallet.count(txid) == 0) {
+            return fail(txid, "stored proof inputs for a record the wallet does not hold");
+        }
+        for (const COutPoint& input : inputs) ++expected_anchors[input];
+    }
+    if (expected_anchors != m_shadow_pow_proof_anchor_txids) {
+        return fail(uint256{}, "proof anchor reference counts differ from a recount");
+    }
+    if (schema_frontiers != m_shadow_pow_schema_relay_frontiers.size() ||
+        legacy_frontiers != m_shadow_pow_legacy_relay_frontiers.size()) {
+        return fail(uint256{}, "a relay frontier set holds an entry no record names");
+    }
+    return true;
+}
+
+#ifdef SHADOW_POW_CLAIM_INDEX_SELFCHECK
+} // namespace wallet
+#include <cstdlib>
+#include <iostream>
+namespace wallet {
+// Test builds only: recount the whole per-record index after every index
+// update. Quadratic, so never define this for a production build.
+static thread_local bool g_shadow_pow_claim_index_rebuilding{false};
+#endif
+
 void CWallet::RefreshShadowPowClaimIndexEntryLocked(const CWalletTx& wtx)
 {
     AssertLockHeld(cs_wallet);
     if (!wtx.tx) return;
+#ifdef SHADOW_POW_CLAIM_INDEX_SELFCHECK
+    struct SelfCheck {
+        const CWallet& wallet;
+        ~SelfCheck() NO_THREAD_SAFETY_ANALYSIS
+        {
+            std::string failure;
+            if (!g_shadow_pow_claim_index_rebuilding &&
+                !wallet.CheckShadowPowClaimIndexConsistencyLocked(&failure)) {
+                tfm::format(std::cerr, "claim index self-check failed: %s\n", failure);
+                std::abort();
+            }
+        }
+    } self_check{*this};
+#endif
     const uint256 txid = wtx.GetHash();
     const bool managed_resolution = wtx.mapValue.count(SHADOW_POW_RESOLUTION_SCHEMA_KEY) != 0;
     if (managed_resolution) {
@@ -1488,15 +1666,18 @@ void CWallet::RefreshShadowPowClaimIndexEntryLocked(const CWalletTx& wtx)
         m_shadow_pow_foreign_claim_txids.erase(txid);
         m_shadow_pow_unconfirmed_implicit_claim_txids.erase(txid);
     };
-    const auto prior_frontier =
-        m_shadow_pow_relay_frontier_by_txid.find(txid);
-    if (prior_frontier !=
-        m_shadow_pow_relay_frontier_by_txid.end()) {
-        auto& domain = prior_frontier->second.first
+    // The relay-frontier reverse index is on the wallet's own record of txid.
+    const auto indexed_record = mapWallet.find(txid);
+    const CWalletTx* const indexed =
+        indexed_record == mapWallet.end() ? nullptr : &indexed_record->second;
+    if (indexed && indexed->m_shadow_pow_index.has_relay_frontier) {
+        auto& domain = indexed->m_shadow_pow_index.legacy_relay_frontier
             ? m_shadow_pow_legacy_relay_frontiers
             : m_shadow_pow_schema_relay_frontiers;
-        domain.erase({prior_frontier->second.second, txid});
-        m_shadow_pow_relay_frontier_by_txid.erase(prior_frontier);
+        domain.erase({indexed->m_shadow_pow_relay_frontier.value, txid});
+        indexed->m_shadow_pow_index.has_relay_frontier = false;
+        indexed->m_shadow_pow_index.legacy_relay_frontier = false;
+        indexed->m_shadow_pow_relay_frontier.value = 0;
     }
     m_shadow_pow_unconfirmed_claim_txids.erase(txid);
     m_shadow_pow_unconfirmed_implicit_claim_txids.erase(txid);
@@ -1513,7 +1694,10 @@ void CWallet::RefreshShadowPowClaimIndexEntryLocked(const CWalletTx& wtx)
             SetShadowPowProofPresenceIndexLocked(
                 wtx, /*exact_proof=*/false, /*unknown=*/true);
         }
-        m_shadow_pow_claim_txids.erase(txid);
+        // A known oversized proof keeps its presence entry above, so its
+        // confirmation state is refreshed here.
+        UpdateShadowPowNonConfirmedProofIndexLocked(wtx);
+        SetShadowPowLocalClaimIndexedLocked(txid, false);
         m_shadow_pow_unconfirmed_claim_txids.erase(txid);
         forget_implicit_ownership();
         // Proof presence itself is ownership-independent. Queue every
@@ -1528,7 +1712,7 @@ void CWallet::RefreshShadowPowClaimIndexEntryLocked(const CWalletTx& wtx)
     SetShadowPowProofPresenceIndexLocked(
         wtx, has_shadow_proof, /*unknown=*/false);
     if (!has_shadow_proof) {
-        m_shadow_pow_claim_txids.erase(txid);
+        SetShadowPowLocalClaimIndexedLocked(txid, false);
         m_shadow_pow_unclassified_claim_txids.erase(txid);
         forget_implicit_ownership();
         return;
@@ -1567,9 +1751,14 @@ void CWallet::RefreshShadowPowClaimIndexEntryLocked(const CWalletTx& wtx)
         const bool legacy = !schema_present;
         auto& domain = legacy ? m_shadow_pow_legacy_relay_frontiers
                               : m_shadow_pow_schema_relay_frontiers;
-        domain.emplace(frontier, txid);
-        m_shadow_pow_relay_frontier_by_txid.emplace(
-            txid, std::pair{legacy, frontier});
+        // Only a wallet record has a frontier: the reverse entry that
+        // removes it again is stored on that record.
+        if (Assume(indexed)) {
+            domain.emplace(frontier, txid);
+            indexed->m_shadow_pow_index.has_relay_frontier = true;
+            indexed->m_shadow_pow_index.legacy_relay_frontier = legacy;
+            indexed->m_shadow_pow_relay_frontier.value = frontier;
+        }
     }
     const auto classified_generation =
         m_shadow_pow_claim_ownership_generation_by_txid.find(txid);
@@ -1589,7 +1778,7 @@ void CWallet::RefreshShadowPowClaimIndexEntryLocked(const CWalletTx& wtx)
     const bool classified_foreign = current_implicit_classification &&
         m_shadow_pow_foreign_claim_txids.count(txid) != 0;
     if (!locally_relevant && !classified_foreign) {
-        m_shadow_pow_claim_txids.erase(txid);
+        SetShadowPowLocalClaimIndexedLocked(txid, false);
         m_shadow_pow_unconfirmed_claim_txids.erase(txid);
         // Confirmed implicit history is inert. Reclassify it only if an exact
         // state transition later makes it unconfirmed and therefore relevant
@@ -1608,13 +1797,13 @@ void CWallet::RefreshShadowPowClaimIndexEntryLocked(const CWalletTx& wtx)
     }
     if (locally_relevant) {
         m_shadow_pow_foreign_claim_txids.erase(txid);
-        m_shadow_pow_claim_txids.insert(txid);
+        SetShadowPowLocalClaimIndexedLocked(txid, true);
         if (!wtx.isConfirmed()) {
             m_shadow_pow_unconfirmed_claim_txids.insert(txid);
         }
 
     } else {
-        m_shadow_pow_claim_txids.erase(txid);
+        SetShadowPowLocalClaimIndexedLocked(txid, false);
         m_shadow_pow_foreign_claim_txids.insert(txid);
     }
 }
@@ -1763,7 +1952,7 @@ void CWallet::RefreshShadowPowClaimOwnershipIndex() const
                 m_shadow_pow_claim_stale_ownership_records > 0) {
                 --m_shadow_pow_claim_stale_ownership_records;
             }
-            wallet.m_shadow_pow_claim_txids.erase(txid);
+            wallet.SetShadowPowLocalClaimIndexedLocked(txid, false);
             wallet.m_shadow_pow_unconfirmed_claim_txids.erase(txid);
             wallet.MarkShadowPowClaimCandidateStateChangedLocked();
             ++classified;
@@ -1840,16 +2029,24 @@ void CWallet::RebuildShadowPowClaimIndexesLocked()
     m_shadow_pow_legacy_cleanup_pending_txids.clear();
     m_shadow_pow_legacy_cleanup_repair_cursor.reset();
     m_shadow_pow_claim_repair_cursor.reset();
-    m_shadow_pow_all_proof_txids.clear();
+    // The proof, local-claim, relay-frontier and anchor-reference state
+    // lives on the records.
+    for (const auto& [txid, wtx] : mapWallet) {
+        (void)txid;
+        wtx.ResetShadowPowIndexState();
+    }
+#ifdef SHADOW_POW_CLAIM_INDEX_SELFCHECK
+    g_shadow_pow_claim_index_rebuilding = true;
+#endif
     m_shadow_pow_unknown_proof_presence_txids.clear();
     m_shadow_pow_known_oversized_proof_txids.clear();
+    m_shadow_pow_nonconfirmed_proof_txids.clear();
     m_shadow_pow_proof_inputs_by_txid.clear();
     m_shadow_pow_proof_anchor_txids.clear();
     m_shadow_pow_unknown_inputs_by_txid.clear();
     m_shadow_pow_unknown_anchor_txids.clear();
     m_shadow_pow_proof_input_index_pending_txids.clear();
     m_shadow_pow_proof_input_index_capacity_txids.clear();
-    m_shadow_pow_claim_txids.clear();
     m_shadow_pow_unconfirmed_claim_txids.clear();
     m_shadow_pow_unclassified_claim_txids.clear();
     m_shadow_pow_legacy_local_claim_txids.clear();
@@ -1860,11 +2057,18 @@ void CWallet::RebuildShadowPowClaimIndexesLocked()
     m_shadow_pow_claim_ownership_reclassification_cursor.reset();
     m_shadow_pow_schema_relay_frontiers.clear();
     m_shadow_pow_legacy_relay_frontiers.clear();
-    m_shadow_pow_relay_frontier_by_txid.clear();
     for (const auto& [txid, wtx] : mapWallet) {
         (void)txid;
         RefreshShadowPowClaimIndexEntryLocked(wtx);
     }
+#ifdef SHADOW_POW_CLAIM_INDEX_SELFCHECK
+    g_shadow_pow_claim_index_rebuilding = false;
+    std::string failure;
+    if (!CheckShadowPowClaimIndexConsistencyLocked(&failure)) {
+        tfm::format(std::cerr, "claim index self-check failed after rebuild: %s\n", failure);
+        std::abort();
+    }
+#endif
 }
 
 bool CWallet::ShadowPowClaimRecoveryInventoryMatchesCurrentLocked(
@@ -2347,7 +2551,7 @@ CWallet::GetShadowPowClaimRecoveryInventoryWithEvaluationsLocked(
 
             if (!consume_transaction_work(parent)) return;
             if (!TransactionHasShadowProof(*parent.tx) ||
-                m_shadow_pow_claim_txids.count(parent.GetHash()) == 0) {
+                !IsShadowPowLocalClaimIndexedLocked(parent.GetHash())) {
                 terminal.anchor = prevout;
                 terminal_resolved = true;
                 break;
@@ -2503,7 +2707,7 @@ CWallet::GetShadowPowClaimRecoveryInventoryWithEvaluationsLocked(
             node.abandoned = wtx.isAbandoned();
             node.wallet_authored =
                 TransactionHasShadowProof(tx)
-                    ? m_shadow_pow_claim_txids.count(txid) != 0
+                    ? IsShadowPowLocalClaimIndexedLocked(txid)
                     : wtx.fFromMe;
             node.wallet_from_me = wtx.fFromMe;
 
@@ -3011,7 +3215,7 @@ CWallet::GetShadowPowClaimRecoveryInventoryWithEvaluationsLocked(
             node.in_mempool = wtx.InMempool();
             node.wallet_authored =
                 TransactionHasShadowProof(*wtx.tx)
-                    ? m_shadow_pow_claim_txids.count(txid) != 0
+                    ? IsShadowPowLocalClaimIndexedLocked(txid)
                     : wtx.fFromMe;
             node.wallet_from_me = wtx.fFromMe;
 
@@ -4414,8 +4618,11 @@ const char* RecoveryOriginString(ShadowPowClaimRecoveryOrigin origin)
                : SHADOW_POW_RESOLUTION_ORIGIN_MANUAL;
 }
 
+// Values is mapValue_t (a record being built) or WalletTxValueMap (a wallet
+// record's own metadata).
+template <typename Values>
 bool StoreResolutionAuthorizationReceipt(
-    mapValue_t& values, const CTransaction& transaction,
+    Values& values, const CTransaction& transaction,
     const ShadowPowClaimRecoveryPlan* plan, std::string& error)
 {
     if (!plan || plan->plan_id.IsNull() || plan->active_tip.IsNull() ||
@@ -6412,7 +6619,7 @@ CWallet::AdoptShadowPowClaimRecoveryComponent(
 
     struct AdoptionUpdate {
         uint256 txid;
-        mapValue_t metadata;
+        WalletTxValueMap metadata;
     };
     std::vector<AdoptionUpdate> updates;
     updates.reserve(component.claim_txids.size());
@@ -6540,7 +6747,13 @@ void CWallet::MaybeAutoResolveShadowPowClaims()
     // operator reviewed. Creation still could never exceed the wallet max.
     manual_retry.max_fee_per_resolution = m_default_max_tx_fee;
     manual_retry.aggregate_batch_fee_cap = MAX_MONEY;
-    if (HaveChain() && chain().isReadyToBroadcast()) {
+    // The retry only looks for managed resolution records. The metadata index
+    // that feeds the inventory's MANAGED_RESOLUTION nodes is empty for almost
+    // every wallet, and building the inventory is the expensive part of this
+    // per-minute pass, so skip it when there is nothing it could find.
+    const bool have_managed_resolutions = WITH_LOCK(
+        cs_wallet, return !m_shadow_pow_managed_resolution_txids.empty());
+    if (have_managed_resolutions && HaveChain() && chain().isReadyToBroadcast()) {
         const ShadowPowClaimRecoveryInventory inventory =
             GetShadowPowClaimRecoveryInventory();
         for (const ShadowPowClaimRecoveryComponent& component :

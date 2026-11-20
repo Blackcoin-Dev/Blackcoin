@@ -132,6 +132,7 @@ BITCOIN_CORE_H = \
   chainparamsbase.h \
   chainparamsseeds.h \
   checkqueue.h \
+  claim_relay_tracker.h \
   clientversion.h \
   coins.h \
   common/args.h \
@@ -209,6 +210,10 @@ BITCOIN_CORE_H = \
   memusage.h \
   merkleblock.h \
   net.h \
+  net_https_seed.h \
+  https_seed_client.h \
+  httpsseed_ca.h \
+  qq_policy.h \
   net_permissions.h \
   net_processing.h \
   net_types.h \
@@ -321,12 +326,14 @@ BITCOIN_CORE_H = \
   util/golombrice.h \
   util/hash_type.h \
   util/hasher.h \
+  util/io_counters.h \
   util/insert.h \
   util/macros.h \
   util/message.h \
   util/moneystr.h \
   util/overflow.h \
   util/overloaded.h \
+  util/readahead.h \
   util/readwritefile.h \
   util/result.h \
   util/serfloat.h \
@@ -337,6 +344,7 @@ BITCOIN_CORE_H = \
   util/syserror.h \
   util/thread.h \
   util/threadinterrupt.h \
+  util/thread_qos.h \
   util/threadnames.h \
   util/time.h \
   util/tokenpipe.h \
@@ -348,6 +356,7 @@ BITCOIN_CORE_H = \
   util/vector.h \
   validation.h \
   validationinterface.h \
+  validation_stall.h \
   version.h \
   versionbits.h \
   wallet/bdb.h \
@@ -361,6 +370,8 @@ BITCOIN_CORE_H = \
   wallet/external_signer_scriptpubkeyman.h \
   wallet/fees.h \
   wallet/load.h \
+  wallet/pow_miner_tip_signal.h \
+  wallet/pow_mining_duty_cycle.h \
   wallet/quantum_stake_ops.h \
   wallet/qq_development_donation.h \
   wallet/receive.h \
@@ -369,6 +380,7 @@ BITCOIN_CORE_H = \
   wallet/rpc/util.h \
   wallet/rpc/wallet.h \
   wallet/salvage.h \
+  wallet/scheduler_stats.h \
   wallet/scriptpubkeyman.h \
   wallet/shadow_pow_claim_pagination.h \
   wallet/shadow_pow_claim_recovery.h \
@@ -378,11 +390,15 @@ BITCOIN_CORE_H = \
   wallet/staking.h \
   wallet/sqlite.h \
   wallet/transaction.h \
+  wallet/txvaluemap.h \
   wallet/types.h \
   wallet/wallet.h \
   wallet/walletdb.h \
   wallet/wallettool.h \
   wallet/walletutil.h \
+  wallet/block_connect_activity.h \
+  wallet/coin_facts.h \
+  wallet/display_balance.h \
   walletinitinterface.h \
   warnings.h \
   zmq/zmqabstractnotifier.h \
@@ -400,7 +416,7 @@ libbitcoin_util_a-clientversion.$(OBJEXT): obj/build.h
 bitcoind-res.$(OBJEXT): obj/build.h
 
 # node #
-libbitcoin_node_a_CPPFLAGS = $(AM_CPPFLAGS) $(BITCOIN_INCLUDES) $(LEVELDB_CPPFLAGS) $(BOOST_CPPFLAGS) $(MINIUPNPC_CPPFLAGS) $(NATPMP_CPPFLAGS) $(EVENT_CFLAGS) $(EVENT_PTHREADS_CFLAGS)
+libbitcoin_node_a_CPPFLAGS = $(AM_CPPFLAGS) $(BITCOIN_INCLUDES) $(LEVELDB_CPPFLAGS) $(BOOST_CPPFLAGS) $(MINIUPNPC_CPPFLAGS) $(NATPMP_CPPFLAGS) $(EVENT_CFLAGS) $(EVENT_PTHREADS_CFLAGS) $(CURL_CFLAGS)
 libbitcoin_node_a_CXXFLAGS = $(AM_CXXFLAGS) $(PIE_FLAGS)
 libbitcoin_node_a_SOURCES = \
   addrdb.cpp \
@@ -434,6 +450,8 @@ libbitcoin_node_a_SOURCES = \
   kernel/mempool_removal_reason.cpp \
   mapport.cpp \
   net.cpp \
+  net_https_seed.cpp \
+  https_seed_client.cpp \
   net_processing.cpp \
   netgroup.cpp \
   node/abort.cpp \
@@ -549,10 +567,14 @@ libbitcoin_wallet_a_SOURCES = \
   wallet/rpc/transactions.cpp \
   wallet/rpc/util.cpp \
   wallet/rpc/wallet.cpp \
+  wallet/scheduler_stats.cpp \
   wallet/scriptpubkeyman.cpp \
   wallet/shadow_pow_claim_recovery.cpp \
+  wallet/coin_facts.cpp \
+  wallet/display_balance.cpp \
   wallet/spend.cpp \
   wallet/transaction.cpp \
+  wallet/txvaluemap.cpp \
   wallet/wallet.cpp \
   wallet/walletdb.cpp \
   wallet/walletutil.cpp \
@@ -803,8 +825,10 @@ libbitcoin_util_a_SOURCES = \
   util/exception.cpp \
   util/fs.cpp \
   util/fs_helpers.cpp \
+  util/readahead.cpp \
   util/getuniquepath.cpp \
   util/hasher.cpp \
+  util/io_counters.cpp \
   util/sock.cpp \
   util/syserror.cpp \
   util/message.cpp \
@@ -812,6 +836,7 @@ libbitcoin_util_a_SOURCES = \
   util/readwritefile.cpp \
   util/signalinterrupt.cpp \
   util/thread.cpp \
+  util/thread_qos.cpp \
   util/threadinterrupt.cpp \
   util/threadnames.cpp \
   util/serfloat.cpp \
@@ -857,7 +882,7 @@ blackcoin_bin_ldadd = \
   $(LIBMEMENV) \
   $(LIBSECP256K1)
 
-blackcoin_bin_ldadd += $(BDB_LIBS) $(MINIUPNPC_LIBS) $(NATPMP_LIBS) $(EVENT_PTHREADS_LIBS) $(EVENT_LIBS) $(ZMQ_LIBS) $(SQLITE_LIBS) $(LIBOQS_LIBS)
+blackcoin_bin_ldadd += $(CURL_LIBS) $(BDB_LIBS) $(MINIUPNPC_LIBS) $(NATPMP_LIBS) $(EVENT_PTHREADS_LIBS) $(EVENT_LIBS) $(ZMQ_LIBS) $(SQLITE_LIBS) $(LIBOQS_LIBS)
 
 blackcoind_SOURCES = $(blackcoin_daemon_sources) init/bitcoind.cpp
 blackcoind_CPPFLAGS = $(blackcoin_bin_cppflags)
@@ -936,7 +961,8 @@ blackcoin_wallet_LDADD = \
   $(LIBSECP256K1) \
   $(BDB_LIBS) \
   $(SQLITE_LIBS) \
-  $(LIBOQS_LIBS)
+  $(LIBOQS_LIBS) \
+  $(CURL_LIBS)
 
 if TARGET_WINDOWS
 blackcoin_wallet_SOURCES += bitcoin-wallet-res.rc
@@ -1057,8 +1083,10 @@ libbitcoinkernel_la_SOURCES = \
   util/exception.cpp \
   util/fs.cpp \
   util/fs_helpers.cpp \
+  util/readahead.cpp \
   util/getuniquepath.cpp \
   util/hasher.cpp \
+  util/io_counters.cpp \
   util/moneystr.cpp \
   util/serfloat.cpp \
   util/signalinterrupt.cpp \
@@ -1066,6 +1094,7 @@ libbitcoinkernel_la_SOURCES = \
   util/string.cpp \
   util/syserror.cpp \
   util/thread.cpp \
+  util/thread_qos.cpp \
   util/threadnames.cpp \
   util/time.cpp \
   util/tokenpipe.cpp \

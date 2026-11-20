@@ -15,6 +15,7 @@
 #include <test/util/coins.h>
 #include <test/util/random.h>
 #include <test/util/setup_common.h>
+#include <txdb.h>
 #include <uint256.h>
 #include <validation.h>
 
@@ -119,6 +120,40 @@ BOOST_AUTO_TEST_CASE(validation_chainstate_resize_caches)
         // The view cache should be empty since we had to destruct to downsize.
         BOOST_CHECK(!c1.CoinsTip().HaveCoinInCache(outpoint));
     }
+}
+
+BOOST_AUTO_TEST_CASE(validation_chainstate_retries_deferred_database_resize)
+{
+    LOCK(::cs_main);
+    auto& manager = *Assert(m_node.chainman);
+    auto& state = manager.InitializeChainstate(Assert(m_node.mempool.get()));
+    constexpr size_t original_size{1 << 23};
+    constexpr size_t requested_size{1 << 22};
+    state.InitCoinsDB(original_size, /*in_memory=*/false, /*should_wipe=*/false);
+    state.InitCoinsCache(original_size);
+    BOOST_REQUIRE(state.LoadGenesisBlock());
+    state.CoinsTip().SetBestBlock(InsecureRand256());
+    BOOST_REQUIRE(state.ResizeCoinsCaches(original_size, original_size));
+    BOOST_REQUIRE_EQUAL(state.m_coinsdb_cache_size_bytes, original_size);
+    const auto outpoint = AddTestCoin(state.CoinsTip());
+    state.CoinsTip().SetBestBlock(InsecureRand256());
+    auto snapshot = state.CoinsDB().Cursor();
+    BOOST_REQUIRE(snapshot);
+
+    // The coinstip resize/flush still runs, but the database size is not
+    // recorded as applied while its immutable cursor prevents reopening.
+    BOOST_REQUIRE(state.ResizeCoinsCaches(requested_size, requested_size));
+    BOOST_CHECK_EQUAL(state.m_coinsdb_cache_size_bytes, original_size);
+    BOOST_CHECK_EQUAL(state.m_coinstip_cache_size_bytes, requested_size);
+    BOOST_CHECK(!state.CoinsTip().HaveCoinInCache(outpoint));
+    BOOST_CHECK(state.CoinsDB().HaveCoin(outpoint));
+
+    snapshot.reset();
+    // An identical request must reach ResizeCache, rather than return early
+    // because the earlier deferred size was incorrectly marked as applied.
+    BOOST_REQUIRE(state.ResizeCoinsCaches(requested_size, requested_size));
+    BOOST_CHECK_EQUAL(state.m_coinsdb_cache_size_bytes, requested_size);
+    BOOST_CHECK(state.CoinsDB().HaveCoin(outpoint));
 }
 
 //! Test UpdateTip behavior for both active and background chainstates.

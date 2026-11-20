@@ -9,11 +9,13 @@
 #include <common/args.h>
 #include <common/system.h>
 #include <chainparams.h>
+#include <coins.h>
 #include <consensus/amount.h>
 #include <consensus/demurrage.h>
 #include <consensus/tx_verify.h>
 #include <consensus/validation.h>
 #include <crypto/mldsa.h>
+#include <hash.h>
 #include <interfaces/chain.h>
 #include <key_io.h>
 #include <numeric>
@@ -37,6 +39,7 @@
 #include <validation.h>
 
 #include <cmath>
+#include <thread>
 
 using interfaces::FoundBlock;
 
@@ -80,10 +83,212 @@ static QuantumFundingPhase GetQuantumFundingPhase(const CWallet& wallet) EXCLUSI
     return phase;
 }
 
+namespace {
+/** Minimum confirmations before an output's chainstate facts may be memoized. */
+constexpr int LIFECYCLE_MEMO_MIN_DEPTH{100};
+
+/** Every chainstate-dependent input of the lifecycle classification of one
+ * output. Everything the classifier needs from the coins database that is
+ * independent of the evaluation tip is gathered here, in one place. */
+struct LifecycleChainFacts {
+    Coin coin;
+    bool synthetic{false};
+    bool confirmed_coin{false};
+};
+
+/** The part of the facts that needs only the chainstate. `in_mempool` and
+ * `tx_time` say what the wallet knows about an output that is not in the UTXO
+ * set: an unconfirmed transaction in the mempool is classified as a candidate
+ * next-block coin. */
+bool GatherLifecycleChainFactsFromView(const COutPoint& outpoint, const CTxOut& txout,
+                                       const CCoinsViewCache& view, const CBlockIndex* tip,
+                                       int evaluation_height, const Consensus::Params& consensus,
+                                       bool in_mempool, int64_t tx_time,
+                                       LifecycleChainFacts& facts, std::string& error)
+    EXCLUSIVE_LOCKS_REQUIRED(::cs_main)
+{
+    facts = {};
+    Coin& coin = facts.coin;
+    facts.confirmed_coin = view.GetCoin(outpoint, coin) && !coin.IsSpent();
+    if (facts.confirmed_coin) {
+        if (coin.out != txout) {
+            error = strprintf("Wallet output %s does not match the active UTXO set", outpoint.ToString());
+            return false;
+        }
+    } else {
+        if (!in_mempool) {
+            error = strprintf("Wallet output %s is absent from the active UTXO set", outpoint.ToString());
+            return false;
+        }
+        coin = Coin(txout, evaluation_height, /*coinbase=*/false,
+                    /*coinstake=*/false, tx_time);
+    }
+
+    // A Gold Rush payout is authenticated only as a coinbase coin, and only a
+    // coinbase coin can be a payout candidate whose record is missing: for
+    // every other coin the status is NOT_CANDIDATE whatever the chainstate
+    // holds, so the provenance records (several reads that miss) are not read.
+    if (facts.confirmed_coin && coin.IsCoinBase()) {
+        const GoldRushPayoutStatus status = GetGoldRushPayoutStatus(
+            view, outpoint, consensus, nullptr, tip);
+        if (status == GoldRushPayoutStatus::CORRUPT) {
+            error = strprintf("Wallet output %s has missing or corrupt Gold Rush provenance", outpoint.ToString());
+            return false;
+        }
+        facts.synthetic = status == GoldRushPayoutStatus::AUTHENTICATED;
+    }
+    return true;
+}
+
+bool GatherLifecycleChainFacts(const CWallet& wallet, const COutPoint& outpoint,
+                               const CTxOut& txout, const CCoinsViewCache& view,
+                               const CBlockIndex* tip, int evaluation_height,
+                               const Consensus::Params& consensus,
+                               LifecycleChainFacts& facts, std::string& error)
+    EXCLUSIVE_LOCKS_REQUIRED(::cs_main, wallet.cs_wallet)
+{
+    const CWalletTx* wtx = wallet.GetWalletTx(outpoint.hash);
+    const bool in_mempool = wtx && outpoint.n < wtx->tx->vout.size() &&
+        wallet.GetTxDepthInMainChain(*wtx) == 0 && wtx->InMempool();
+    return GatherLifecycleChainFactsFromView(outpoint, txout, view, tip, evaluation_height, consensus,
+                                             in_mempool, in_mempool ? wtx->GetTxTime() : 0, facts, error);
+}
+
+uint64_t LifecycleTxOutDigest(const CTxOut& txout)
+{
+    HashWriter hasher{};
+    hasher << txout;
+    return hasher.GetSHA256().GetUint64(0);
+}
+
+bool LifecycleMemoMatches(const WalletOutputLifecycleMemo& memo, const TxStateConfirmed& conf,
+                          uint64_t digest)
+{
+    return memo.confirmed_block_hash_prefix == conf.confirmed_block_hash.GetUint64(0) &&
+           memo.confirmed_block_height == conf.confirmed_block_height &&
+           memo.txout_digest == digest;
+}
+
+bool LifecycleFactsEqualMemo(const LifecycleChainFacts& facts, const WalletOutputLifecycleMemo& memo)
+{
+    return facts.confirmed_coin &&
+           facts.coin.nHeight == memo.coin_height &&
+           facts.coin.nTime == memo.coin_time &&
+           facts.coin.IsCoinBase() == memo.coinbase &&
+           facts.coin.IsCoinStake() == memo.coinstake &&
+           facts.synthetic == memo.synthetic;
+}
+
+/** Everything the wallet itself can say about the memo of one output: whether
+ * it is memo-eligible (a confirmed wallet transaction at least
+ * LIFECYCLE_MEMO_MIN_DEPTH deep), and whether its memo entry may be served as
+ * is (`serve`) or must be compared with the chainstate (`verify`, the
+ * deterministic 1/LIFECYCLE_MEMO_VERIFY_MODULUS slice). Needs no chainstate. */
+struct LifecycleMemoLookup {
+    const TxStateConfirmed* confirmed_state{nullptr};
+    uint64_t txout_digest{0};
+    const WalletOutputLifecycleMemo* serve{nullptr};
+    const WalletOutputLifecycleMemo* verify{nullptr};
+    //! Set for an output of a confirmed transaction that is not coinbase
+    //! shaped, whatever its depth: under cs_main DeriveConfirmedCoin() says
+    //! what coin it is without a database read.
+    std::optional<ConfirmedTxFacts> derivable;
+};
+
+LifecycleMemoLookup LookupLifecycleMemo(const CWallet& wallet, const COutPoint& outpoint,
+                                        const CTxOut& txout, int tip_height, bool use_memo)
+    EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet)
+{
+    LifecycleMemoLookup lookup;
+    if (!use_memo) return lookup;
+    const CWalletTx* wtx = wallet.GetWalletTx(outpoint.hash);
+    if (!wtx || outpoint.n >= wtx->tx->vout.size()) return lookup;
+    const TxStateConfirmed* confirmed = wtx->state<TxStateConfirmed>();
+    if (confirmed && !wtx->IsCoinBase() && !txout.scriptPubKey.IsUnspendable()) {
+        lookup.derivable = ConfirmedTxFacts{wtx->tx->nVersion, wtx->tx->nTime, /*coinbase=*/false, wtx->IsCoinStake(),
+                                            confirmed->confirmed_block_hash, confirmed->confirmed_block_height};
+    }
+    if (wallet.GetTxDepthInMainChain(*wtx) < LIFECYCLE_MEMO_MIN_DEPTH) return lookup;
+    lookup.confirmed_state = confirmed;
+    if (!lookup.confirmed_state) return lookup;
+    lookup.txout_digest = LifecycleTxOutDigest(txout);
+    const auto it = wallet.m_output_lifecycle_memo.find(outpoint);
+    if (it == wallet.m_output_lifecycle_memo.end() ||
+        !LifecycleMemoMatches(it->second, *lookup.confirmed_state, lookup.txout_digest)) return lookup;
+    const uint64_t slice = outpoint.hash.GetUint64(0) + outpoint.n +
+                           static_cast<uint64_t>(tip_height);
+    if (slice % LIFECYCLE_MEMO_VERIFY_MODULUS == 0) {
+        lookup.verify = &it->second;
+    } else {
+        lookup.serve = &it->second;
+    }
+    return lookup;
+}
+
+WalletOutputLifecycleMemo LifecycleMemoFromFacts(const LifecycleChainFacts& facts, const uint256& block_hash,
+                                                 int block_height, uint64_t digest)
+{
+    WalletOutputLifecycleMemo memo;
+    memo.confirmed_block_hash_prefix = block_hash.GetUint64(0);
+    memo.confirmed_block_height = block_height;
+    memo.txout_digest = digest;
+    memo.coin_height = facts.coin.nHeight;
+    memo.coin_time = facts.coin.nTime;
+    memo.coinbase = facts.coin.IsCoinBase();
+    memo.coinstake = facts.coin.IsCoinStake();
+    memo.synthetic = facts.synthetic;
+    return memo;
+}
+
+LifecycleChainFacts LifecycleFactsFromMemo(const CTxOut& txout, const WalletOutputLifecycleMemo& memo)
+{
+    LifecycleChainFacts facts;
+    facts.coin = Coin(txout, memo.coin_height, memo.coinbase, memo.coinstake, memo.coin_time);
+    facts.synthetic = memo.synthetic;
+    facts.confirmed_coin = true;
+    return facts;
+}
+
+std::optional<Consensus::DemurrageAttestationState> LifecycleAttestationFor(
+    const CCoinsViewCache& view, const CScript& script, LifecycleAttestationMap* cache)
+{
+    if (cache) {
+        const auto it = cache->find(script);
+        if (it != cache->end()) return it->second;
+    }
+    std::optional<Consensus::DemurrageAttestationState> state =
+        Consensus::LatestDemurrageAttestationStateForScript(view, script);
+    if (cache) cache->emplace(script, state);
+    return state;
+}
+
+/** The one place the lifecycle classification is computed from gathered or
+ * memoized facts. */
+bool ClassifyLifecycleFacts(const LifecycleChainFacts& facts, const COutPoint& outpoint,
+                            const Consensus::Params& consensus, int evaluation_height,
+                            int64_t evaluation_mtp,
+                            const std::optional<Consensus::DemurrageAttestationState>& attestation,
+                            ValueLifecycleClassification& classification, std::string& error)
+{
+    const ValueLifecycleResult result = ClassifyValueLifecycle(
+        facts.coin, facts.synthetic, consensus, evaluation_height, evaluation_mtp,
+        attestation ? std::optional<int>{attestation->height} : std::nullopt,
+        attestation ? std::optional<int>{static_cast<int>(attestation->coverage_start_height)} : std::nullopt,
+        classification);
+    if (result != ValueLifecycleResult::OK) {
+        error = strprintf("Unable to classify wallet output %s (lifecycle error %u)",
+                          outpoint.ToString(), static_cast<unsigned>(result));
+        return false;
+    }
+    return true;
+}
+} // namespace
+
 bool GetWalletOutputLifecycle(const CWallet& wallet, const COutPoint& outpoint,
                               const CTxOut& txout,
                               ValueLifecycleClassification& classification,
-                              std::string& error)
+                              std::string& error,
+                              const WalletLifecycleOptions& options)
 {
     AssertLockHeld(::cs_main);
     AssertLockHeld(wallet.cs_wallet);
@@ -103,49 +308,54 @@ bool GetWalletOutputLifecycle(const CWallet& wallet, const COutPoint& outpoint,
     const int64_t evaluation_mtp = tip->GetMedianTimePast();
     const Consensus::Params& consensus = Params().GetConsensus();
     const CCoinsViewCache& view = wallet.chain().getCoinsTip();
+    if (options.stats) ++options.stats->outputs;
 
-    Coin coin;
-    bool confirmed_coin = view.GetCoin(outpoint, coin) && !coin.IsSpent();
-    if (confirmed_coin) {
-        if (coin.out != txout) {
-            error = strprintf("Wallet output %s does not match the active UTXO set", outpoint.ToString());
-            return false;
-        }
+    // Memo eligibility: a confirmed wallet transaction at least
+    // LIFECYCLE_MEMO_MIN_DEPTH deep. Only the GUI display path asks for it.
+    const LifecycleMemoLookup lookup = LookupLifecycleMemo(
+        wallet, outpoint, txout, tip->nHeight, options.use_memo);
+
+    LifecycleChainFacts facts;
+    const bool from_memo = lookup.serve != nullptr;
+    if (from_memo) {
+        facts = LifecycleFactsFromMemo(txout, *lookup.serve);
+        if (options.stats) ++options.stats->memo_hits;
+    } else if (std::optional<Coin> derived = lookup.derivable && !lookup.verify
+                   ? DeriveConfirmedCoin(txout, *lookup.derivable, tip) : std::nullopt) {
+        // Display paths only (use_memo): the coin of a confirmed transaction
+        // that is not coinbase shaped follows from the transaction and its
+        // block. The verify slice still compares it with the database.
+        facts.coin = std::move(*derived);
+        facts.confirmed_coin = true;
+        if (options.stats) ++options.stats->derived;
     } else {
-        const CWalletTx* wtx = wallet.GetWalletTx(outpoint.hash);
-        if (!wtx || outpoint.n >= wtx->tx->vout.size() ||
-            wallet.GetTxDepthInMainChain(*wtx) != 0 || !wtx->InMempool()) {
-            error = strprintf("Wallet output %s is absent from the active UTXO set", outpoint.ToString());
-            return false;
+        if (options.stats) ++options.stats->database_reads;
+        const bool gathered = GatherLifecycleChainFacts(
+            wallet, outpoint, txout, view, tip, evaluation_height, consensus, facts, error);
+        if (lookup.verify && (!gathered || !LifecycleFactsEqualMemo(facts, *lookup.verify))) {
+            // The chainstate no longer agrees with what was memoized. An entry
+            // in the verify slice is never served, so nothing computed so far
+            // rests on it: drop this entry only and report what the database
+            // says (the entry is written again below from what was just read).
+            wallet.WalletLogPrintf("Lifecycle memo disagrees with the chainstate for %s; dropping the entry (%u kept)\n",
+                                   outpoint.ToString(), wallet.m_output_lifecycle_memo.size() - 1);
+            wallet.m_output_lifecycle_memo.erase(outpoint);
+            if (options.stats) ++options.stats->memo_mismatches;
         }
-        coin = Coin(txout, evaluation_height, /*coinbase=*/false,
-                    /*coinstake=*/false, wtx->GetTxTime());
-    }
-
-    bool synthetic{false};
-    if (confirmed_coin) {
-        const GoldRushPayoutStatus status = GetGoldRushPayoutStatus(
-            view, outpoint, consensus, nullptr, tip);
-        if (status == GoldRushPayoutStatus::CORRUPT) {
-            error = strprintf("Wallet output %s has missing or corrupt Gold Rush provenance", outpoint.ToString());
-            return false;
-        }
-        synthetic = status == GoldRushPayoutStatus::AUTHENTICATED;
+        if (!gathered) return false;
     }
 
     std::optional<Consensus::DemurrageAttestationState> attestation;
     if (consensus.IsDemurrageActive(evaluation_height, evaluation_mtp)) {
-        attestation = Consensus::LatestDemurrageAttestationStateForScript(view, txout.scriptPubKey);
+        attestation = LifecycleAttestationFor(view, txout.scriptPubKey,
+                                              options.use_memo ? options.attestations : nullptr);
     }
-    const ValueLifecycleResult result = ClassifyValueLifecycle(
-        coin, synthetic, consensus, evaluation_height, evaluation_mtp,
-        attestation ? std::optional<int>{attestation->height} : std::nullopt,
-        attestation ? std::optional<int>{static_cast<int>(attestation->coverage_start_height)} : std::nullopt,
-        classification);
-    if (result != ValueLifecycleResult::OK) {
-        error = strprintf("Unable to classify wallet output %s (lifecycle error %u)",
-                          outpoint.ToString(), static_cast<unsigned>(result));
-        return false;
+    if (!ClassifyLifecycleFacts(facts, outpoint, consensus, evaluation_height, evaluation_mtp,
+                                attestation, classification, error)) return false;
+    if (lookup.confirmed_state && !from_memo && facts.confirmed_coin) {
+        wallet.StoreOutputLifecycleMemo(outpoint, LifecycleMemoFromFacts(
+            facts, lookup.confirmed_state->confirmed_block_hash,
+            lookup.confirmed_state->confirmed_block_height, lookup.txout_digest));
     }
     return true;
 }
@@ -193,12 +403,150 @@ bool RemoveLifecycleCredit(CAmount& balance, CAmount amount)
     balance -= amount;
     return true;
 }
+
+/** One wallet output that takes part in the lifecycle balance. */
+struct LifecycleOutputRef {
+    const CWalletTx& wtx;
+    COutPoint outpoint;
+    const CTxOut& txout;
+    bool wallet_immature;
+    bool mine_spendable;
+    bool watchonly;
+};
+
+/** Visit every output of one wallet transaction that counts toward the
+ * lifecycle balance: the output of a live trusted transaction at least
+ * min_depth deep, unspent, and ours (or watched). Needs only cs_wallet. fn
+ * returns false to stop; so does this function. Both the single-lock scan and
+ * the sliced display pass walk the wallet through here. `trusted_parents` is
+ * the cache of CachedTxIsTrusted() and must be one set for the whole walk. */
+template <typename Fn>
+bool ForEachLifecycleOutputOfTx(const CWallet& wallet, const uint256& wtxid, const CWalletTx& wtx,
+                                int min_depth, bool exclude_reused,
+                                std::set<uint256>& trusted_parents, Fn&& fn)
+    EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet)
+{
+    const int depth = wallet.GetTxDepthInMainChain(wtx);
+    if (depth < 0 || (depth == 0 && !wtx.InMempool())) return true;
+    const bool trusted = CachedTxIsTrusted(wallet, wtx, trusted_parents);
+    if (!trusted || depth < min_depth) return true;
+
+    const bool wallet_immature = wallet.IsTxImmature(wtx);
+    for (uint32_t n = 0; n < wtx.tx->vout.size(); ++n) {
+        const COutPoint outpoint{wtxid, n};
+        const CTxOut& txout = wtx.tx->vout[n];
+        if (wallet.IsSpent(outpoint) ||
+            (exclude_reused && wallet.IsSpentKey(txout.scriptPubKey))) continue;
+
+        const isminetype mine = wallet.IsMine(txout);
+        const bool mine_spendable = (mine & ISMINE_SPENDABLE) != ISMINE_NO;
+        const bool watchonly = (mine & ISMINE_WATCH_ONLY) != ISMINE_NO;
+        if (!mine_spendable && !watchonly) continue;
+
+        if (!fn(LifecycleOutputRef{wtx, outpoint, txout, wallet_immature, mine_spendable, watchonly})) return false;
+    }
+    return true;
+}
+
+/** The same over every transaction, in the order of mapWallet. */
+template <typename Fn>
+bool ForEachLifecycleOutput(const CWallet& wallet, int min_depth, bool exclude_reused, Fn&& fn)
+    EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet)
+{
+    std::set<uint256> trusted_parents;
+    for (const auto& [wtxid, wtx] : wallet.mapWallet) {
+        if (!ForEachLifecycleOutputOfTx(wallet, wtxid, wtx, min_depth, exclude_reused, trusted_parents, fn)) return false;
+    }
+    return true;
+}
+
+/** Fold one classified output into the balance and the lifecycle summary. */
+bool AccumulateLifecycleOutput(Balance& balance, WalletLifecycleSummary& summary,
+                               bool tx_coinbase, bool tx_coinstake, CAmount txout_value,
+                               ValueLifecycleClassification classification,
+                               bool wallet_immature, bool mine_spendable, bool watchonly,
+                               std::string& error)
+{
+    // Ordinary generated outputs retain the wallet's inherited
+    // M+1 display/selection policy. Consensus may accept the output
+    // in the candidate next block at depth M, but AvailableCoins does
+    // not select it until IsTxImmature() clears. Do not report that
+    // value as available one block before the wallet can use it.
+    // Authenticated Gold Rush payouts have their own narrowly scoped
+    // next-block maturity exception in IsTxImmature().
+    if (wallet_immature && !classification.synthetic &&
+        classification.ordinary_spendable) {
+        classification.category =
+            classification.category == ValueLifecycleCategory::SPENDABLE_LEGACY
+            ? ValueLifecycleCategory::IMMATURE_LEGACY
+            : ValueLifecycleCategory::IMMATURE_OTHER;
+        classification.mature = false;
+        classification.ordinary_spendable = false;
+    }
+    if (mine_spendable && !AddLifecycleOutput(summary.mine, classification)) {
+        error = "Wallet lifecycle mine balance is out of range";
+        return false;
+    }
+    if (watchonly && !AddLifecycleOutput(summary.watchonly, classification)) {
+        error = "Wallet lifecycle watch-only balance is out of range";
+        return false;
+    }
+
+    const CAmount baseline = wallet_immature ? 0 : txout_value;
+    const CAmount desired = classification.ordinary_spendable
+        ? classification.effective_amount : 0;
+    if (mine_spendable &&
+        !ReplaceLifecycleCredit(balance.m_mine_trusted, baseline, desired)) {
+        error = "Wallet lifecycle-adjusted trusted balance is out of range";
+        return false;
+    }
+    if (watchonly &&
+        !ReplaceLifecycleCredit(balance.m_watchonly_trusted, baseline, desired)) {
+        error = "Wallet lifecycle-adjusted watch-only balance is out of range";
+        return false;
+    }
+
+    if (wallet_immature &&
+        (classification.mature || classification.permanently_locked)) {
+        if (tx_coinbase) {
+            if (mine_spendable && !RemoveLifecycleCredit(balance.m_mine_immature, txout_value)) {
+                error = "Wallet lifecycle-adjusted immature balance is out of range";
+                return false;
+            }
+            if (watchonly && !RemoveLifecycleCredit(balance.m_watchonly_immature, txout_value)) {
+                error = "Wallet lifecycle-adjusted watch-only immature balance is out of range";
+                return false;
+            }
+        } else if (tx_coinstake) {
+            if (mine_spendable && !RemoveLifecycleCredit(balance.m_mine_stake, txout_value)) {
+                error = "Wallet lifecycle-adjusted stake balance is out of range";
+                return false;
+            }
+            if (watchonly && !RemoveLifecycleCredit(balance.m_watchonly_stake, txout_value)) {
+                error = "Wallet lifecycle-adjusted watch-only stake balance is out of range";
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+bool AccumulateLifecycleOutput(Balance& balance, WalletLifecycleSummary& summary,
+                               const CWalletTx& wtx, const CTxOut& txout,
+                               const ValueLifecycleClassification& classification,
+                               bool wallet_immature, bool mine_spendable, bool watchonly,
+                               std::string& error)
+{
+    return AccumulateLifecycleOutput(balance, summary, wtx.IsCoinBase(), wtx.IsCoinStake(), txout.nValue,
+                                     classification, wallet_immature, mine_spendable, watchonly, error);
+}
 } // namespace
 
 bool GetLifecycleAdjustedBalance(const CWallet& wallet, int min_depth,
                                  bool avoid_reuse, Balance& balance,
                                  WalletLifecycleSummary& summary,
-                                 std::string& error)
+                                 std::string& error,
+                                 const WalletLifecycleOptions& options)
 {
     AssertLockHeld(::cs_main);
     AssertLockHeld(wallet.cs_wallet);
@@ -222,92 +570,625 @@ bool GetLifecycleAdjustedBalance(const CWallet& wallet, int min_depth,
     const bool exclude_reused = avoid_reuse &&
         wallet.IsWalletFlagSet(WALLET_FLAG_AVOID_REUSE);
 
-    std::set<uint256> trusted_parents;
-    for (const auto& [wtxid, wtx] : wallet.mapWallet) {
-        const int depth = wallet.GetTxDepthInMainChain(wtx);
-        if (depth < 0 || (depth == 0 && !wtx.InMempool())) continue;
-        const bool trusted = CachedTxIsTrusted(wallet, wtx, trusted_parents);
-        if (!trusted || depth < min_depth) continue;
+    // Budget (memo-enabled scans only): the memo is filled output by output as
+    // the scan proceeds, so a scan cut short still leaves its progress for the
+    // next attempt; the order of mapWallet is irrelevant to correctness.
+    WalletLifecycleScanStats local_stats;
+    WalletLifecycleOptions scan_options = options;
+    if (!scan_options.stats) scan_options.stats = &local_stats;
+    scan_options.stats->budget_exhausted = false;
+    const bool limited = options.use_memo &&
+        (options.budget.count() > 0 || options.max_database_reads > 0);
+    const auto deadline = std::chrono::steady_clock::now() + options.budget;
+    uint64_t scan_database_reads{0};
 
-        const bool wallet_immature = wallet.IsTxImmature(wtx);
-        for (uint32_t n = 0; n < wtx.tx->vout.size(); ++n) {
-            const COutPoint outpoint{wtxid, n};
-            const CTxOut& txout = wtx.tx->vout[n];
-            if (wallet.IsSpent(outpoint) ||
-                (exclude_reused && wallet.IsSpentKey(txout.scriptPubKey))) continue;
-
-            const isminetype mine = wallet.IsMine(txout);
-            const bool mine_spendable = (mine & ISMINE_SPENDABLE) != ISMINE_NO;
-            const bool watchonly = (mine & ISMINE_WATCH_ONLY) != ISMINE_NO;
-            if (!mine_spendable && !watchonly) continue;
-
+    return ForEachLifecycleOutput(wallet, min_depth, exclude_reused,
+        [&](const LifecycleOutputRef& out) NO_THREAD_SAFETY_ANALYSIS {
+            AssertLockHeld(::cs_main);
+            AssertLockHeld(wallet.cs_wallet);
             ValueLifecycleClassification classification;
-            if (!GetWalletOutputLifecycle(wallet, outpoint, txout, classification, error)) return false;
-
-            // Ordinary generated outputs retain the wallet's inherited
-            // M+1 display/selection policy. Consensus may accept the output
-            // in the candidate next block at depth M, but AvailableCoins does
-            // not select it until IsTxImmature() clears. Do not report that
-            // value as available one block before the wallet can use it.
-            // Authenticated Gold Rush payouts have their own narrowly scoped
-            // next-block maturity exception in IsTxImmature().
-            if (wallet_immature && !classification.synthetic &&
-                classification.ordinary_spendable) {
-                classification.category =
-                    classification.category == ValueLifecycleCategory::SPENDABLE_LEGACY
-                    ? ValueLifecycleCategory::IMMATURE_LEGACY
-                    : ValueLifecycleCategory::IMMATURE_OTHER;
-                classification.mature = false;
-                classification.ordinary_spendable = false;
-            }
-            if (mine_spendable && !AddLifecycleOutput(summary.mine, classification)) {
-                error = "Wallet lifecycle mine balance is out of range";
-                return false;
-            }
-            if (watchonly && !AddLifecycleOutput(summary.watchonly, classification)) {
-                error = "Wallet lifecycle watch-only balance is out of range";
-                return false;
-            }
-
-            const CAmount baseline = wallet_immature ? 0 : txout.nValue;
-            const CAmount desired = classification.ordinary_spendable
-                ? classification.effective_amount : 0;
-            if (mine_spendable &&
-                !ReplaceLifecycleCredit(balance.m_mine_trusted, baseline, desired)) {
-                error = "Wallet lifecycle-adjusted trusted balance is out of range";
-                return false;
-            }
-            if (watchonly &&
-                !ReplaceLifecycleCredit(balance.m_watchonly_trusted, baseline, desired)) {
-                error = "Wallet lifecycle-adjusted watch-only balance is out of range";
-                return false;
-            }
-
-            if (wallet_immature &&
-                (classification.mature || classification.permanently_locked)) {
-                if (wtx.IsCoinBase()) {
-                    if (mine_spendable && !RemoveLifecycleCredit(balance.m_mine_immature, txout.nValue)) {
-                        error = "Wallet lifecycle-adjusted immature balance is out of range";
-                        return false;
-                    }
-                    if (watchonly && !RemoveLifecycleCredit(balance.m_watchonly_immature, txout.nValue)) {
-                        error = "Wallet lifecycle-adjusted watch-only immature balance is out of range";
-                        return false;
-                    }
-                } else if (wtx.IsCoinStake()) {
-                    if (mine_spendable && !RemoveLifecycleCredit(balance.m_mine_stake, txout.nValue)) {
-                        error = "Wallet lifecycle-adjusted stake balance is out of range";
-                        return false;
-                    }
-                    if (watchonly && !RemoveLifecycleCredit(balance.m_watchonly_stake, txout.nValue)) {
-                        error = "Wallet lifecycle-adjusted watch-only stake balance is out of range";
-                        return false;
-                    }
+            const uint64_t reads_before = scan_options.stats->database_reads;
+            if (!GetWalletOutputLifecycle(wallet, out.outpoint, out.txout, classification, error, scan_options)) return false;
+            if (limited && scan_options.stats->database_reads != reads_before) {
+                scan_database_reads += scan_options.stats->database_reads - reads_before;
+                if ((options.max_database_reads > 0 && scan_database_reads >= options.max_database_reads) ||
+                    (options.budget.count() > 0 && scan_database_reads % 16 == 0 &&
+                     std::chrono::steady_clock::now() >= deadline)) {
+                    scan_options.stats->budget_exhausted = true;
+                    error = "Wallet lifecycle scan budget exhausted";
+                    return false;
                 }
             }
+            return AccumulateLifecycleOutput(balance, summary, out.wtx, out.txout, classification,
+                                             out.wallet_immature, out.mine_spendable, out.watchonly, error);
+        });
+}
+
+namespace {
+/** Apply the journal to the memo. Every entry is checked against what the
+ * wallet says now, so it does not matter how old the entry is or what moved
+ * since it was read. Returns false when the meter ended the slice first. */
+bool DrainLifecycleMemoJournal(const CWallet& wallet, LifecycleMemoJournal& journal, SliceMeter& meter)
+    EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet)
+{
+    if (journal.clear_all) {
+        wallet.WalletLogPrintf("Lifecycle memo: repeated disagreements with the chainstate; clearing %u entries\n",
+                               wallet.m_output_lifecycle_memo.size());
+        wallet.m_output_lifecycle_memo.clear();
+        wallet.m_output_lifecycle_memo_max_height = -1;
+        journal.clear_all = false;
+    }
+    while (journal.cursor < journal.entries.size()) {
+        if (meter.Expired()) return false;
+        const LifecycleMemoJournal::Entry& entry = journal.entries[journal.cursor++];
+        if (entry.erase) {
+            journal.erased += wallet.m_output_lifecycle_memo.erase(entry.outpoint);
+        } else {
+            const CWalletTx* wtx = wallet.GetWalletTx(entry.outpoint.hash);
+            const TxStateConfirmed* conf = wtx ? wtx->state<TxStateConfirmed>() : nullptr;
+            if (!conf || entry.outpoint.n >= wtx->tx->vout.size() ||
+                conf->confirmed_block_hash != entry.confirmed_block_hash ||
+                conf->confirmed_block_height != entry.confirmed_block_height ||
+                wallet.GetTxDepthInMainChain(*wtx) < LIFECYCLE_MEMO_MIN_DEPTH ||
+                LifecycleTxOutDigest(wtx->tx->vout[entry.outpoint.n]) != entry.txout_digest) {
+                ++journal.dropped;
+            } else {
+                wallet.StoreOutputLifecycleMemo(entry.outpoint, entry.memo);
+                ++journal.stored;
+            }
+        }
+        meter.Tick();
+    }
+    journal.entries.clear();
+    journal.cursor = 0;
+    return true;
+}
+
+LifecycleSliceResult PassMainSliceLocked(const CWallet& wallet, LifecyclePass& pass,
+                                         LifecycleMemoJournal& journal,
+                                         LifecycleAttestationCache& attestations,
+                                         SliceMeter& meter, std::string& error)
+    EXCLUSIVE_LOCKS_REQUIRED(::cs_main)
+{
+    const CBlockIndex* tip_index = wallet.HaveChain() ? wallet.chain().getTip() : nullptr;
+    const Consensus::Params& consensus = Params().GetConsensus();
+    if (pass.stage == LifecyclePass::Stage::TIP) {
+        if (!tip_index) {
+            error = "Unable to calculate wallet lifecycle balance without an active chain tip";
+            pass.Reset();
+            return LifecycleSliceResult::NOT_SYNCED;
+        }
+        pass.tip.hash = tip_index->GetBlockHash();
+        pass.tip.height = tip_index->nHeight;
+        pass.tip.evaluation_height = tip_index->nHeight + 1;
+        pass.tip.evaluation_mtp = tip_index->GetMedianTimePast();
+        pass.tip.demurrage_active = pass.force_demurrage ||
+            consensus.IsDemurrageActive(pass.tip.evaluation_height, pass.tip.evaluation_mtp);
+        pass.stage = LifecyclePass::Stage::WALK;
+        return LifecycleSliceResult::MORE;
+    }
+
+    // Everything read from the chainstate for this pass is read at pass.tip.
+    if (!tip_index || tip_index->GetBlockHash() != pass.tip.hash) {
+        error = "The chain tip moved while the wallet balance was being calculated";
+        pass.Reset();
+        return LifecycleSliceResult::TIP_MOVED;
+    }
+    // The wallet lock is not held here. The marker is read without it only
+    // to stop early: a pass whose wallet has changed cannot be completed, and
+    // what it has read for the memo is in the journal already.
+    if (wallet.GetBalanceScanMarkerUnlocked() != pass.marker) {
+        error = "The wallet changed while its balance was being calculated";
+        pass.Reset();
+        return LifecycleSliceResult::WALLET_MOVED;
+    }
+    if (pass.stage == LifecyclePass::Stage::CONFIRM) {
+        pass.stage = LifecyclePass::Stage::DONE;
+        return LifecycleSliceResult::DONE;
+    }
+
+    attestations.ResetFor(pass.tip.hash);
+    meter.SeedMaxChainItem(pass.max_chain_item);
+    // Computed against what the plan has read so far; nothing here has an
+    // effect before the plan commits it (see ChainReadPlan).
+    struct Evaluation {
+        enum class Source { MEMO, DERIVED, READ };
+        Source source{Source::READ};
+        LifecycleChainFacts facts;
+        bool gathered{true};
+        std::string error;
+        std::optional<Consensus::DemurrageAttestationState> attestation;
+        bool attestation_cached{true};
+    };
+    const auto compute = [&](uint32_t item, const CCoinsViewCache& view) NO_THREAD_SAFETY_ANALYSIS {
+        AssertLockHeld(::cs_main);
+        const LifecyclePassOutput& out = pass.pending[item];
+        Evaluation eval;
+        std::optional<Coin> derived;
+        if (!out.memo_hit && out.derivable && !out.verify) {
+            derived = DeriveConfirmedCoin(out.txout,
+                ConfirmedTxFacts{out.tx_version, out.tx_ntime, out.tx_coinbase, out.tx_coinstake,
+                                 out.confirmed_block_hash, out.confirmed_block_height}, tip_index);
+        }
+        if (out.memo_hit) {
+            eval.source = Evaluation::Source::MEMO;
+            eval.facts = LifecycleFactsFromMemo(out.txout, out.memo);
+        } else if (derived) {
+            // The wallet is at pass.tip and holds this output unspent, and
+            // its block is the active chain's block at that height.
+            eval.source = Evaluation::Source::DERIVED;
+            eval.facts.coin = std::move(*derived);
+            eval.facts.confirmed_coin = true;
+        } else {
+            eval.gathered = GatherLifecycleChainFactsFromView(
+                out.outpoint, out.txout, view, tip_index, pass.tip.evaluation_height, consensus,
+                out.in_mempool, out.tx_time, eval.facts, eval.error);
+        }
+        if (pass.tip.demurrage_active) {
+            const auto cached = attestations.map.find(out.txout.scriptPubKey);
+            if (cached != attestations.map.end()) {
+                eval.attestation = cached->second;
+            } else {
+                eval.attestation = Consensus::LatestDemurrageAttestationStateForScript(view, out.txout.scriptPubKey);
+                eval.attestation_cached = false;
+            }
+        }
+        return eval;
+    };
+    const auto commit = [&](uint32_t item, Evaluation&& eval) {
+        const LifecyclePassOutput& out = pass.pending[item];
+        const LifecycleChainFacts& facts = eval.facts;
+        const auto journal_facts = [&] {
+            LifecycleMemoJournal::Entry entry;
+            entry.outpoint = out.outpoint;
+            entry.confirmed_block_hash = out.confirmed_block_hash;
+            entry.confirmed_block_height = out.confirmed_block_height;
+            entry.txout_digest = out.txout_digest;
+            entry.memo = LifecycleMemoFromFacts(facts, out.confirmed_block_hash,
+                                                out.confirmed_block_height, out.txout_digest);
+            journal.entries.push_back(std::move(entry));
+        };
+        switch (eval.source) {
+        case Evaluation::Source::MEMO:
+            ++pass.stats.memo_hits;
+            break;
+        case Evaluation::Source::DERIVED:
+            ++pass.stats.derived;
+            if (out.memo_eligible) journal_facts();
+            break;
+        case Evaluation::Source::READ: {
+            ++pass.stats.database_reads;
+            const bool usable = eval.gathered && facts.confirmed_coin;
+            bool store = out.memo_eligible && usable && !out.verify;
+            if (out.verify && (!usable || !LifecycleFactsEqualMemo(facts, out.memo))) {
+                // An entry in the verify slice is never served, so nothing of
+                // this pass rests on it. Replace that one entry (or drop it
+                // when the chainstate has nothing to say) and carry on.
+                ++pass.memo_mismatches;
+                ++pass.stats.memo_mismatches;
+                ++journal.mismatches;
+                wallet.WalletLogPrintf("Lifecycle memo disagrees with the chainstate for %s; dropping the entry\n",
+                                       out.outpoint.ToString());
+                if (usable) {
+                    store = true;
+                } else {
+                    LifecycleMemoJournal::Entry erase;
+                    erase.outpoint = out.outpoint;
+                    erase.erase = true;
+                    journal.entries.push_back(std::move(erase));
+                }
+            }
+            if (!eval.gathered) {
+                error = eval.error;
+                return false;
+            }
+            if (store) journal_facts();
+            break;
+        }
+        }
+        ++pass.stats.outputs;
+        if (pass.tip.demurrage_active && !eval.attestation_cached) {
+            attestations.map.emplace(out.txout.scriptPubKey, eval.attestation);
+        }
+        ValueLifecycleClassification classification;
+        return ClassifyLifecycleFacts(facts, out.outpoint, consensus, pass.tip.evaluation_height,
+                                      pass.tip.evaluation_mtp, eval.attestation, classification, error) &&
+               AccumulateLifecycleOutput(pass.balance, pass.summary, out.tx_coinbase, out.tx_coinstake,
+                                         out.txout.nValue, classification, out.wallet_immature,
+                                         out.mine_spendable, out.watchonly, error);
+    };
+    const OrderedSliceResult walked = pass.chain_plan.RunSlice(
+        wallet.chain().getCoinsTip(), pass.tip.hash, /*restart_on_tip_move=*/true, meter, compute, commit);
+    pass.chain_cursor = pass.chain_plan.Count() - pass.chain_plan.Unresolved();
+    pass.max_chain_item = meter.MaxChainItem();
+    switch (walked) {
+    case OrderedSliceResult::MORE:
+        return LifecycleSliceResult::MORE;
+    case OrderedSliceResult::STOPPED:
+        pass.Reset();
+        return LifecycleSliceResult::FAILED;
+    case OrderedSliceResult::RESTARTED:
+        // Not reached: the tip was compared with pass.tip above.
+        error = "The chain tip moved while the wallet balance was being calculated";
+        pass.Reset();
+        return LifecycleSliceResult::TIP_MOVED;
+    case OrderedSliceResult::DONE:
+        break;
+    }
+    pass.stage = LifecyclePass::Stage::STORE;
+    return LifecycleSliceResult::MORE;
+}
+
+LifecycleSliceResult PassWalletSliceLocked(const CWallet& wallet, LifecyclePass& pass,
+                                           LifecycleMemoJournal& journal,
+                                           SliceMeter& meter, std::string& error)
+    EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet)
+{
+    // Memo changes that were read under cs_main come first: an entry that was
+    // found wrong must be gone before the walk can serve it.
+    if (!DrainLifecycleMemoJournal(wallet, journal, meter)) return LifecycleSliceResult::MORE;
+
+    const std::optional<int> wallet_height = wallet.GetLastBlockHeightIfSet();
+    const bool at_tip = wallet_height && *wallet_height == pass.tip.height &&
+        wallet.GetLastBlockHash() == pass.tip.hash;
+    const uint64_t marker = wallet.GetBalanceScanMarker();
+    if (!pass.marker_set) {
+        if (!at_tip) {
+            error = "Wallet lifecycle view is not synchronized with the active chain tip";
+            pass.Reset();
+            return LifecycleSliceResult::NOT_SYNCED;
+        }
+        if (pass.known && pass.known->first == pass.tip.hash && pass.known->second == marker) {
+            pass.Reset();
+            return LifecycleSliceResult::UP_TO_DATE;
+        }
+        pass.marker = marker;
+        pass.marker_set = true;
+        pass.bucket = 0;
+        pass.bucket_count = wallet.mapWallet.bucket_count();
+        pass.summary.evaluation_height = pass.tip.evaluation_height;
+        pass.summary.evaluation_mtp = pass.tip.evaluation_mtp;
+        const LegacyScriptPubKeyMan* legacy = wallet.GetLegacyScriptPubKeyMan();
+        pass.have_watch_only = legacy && legacy->HaveWatchOnly();
+    } else if (!at_tip || marker != pass.marker ||
+               (pass.stage == LifecyclePass::Stage::WALK && pass.bucket_count != wallet.mapWallet.bucket_count())) {
+        error = "The wallet changed while its balance was being calculated";
+        pass.Reset();
+        return LifecycleSliceResult::WALLET_MOVED;
+    }
+    if (pass.stage == LifecyclePass::Stage::STORE) {
+        pass.stage = LifecyclePass::Stage::CONFIRM;
+        return LifecycleSliceResult::MORE;
+    }
+
+    const bool exclude_reused = pass.avoid_reuse && wallet.IsWalletFlagSet(WALLET_FLAG_AVOID_REUSE);
+    const Consensus::Params& consensus = Params().GetConsensus();
+    bool need_warmup{false};
+    const auto visit = [&](const LifecycleOutputRef& out) NO_THREAD_SAFETY_ANALYSIS {
+        AssertLockHeld(wallet.cs_wallet);
+        meter.Tick();
+        const LifecycleMemoLookup lookup = LookupLifecycleMemo(
+            wallet, out.outpoint, out.txout, pass.tip.height, /*use_memo=*/true);
+        if (lookup.serve && !pass.tip.demurrage_active) {
+            ++pass.stats.outputs;
+            ++pass.stats.memo_hits;
+            ValueLifecycleClassification classification;
+            if (!ClassifyLifecycleFacts(LifecycleFactsFromMemo(out.txout, *lookup.serve), out.outpoint,
+                                        consensus, pass.tip.evaluation_height, pass.tip.evaluation_mtp,
+                                        std::nullopt, classification, error)) return false;
+            return AccumulateLifecycleOutput(pass.balance, pass.summary, out.wtx, out.txout, classification,
+                                             out.wallet_immature, out.mine_spendable, out.watchonly, error);
+        }
+        // An output the chainstate slice derives costs no database read:
+        // it is no reason for a warm-up.
+        if (lookup.confirmed_state && !lookup.serve && !lookup.verify && !lookup.derivable) {
+            ++pass.memo_misses;
+            if (pass.warmup_threshold > 0 && pass.memo_misses > pass.warmup_threshold) {
+                need_warmup = true;
+                return false;
+            }
+        }
+        // The chainstate decides (no usable memo, or the verify slice), or
+        // only the attestation of the script is missing (demurrage).
+        LifecyclePassOutput pending;
+        pending.outpoint = out.outpoint;
+        pending.txout = out.txout;
+        pending.wallet_immature = out.wallet_immature;
+        pending.mine_spendable = out.mine_spendable;
+        pending.watchonly = out.watchonly;
+        pending.tx_coinbase = out.wtx.IsCoinBase();
+        pending.tx_coinstake = out.wtx.IsCoinStake();
+        pending.memo_hit = lookup.serve != nullptr;
+        pending.verify = lookup.verify != nullptr;
+        if (lookup.serve) pending.memo = *lookup.serve;
+        if (lookup.verify) pending.memo = *lookup.verify;
+        if (lookup.confirmed_state) {
+            pending.memo_eligible = true;
+            pending.confirmed_block_hash = lookup.confirmed_state->confirmed_block_hash;
+            pending.confirmed_block_height = lookup.confirmed_state->confirmed_block_height;
+            pending.txout_digest = lookup.txout_digest;
+        }
+        if (lookup.derivable) {
+            pending.derivable = true;
+            pending.tx_version = lookup.derivable->version;
+            pending.tx_ntime = lookup.derivable->time;
+            pending.confirmed_block_hash = lookup.derivable->block_hash;
+            pending.confirmed_block_height = lookup.derivable->block_height;
+        }
+        pending.in_mempool = wallet.GetTxDepthInMainChain(out.wtx) == 0 && out.wtx.InMempool();
+        pending.tx_time = out.wtx.GetTxTime();
+        pass.pending.push_back(std::move(pending));
+        return true;
+    };
+
+    while (pass.bucket < pass.bucket_count) {
+        if (meter.Expired()) return LifecycleSliceResult::MORE;
+        // A bucket is always finished within the slice that started it, so
+        // the cursor is a bucket number and no iterator outlives a lock hold.
+        // The bound on one slice is therefore the budget plus one mapWallet
+        // bucket (a handful of records), not the budget plus one record.
+        for (auto it = wallet.mapWallet.begin(pass.bucket); it != wallet.mapWallet.end(pass.bucket); ++it) {
+            meter.Tick();
+            AddTxToBalance(wallet, it->second, pass.min_depth, pass.avoid_reuse, pass.trusted_parents, pass.balance);
+            if (!ForEachLifecycleOutputOfTx(wallet, it->first, it->second, pass.min_depth, exclude_reused,
+                                            pass.trusted_parents, visit)) {
+                pass.Reset();
+                if (need_warmup) {
+                    error = "Too many deep outputs without a lifecycle memo entry";
+                    return LifecycleSliceResult::NEED_WARMUP;
+                }
+                return LifecycleSliceResult::FAILED;
+            }
+        }
+        ++pass.bucket;
+    }
+    pass.stats.pending = pass.pending.size();
+    pass.stage = pass.pending.empty() ? LifecyclePass::Stage::CONFIRM : LifecyclePass::Stage::CHAIN;
+    return LifecycleSliceResult::MORE;
+}
+
+LifecycleSliceResult WarmupMainSliceLocked(const CWallet& wallet, LifecycleWarmup& warmup,
+                                           LifecycleMemoJournal& journal, SliceMeter& meter)
+    EXCLUSIVE_LOCKS_REQUIRED(::cs_main)
+{
+    const CBlockIndex* tip_index = wallet.HaveChain() ? wallet.chain().getTip() : nullptr;
+    if (!tip_index) return LifecycleSliceResult::LOCK_BUSY;
+    const Consensus::Params& consensus = Params().GetConsensus();
+    meter.SeedMaxChainItem(warmup.max_chain_item);
+    struct Evaluation {
+        LifecycleChainFacts facts;
+        bool have_facts{false};
+        bool derived{false};
+    };
+    const auto compute = [&](uint32_t index, const CCoinsViewCache& view) NO_THREAD_SAFETY_ANALYSIS {
+        AssertLockHeld(::cs_main);
+        const LifecycleWarmupItem& item = warmup.items[index];
+        Evaluation eval;
+        // The facts are memoized under the block the wallet names. Read them
+        // only while that block is in the active chain; whether the wallet
+        // still names it is checked again when the journal is applied.
+        const CBlockIndex* block = item.confirmed_block_height >= 0 && item.confirmed_block_height <= tip_index->nHeight
+            ? tip_index->GetAncestor(item.confirmed_block_height) : nullptr;
+        if (!block || block->GetBlockHash() != item.confirmed_block_hash) return eval;
+        if (item.derivable) {
+            if (std::optional<Coin> derived = DeriveConfirmedCoin(item.txout,
+                    ConfirmedTxFacts{item.tx_version, item.tx_ntime, /*coinbase=*/false, item.tx_coinstake,
+                                     item.confirmed_block_hash, item.confirmed_block_height}, tip_index)) {
+                eval.facts.coin = std::move(*derived);
+                eval.facts.confirmed_coin = true;
+                eval.have_facts = true;
+                eval.derived = true;
+                return eval;
+            }
+        }
+        std::string error;
+        eval.have_facts = GatherLifecycleChainFactsFromView(item.outpoint, item.txout, view, tip_index, tip_index->nHeight + 1,
+                                                            consensus, /*in_mempool=*/false, /*tx_time=*/0, eval.facts, error) &&
+                          eval.facts.confirmed_coin;
+        return eval;
+    };
+    const auto commit = [&](uint32_t index, Evaluation&& eval) {
+        const LifecycleWarmupItem& item = warmup.items[index];
+        if (eval.have_facts) {
+            LifecycleMemoJournal::Entry entry;
+            entry.outpoint = item.outpoint;
+            entry.confirmed_block_hash = item.confirmed_block_hash;
+            entry.confirmed_block_height = item.confirmed_block_height;
+            entry.txout_digest = item.txout_digest;
+            entry.memo = LifecycleMemoFromFacts(eval.facts, item.confirmed_block_hash,
+                                                item.confirmed_block_height, item.txout_digest);
+            journal.entries.push_back(std::move(entry));
+            ++warmup.fetched;
+            if (eval.derived) ++warmup.derived;
+        } else {
+            // Left to the consistent pass, which reports what is wrong.
+            ++warmup.skipped;
+        }
+        return true;
+    };
+    const OrderedSliceResult walked = warmup.fetch_plan.RunSlice(
+        wallet.chain().getCoinsTip(), tip_index->GetBlockHash(), /*restart_on_tip_move=*/false, meter, compute, commit);
+    warmup.max_chain_item = meter.MaxChainItem();
+    if (walked != OrderedSliceResult::DONE) return LifecycleSliceResult::MORE;
+    warmup.items.clear();
+    warmup.fetch_plan = ChainReadPlan{};
+    warmup.stage = LifecycleWarmup::Stage::STORE;
+    return LifecycleSliceResult::MORE;
+}
+
+LifecycleSliceResult WarmupWalletSliceLocked(const CWallet& wallet, LifecycleWarmup& warmup,
+                                             LifecycleMemoJournal& journal, SliceMeter& meter)
+    EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet)
+{
+    if (!DrainLifecycleMemoJournal(wallet, journal, meter)) return LifecycleSliceResult::MORE;
+    if (warmup.stage == LifecycleWarmup::Stage::STORE) {
+        warmup.stage = warmup.walk_finished ? LifecycleWarmup::Stage::DONE : LifecycleWarmup::Stage::COLLECT;
+        return warmup.stage == LifecycleWarmup::Stage::DONE ? LifecycleSliceResult::DONE : LifecycleSliceResult::MORE;
+    }
+
+    if (warmup.bucket_count != wallet.mapWallet.bucket_count()) {
+        // First slice, or mapWallet was rehashed: start over. What is in the
+        // memo already is skipped, so only the walk itself is repeated.
+        if (warmup.bucket_count != 0) ++warmup.rewinds;
+        warmup.bucket_count = wallet.mapWallet.bucket_count();
+        warmup.bucket = 0;
+        warmup.items.clear();
+    }
+    // The whole wallet is listed before anything is read, so that the reads
+    // can be sorted once for all of it.
+    while (warmup.bucket < warmup.bucket_count) {
+        if (meter.Expired()) return LifecycleSliceResult::MORE;
+        for (auto it = wallet.mapWallet.begin(warmup.bucket); it != wallet.mapWallet.end(warmup.bucket); ++it) {
+            meter.Tick();
+            const CWalletTx& wtx = it->second;
+            const TxStateConfirmed* conf = wtx.state<TxStateConfirmed>();
+            if (!conf || wallet.GetTxDepthInMainChain(wtx) < LIFECYCLE_MEMO_MIN_DEPTH) continue;
+            for (uint32_t n = 0; n < wtx.tx->vout.size(); ++n) {
+                const COutPoint outpoint{it->first, n};
+                const CTxOut& txout = wtx.tx->vout[n];
+                if (wallet.IsSpent(outpoint) || wallet.IsMine(txout) == ISMINE_NO) continue;
+                meter.Tick();
+                const uint64_t digest = LifecycleTxOutDigest(txout);
+                const auto memo = wallet.m_output_lifecycle_memo.find(outpoint);
+                if (memo != wallet.m_output_lifecycle_memo.end() &&
+                    LifecycleMemoMatches(memo->second, *conf, digest)) continue;
+                LifecycleWarmupItem item{outpoint, txout, conf->confirmed_block_hash,
+                                         conf->confirmed_block_height, digest};
+                if (!wtx.IsCoinBase() && !txout.scriptPubKey.IsUnspendable()) {
+                    item.derivable = true;
+                    item.tx_coinstake = wtx.IsCoinStake();
+                    item.tx_version = wtx.tx->nVersion;
+                    item.tx_ntime = wtx.tx->nTime;
+                }
+                warmup.items.push_back(std::move(item));
+                ++warmup.collected;
+            }
+        }
+        ++warmup.bucket;
+    }
+    if (warmup.bucket >= warmup.bucket_count) warmup.walk_finished = true;
+    if (!warmup.items.empty()) {
+        warmup.stage = LifecycleWarmup::Stage::FETCH;
+    } else if (warmup.walk_finished) {
+        warmup.stage = LifecycleWarmup::Stage::DONE;
+        return LifecycleSliceResult::DONE;
+    }
+    return LifecycleSliceResult::MORE;
+}
+} // namespace
+
+LifecycleSliceReport RunLifecyclePassSlice(const CWallet& wallet, LifecyclePass& pass,
+                                           LifecycleMemoJournal& journal,
+                                           LifecycleAttestationCache& attestations,
+                                           const LifecycleSliceLimits& limits)
+{
+    AssertLockNotHeld(::cs_main);
+    AssertLockNotHeld(wallet.cs_wallet);
+    LifecycleSliceReport report;
+    if (pass.stage == LifecyclePass::Stage::DONE) {
+        report.result = LifecycleSliceResult::DONE;
+        return report;
+    }
+    ++pass.slices;
+    try {
+        if (pass.stage == LifecyclePass::Stage::WALK || pass.stage == LifecyclePass::Stage::STORE) {
+            TRY_LOCK(wallet.cs_wallet, locked_wallet);
+            if (!locked_wallet) {
+                report.result = LifecycleSliceResult::LOCK_BUSY;
+                return report;
+            }
+            report.held_wallet = true;
+            SliceMeter meter{limits, limits.wallet_budget};
+            report.result = PassWalletSliceLocked(wallet, pass, journal, meter, report.error);
+            report.held = meter.Held();
+        } else {
+            if (pass.stage == LifecyclePass::Stage::CHAIN) {
+                // The keys of the next sweep are sorted here, where no lock
+                // is held: the pass belongs to the calling thread.
+                if (!pass.chain_plan.Active()) pass.chain_plan.Reset(pass.pending.size());
+                pass.chain_plan.PrepareUnlocked();
+            }
+            TRY_LOCK(::cs_main, locked_main);
+            if (!locked_main) {
+                report.result = LifecycleSliceResult::LOCK_BUSY;
+                return report;
+            }
+            report.held_main = true;
+            SliceMeter meter{limits, limits.main_budget};
+            report.result = PassMainSliceLocked(wallet, pass, journal, attestations, meter, report.error);
+            report.held = meter.Held();
+        }
+    } catch (...) {
+        pass.Reset();
+        throw;
+    }
+    return report;
+}
+
+LifecycleSliceReport RunLifecyclePassToEnd(const CWallet& wallet, LifecyclePass& pass,
+                                           LifecycleMemoJournal& journal,
+                                           LifecycleAttestationCache& attestations,
+                                           const LifecycleSliceLimits& limits, int max_restarts)
+{
+    int restarts{0};
+    for (;;) {
+        LifecycleSliceReport report = RunLifecyclePassSlice(wallet, pass, journal, attestations, limits);
+        switch (report.result) {
+        case LifecycleSliceResult::MORE:
+            break;
+        case LifecycleSliceResult::LOCK_BUSY:
+            std::this_thread::yield();
+            break;
+        case LifecycleSliceResult::TIP_MOVED:
+        case LifecycleSliceResult::WALLET_MOVED:
+            if (restarts++ >= max_restarts) return report;
+            break;
+        case LifecycleSliceResult::DONE:
+        case LifecycleSliceResult::UP_TO_DATE:
+        case LifecycleSliceResult::NOT_SYNCED:
+        case LifecycleSliceResult::NEED_WARMUP:
+        case LifecycleSliceResult::FAILED:
+            return report;
         }
     }
-    return true;
+}
+
+LifecycleSliceReport RunLifecycleWarmupSlice(const CWallet& wallet, LifecycleWarmup& warmup,
+                                             LifecycleMemoJournal& journal,
+                                             const LifecycleSliceLimits& limits)
+{
+    AssertLockNotHeld(::cs_main);
+    AssertLockNotHeld(wallet.cs_wallet);
+    LifecycleSliceReport report;
+    if (warmup.stage == LifecycleWarmup::Stage::DONE) {
+        report.result = LifecycleSliceResult::DONE;
+        return report;
+    }
+    ++warmup.slices;
+    if (warmup.stage == LifecycleWarmup::Stage::FETCH) {
+        if (!warmup.fetch_plan.Active()) warmup.fetch_plan.Reset(warmup.items.size());
+        warmup.fetch_plan.PrepareUnlocked();
+        TRY_LOCK(::cs_main, locked_main);
+        if (!locked_main) {
+            report.result = LifecycleSliceResult::LOCK_BUSY;
+            return report;
+        }
+        report.held_main = true;
+        SliceMeter meter{limits, limits.main_budget};
+        report.result = WarmupMainSliceLocked(wallet, warmup, journal, meter);
+        report.held = meter.Held();
+    } else {
+        TRY_LOCK(wallet.cs_wallet, locked_wallet);
+        if (!locked_wallet) {
+            report.result = LifecycleSliceResult::LOCK_BUSY;
+            return report;
+        }
+        report.held_wallet = true;
+        SliceMeter meter{limits, limits.wallet_budget};
+        report.result = WarmupWalletSliceLocked(wallet, warmup, journal, meter);
+        report.held = meter.Held();
+    }
+    return report;
 }
 
 static int64_t QuantumMigrationInputWeight()
@@ -831,6 +1712,48 @@ util::Result<PreSelectedInputs> FetchSelectedInputs(const CWallet& wallet, const
     return result;
 }
 
+namespace {
+//! What AvailableCoins learns about an output from its script alone.
+struct ScriptFacts {
+    isminetype mine{ISMINE_NO};
+    int input_bytes{-1};
+    TxoutType type{TxoutType::NONSTANDARD};
+    bool is_from_p2sh{false};
+    //! A solvable P2SH output whose redeem script the provider cannot return.
+    bool missing_redeem_script{false};
+};
+
+ScriptFacts ComputeScriptFacts(const CWallet& wallet, const CTxOut& output, bool can_grind_r, const CCoinControl* coinControl)
+    EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet)
+{
+    ScriptFacts facts;
+    facts.mine = wallet.IsMine(output);
+    if (facts.mine == ISMINE_NO) return facts;
+
+    std::unique_ptr<SigningProvider> provider = wallet.GetSolvingProvider(output.scriptPubKey);
+    facts.input_bytes = CalculateMaximumSignedInputSize(output, COutPoint(), provider.get(), can_grind_r, coinControl);
+
+    // Obtain script type
+    std::vector<std::vector<uint8_t>> script_solutions;
+    facts.type = Solver(output.scriptPubKey, script_solutions);
+
+    // If the output is P2SH and solvable, we want to know if it is
+    // a P2SH (legacy) or one of P2SH-P2WPKH, P2SH-P2WSH (P2SH-Segwit). We can determine
+    // this from the redeemScript. If the output is not solvable, it will be classified
+    // as a P2SH (legacy), since we have no way of knowing otherwise without the redeemScript
+    if (facts.type == TxoutType::SCRIPTHASH && facts.input_bytes > -1) {
+        CScript script;
+        if (!provider->GetCScript(CScriptID(uint160(script_solutions[0])), script)) {
+            facts.missing_redeem_script = true;
+            return facts;
+        }
+        facts.type = Solver(script, script_solutions);
+        facts.is_from_p2sh = true;
+    }
+    return facts;
+}
+} // namespace
+
 CoinsResult AvailableCoins(const CWallet& wallet,
                            const CCoinControl* coinControl,
                            std::optional<CFeeRate> feerate,
@@ -856,8 +1779,14 @@ CoinsResult AvailableCoins(const CWallet& wallet,
     const std::set<COutPoint> protected_rgb_seals = wallet.GetProtectedRGBSeals();
 
     std::set<uint256> trusted_parents;
+    size_t walked{0};
+    std::map<CScript, ScriptFacts> script_memo;
     for (const auto& entry : wallet.mapWallet)
     {
+        if (params.interrupt && walked++ % CoinFilterParams::INTERRUPT_CHECK_INTERVAL == 0 && params.interrupt()) {
+            result.interrupted = true;
+            return result;
+        }
         const uint256& wtxid = entry.first;
         const CWalletTx& wtx = entry.second;
 
@@ -881,6 +1810,10 @@ CoinsResult AvailableCoins(const CWallet& wallet,
         bool tx_from_me = CachedTxIsFromMe(wallet, wtx, ISMINE_ALL);
 
         for (unsigned int i = 0; i < wtx.tx->vout.size(); i++) {
+            if (params.interrupt && walked++ % CoinFilterParams::INTERRUPT_CHECK_INTERVAL == 0 && params.interrupt()) {
+                result.interrupted = true;
+                return result;
+            }
             const CTxOut& output = wtx.tx->vout[i];
             const COutPoint outpoint(wtxid, i);
 
@@ -917,7 +1850,26 @@ CoinsResult AvailableCoins(const CWallet& wallet,
             if (protected_rgb_seals.count(outpoint))
                 continue;
 
-            isminetype mine = wallet.IsMine(output);
+            // Everything below up to the script type depends only on the
+            // output script (and on coin control, which is fixed for this
+            // call), and a mining wallet pays to a handful of scripts. Look
+            // each script up once. Coin control that can change the answer for
+            // one output (a watch-only allowance, a weight or an external
+            // signer for this very outpoint) bypasses the memo.
+            const bool use_memo = !coinControl || !(coinControl->fAllowWatchOnly ||
+                                                    coinControl->HasInputWeight(outpoint) ||
+                                                    coinControl->IsExternalSelected(outpoint));
+            ScriptFacts local_facts;
+            const ScriptFacts* facts{nullptr};
+            if (use_memo) {
+                auto [memo_it, inserted] = script_memo.try_emplace(output.scriptPubKey);
+                if (inserted) memo_it->second = ComputeScriptFacts(wallet, output, can_grind_r, coinControl);
+                facts = &memo_it->second;
+            } else {
+                local_facts = ComputeScriptFacts(wallet, output, can_grind_r, coinControl);
+                facts = &local_facts;
+            }
+            const isminetype mine = facts->mine;
 
             if (mine == ISMINE_NO) {
                 continue;
@@ -927,9 +1879,7 @@ CoinsResult AvailableCoins(const CWallet& wallet,
                 continue;
             }
 
-            std::unique_ptr<SigningProvider> provider = wallet.GetSolvingProvider(output.scriptPubKey);
-
-            int input_bytes = CalculateMaximumSignedInputSize(output, COutPoint(), provider.get(), can_grind_r, coinControl);
+            const int input_bytes = facts->input_bytes;
             // Because CalculateMaximumSignedInputSize infers a solvable descriptor to get the satisfaction size,
             // it is safe to assume that this input is solvable if input_bytes is greater than -1.
             bool solvable = input_bytes > -1;
@@ -938,21 +1888,9 @@ CoinsResult AvailableCoins(const CWallet& wallet,
             // Filter by spendable outputs only
             if (!spendable && params.only_spendable) continue;
 
-            // Obtain script type
-            std::vector<std::vector<uint8_t>> script_solutions;
-            TxoutType type = Solver(output.scriptPubKey, script_solutions);
-
-            // If the output is P2SH and solvable, we want to know if it is
-            // a P2SH (legacy) or one of P2SH-P2WPKH, P2SH-P2WSH (P2SH-Segwit). We can determine
-            // this from the redeemScript. If the output is not solvable, it will be classified
-            // as a P2SH (legacy), since we have no way of knowing otherwise without the redeemScript
-            bool is_from_p2sh{false};
-            if (type == TxoutType::SCRIPTHASH && solvable) {
-                CScript script;
-                if (!provider->GetCScript(CScriptID(uint160(script_solutions[0])), script)) continue;
-                type = Solver(script, script_solutions);
-                is_from_p2sh = true;
-            }
+            if (facts->missing_redeem_script) continue;
+            const TxoutType type = facts->type;
+            const bool is_from_p2sh = facts->is_from_p2sh;
 
             COutput candidate(outpoint, output, nDepth, input_bytes, spendable, solvable, safeTx, wtx.GetTxTime(), tx_from_me, feerate);
             if (const auto demurrage = GetDemurrageEvaluationForOutput(wallet, outpoint, output.scriptPubKey, spend_height, spend_time);
@@ -999,14 +1937,18 @@ CoinsResult AvailableCoinsListUnspent(const CWallet& wallet, const CCoinControl*
     return AvailableCoins(wallet, coinControl, /*feerate=*/ std::nullopt, params);
 }
 
-const CTxOut& FindNonChangeParentOutput(const CWallet& wallet, const COutPoint& outpoint)
+static const CTxOut* FindNonChangeParentOutputInterruptible(const CWallet& wallet, const COutPoint& outpoint,
+                                                         const std::function<bool()>& interrupt)
+    EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet)
 {
     AssertLockHeld(wallet.cs_wallet);
     const CWalletTx* wtx{Assert(wallet.GetWalletTx(outpoint.hash))};
 
     const CTransaction* ptx = wtx->tx.get();
     int n = outpoint.n;
+    size_t ancestors{0};
     while (OutputIsChange(wallet, ptx->vout[n]) && ptx->vin.size() > 0) {
+        if (interrupt && ancestors++ % CoinFilterParams::INTERRUPT_CHECK_INTERVAL == 0 && interrupt()) return nullptr;
         const COutPoint& prevout = ptx->vin[0].prevout;
         const CWalletTx* it = wallet.GetWalletTx(prevout.hash);
         if (!it || it->tx->vout.size() <= prevout.n ||
@@ -1016,10 +1958,20 @@ const CTxOut& FindNonChangeParentOutput(const CWallet& wallet, const COutPoint& 
         ptx = it->tx.get();
         n = prevout.n;
     }
-    return ptx->vout[n];
+    return &ptx->vout[n];
+}
+
+const CTxOut& FindNonChangeParentOutput(const CWallet& wallet, const COutPoint& outpoint)
+{
+    return *FindNonChangeParentOutputInterruptible(wallet, outpoint, {});
 }
 
 std::map<CTxDestination, std::vector<COutput>> ListCoins(const CWallet& wallet)
+{
+    return *ListCoins(wallet, /*interrupt=*/{});
+}
+
+std::optional<std::map<CTxDestination, std::vector<COutput>>> ListCoins(const CWallet& wallet, const std::function<bool()>& interrupt)
 {
     AssertLockHeld(::cs_main);
     AssertLockHeld(wallet.cs_wallet);
@@ -1032,18 +1984,28 @@ std::map<CTxDestination, std::vector<COutput>> ListCoins(const CWallet& wallet)
     CoinFilterParams coins_params;
     coins_params.only_spendable = false;
     coins_params.skip_locked = false;
-    for (const COutput& coin : AvailableCoins(wallet, &coin_control, /*feerate=*/std::nullopt, coins_params).All()) {
-        CTxDestination address;
-        if ((coin.spendable || (wallet.IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS) && coin.solvable))) {
-            if (!ExtractDestination(FindNonChangeParentOutput(wallet, coin.outpoint).scriptPubKey, address)) {
-                // For backwards compatibility, we convert P2PK output scripts into PKHash destinations
-                if (auto pk_dest = std::get_if<PubKeyDestination>(&address)) {
-                    address = PKHash(pk_dest->GetPubKey());
-                } else {
-                    continue;
+    coins_params.interrupt = interrupt;
+    const CoinsResult available = AvailableCoins(wallet, &coin_control, /*feerate=*/std::nullopt, coins_params);
+    if (available.interrupted) return std::nullopt;
+    size_t grouped{0};
+    // Iterate the existing groups directly; All() would make another full copy.
+    for (const auto& entry : available.coins) {
+        for (const COutput& coin : entry.second) {
+            if (interrupt && grouped++ % CoinFilterParams::INTERRUPT_CHECK_INTERVAL == 0 && interrupt()) return std::nullopt;
+            CTxDestination address;
+            if ((coin.spendable || (wallet.IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS) && coin.solvable))) {
+                const CTxOut* parent = FindNonChangeParentOutputInterruptible(wallet, coin.outpoint, interrupt);
+                if (!parent) return std::nullopt;
+                if (!ExtractDestination(parent->scriptPubKey, address)) {
+                    // For backwards compatibility, we convert P2PK output scripts into PKHash destinations
+                    if (auto pk_dest = std::get_if<PubKeyDestination>(&address)) {
+                        address = PKHash(pk_dest->GetPubKey());
+                    } else {
+                        continue;
+                    }
                 }
+                result[address].emplace_back(coin);
             }
-            result[address].emplace_back(coin);
         }
     }
     return result;

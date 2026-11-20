@@ -16,24 +16,31 @@
 #include <qt/paymentserver.h>
 #include <qt/recentrequeststablemodel.h>
 #include <qt/sendcoinsdialog.h>
+#include <qt/transactionrecord.h>
 #include <qt/transactiontablemodel.h>
 
 #include <common/args.h> // for GetBoolArg
+#include <common/settings.h>
 #include <interfaces/handler.h>
 #include <interfaces/node.h>
 #include <key_io.h>
+#include <logging.h>
 #include <node/interface_ui.h>
 #include <psbt.h>
 #include <util/translation.h>
+#include <univalue.h>
 #include <wallet/coincontrol.h>
 #include <wallet/wallet.h> // for CRecipient
 
 #include <algorithm>
+#include <chrono>
+#include <deque>
 #include <exception>
 #include <functional>
 #include <stdint.h>
 #include <utility>
 
+#include <QCoreApplication>
 #include <QDebug>
 #include <QMessageBox>
 #include <QPointer>
@@ -45,42 +52,26 @@ using wallet::CCoinControl;
 using wallet::CRecipient;
 using wallet::DEFAULT_DISABLE_WALLET;
 
-static int pollSyncSkip = 30;
 
 class WalletWorker : public QObject
 {
     Q_OBJECT
-public:
-    WalletModel *walletModel;
-    WalletWorker(WalletModel *_walletModel):
-        walletModel(_walletModel){}
-
-private Q_SLOTS:
-    void updateModel()
-    {
-        if(walletModel && walletModel->node().shutdownRequested())
-            return;
-
-        // Update the model with results of tasks that take more time to be
-        // completed. Both walk the wallet, so they run on this worker thread;
-        // GUI-side state is applied via queued invocations back to the model.
-        walletModel->pollBalanceChanged();
-        walletModel->checkStakeWeightChanged();
-    }
 };
 
 #include <qt/walletmodel.moc>
 
-WalletModel::WalletModel(std::unique_ptr<interfaces::Wallet> wallet, ClientModel& client_model, const PlatformStyle *platformStyle, QObject *parent) :
+WalletModel::WalletModel(std::unique_ptr<interfaces::Wallet> wallet, ClientModel& client_model, const PlatformStyle* platformStyle, QObject* parent, bool defer_history) :
     QObject(parent),
     m_wallet(std::move(wallet)),
-    m_client_model(&client_model),
+    m_client_model(nullptr),
     m_node(client_model.node()),
     optionsModel(client_model.getOptionsModel()),
     timer(new QTimer(this)),
     nWeight(0),
     updateStakeWeight(true),
-    worker(0)
+    m_deferred_history(defer_history),
+    worker(nullptr),
+    m_address_capability_retry(new QTimer(this))
 {
     // Establish the GUI-thread cache before any view is attached. Later
     // keystore notifications update it in updateStatus(). Timer-driven views
@@ -88,18 +79,23 @@ WalletModel::WalletModel(std::unique_ptr<interfaces::Wallet> wallet, ClientModel
     cachedEncryptionStatus.store(getEncryptionStatus(), std::memory_order_release);
     fHaveWatchOnly = m_wallet->haveWatchOnly();
     addressTableModel = new AddressTableModel(this);
-    transactionTableModel = new TransactionTableModel(platformStyle, this);
+    transactionTableModel = new TransactionTableModel(platformStyle, this, defer_history);
     recentRequestsTableModel = new RecentRequestsTableModel(this);
 
     // Start thread
-    worker = new WalletWorker(this);
+    worker = new WalletWorker;
     worker->moveToThread(&(t));
     // WalletWorker has thread affinity and deliberately has no QObject parent.
-    // Retire it on its own thread when the event loop finishes instead of
-    // leaking one worker for every WalletModel lifetime.
-    connect(&t, &QThread::finished, worker, &QObject::deleteLater);
+    // join() deletes it after the worker thread has fully exited. It must not
+    // be retired through QThread::finished: that destroys the worker on the
+    // exiting thread while QThread::isRunning() can still be true, so join()
+    // could dereference a freed worker.
     t.start();
 
+    m_address_capability_retry->setSingleShot(true);
+    connect(m_address_capability_retry, &QTimer::timeout, this, &WalletModel::requestAddressCapability);
+
+    setClientModel(&client_model);
     subscribeToCoreSignals();
 }
 
@@ -108,31 +104,249 @@ WalletModel::~WalletModel()
     unsubscribeFromCoreSignals();
 
     join();
+    releaseHistorySlot();
 }
 
 void WalletModel::startPollBalance()
 {
-    // Update the cached balance right away, so every view can make use of it,
-    // so them don't need to waste resources recalculating it. This initial
-    // call runs on the GUI thread once, before the worker timer starts.
-    pollBalanceChanged();
-
-    // The periodic balance/stake-weight poll walks the wallet, which takes
-    // seconds on large wallets, so it runs on the worker thread (see
-    // WalletWorker::updateModel); results are marshalled back to this (GUI)
-    // thread via queued invocations.
-    connect(timer, SIGNAL(timeout()), worker, SLOT(updateModel()));
+    if (m_joined || timer->isActive()) return;
+    m_balance_poll_started = true;
+    connect(timer, &QTimer::timeout, this, &WalletModel::pollBalanceChanged, Qt::UniqueConnection);
     timer->start(MODEL_UPDATE_DELAY);
+    pollBalanceChanged();
+}
+
+void WalletModel::setBalancePollForeground(bool foreground)
+{
+    if (m_poll_foreground == foreground) return;
+    m_poll_foreground = foreground;
+    // Showing a wallet refreshes it now instead of waiting for the next tick.
+    if (foreground && m_balance_poll_started) pollBalanceChanged();
+}
+
+// History loading. Only the wallet the user looks at has its transactions read, one wallet at a time in the whole
+// process, and each read is a series of short jobs on the wallet's own worker thread (so other worker requests
+// interleave) instead of one snapshot of every transaction. The state below is touched on the GUI thread only.
+struct WalletModel::HistoryLoad {
+    //! Every transaction hash of the wallet, sorted: the table keeps its rows in this order.
+    std::vector<uint256> hashes;
+    size_t pos{0};
+    bool have_hashes{false};
+};
+
+namespace {
+QPointer<WalletModel>& HistoryActive()
+{
+    static QPointer<WalletModel> active;
+    return active;
+}
+std::deque<QPointer<WalletModel>>& HistoryWaiting()
+{
+    static std::deque<QPointer<WalletModel>> waiting;
+    return waiting;
+}
+//! The only free-form transaction notes the list and the incoming-transaction notice read.
+const std::vector<std::string>& HistoryValueKeys()
+{
+    static const std::vector<std::string> keys{"comment", "to", "from"};
+    return keys;
+}
+constexpr size_t HISTORY_CHUNK_TXS{2000};
+constexpr auto HISTORY_CHUNK_LOCK_BUDGET{std::chrono::milliseconds{20}};
+//! Rows received but not yet published to the views; the loader waits while more than this are queued.
+constexpr size_t HISTORY_UNPUBLISHED_LIMIT{4096};
+} // namespace
+
+WalletModel* WalletModel::historyLoadActiveForTest() { return HistoryActive().data(); }
+size_t WalletModel::historyLoadWaitingForTest()
+{
+    size_t waiting{0};
+    for (const auto& model : HistoryWaiting()) waiting += model && !model->m_joined ? 1 : 0;
+    return waiting;
+}
+
+void WalletModel::requestHistory()
+{
+    if (m_joined) return;
+    if (!m_deferred_history) {
+        // Loaded (or built eagerly): only statuses left out of date while the wallet was hidden remain.
+        transactionTableModel->refreshIfStale();
+        return;
+    }
+    if (!m_history_requested) {
+        m_history_requested = true;
+        m_history_load = std::make_shared<HistoryLoad>();
+        transactionTableModel->beginHistoryLoad();
+        LogPrint(BCLog::QT, "GUI history: requested for wallet \"%s\"\n", getWalletName().toStdString());
+    }
+    // The wallet being shown goes to the front of the line (it may already be the one running).
+    if (HistoryActive() != this) {
+        auto& waiting = HistoryWaiting();
+        waiting.erase(std::remove_if(waiting.begin(), waiting.end(), [this](const QPointer<WalletModel>& model) { return model == this; }), waiting.end());
+        waiting.push_front(this);
+    }
+    startNextHistoryLoad();
+}
+
+void WalletModel::startNextHistoryLoad()
+{
+    auto& active = HistoryActive();
+    if (active && !active->m_joined && active->m_deferred_history) return;
+    active.clear();
+    auto& waiting = HistoryWaiting();
+    while (!waiting.empty()) {
+        QPointer<WalletModel> next = waiting.front();
+        waiting.pop_front();
+        if (!next || next->m_joined || !next->m_deferred_history) continue;
+        active = next;
+        next->runHistoryChunk();
+        return;
+    }
+}
+
+void WalletModel::releaseHistorySlot()
+{
+    auto& waiting = HistoryWaiting();
+    waiting.erase(std::remove_if(waiting.begin(), waiting.end(), [this](const QPointer<WalletModel>& model) { return model == this || !model; }), waiting.end());
+    if (HistoryActive() == this) {
+        HistoryActive().clear();
+        if (!QCoreApplication::closingDown()) startNextHistoryLoad();
+    }
+}
+
+void WalletModel::runHistoryChunk()
+{
+    if (m_joined || m_history_chunk_pending || !m_history_load || !m_deferred_history) return;
+    m_history_chunk_pending = true;
+    const auto load = m_history_load;
+    const bool invoked = QMetaObject::invokeMethod(worker, [this, load] {
+        std::vector<TransactionRecord> rows;
+        bool busy{false};
+        bool failed{false};
+        bool hashes_read{false};
+        try {
+            if (m_history_cancel.load(std::memory_order_acquire)) {
+                busy = true;
+            } else if (!load->have_hashes) {
+                std::vector<uint256> hashes;
+                if (m_wallet->tryGetWalletTxHashes(hashes)) {
+                    std::sort(hashes.begin(), hashes.end());
+                    load->hashes = std::move(hashes);
+                    load->pos = 0;
+                    load->have_hashes = true;
+                    hashes_read = true;
+                } else {
+                    busy = true;
+                }
+            } else {
+                std::vector<interfaces::WalletTx> transactions;
+                if (m_wallet->tryGetWalletTxChunk(load->hashes, load->pos, HISTORY_CHUNK_TXS, HISTORY_CHUNK_LOCK_BUDGET,
+                                                  HistoryValueKeys(), transactions)) {
+                    rows.reserve(transactions.size());
+                    for (const auto& tx : transactions) {
+                        if (!TransactionRecord::showTransaction(tx)) continue;
+                        for (auto& row : TransactionRecord::decomposeTransaction(tx)) rows.push_back(std::move(row));
+                    }
+                } else {
+                    busy = true;
+                }
+            }
+        } catch (const std::exception& error) {
+            qWarning() << "Initial wallet history snapshot failed:" << error.what();
+            failed = true;
+        }
+        const bool done = !busy && !failed && load->have_hashes && load->pos >= load->hashes.size();
+        const size_t total = load->hashes.size();
+        QMetaObject::invokeMethod(this, [this, load, rows = std::move(rows), busy, failed, done, hashes_read, total]() mutable {
+            m_history_chunk_pending = false;
+            if (m_joined || load != m_history_load) return;
+            if (failed) {
+                m_deferred_history = false;
+                m_history_load.reset();
+                transactionTableModel->reportHistoryLoadFailure();
+                releaseHistorySlot();
+                return;
+            }
+            if (busy) {
+                // The wallet lock was busy (a staking pass, a scan). A wallet that may be busy for long must not hold
+                // the process-wide turn against the wallet being shown; otherwise ask again shortly, holding our turn.
+                if (yieldHistorySlotToShownWallet()) return;
+                QTimer::singleShot(25, this, &WalletModel::runHistoryChunk);
+                return;
+            }
+            if (hashes_read) {
+                transactionTableModel->reserveHistory(total);
+                LogPrint(BCLog::QT, "GUI history: wallet \"%s\" has %u transactions, reading in chunks\n", getWalletName().toStdString(), total);
+            }
+            if (!rows.empty()) transactionTableModel->appendInitialHistory(std::move(rows));
+            if (done) {
+                LogPrint(BCLog::QT, "GUI history: wallet \"%s\" read completely\n", getWalletName().toStdString());
+                m_deferred_history = false;
+                m_history_load.reset();
+                transactionTableModel->finishInitialHistoryStream();
+                releaseHistorySlot();
+                return;
+            }
+            historyChunkDone();
+        }, Qt::QueuedConnection);
+    }, Qt::QueuedConnection);
+    assert(invoked);
+}
+
+bool WalletModel::yieldHistorySlotToShownWallet()
+{
+    // A wallet that is not shown gives way to one that is: its place in the file is kept (the read resumes where it
+    // stopped), and the wallet being looked at starts at once.
+    auto& waiting = HistoryWaiting();
+    if (!m_poll_foreground && !waiting.empty() && waiting.front() && waiting.front()->m_poll_foreground) {
+        waiting.push_back(this);
+        HistoryActive().clear();
+        startNextHistoryLoad();
+        return true;
+    }
+    return false;
+}
+
+void WalletModel::historyChunkDone()
+{
+    if (yieldHistorySlotToShownWallet()) return;
+    // Another worker request asked for the thread: let it run before the next chunk.
+    int delay_ms{0};
+    if (m_history_yield.exchange(false, std::memory_order_acq_rel)) delay_ms = 25;
+    else if (transactionTableModel->unpublishedHistoryRows() > HISTORY_UNPUBLISHED_LIMIT) delay_ms = 10;
+    QTimer::singleShot(delay_ms, this, &WalletModel::runHistoryChunk);
 }
 
 void WalletModel::setClientModel(ClientModel* client_model)
 {
+    if (m_client_model == client_model) return;
+    disconnect(m_balance_tip_connection);
     m_client_model = client_model;
-    if (!m_client_model) timer->stop();
+    ++m_balance_context_generation;
+    invalidateBalanceSnapshot();
+    if (!m_client_model) {
+        timer->stop();
+        return;
+    }
+    m_node_tip_height = -1;
+    m_node_tip_hash.SetNull();
+    m_node_tip_regressed = false;
+    m_balance_tip_connection = connect(m_client_model, &ClientModel::numBlocksChanged, this,
+        [this](int count, const QDateTime&, double, SyncType type, SynchronizationState) {
+            if (type != SyncType::BLOCK_SYNC) return;
+            m_node_tip_regressed = m_node_tip_height >= 0 && count < m_node_tip_height;
+            m_node_tip_height = count;
+            // The client model's cached tip (a leaf mutex, no chain lock); it
+            // is never older than the count this signal carries.
+            m_node_tip_hash = m_client_model ? m_client_model->getBestBlockHash() : uint256{};
+            invalidateBalanceSnapshot();
+        });
+    if (m_balance_poll_started) startPollBalance();
 }
 
 void WalletModel::updateStatus()
 {
+    if (m_joined) return;
     interfaces::WalletEncryptionStatus status;
     if (!m_wallet->tryGetEncryptionStatus(status)) {
         // Keystore notifications can race with QQSIGNAL signing. Never wait
@@ -160,53 +374,174 @@ void WalletModel::updateStatus()
 
 void WalletModel::pollBalanceChanged()
 {
-    // Get node synchronization information
-    int numBlocks = -1;
-    bool isSyncing = false;
-    pollNum++;
-    if (!m_node.tryGetSyncInfo(numBlocks, isSyncing) || (isSyncing && pollNum < pollSyncSkip))
-        return;
+    if (m_joined || !m_client_model) return;
+    m_balance_poll_requested = true;
+    // Reading the balance is a read of the snapshot the display balance
+    // worker published: a leaf mutex and nothing else, so it is done here on
+    // the GUI thread. Nothing is retried from here either; the worker decides
+    // when this wallet gets its next snapshot and announces it
+    // (handleDisplayBalancesChanged), and the timer only catches up.
+    m_wallet->requestDisplayBalances(m_poll_foreground, m_requested_send_family,
+                                     std::exchange(m_send_retry_requested, false));
+    applyDisplaySnapshot(m_wallet->getDisplaySnapshot());
+    pollStakeWeight();
+}
 
-    // Avoid recomputing wallet balances unless a TransactionChanged or
-    // BlockTip notification was received.
-    if (!fForceCheckBalanceChanged && m_cached_last_update_tip == getLastBlockProcessed()) return;
+void WalletModel::displayBalancesChanged()
+{
+    // A model nobody has polled yet stays untouched until it is.
+    if (m_balance_poll_requested) pollBalanceChanged();
+}
 
-    // Try to get balances and return early if locks can't be acquired. This
-    // avoids the GUI from getting stuck on periodical polls if the core is
-    // holding the locks for a longer time - for example, during a wallet
-    // rescan.
-    interfaces::WalletBalances new_balances;
-    uint256 block_hash;
-    if (!m_wallet->tryGetBalances(new_balances, block_hash)) {
-        return;
+WalletModel::BalanceState WalletModel::ClassifyBalance(bool available, bool exact, bool failed, int snapshot_height, int node_tip_height,
+                                                       bool other_block_at_tip_height, bool node_tip_regressed)
+{
+    if (!available) return BalanceState::None;
+    if (node_tip_height >= 0 && snapshot_height < node_tip_height) return BalanceState::Behind;
+    // The node's tip went down (invalidateblock, or a reorg to a heavier but
+    // shorter chain) and the snapshot is above it: of a block the node left.
+    // Without the regression a snapshot above the tip the model was told is
+    // only the tip announcement lagging the wallet, which is not behind.
+    if (node_tip_regressed && node_tip_height >= 0 && snapshot_height > node_tip_height) return BalanceState::Behind;
+    // A reorg that ends at the height it started from: the snapshot is of a
+    // block the node has left, which is behind too.
+    if (node_tip_height >= 0 && snapshot_height == node_tip_height && other_block_at_tip_height) return BalanceState::Behind;
+    if (failed) return BalanceState::Failed;
+    return exact ? BalanceState::Exact : BalanceState::CurrentUnverified;
+}
+
+void WalletModel::applyDisplaySnapshot(const interfaces::WalletDisplayBalances& snapshot)
+{
+    if (snapshot.failed && !m_balance_failure_reported) {
+        qWarning("Wallet display snapshot failed");
+        m_balance_failure_reported = true;
+    } else if (!snapshot.failed) {
+        m_balance_failure_reported = false;
     }
-    pollNum = 0;
 
-    bool cachedBlockHashChanged = block_hash != m_cached_last_update_tip;
-    if (fForceCheckBalanceChanged || cachedBlockHashChanged) {
-        fForceCheckBalanceChanged = false;
+    const uint64_t context_generation = m_balance_context_generation;
+    const QPointer<WalletModel> model{this};
+    const auto gone = [&] { return !model || m_joined || context_generation != m_balance_context_generation; };
 
-        // Balance and number of transactions might have changed
-        m_cached_last_update_tip = block_hash;
+    // The balance on screen is that of snapshot.block_height. It is stale
+    // when the wallet has changed since, or the node is past that block; the
+    // user is told only in the second case (Behind).
+    const BalanceState state = ClassifyBalance(snapshot.available, snapshot.exact, snapshot.failed,
+                                               snapshot.block_height, m_node_tip_height,
+                                               !m_node_tip_hash.IsNull() && snapshot.block_hash != m_node_tip_hash,
+                                               m_node_tip_regressed);
+    // A snapshot of the node's tip, or of a block no higher than it, is the
+    // worker having caught up with the regression.
+    if (snapshot.available && (snapshot.block_hash == m_node_tip_hash || snapshot.block_height <= m_node_tip_height)) {
+        m_node_tip_regressed = false;
+    }
+    const bool stale = snapshot.available && state != BalanceState::Exact;
+    const bool behind = state == BalanceState::Behind;
+    const bool was_behind = m_balance_state == BalanceState::Behind;
+    const int previous_height = m_balance_height;
+    m_balance_state = state;
+    if (stale != m_balance_stale || (stale && snapshot.block_height != previous_height)) {
+        m_balance_stale = stale;
+        m_balance_height = snapshot.block_height;
+        Q_EMIT balanceStaleChanged(stale, snapshot.block_height);
+        if (gone()) return;
+    }
+    if (behind != was_behind || (behind && snapshot.block_height != previous_height)) {
+        m_balance_height = snapshot.block_height;
+        Q_EMIT balanceBehindChanged(behind, snapshot.block_height);
+        if (gone()) return;
+    }
+    if (!snapshot.available) return;
+    m_balance_height = snapshot.block_height;
 
-        // This poll runs on the wallet worker thread, but the balance cache,
-        // the balanceChanged listeners, and the transaction table all live on
-        // the GUI thread, so apply the results there. The queued call is
-        // dropped automatically if this model is destroyed first.
-        const bool is_syncing{isSyncing};
-        QMetaObject::invokeMethod(this, [this, new_balances, cachedBlockHashChanged, is_syncing] {
-            bool balanceChanged = checkBalanceChanged(new_balances);
+    const bool new_snapshot = snapshot.sequence != m_applied_balance_sequence;
+    const bool wallet_changed = m_balance_generation != m_applied_balance_generation;
+    if (new_snapshot || (wallet_changed && snapshot.exact)) {
+        const bool tip_changed = snapshot.block_hash != m_cached_last_update_tip;
+        // A snapshot the wallet has already moved past leaves the newer
+        // generation pending; the next snapshot applies it.
+        if (snapshot.exact) m_applied_balance_generation = m_balance_generation;
+        m_applied_balance_sequence = snapshot.sequence;
+        m_cached_last_update_tip = snapshot.block_hash;
+        const bool balance_changed = checkBalanceChanged(snapshot.balances);
+        if (gone()) return;
+        if ((tip_changed || wallet_changed) && transactionTableModel) {
+            transactionTableModel->updateConfirmations();
+            if (gone()) return;
+        }
+        if (tip_changed || balance_changed) ++m_stake_weight_generation;
+    }
 
-            if (transactionTableModel)
-                transactionTableModel->updateConfirmations();
+    // The send-family balance belongs to one snapshot. A snapshot without the
+    // requested one (not computed yet, or not within its bound) shows none.
+    if (m_requested_send_family) {
+        const std::optional<CAmount> send_balance = snapshot.send_family == m_requested_send_family
+            ? snapshot.send_family_balance : std::nullopt;
+        if (m_cached_send_family != m_requested_send_family || m_cached_send_balance != send_balance) {
+            m_cached_send_family = m_requested_send_family;
+            m_cached_send_balance = send_balance;
+            Q_EMIT sendBalanceChanged();
+        }
+    }
+}
 
-            // The stake weight is used for the staking icon status
-            // Get the stake weight only when not syncing because it is time consuming
-            if (!is_syncing && (balanceChanged || cachedBlockHashChanged)) {
-                updateStakeWeight = true;
+void WalletModel::pollStakeWeight()
+{
+    if (!worker || m_stake_weight_poll_in_flight) return;
+    const uint64_t generation = m_stake_weight_generation;
+    const bool stale = generation != m_stake_weight_applied_generation;
+    if (!stale && !updateStakeWeight.load(std::memory_order_relaxed)) return;
+    m_stake_weight_poll_in_flight = true;
+    const bool invoked = QMetaObject::invokeMethod(worker, [this, generation, stale] {
+        bool applied{false};
+        try {
+            if (!m_node.shutdownRequested()) {
+                int height{-1};
+                bool syncing{false};
+                // The stake weight follows the tip and the balance, but not
+                // while the node is still synchronizing.
+                if (stale && m_node.tryGetSyncInfo(height, syncing) && !syncing) {
+                    updateStakeWeight = true;
+                    applied = true;
+                }
+                checkStakeWeightChanged();
             }
+        } catch (...) {
+        }
+        QMetaObject::invokeMethod(this, [this, generation, applied] {
+            m_stake_weight_poll_in_flight = false;
+            if (applied) m_stake_weight_applied_generation = generation;
         }, Qt::QueuedConnection);
-    }
+    }, Qt::QueuedConnection);
+    if (!invoked) m_stake_weight_poll_in_flight = false;
+}
+
+void WalletModel::invalidateBalanceSnapshot()
+{
+    ++m_balance_generation;
+}
+
+void WalletModel::setSendBalanceFamily(std::optional<interfaces::WalletDisplayCoinFamily> family)
+{
+    if (m_requested_send_family == family) return;
+    m_requested_send_family = family;
+    if (family) pollBalanceChanged();
+    else if (!m_joined && m_client_model) m_wallet->requestDisplayBalances(m_poll_foreground, std::nullopt, false);
+}
+
+std::optional<CAmount> WalletModel::getCachedSendBalance(interfaces::WalletDisplayCoinFamily family) const
+{
+    if (m_cached_send_family != family) return std::nullopt;
+    return m_cached_send_balance;
+}
+
+void WalletModel::refreshSendBalance()
+{
+    if (!m_requested_send_family) return;
+    // Ask again for a send-family balance that could not be computed.
+    m_send_retry_requested = true;
+    invalidateBalanceSnapshot();
+    pollBalanceChanged();
 }
 
 bool WalletModel::checkBalanceChanged(const interfaces::WalletBalances& new_balances)
@@ -224,18 +559,108 @@ interfaces::WalletBalances WalletModel::getCachedBalance() const
     return m_cached_balances;
 }
 
+std::shared_ptr<std::atomic<bool>> WalletModel::requestAccountSnapshot(
+    std::function<void(std::shared_ptr<const AccountSnapshot>)> callback)
+{
+    if (m_joined || !worker) return {};
+    if (m_account_snapshot_cancel) m_account_snapshot_cancel->store(true, std::memory_order_release);
+    auto cancel = std::make_shared<std::atomic<bool>>(false);
+    m_account_snapshot_cancel = cancel;
+    const auto generation = m_balance_generation;
+
+    const bool invoked = QMetaObject::invokeMethod(worker, [this, cancel, generation, callback = std::move(callback)] {
+        auto snapshot = std::make_shared<AccountSnapshot>();
+        const auto checkpoint = [&] {
+            snapshot->cancelled = cancel->load(std::memory_order_acquire) || m_node.shutdownRequested();
+            return snapshot->cancelled;
+        };
+        const auto unavailable = [&](bool available) {
+            if (!available) snapshot->stale = true;
+            return !available;
+        };
+        const auto collect = [&] {
+            if (checkpoint()) return;
+            uint256 tip;
+            if (!m_wallet->tryGetBalances(snapshot->balances, tip)) {
+                snapshot->stale = true;
+                return;
+            }
+            if (checkpoint()) return;
+            snapshot->migration = m_wallet->getMigrationStatus();
+            if (unavailable(snapshot->migration.available) || checkpoint()) return;
+            snapshot->demurrage = m_wallet->getDemurrageInfo();
+            if (unavailable(snapshot->demurrage.available) || checkpoint()) return;
+            bool available{false};
+            snapshot->rgb_assets = m_wallet->listRGBAssets(/*include_spent=*/false, &available).size();
+            if (unavailable(available) || checkpoint()) return;
+            snapshot->eutxo_states = m_wallet->listEUTXOStates(/*include_spent=*/true, &available).size();
+            if (unavailable(available) || checkpoint()) return;
+            // Poll cancellation inside the coin walk so wallet switches and
+            // shutdown do not wait for a full listing of a large wallet.
+            auto coins = m_wallet->tryListCoins(checkpoint);
+            if (checkpoint()) return;
+            if (!coins) { snapshot->stale = true; return; }
+            snapshot->coins = std::move(*coins);
+            std::vector<interfaces::WalletAddress> addresses;
+            const bool addresses_available = m_wallet->tryGetAddresses(addresses, checkpoint);
+            if (checkpoint() || unavailable(addresses_available)) return;
+            for (const auto& address : addresses) {
+                if (checkpoint()) return;
+                snapshot->labels.emplace(address.dest, address.name);
+            }
+            if (checkpoint()) return;
+            snapshot->quantum_addresses = m_wallet->listQuantumAddresses(&available);
+            if (unavailable(available) || checkpoint()) return;
+            for (const auto& info : snapshot->quantum_addresses) {
+                if (!info.tiered) continue;
+                snapshot->stake_outputs.emplace(info.address, m_wallet->listQuantumStakeOutputs(info.address, &available));
+                if (unavailable(available) || checkpoint()) return;
+            }
+            snapshot->coldstake_delegations = m_wallet->listQuantumColdStakeDelegations(&available);
+            if (unavailable(available) || checkpoint()) return;
+            std::vector<std::string> coldstake_addresses;
+            coldstake_addresses.reserve(snapshot->coldstake_delegations.size());
+            for (const auto& info : snapshot->coldstake_delegations) coldstake_addresses.push_back(info.address);
+            snapshot->coldstake_balances = m_wallet->getQuantumColdStakeBalances(coldstake_addresses);
+            const bool coldstake_available = std::all_of(snapshot->coldstake_balances.begin(), snapshot->coldstake_balances.end(),
+                [](const auto& entry) { return entry.second.available; });
+            if (unavailable(coldstake_available) || checkpoint()) return;
+            uint256 end_tip;
+            snapshot->stale = !m_node.tryGetBestBlockHash(end_tip) || end_tip != tip;
+        };
+        try {
+            collect();
+        } catch (const std::exception& e) {
+            snapshot->error = e.what();
+        } catch (...) {
+            snapshot->error = "Unknown wallet read error";
+        }
+
+        QMetaObject::invokeMethod(this, [this, cancel, generation, snapshot, callback] {
+            if (m_joined || m_account_snapshot_cancel != cancel) return;
+            m_account_snapshot_cancel.reset();
+            snapshot->cancelled |= cancel->load(std::memory_order_acquire);
+            snapshot->stale |= generation != m_balance_generation;
+            callback(snapshot);
+        }, Qt::QueuedConnection);
+    }, Qt::QueuedConnection);
+    assert(invoked);
+    return cancel;
+}
+
 void WalletModel::requestStakingMiningSnapshot(const StakingMiningSnapshotRequest& request)
 {
     // Only the GUI thread owns request/coalescing state. The cancellation flag
     // is the sole object shared with WalletWorker and is checked between every
     // wallet walk so teardown and wallet switches never wait in the view.
     cancelStakingMiningSnapshot();
+    if (m_joined || !worker) return;
     m_completed_staking_snapshot.reset();
     m_staking_snapshot_request_id = request.request_id;
     const auto cancel = std::make_shared<std::atomic<bool>>(false);
     m_staking_snapshot_cancel = cancel;
 
-    const bool invoked = QMetaObject::invokeMethod(worker, [this, request, cancel] {
+    const bool invoked = QMetaObject::invokeMethod(worker, [this, request, cancel, mining_details_read = m_staking_snapshot_mining_details_read] {
         assert(QThread::currentThread() == worker->thread());
         auto snapshot = std::make_shared<StakingMiningSnapshot>();
         snapshot->request = request;
@@ -263,28 +688,52 @@ void WalletModel::requestStakingMiningSnapshot(const StakingMiningSnapshotReques
         }
 
         try {
-            snapshot->start_tip = m_node.getBestBlockHash().GetHex();
-            if (!request.expected_tip.empty() && snapshot->start_tip != request.expected_tip) {
+            // The tip the worker sees first labels this result. A busy cs_main
+            // (block connect can hold it for tens of seconds) falls back to the
+            // tip the page requested against; the request's expected_tip is a
+            // label, not a gate, so a tip that advances between requests cannot
+            // discard the work.
+            uint256 start_tip;
+            if (m_node.tryGetBestBlockHash(start_tip)) {
+                snapshot->start_tip = start_tip.GetHex();
+            } else if (!request.expected_tip.empty()) {
+                snapshot->start_tip = request.expected_tip;
+                start_tip.SetHex(request.expected_tip);
+            } else {
                 snapshot->stale_tip = true;
                 publish();
                 return;
             }
+            {
+                bool start_in_active_chain{false};
+                int start_height{-1};
+                if (m_node.tryGetBlockHeight(start_tip, start_height, start_in_active_chain)) {
+                    snapshot->start_height = start_height;
+                }
+            }
 
-            m_wallet->refreshPowMiningStakeReserve();
+            // These collections use try-locks. An unavailable read is not an
+            // authoritative empty wallet. Probe before the blocking detail
+            // calls so contention returns promptly to the page's bounded retry.
+            bool available{false};
+            const auto unavailable = [&](const char* stage) {
+                if (available) return false;
+                snapshot->transient_unavailable = true;
+                snapshot->unavailable_stage = stage;
+                publish();
+                return true;
+            };
+            snapshot->coldstake_delegations = m_wallet->listQuantumColdStakeDelegations(&available);
+            if (unavailable("coldstake_delegations")) return;
             if (checkpoint()) { publish(); return; }
-            snapshot->pow = m_wallet->getPowMiningInfo();
+            snapshot->quantum_addresses = m_wallet->listQuantumAddresses(&available);
+            if (unavailable("quantum_addresses")) return;
             if (checkpoint()) { publish(); return; }
-            snapshot->migration = m_wallet->getMigrationStatus();
+            snapshot->rgb_assets = m_wallet->listRGBAssets(/*include_spent=*/false, &available);
+            if (unavailable("rgb_assets")) return;
             if (checkpoint()) { publish(); return; }
-            snapshot->demurrage = m_wallet->getDemurrageInfo();
-            if (checkpoint()) { publish(); return; }
-            snapshot->rgb_assets = m_wallet->listRGBAssets(/*include_spent=*/false);
-            if (checkpoint()) { publish(); return; }
-            snapshot->eutxo_states = m_wallet->listEUTXOStates(/*include_spent=*/true);
-            if (checkpoint()) { publish(); return; }
-            snapshot->quantum_addresses = m_wallet->listQuantumAddresses();
-            if (checkpoint()) { publish(); return; }
-            snapshot->coldstake_delegations = m_wallet->listQuantumColdStakeDelegations();
+            snapshot->eutxo_states = m_wallet->listEUTXOStates(/*include_spent=*/true, &available);
+            if (unavailable("eutxo_states")) return;
             if (checkpoint()) { publish(); return; }
 
             snapshot->selfstake_query_address = request.selfstake_address;
@@ -296,8 +745,25 @@ void WalletModel::requestStakingMiningSnapshot(const StakingMiningSnapshotReques
             }
             if (!snapshot->selfstake_query_address.empty()) {
                 snapshot->selfstake_queried = true;
-                snapshot->selfstake_outputs = m_wallet->listQuantumStakeOutputs(snapshot->selfstake_query_address);
+                snapshot->selfstake_outputs = m_wallet->listQuantumStakeOutputs(snapshot->selfstake_query_address, &available);
+                if (unavailable("selfstake_outputs")) return;
                 if (checkpoint()) { publish(); return; }
+            }
+
+            m_wallet->refreshPowMiningStakeReserve();
+            if (checkpoint()) { publish(); return; }
+            const auto read_mining_details = [&] {
+                interfaces::WalletPowMiningInfo info = m_wallet->getPowMiningInfo();
+                if (mining_details_read) mining_details_read(info);
+                return info;
+            };
+            snapshot->pow = read_mining_details();
+            if (checkpoint()) { publish(); return; }
+            snapshot->migration = m_wallet->getMigrationStatus();
+            if (checkpoint()) { publish(); return; }
+            snapshot->demurrage = m_wallet->getDemurrageInfo();
+            if (checkpoint()) { publish(); return; }
+            if (snapshot->selfstake_queried) {
                 snapshot->selfstake_bond = m_wallet->getQuantumStakeAddressBondInfo(snapshot->selfstake_query_address);
                 if (checkpoint()) { publish(); return; }
             }
@@ -308,40 +774,67 @@ void WalletModel::requestStakingMiningSnapshot(const StakingMiningSnapshotReques
                 if (checkpoint()) { publish(); return; }
             }
 
-            snapshot->coldstake_balances.reserve(snapshot->coldstake_delegations.size());
-            for (const interfaces::WalletQuantumColdStakeInfo& info : snapshot->coldstake_delegations) {
-                snapshot->coldstake_balances.push_back({info.address, m_wallet->getQuantumColdStakeBalanceInfo(info.address)});
-                if (checkpoint()) { publish(); return; }
+            std::vector<std::string> coldstake_addresses;
+            coldstake_addresses.reserve(snapshot->coldstake_delegations.size() + 1);
+            for (const auto& info : snapshot->coldstake_delegations) {
+                coldstake_addresses.push_back(info.address);
             }
             snapshot->selected_coldstake_query_address = request.coldstake_address;
             if (!snapshot->selected_coldstake_query_address.empty()) {
+                coldstake_addresses.push_back(snapshot->selected_coldstake_query_address);
+            }
+            const auto coldstake_balances = m_wallet->getQuantumColdStakeBalances(coldstake_addresses);
+            if (checkpoint()) { publish(); return; }
+            snapshot->coldstake_balances.reserve(snapshot->coldstake_delegations.size());
+            for (const auto& info : snapshot->coldstake_delegations) {
+                snapshot->coldstake_balances.push_back({info.address, coldstake_balances.at(info.address)});
+            }
+            if (!snapshot->selected_coldstake_query_address.empty()) {
                 snapshot->selected_coldstake_queried = true;
-                snapshot->selected_coldstake_balance = m_wallet->getQuantumColdStakeBalanceInfo(snapshot->selected_coldstake_query_address);
-                if (checkpoint()) { publish(); return; }
+                snapshot->selected_coldstake_balance = coldstake_balances.at(snapshot->selected_coldstake_query_address);
             }
 
             snapshot->pool = m_wallet->getQuantumPoolInfo();
             if (checkpoint()) { publish(); return; }
             // getPowMiningInfo() deliberately uses try-locks so callers never
             // stall a GUI thread. A transient miss is not an authoritative
-            // empty payout or eligibility state. The intervening detail reads
-            // have crossed the same wallet/chain locks, so resample once and
-            // reject the whole snapshot if it is still incomplete.
+            // empty payout or eligibility state, so resample once. The
+            // intervening detail reads have crossed the same wallet/chain
+            // locks, but a thread that takes cs_main or cs_wallet repeatedly
+            // (a block being built and then connected, blocks connecting
+            // one after another) can hold it again at the resample. That is
+            // the busy lock the collection probes report, not a failure:
+            // hand it to the page's bounded retry like them.
             if (!snapshot->pow.payout_address_available ||
                 !snapshot->pow.wallet_goldrush_status_available) {
-                snapshot->pow = m_wallet->getPowMiningInfo();
+                snapshot->pow = read_mining_details();
                 if (checkpoint()) { publish(); return; }
                 if (!snapshot->pow.payout_address_available ||
                     !snapshot->pow.wallet_goldrush_status_available) {
-                    snapshot->error =
-                        "Wallet mining details are temporarily unavailable; retry the refresh";
+                    snapshot->transient_unavailable = true;
+                    snapshot->unavailable_stage = "pow_mining_info";
                     publish();
                     return;
                 }
             }
-            snapshot->end_tip = m_node.getBestBlockHash().GetHex();
-            snapshot->stale_tip = snapshot->start_tip != snapshot->end_tip ||
-                (!request.expected_tip.empty() && snapshot->end_tip != request.expected_tip);
+            // A tip that advanced while the wallet was read still yields a
+            // usable result, flagged so the view can say it may span blocks.
+            // Only a start block that left the active chain invalidates it.
+            uint256 end_tip;
+            if (m_node.tryGetBestBlockHash(end_tip)) {
+                snapshot->end_tip = end_tip.GetHex();
+                snapshot->tip_advanced = snapshot->end_tip != snapshot->start_tip;
+            } else {
+                snapshot->tip_advanced = true;
+            }
+            if (snapshot->tip_advanced) {
+                bool start_in_active_chain{true};
+                int ignored_height{-1};
+                if (m_node.tryGetBlockHeight(start_tip, ignored_height, start_in_active_chain) &&
+                    !start_in_active_chain) {
+                    snapshot->stale_tip = true;
+                }
+            }
         } catch (const std::exception& e) {
             snapshot->error = e.what();
         } catch (...) {
@@ -370,9 +863,143 @@ std::shared_ptr<const WalletModel::StakingMiningSnapshot> WalletModel::takeStaki
     return std::exchange(m_completed_staking_snapshot, {});
 }
 
+uint64_t WalletModel::requestPowMiningControl(PowMiningControlRequest request)
+{
+    Q_ASSERT(QThread::currentThread() == thread());
+    if (m_account_snapshot_cancel) m_account_snapshot_cancel->store(true, std::memory_order_release);
+    m_history_yield.store(true, std::memory_order_release);
+    cancelStakingMiningSnapshot();
+    if (++m_pow_mining_control_sequence == 0) ++m_pow_mining_control_sequence;
+    request.request_id = m_pow_mining_control_sequence;
+    request.wallet_name = m_wallet->getWalletName();
+    const auto cancel = std::make_shared<std::atomic<bool>>(false);
+    m_pow_mining_control_cancels.emplace(request.request_id, cancel);
+    if (m_joined || !worker || !t.isRunning()) {
+        cancel->store(true, std::memory_order_release);
+        auto result = std::make_shared<PowMiningControlResult>();
+        result->request = request;
+        result->cancelled = true;
+        result->error = "Wallet worker is stopping; mining control was not started";
+        QMetaObject::invokeMethod(this, [this, result] {
+            m_pow_mining_control_cancels.erase(result->request.request_id);
+            m_completed_pow_mining_controls.emplace(result->request.request_id, result);
+            Q_EMIT powMiningControlReady(result->request.request_id, result->request.generation);
+        }, Qt::QueuedConnection);
+        return request.request_id;
+    }
+    const bool invoked = QMetaObject::invokeMethod(worker, [this, request, cancel] {
+        auto result = std::make_shared<PowMiningControlResult>();
+        result->request = request;
+        const auto cancelled = [this, request, cancel] {
+            return cancel->load(std::memory_order_acquire) ||
+                (request.view_current && !request.view_current->load(std::memory_order_acquire)) ||
+                m_node.shutdownRequested();
+        };
+        try {
+            if (cancelled()) {
+                result->cancelled = true;
+            } else if (request.threads < 1 || request.threads > 256 ||
+                       request.cpu_percent < 1 || request.cpu_percent > 100) {
+                result->error = "Invalid miner resource preferences";
+            } else {
+                result->core_entered = true;
+                result->success = m_wallet->setPowMining(
+                    request.enabled, request.threads, request.cpu_percent,
+                    result->error, request.allow_new_payout_key,
+                    &result->created_payout_key, cancelled);
+                // A completed mutation remains a completed mutation when its
+                // originating view disappears. Cancellation never rolls back
+                // a durable payout key or a committed worker replacement.
+                result->cancelled = !result->success && cancelled();
+                if (result->success && request.lock_wallet) {
+                    result->success = m_wallet->lock();
+                    if (!result->success) result->error = "Unable to lock the wallet after stopping mining";
+                }
+                if (result->success && !request.lock_wallet) {
+                    const bool save_threads = !m_node.isSettingIgnored("powminingthreads");
+                    const bool save_cpu = !m_node.isSettingIgnored("powminingcpu");
+                    if (save_threads || save_cpu) {
+                        // Write the pair together, independently of startup
+                        // consent. Node's void update API cannot report disk
+                        // failure, so use the checked settings writer here.
+                        gArgs.LockSettings([&](common::Settings& settings) {
+                            if (save_threads) settings.rw_settings["powminingthreads"] = request.threads;
+                            if (save_cpu) settings.rw_settings["powminingcpu"] = request.cpu_percent;
+                        });
+                        result->preferences_saved = gArgs.WriteSettingsFile();
+                        if (!result->preferences_saved) result->error = "Mining control succeeded, but resource preferences could not be saved";
+                    } else {
+                        result->preferences_saved = true;
+                    }
+                }
+            }
+        } catch (const std::exception& e) {
+            result->error = e.what();
+        } catch (...) {
+            result->error = "Unknown error while configuring Gold Rush PoW mining";
+        }
+        if (result->created_payout_key) {
+            std::lock_guard<std::mutex> lock{m_pow_payout_warning_mutex};
+            m_pending_pow_payout_warnings.emplace(request.request_id, request.wallet_name);
+        }
+        result->info = m_wallet->getPowMiningInfo();
+        QMetaObject::invokeMethod(this, [this, result] {
+            QPointer<WalletModel> still_alive{this};
+            publishPendingPowPayoutWarnings();
+            if (!still_alive) return;
+            m_pow_mining_control_cancels.erase(result->request.request_id);
+            if (!result->request.view_current || result->request.view_current->load(std::memory_order_acquire)) {
+                m_completed_pow_mining_controls.emplace(result->request.request_id, result);
+                // Completed reads are retained until consumed, with a fixed
+                // ceiling for clients which disappear without taking them.
+                while (m_completed_pow_mining_controls.size() > 32) m_completed_pow_mining_controls.erase(m_completed_pow_mining_controls.begin());
+                Q_EMIT powMiningControlReady(result->request.request_id, result->request.generation);
+                if (!still_alive) return;
+            }
+            updateStatus();
+        }, Qt::QueuedConnection);
+    }, Qt::QueuedConnection);
+    assert(invoked);
+    return request.request_id;
+}
+
+void WalletModel::publishPendingPowPayoutWarnings()
+{
+    Q_ASSERT(QThread::currentThread() == thread());
+    std::map<uint64_t, std::string> pending;
+    {
+        std::lock_guard<std::mutex> lock{m_pow_payout_warning_mutex};
+        pending.swap(m_pending_pow_payout_warnings);
+    }
+    QPointer<WalletModel> still_alive{this};
+    for (const auto& warning : pending) {
+        Q_EMIT powPayoutKeyCreated(QString::fromStdString(warning.second));
+        if (!still_alive) return;
+    }
+}
+
+void WalletModel::cancelPowMiningControl(uint64_t request_id)
+{
+    const auto it = m_pow_mining_control_cancels.find(request_id);
+    if (it != m_pow_mining_control_cancels.end()) it->second->store(true, std::memory_order_release);
+    m_completed_pow_mining_controls.erase(request_id);
+}
+
+std::shared_ptr<const WalletModel::PowMiningControlResult> WalletModel::takePowMiningControlResult(uint64_t request_id)
+{
+    const auto it = m_completed_pow_mining_controls.find(request_id);
+    if (it == m_completed_pow_mining_controls.end()) return {};
+    auto result = it->second;
+    m_completed_pow_mining_controls.erase(it);
+    return result;
+}
+
 uint64_t WalletModel::requestPowClaimRecoveryPolicy(PowClaimRecoveryPolicyRequest request)
 {
     Q_ASSERT(QThread::currentThread() == thread());
+    if (m_account_snapshot_cancel) m_account_snapshot_cancel->store(true, std::memory_order_release);
+    m_history_yield.store(true, std::memory_order_release);
+    cancelStakingMiningSnapshot();
     // Policy reads and durable updates share WalletWorker with other wallet
     // walks. The Qt event thread only owns request/result bookkeeping. Issue
     // correlation lives here (rather than in a view) so recreated or parallel
@@ -463,7 +1090,7 @@ uint64_t WalletModel::requestPowClaimRecoveryPolicy(PowClaimRecoveryPolicyReques
                     m_wallet->setPowClaimRecoveryPolicyDetailed(request.policy);
                 result->authoritative_state_checked = true;
                 result->success = result->mutation.success;
-                result->error = result->mutation.detail;
+                if (!result->success) result->error = result->mutation.detail;
                 result->policy_available =
                     result->mutation.authoritative_state_available;
                 if (result->policy_available) {
@@ -475,7 +1102,7 @@ uint64_t WalletModel::requestPowClaimRecoveryPolicy(PowClaimRecoveryPolicyReques
                     m_wallet->getPowClaimRecoveryPolicyState();
                 result->authoritative_state_checked = true;
                 result->success = result->mutation.success;
-                result->error = result->mutation.detail;
+                if (!result->success) result->error = result->mutation.detail;
                 result->policy_available =
                     result->mutation.authoritative_state_available;
                 if (result->policy_available) {
@@ -521,6 +1148,9 @@ uint64_t WalletModel::requestPowClaimRecoveryOperation(
     PowClaimRecoveryOperationRequest request)
 {
     Q_ASSERT(QThread::currentThread() == thread());
+    if (m_account_snapshot_cancel) m_account_snapshot_cancel->store(true, std::memory_order_release);
+    m_history_yield.store(true, std::memory_order_release);
+    cancelStakingMiningSnapshot();
     if (++m_pow_claim_recovery_operation_request_sequence == 0) {
         ++m_pow_claim_recovery_operation_request_sequence;
     }
@@ -535,7 +1165,7 @@ uint64_t WalletModel::requestPowClaimRecoveryOperation(
     const bool mutating =
         request.operation == PowClaimRecoveryOperationRequest::Operation::EXECUTE ||
         request.operation == PowClaimRecoveryOperationRequest::Operation::ADOPT;
-    const auto reject_queued = [this, &request](std::string error,
+    const auto reject_queued = [this, &request, control](std::string error,
                                                 bool cancelled,
                                                 bool busy) {
         auto result = std::make_shared<PowClaimRecoveryOperationResult>();
@@ -543,6 +1173,7 @@ uint64_t WalletModel::requestPowClaimRecoveryOperation(
         result->cancelled = cancelled;
         result->busy_rejected = busy;
         result->error = std::move(error);
+        control->stage.store(PowClaimRecoveryOperationStage::FINISHED, std::memory_order_release);
         const bool invoked = QMetaObject::invokeMethod(
             this, [this, result] {
                 publishPowClaimRecoveryOperationResult(result);
@@ -702,6 +1333,7 @@ void WalletModel::dispatchPowClaimRecoveryOperation(
         result->cancelled = true;
         result->error =
             "Wallet worker stopped before the PoW claim recovery operation entered Core";
+        control->stage.store(PowClaimRecoveryOperationStage::FINISHED, std::memory_order_release);
         const bool invoked = QMetaObject::invokeMethod(
             this, [this, result] {
                 publishPowClaimRecoveryOperationResult(result);
@@ -714,7 +1346,10 @@ void WalletModel::dispatchPowClaimRecoveryOperation(
         auto result = std::make_shared<PowClaimRecoveryOperationResult>();
         result->request = request;
 
-        const auto publish = [this, result] {
+        const auto publish = [this, result, control] {
+            // Retain the model through publication, including a produced
+            // pre-Core cancellation and the worker-finished/GUI-queued gap.
+            control->stage.store(PowClaimRecoveryOperationStage::FINISHED, std::memory_order_release);
             QMetaObject::invokeMethod(
                 this, [this, result] {
                     publishPowClaimRecoveryOperationResult(result);
@@ -825,6 +1460,14 @@ void WalletModel::publishPowClaimRecoveryOperationResult(
 {
     Q_ASSERT(QThread::currentThread() == thread());
     const uint64_t request_id = result->request.request_id;
+    const auto pending = m_pow_claim_recovery_operation_controls.find(request_id);
+    if (pending != m_pow_claim_recovery_operation_controls.end()) {
+        pending->second->stage.store(PowClaimRecoveryOperationStage::FINISHED, std::memory_order_release);
+    }
+    if (m_joined && !tryRestorePowClaimRecoveryUnlock(request_id)) {
+        QTimer::singleShot(25, this, [this, result] { publishPowClaimRecoveryOperationResult(result); });
+        return;
+    }
     const auto control_it =
         m_pow_claim_recovery_operation_controls.find(request_id);
     const bool cancel_requested_now =
@@ -842,7 +1485,8 @@ void WalletModel::publishPowClaimRecoveryOperationResult(
         (result->core_entered &&
          (cancel_requested_now || !originating_view_current));
     m_completed_pow_claim_recovery_operation_results[request_id] = result;
-    m_pow_claim_recovery_operation_controls.erase(request_id);
+    // Keep FINISHED through both signals: their handlers may spin an event
+    // loop which runs shutdownReady again before publication has returned.
 
     // Restore the exact pre-request unlock state before making the result
     // observable. For an initially staking-only-unlocked wallet the context
@@ -900,6 +1544,7 @@ void WalletModel::publishPowClaimRecoveryOperationResult(
     Q_EMIT powClaimRecoveryOperationReady(
         request_id, result->request.generation);
     if (!still_alive) return;
+    m_pow_claim_recovery_operation_controls.erase(request_id);
     m_completed_pow_claim_recovery_operation_results.erase(request_id);
 }
 
@@ -927,6 +1572,12 @@ void WalletModel::cancelPowClaimRecoveryOperation(uint64_t request_id)
 void WalletModel::restorePowClaimRecoveryUnlock(uint64_t request_id)
 {
     Q_ASSERT(QThread::currentThread() == thread());
+    if (m_joined) {
+        // Keep the cleanup obligation until a later shutdown poll can obtain
+        // both locks. A queued completion must not reintroduce a GUI wait.
+        tryRestorePowClaimRecoveryUnlock(request_id);
+        return;
+    }
     m_pow_claim_recovery_operation_unlocks.erase(request_id);
     const auto restore_it =
         m_pow_claim_recovery_restore_staking_only.find(request_id);
@@ -934,6 +1585,22 @@ void WalletModel::restorePowClaimRecoveryUnlock(uint64_t request_id)
         if (restore_it->second) setWalletUnlockStakingOnly(true);
         m_pow_claim_recovery_restore_staking_only.erase(restore_it);
     }
+}
+
+bool WalletModel::tryRestorePowClaimRecoveryUnlock(uint64_t request_id)
+{
+    Q_ASSERT(QThread::currentThread() == thread());
+    const auto unlock = m_pow_claim_recovery_operation_unlocks.find(request_id);
+    if (unlock != m_pow_claim_recovery_operation_unlocks.end()) {
+        if (!unlock->second->tryRestore()) return false;
+        m_pow_claim_recovery_operation_unlocks.erase(unlock);
+    }
+    const auto scope = m_pow_claim_recovery_restore_staking_only.find(request_id);
+    if (scope != m_pow_claim_recovery_restore_staking_only.end()) {
+        if (!m_wallet->tryRestoreGuiUnlockState(false, scope->second)) return false;
+        m_pow_claim_recovery_restore_staking_only.erase(scope);
+    }
+    return true;
 }
 
 std::shared_ptr<const WalletModel::PowClaimRecoveryOperationResult>
@@ -951,12 +1618,14 @@ WalletModel::takePowClaimRecoveryOperationResult(uint64_t request_id)
 void WalletModel::updateTransaction()
 {
     // Balance and number of transactions might have changed
-    fForceCheckBalanceChanged = true;
+    invalidateBalanceSnapshot();
 }
 
 void WalletModel::updateAddressBook(const QString &address, const QString &label,
         bool isMine, wallet::AddressPurpose purpose, int status)
 {
+    invalidateBalanceSnapshot();
+    transactionTableModel->invalidateAddressLabel(address);
     if(addressTableModel)
         addressTableModel->updateEntry(address, label, isMine, purpose, status);
 }
@@ -1105,7 +1774,9 @@ void WalletModel::sendCoins(WalletModelTransaction& transaction)
         Q_EMIT coinsSent(this, rcp, transaction_array);
     }
 
-    checkBalanceChanged(m_wallet->getBalances()); // update balance immediately, otherwise there could be a short noticeable delay until pollBalanceChanged hits
+    // Commit and funding checks above stay authoritative. Refresh display asynchronously.
+    invalidateBalanceSnapshot();
+    pollBalanceChanged();
 }
 
 OptionsModel* WalletModel::getOptionsModel() const
@@ -1211,7 +1882,18 @@ static void NotifyTransactionChanged(WalletModel *walletmodel, const uint256 &ha
 {
     Q_UNUSED(hash);
     Q_UNUSED(status);
-    bool invoked = QMetaObject::invokeMethod(walletmodel, "updateTransaction", Qt::QueuedConnection);
+    walletmodel->queueTransactionChanged();
+}
+
+void WalletModel::queueTransactionChanged()
+{
+    if (m_transaction_notification_queued.exchange(true, std::memory_order_acq_rel)) return;
+    const bool invoked = QMetaObject::invokeMethod(this, [this] {
+        // Rearm before sampling so a concurrent mutation always has a later
+        // notification. A burst before rearming needs only this dirty update.
+        m_transaction_notification_queued.store(false, std::memory_order_release);
+        if (!m_joined) updateTransaction();
+    }, Qt::QueuedConnection);
     assert(invoked);
 }
 
@@ -1231,10 +1913,73 @@ static void NotifyWatchonlyChanged(WalletModel *walletmodel, bool fHaveWatchonly
     assert(invoked);
 }
 
+void WalletModel::setAddressCapabilityConsumer(const QObject* consumer, bool active)
+{
+    if (active && !m_joined) {
+        if (!m_address_capability_consumers.insert(consumer).second) return;
+        m_address_capability_observed.store(true, std::memory_order_release);
+        // Refresh on reentry even if a notification was suppressed while hidden.
+        m_address_capability_dirty.store(true, std::memory_order_release);
+        requestAddressCapability();
+    } else {
+        m_address_capability_consumers.erase(consumer);
+        if (!m_address_capability_consumers.empty()) return;
+        m_address_capability_observed.store(false, std::memory_order_release);
+        m_address_capability_dirty.store(true, std::memory_order_release);
+        m_address_capability_retry->stop();
+        if (m_address_capability_cancel) m_address_capability_cancel->store(true, std::memory_order_release);
+    }
+}
+
+void WalletModel::queueAddressCapabilityChanged()
+{
+    m_address_capability_dirty.store(true, std::memory_order_release);
+    if (!m_address_capability_observed.load(std::memory_order_acquire) ||
+        m_address_capability_notification_queued.exchange(true, std::memory_order_acq_rel)) return;
+    const bool invoked = QMetaObject::invokeMethod(this, [this] {
+        m_address_capability_notification_queued.store(false, std::memory_order_release);
+        requestAddressCapability();
+    }, Qt::QueuedConnection);
+    assert(invoked);
+}
+
+void WalletModel::requestAddressCapability()
+{
+    if (m_joined || m_address_capability_consumers.empty() || m_address_capability_in_flight ||
+        m_address_capability_retry->isActive() || !m_address_capability_dirty.exchange(false, std::memory_order_acq_rel)) return;
+    m_address_capability_in_flight = true;
+    const auto cancel = std::make_shared<std::atomic<bool>>(false);
+    m_address_capability_cancel = cancel;
+    const bool invoked = QMetaObject::invokeMethod(worker, [this, cancel] {
+        bool capable{false};
+        const bool ready = !cancel->load(std::memory_order_acquire) && m_wallet->tryCanGetAddresses(capable);
+        QMetaObject::invokeMethod(this, [this, cancel, ready, capable] {
+            m_address_capability_in_flight = false;
+            if (m_joined) return;
+            // A successful read is an advisory point-in-time value. Do not
+            // starve initial publication during notification-heavy sync, and
+            // never clear a concurrent dirty notification here. Hide/rebind
+            // cancellation still prevents publication into a later epoch.
+            if (!cancel->load(std::memory_order_acquire) && ready &&
+                m_address_capability_cancel == cancel && !m_address_capability_consumers.empty()) {
+                if (m_address_capability != capable) {
+                    m_address_capability = capable;
+                    Q_EMIT canGetAddressesChanged();
+                }
+            } else {
+                m_address_capability_dirty.store(true, std::memory_order_release);
+            }
+            if (!m_address_capability_consumers.empty() && m_address_capability_dirty.load(std::memory_order_acquire)) {
+                m_address_capability_retry->start(MODEL_UPDATE_DELAY);
+            }
+        }, Qt::QueuedConnection);
+    }, Qt::QueuedConnection);
+    assert(invoked);
+}
+
 static void NotifyCanGetAddressesChanged(WalletModel* walletmodel)
 {
-    bool invoked = QMetaObject::invokeMethod(walletmodel, "canGetAddressesChanged");
-    assert(invoked);
+    walletmodel->queueAddressCapabilityChanged();
 }
 
 void WalletModel::subscribeToCoreSignals()
@@ -1247,6 +1992,11 @@ void WalletModel::subscribeToCoreSignals()
     m_handler_show_progress = m_wallet->handleShowProgress(std::bind(ShowProgress, this, std::placeholders::_1, std::placeholders::_2));
     m_handler_watch_only_changed = m_wallet->handleWatchOnlyChanged(std::bind(NotifyWatchonlyChanged, this, std::placeholders::_1));
     m_handler_can_get_addrs_changed = m_wallet->handleCanGetAddressesChanged(std::bind(NotifyCanGetAddressesChanged, this));
+    // A new display snapshot was published (display worker thread): read it
+    // on the GUI thread.
+    m_handler_display_balances_changed = m_wallet->handleDisplayBalancesChanged([this] {
+        QMetaObject::invokeMethod(this, "displayBalancesChanged", Qt::QueuedConnection);
+    });
 }
 
 void WalletModel::unsubscribeFromCoreSignals()
@@ -1259,6 +2009,7 @@ void WalletModel::unsubscribeFromCoreSignals()
     m_handler_show_progress->disconnect();
     m_handler_watch_only_changed->disconnect();
     m_handler_can_get_addrs_changed->disconnect();
+    m_handler_display_balances_changed->disconnect();
 }
 
 // WalletModel::UnlockContext implementation
@@ -1315,8 +2066,17 @@ WalletModel::UnlockContext::UnlockContext(
         restoreStakingOnly(restore_staking_only)
 {}
 
+bool WalletModel::UnlockContext::tryRestore()
+{
+    if (restored) return true;
+    if (!wallet->wallet().tryRestoreGuiUnlockState(valid && relock, restoreStakingOnly.value_or(false))) return false;
+    restored = true;
+    return true;
+}
+
 WalletModel::UnlockContext::~UnlockContext()
 {
+    if (restored) return;
     if(valid && relock)
     {
         wallet->setWalletLocked(true);
@@ -1414,15 +2174,26 @@ void WalletModel::checkStakeWeightChanged()
     }
 }
 
-void WalletModel::join()
+void WalletModel::beginShutdown()
 {
+    if (m_joined) return;
     m_joined = true;
+    m_address_capability_observed.store(false, std::memory_order_release);
+    m_address_capability_consumers.clear();
+    m_address_capability_retry->stop();
+    if (m_address_capability_cancel) m_address_capability_cancel->store(true, std::memory_order_release);
+    m_history_cancel.store(true, std::memory_order_release);
 
     // Stop timer
     if (timer)
         timer->stop();
 
+    if (m_account_snapshot_cancel) m_account_snapshot_cancel->store(true, std::memory_order_release);
+    m_history_yield.store(true, std::memory_order_release);
     cancelStakingMiningSnapshot();
+    for (const auto& entry : m_pow_mining_control_cancels) {
+        entry.second->store(true, std::memory_order_release);
+    }
     for (const auto& entry : m_pow_claim_recovery_policy_cancels) {
         entry.second->store(true, std::memory_order_release);
     }
@@ -1441,17 +2212,45 @@ void WalletModel::join()
         }
     }
 
-    // Quit thread
-    if (t.isRunning()) {
-        if (worker)
-            worker->disconnect(this);
-        t.quit();
-        t.wait();
-        // The finished-to-deleteLater connection destroys the worker in its
-        // owning thread before wait() returns. Avoid retaining a dangling
-        // pointer when join() is called again during WalletModel destruction.
-        worker = nullptr;
+    t.quit();
+}
+
+bool WalletModel::shutdownReady()
+{
+    // In-Core requests retain their unlock until the owned worker has exited.
+    if (!t.wait(0)) return false;
+    while (!m_pow_claim_recovery_operation_unlocks.empty()) {
+        if (!tryRestorePowClaimRecoveryUnlock(m_pow_claim_recovery_operation_unlocks.begin()->first)) return false;
     }
+    while (!m_pow_claim_recovery_restore_staking_only.empty()) {
+        if (!tryRestorePowClaimRecoveryUnlock(m_pow_claim_recovery_restore_staking_only.begin()->first)) return false;
+    }
+    for (const auto& entry : m_pow_claim_recovery_operation_controls) {
+        if (entry.second->stage.load(std::memory_order_acquire) == PowClaimRecoveryOperationStage::FINISHED) return false;
+    }
+    return true;
+}
+
+void WalletModel::join()
+{
+    beginShutdown();
+    // Destructors retain a safe blocking fallback; the application drains on
+    // its event loop and reaches this point only after shutdownReady().
+    // The worker stays alive until this function deletes it, so it is safe to
+    // disconnect it here even if beginShutdown() already asked the thread to
+    // quit and the thread is exiting concurrently.
+    if (worker) worker->disconnect(this);
+    t.quit();
+    t.wait();
+    // The thread has exited: no slot can be running on the worker, and a
+    // QObject whose thread has finished may be deleted from another thread.
+    delete worker;
+    worker = nullptr;
+
+    // The queued completion may never run during unload. Critical backup
+    // receipts are recorded by the worker and drained before model destruction;
+    // WalletController forwards them independently of the deleted WalletView.
+    publishPendingPowPayoutWarnings();
 
     // A worker result normally performs this restoration on the GUI thread.
     // join() may prevent that queued publication from running, so restore all

@@ -207,6 +207,11 @@ public:
 
     //! Get best block hash.
     virtual uint256 getBestBlockHash() = 0;
+    virtual bool tryGetBestBlockHash(uint256& hash) = 0;
+
+    //! Non-blocking lookup of a known block's height and whether it is on the
+    //! active chain. Returns false when the block is unknown or cs_main is busy.
+    virtual bool tryGetBlockHeight(const uint256& hash, int& height, bool& in_active_chain) = 0;
 
     //! Get last block time.
     virtual int64_t getLastBlockTime() = 0;
@@ -258,6 +263,11 @@ public:
 
     //! Get PoS kernel PS
     virtual double getPoSKernelPS() = 0;
+    //! Advance a bounded telemetry sample (at most 512 headers) under a try-lock.
+    //! Return only a complete estimate bound to its sampled header hash.
+    //! The target stays fixed until complete. current_header is authoritative even
+    //! for an incomplete sample, and null when the try-lock/header is unavailable.
+    virtual bool tryGetPoSKernelPS(uint256& header_hash, double& estimate, uint256& current_header) = 0;
 
     //! Register handler for init messages.
     using InitMessageFn = std::function<void(const std::string& message)>;

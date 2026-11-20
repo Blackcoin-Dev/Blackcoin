@@ -10,8 +10,10 @@
 
 #include <atomic>
 #include <memory>
+#include <optional>
 #include <sync.h>
 #include <uint256.h>
+#include <util/time.h>
 
 class BanTableModel;
 class CBlockIndex;
@@ -31,6 +33,7 @@ class QTimer;
 QT_END_NAMESPACE
 
 enum class BlockSource {
+    UNKNOWN,
     NONE,
     DISK,
     NETWORK,
@@ -57,6 +60,9 @@ class ClientModel : public QObject
 public:
     explicit ClientModel(interfaces::Node& node, OptionsModel *optionsModel, QObject *parent = nullptr);
     ~ClientModel();
+    void beginShutdown();
+    bool shutdownReady();
+    std::optional<double> cachedPoSKernelPS();
 
     interfaces::Node& node() const { return m_node; }
     OptionsModel *getOptionsModel();
@@ -64,7 +70,14 @@ public:
     PeerTableSortProxy* peerTableSortProxy();
     BanTableModel *getBanTableModel();
 
-    //! Return number of connections, default is in- and outbound (total)
+    struct ConnectionCounts {
+        int total{-1};
+        int inbound{-1};
+        int outbound{-1};
+    };
+    ConnectionCounts getConnectionCounts() const;
+    //! Return last observed count, or -1 while unavailable; never enters Core.
+    //! Default is in- and outbound (total).
     int getNumConnections(unsigned int flags = CONNECTIONS_ALL) const;
     int getNumBlocks() const;
     uint256 getBestBlockHash() EXCLUSIVE_LOCKS_REQUIRED(!m_cached_tip_mutex);
@@ -92,8 +105,20 @@ public:
 
     Mutex m_cached_tip_mutex;
     uint256 m_cached_tip_blocks GUARDED_BY(m_cached_tip_mutex){};
+    uint256 m_verified_header_hash GUARDED_BY(m_cached_tip_mutex){};
+    uint64_t m_header_generation GUARDED_BY(m_cached_tip_mutex){0};
+    uint256 m_kernel_sample_hash GUARDED_BY(m_cached_tip_mutex){};
+    std::optional<double> m_kernel_sample GUARDED_BY(m_cached_tip_mutex);
+    std::atomic<bool> m_kernel_sample_requested{false};
 
 private:
+    friend class UiWorkerTests;
+    void sampleConnectionCounts();
+    void publishConnectionCounts(uint64_t generation, size_t before, size_t inbound, size_t outbound, size_t after);
+    mutable Mutex m_connection_cache_mutex;
+    ConnectionCounts m_connection_counts GUARDED_BY(m_connection_cache_mutex);
+    uint64_t m_connection_generation GUARDED_BY(m_connection_cache_mutex){0};
+    std::atomic<bool> m_stopping{false};
     interfaces::Node& m_node;
     std::unique_ptr<interfaces::Handler> m_handler_show_progress;
     std::unique_ptr<interfaces::Handler> m_handler_notify_num_connections_changed;
@@ -110,7 +135,26 @@ private:
     //! A thread to interact with m_node asynchronously
     QThread* const m_thread;
 
-    void TipChanged(SynchronizationState sync_state, interfaces::BlockTip tip, double verification_progress, SyncType synctype) EXCLUSIVE_LOCKS_REQUIRED(!m_cached_tip_mutex);
+    //! Latest block tip not yet delivered to the GUI. Block-tip notifications
+    //! are coalesced in every synchronization state: at most one is emitted per
+    //! MODEL_UPDATE_DELAY, a quiet period is followed by an immediate leading
+    //! emit, and the newest tip of a burst is always delivered by the model
+    //! timer. m_block_tip_mutex is a leaf lock: it is never held while taking
+    //! another lock or emitting a signal.
+    struct PendingBlockTip {
+        int height{0};
+        int64_t time{0};
+        double verification_progress{0};
+        SynchronizationState sync_state{};
+    };
+    Mutex m_block_tip_mutex;
+    std::optional<PendingBlockTip> m_pending_block_tip GUARDED_BY(m_block_tip_mutex);
+    std::optional<SteadyClock::time_point> m_last_block_tip_emit GUARDED_BY(m_block_tip_mutex);
+    void submitBlockTip(const PendingBlockTip& tip) EXCLUSIVE_LOCKS_REQUIRED(!m_block_tip_mutex);
+    void flushPendingBlockTip() EXCLUSIVE_LOCKS_REQUIRED(!m_block_tip_mutex);
+    void emitBlockTip(const PendingBlockTip& tip);
+
+    void TipChanged(SynchronizationState sync_state, interfaces::BlockTip tip, double verification_progress, SyncType synctype) EXCLUSIVE_LOCKS_REQUIRED(!m_cached_tip_mutex, !m_block_tip_mutex);
     void subscribeToCoreSignals();
     void unsubscribeFromCoreSignals();
 

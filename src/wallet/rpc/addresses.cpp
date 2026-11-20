@@ -448,9 +448,10 @@ RPCHelpMan getnewquantumcoldstakingaddress()
 
         LOCK(cs_main);
         const CCoinsViewCache& view = pwallet->chain().getCoinsTip();
-        const node::QuantumPoolShare share = node::ComputeQuantumPoolShare(view, staker_hash, node::GetQuantumPoolClaims(staker_hash));
+        const node::QuantumPoolShareCalculator pool_shares{view};
+        const node::QuantumPoolShare share = pool_shares.ComputeShare(staker_hash, node::GetQuantumPoolClaims(staker_hash));
         const bool would_exceed_cap = node::WouldQuantumPoolExceedCap(share.total_coldstake, share.operator_share.verified_value, delegation_amount);
-        const bool cap_filter_unlocked = would_exceed_cap && !node::HasQuantumPoolUnderCapCandidate(view, delegation_amount, {staker_hash});
+        const bool cap_filter_unlocked = would_exceed_cap && !pool_shares.HasUnderCapCandidate(delegation_amount, {staker_hash});
 
         pool_preflight.pushKV("delegation_amount", ValueFromAmount(delegation_amount));
         pool_preflight.pushKV("total_coldstake", ValueFromAmount(share.total_coldstake));

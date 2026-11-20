@@ -21,6 +21,102 @@
 
 struct ConnmanTestMsg : public CConnman {
     using CConnman::CConnman;
+    using CConnman::AddAddrFetch;
+    using CConnman::ProcessAddrFetch;
+
+    void StartHTTPSForTest(const httpsseed::WorkerHooks& hooks)
+    {
+        m_https_seed_test_hooks = &hooks;
+        interruptNet.reset();
+        threadHTTPSAddressSeed = std::thread([this] { ThreadHTTPSAddressSeed(); });
+    }
+
+    void StartDNSForTest(const httpsseed::WorkerHooks& hooks)
+    {
+        m_dns_seed_test_hooks = &hooks;
+        interruptNet.reset();
+        threadDNSAddressSeed = std::thread([this] { ThreadDNSAddressSeed(); });
+    }
+
+    bool HTTPSInterruptedForTest() const { return bool{interruptNet}; }
+
+    void StartHTTPSAutomaticConnectionsForTest()
+    {
+        semOutbound = std::make_unique<CSemaphore>(m_max_outbound);
+        threadOpenConnections = std::thread([this] { ThreadOpenConnections({}); });
+    }
+
+    CNode* FindHTTPSNodeForTest(const std::string& endpoint)
+    {
+        LOCK(m_nodes_mutex);
+        for (auto* node : m_nodes) if (node->addr.ToStringAddrPort() == endpoint) return node;
+        return nullptr;
+    }
+
+    void StopHTTPSForTest()
+    {
+        Interrupt();
+        StopThreads();
+        m_https_seed_test_hooks = nullptr;
+        m_dns_seed_test_hooks = nullptr;
+    }
+
+    void InitAddrFetchTest()
+    {
+        semOutbound = std::make_unique<CSemaphore>(1);
+    }
+
+    void InitReconnectionTest()
+    {
+        semOutbound = std::make_unique<CSemaphore>(1);
+        semAddnode = std::make_unique<CSemaphore>(1);
+        m_max_outbound = nMaxAddnode = 1;
+    }
+
+    CSemaphoreGrant AcquireAddnodePermit()
+    {
+        return CSemaphoreGrant{*semAddnode};
+    }
+
+    void QueueReconnection(CSemaphoreGrant&& grant, std::shared_ptr<qq::Probe> probe = {})
+    {
+        LOCK(m_reconnections_mutex);
+        m_reconnections.push_back({CAddress{}, std::move(grant), "8.8.8.8:15714", probe ? ConnectionType::OUTBOUND_FULL_RELAY : ConnectionType::MANUAL, false, std::move(probe)});
+    }
+
+    size_t GetReconnectionCount()
+    {
+        LOCK(m_reconnections_mutex);
+        return m_reconnections.size();
+    }
+
+    void StartConnectionWorker(bool addnode)
+    {
+        if (addnode) {
+            threadOpenAddedConnections = std::thread([this] { ThreadOpenAddedConnections(); });
+        } else {
+            threadOpenConnections = std::thread([this] { ThreadOpenConnections({}); });
+        }
+    }
+
+    using CConnman::PerformReconnections;
+
+    CSemaphoreGrant AcquireOutboundPermit()
+    {
+        return CSemaphoreGrant{*semOutbound};
+    }
+
+    size_t GetAddrFetchCount()
+    {
+        LOCK(m_addr_fetches_mutex);
+        return m_addr_fetches.size();
+    }
+
+    std::string GetAddrFetchFront()
+    {
+        LOCK(m_addr_fetches_mutex);
+        return m_addr_fetches.front();
+    }
 
     void SetPeerConnectTimeout(std::chrono::seconds timeout)
     {

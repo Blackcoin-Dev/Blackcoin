@@ -8,18 +8,24 @@
 
 #include <wallet/load.h>
 
+#include <chainparams.h>
 #include <common/args.h>
 #include <interfaces/chain.h>
 #include <kernel/cs_main.h>
 #include <scheduler.h>
 #include <util/check.h>
+#include <util/chaintype.h>
 #include <util/fs.h>
 #include <util/string.h>
 #include <util/thread.h>
 #include <util/translation.h>
 #include <wallet/claim_maintenance.h>
 #include <wallet/context.h>
+#include <wallet/display_balance.h>
 #include <wallet/spend.h>
+#ifdef USE_SQLITE
+#include <wallet/sqlite.h>
+#endif
 #include <wallet/wallet.h>
 #include <wallet/walletdb.h>
 
@@ -259,6 +265,11 @@ bool VerifyWallets(WalletContext& context)
 
     LogPrintf("Using wallet directory %s\n", fs::PathToString(GetWalletDir()));
 
+    if (args.IsArgSet("-testwalletfullcheckdelay") && Params().GetChainType() != ChainType::REGTEST) {
+        chain.initError(Untranslated("-testwalletfullcheckdelay is only supported on regtest"));
+        return false;
+    }
+
     chain.initMessage(_("Verifying wallet(s)…").translated);
 
     // For backwards compatibility if an unnamed top level wallet exists in the
@@ -297,6 +308,9 @@ bool VerifyWallets(WalletContext& context)
         ReadDatabaseArgs(args, options);
         options.require_existing = true;
         options.verify = true;
+        // Start-up runs the quick check; the full one follows in the
+        // background once the wallet is loaded (see StartWallets).
+        options.full_integrity_check = args.GetBoolArg("-walletfullcheck", DEFAULT_WALLETFULLCHECK);
         bilingual_str error_string;
         if (!MakeWalletDatabase(wallet_file, options, status, error_string)) {
             if (status == DatabaseStatus::FAILED_NOT_FOUND) {
@@ -313,6 +327,8 @@ bool VerifyWallets(WalletContext& context)
 
 bool LoadWallets(WalletContext& context)
 {
+    // No balance pass or warm-up of a loaded wallet while the others load.
+    const StartupWalletLoadGuard startup_load_guard;
     interfaces::Chain& chain = *context.chain;
     try {
         std::set<fs::path> wallet_paths;
@@ -359,8 +375,25 @@ bool LoadWallets(WalletContext& context)
 
 void StartWallets(WalletContext& context, CScheduler& scheduler)
 {
+#ifdef USE_SQLITE
+    // One background check at a time, after a quiet delay and once the node is
+    // out of initial block download. Regtest tests may set the delay and then
+    // skip the readiness test.
+    if (context.args->IsArgSet("-testwalletfullcheckdelay")) {
+        SQLiteDatabase::ConfigureBackgroundChecks(
+            std::chrono::seconds{std::max<int64_t>(0, context.args->GetIntArg("-testwalletfullcheckdelay", 0))},
+            std::chrono::milliseconds{0}, nullptr);
+    } else {
+        interfaces::Chain* chain{context.chain};
+        SQLiteDatabase::ConfigureBackgroundChecks(BACKGROUND_CHECK_START_DELAY, BACKGROUND_CHECK_WALLET_PAUSE,
+            [chain] { return !chain->isInitialBlockDownload() && !chain->validationCallbacksBusy(); });
+    }
+#endif
     for (const std::shared_ptr<CWallet>& pwallet : GetWallets(context)) {
         pwallet->postInitProcess();
+        if (!context.args->GetBoolArg("-walletfullcheck", DEFAULT_WALLETFULLCHECK)) {
+            pwallet->GetDatabase().StartBackgroundIntegrityCheck();
+        }
         context.claim_maintenance->Register(pwallet);
     }
     context.claim_maintenance->Start();

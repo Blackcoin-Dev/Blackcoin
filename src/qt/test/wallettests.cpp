@@ -7,12 +7,16 @@
 
 #include <addresstype.h>
 #include <core_io.h>
+#include <common/args.h>
+#include <common/settings.h>
 #include <crypto/mldsa.h>
 #include <wallet/coincontrol.h>
+#include <wallet/context.h>
 #include <interfaces/chain.h>
 #include <interfaces/node.h>
 #include <interfaces/wallet.h>
 #include <key_io.h>
+#include <qt/accountpage.h>
 #include <qt/bitcoinunits.h>
 #include <qt/bitcoinamountfield.h>
 #include <qt/clientmodel.h>
@@ -27,11 +31,14 @@
 #include <qt/sendcoinsdialog.h>
 #include <qt/sendcoinsentry.h>
 #include <qt/stakingminingpage.h>
+#include <qt/transactionfilterproxy.h>
+#include <qt/transactionrecord.h>
 #include <qt/transactiontablemodel.h>
 #include <qt/transactionview.h>
 #include <qt/utilitydialog.h>
 #include <qt/walletview.h>
 #include <qt/walletmodel.h>
+#include <qt/walletcontroller.h>
 #include <rpc/client.h>
 #include <rpc/protocol.h>
 #include <rpc/server.h>
@@ -43,21 +50,37 @@
 #include <util/string.h>
 #include <validation.h>
 #include <validationinterface.h>
+#include <univalue.h>
 #include <wallet/test/util.h>
 #include <wallet/spend.h>
+#include <wallet/scriptpubkeyman.h>
 #include <wallet/wallet.h>
+#include <wallet/walletdb.h>
 
 #include <clientversion.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <limits>
+#include <unordered_map>
+#ifdef __APPLE__
+#include <malloc/malloc.h>
+#endif
 #include <chrono>
 #include <functional>
+#include <exception>
+#include <stdexcept>
 #include <future>
 #include <map>
+#include <random>
+#include <filesystem>
+#include <util/fs.h>
+#include <wallet/walletutil.h>
 #include <memory>
 #include <optional>
 #include <thread>
+#include <set>
 
 #include <QAbstractButton>
 #include <QAction>
@@ -65,6 +88,12 @@
 #include <QCheckBox>
 #include <QClipboard>
 #include <QComboBox>
+#include <QCoreApplication>
+#include <QDeadlineTimer>
+#include <QDebug>
+#include <QFile>
+#include <QMenu>
+#include <QMessageBox>
 #include <QLabel>
 #include <QLineEdit>
 #include <QObject>
@@ -75,16 +104,31 @@
 #include <QStyleOptionButton>
 #include <QTableView>
 #include <QTableWidget>
+#include <QTemporaryDir>
+#ifndef WIN32
+#include <sys/resource.h>
+#endif
+#ifdef __APPLE__
+#include <mach/mach.h>
+#include <pthread.h>
+#endif
+#include <QAbstractItemModelTester>
+#include <QAccessible>
 #include <QTest>
 #include <QTimer>
 #include <QVBoxLayout>
 #include <QTextEdit>
+#include <QTreeWidget>
 #include <QListView>
 #include <QDialogButtonBox>
 #include <QDialog>
 #include <QElapsedTimer>
 #include <QEventLoop>
+#include <QItemSelectionModel>
+#include <QEvent>
+#include <QPointer>
 #include <QSignalSpy>
+#include <QRegularExpression>
 
 using wallet::AddWallet;
 using wallet::CWallet;
@@ -98,6 +142,75 @@ using wallet::WalletRescanReserver;
 
 namespace
 {
+// A normal native event loop advances worker completions without QTRY's
+// repeated qWait sleeps. The observation timer also covers unavailable reads,
+// which intentionally do not emit a capability-value change.
+bool WaitForReceiveCondition(WalletModel& model, const std::function<bool()>& predicate, int timeout_ms = 5000)
+{
+    if (predicate()) return true;
+    QEventLoop loop;
+    QTimer deadline, observation;
+    deadline.setSingleShot(true);
+    deadline.setTimerType(Qt::PreciseTimer);
+    QObject::connect(&deadline, &QTimer::timeout, &loop, &QEventLoop::quit);
+    const auto check = [&] { if (predicate()) loop.quit(); };
+    QObject::connect(&model, &WalletModel::canGetAddressesChanged, &loop, check);
+    QObject::connect(&observation, &QTimer::timeout, &loop, check);
+    QElapsedTimer elapsed;
+    elapsed.start();
+    deadline.start(timeout_ms);
+    observation.start(5);
+    loop.exec();
+    return elapsed.elapsed() <= timeout_ms && predicate();
+}
+
+class ReceiveCapabilityLockHolder
+{
+    std::promise<bool> m_locked;
+    std::promise<void> m_release;
+    std::future<bool> m_locked_future{m_locked.get_future()};
+    std::shared_future<void> m_release_future{m_release.get_future().share()};
+    std::atomic<bool> m_release_requested{false};
+    std::thread m_thread;
+public:
+    std::atomic<bool> expired{false};
+    explicit ReceiveCapabilityLockHolder(RecursiveMutex& mutex)
+    {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{1};
+        m_thread = std::thread([this, &mutex, deadline] {
+            while (!m_release_requested.load() && std::chrono::steady_clock::now() < deadline) {
+                TRY_LOCK(mutex, lock);
+                if (lock) {
+                    m_locked.set_value(true);
+                    expired = m_release_future.wait_for(std::chrono::seconds{15}) == std::future_status::timeout;
+                    return;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds{1});
+            }
+            m_locked.set_value(false);
+        });
+    }
+    bool locked()
+    {
+        return m_locked_future.wait_for(std::chrono::seconds{1}) == std::future_status::ready && m_locked_future.get();
+    }
+    void release()
+    {
+        if (!m_thread.joinable()) return;
+        m_release_requested.store(true);
+        m_release.set_value();
+        m_thread.join();
+    }
+    ~ReceiveCapabilityLockHolder() { release(); }
+};
+
+class ReceiveCapabilityOptionsModel : public OptionsModel
+{
+public:
+    using OptionsModel::OptionsModel;
+    int displayUnitReceiverCount() const { return receivers(SIGNAL(displayUnitChanged(BitcoinUnit))); }
+};
+
 class QtRecoveryShadowScheduleGuard
 {
 public:
@@ -172,13 +285,20 @@ void ConfirmSend(QString* text = nullptr, QMessageBox::StandardButton confirm_ty
     });
 }
 
-void WaitForModal(const QString& description, std::function<bool()> action)
+//! How long a test thread keeps a lock while it waits for the GUI to prove that it did not wait for that lock. The
+//! thread returns as soon as the proof arrives, so the limit only bounds a failing run: it is generous because the
+//! proof is one or more event loop turns of a build that can be many times slower than a release build.
+constexpr std::chrono::seconds LOCK_HOLD_LIMIT{10};
+
+void WaitForModal(const QString& description, std::function<bool()> action,
+                  std::function<void()> timeout_action = {})
 {
     auto* timer = new QTimer(qApp);
     timer->setInterval(10);
     timer->setSingleShot(false);
     QObject::connect(timer, &QTimer::timeout, timer,
-                     [timer, description, action = std::move(action), attempts = 0]() mutable {
+                     [timer, description, action = std::move(action),
+                      timeout_action = std::move(timeout_action), attempts = 0]() mutable {
         if (action()) {
             timer->stop();
             timer->deleteLater();
@@ -189,7 +309,9 @@ void WaitForModal(const QString& description, std::function<bool()> action)
         QTest::qFail(
             QStringLiteral("Timed out waiting for %1").arg(description).toUtf8().constData(),
             __FILE__, __LINE__);
-        if (auto* dialog = qobject_cast<QDialog*>(QApplication::activeModalWidget())) {
+        if (timeout_action) {
+            timeout_action();
+        } else if (auto* dialog = qobject_cast<QDialog*>(QApplication::activeModalWidget())) {
             dialog->reject();
         }
         timer->stop();
@@ -214,30 +336,108 @@ void ClickCheckBoxIndicator(QCheckBox* checkbox)
 
 //! Press a standard button in a modal message box.
 void ConfirmMessageBox(QMessageBox::StandardButton confirm_type,
-                       const QString& expected_text = {})
+                       const QString& expected_text = {},
+                       const QString& expected_title = {})
 {
-    WaitForModal(QStringLiteral("message box"), [confirm_type, expected_text]() {
-        for (QWidget* widget : QApplication::topLevelWidgets()) {
-            if (auto* dialog = qobject_cast<QMessageBox*>(widget)) {
-                if (!expected_text.isEmpty() &&
-                    !dialog->text().contains(expected_text)) {
-                    QTest::qFail(
-                        QStringLiteral("Message box omitted required disclosure: %1; actual: %2")
-                            .arg(expected_text, dialog->text())
-                            .toUtf8().constData(),
-                        __FILE__, __LINE__);
-                    dialog->reject();
-                    return true;
-                }
-                if (QAbstractButton* button = dialog->button(confirm_type)) {
-                    button->click();
-                    return true;
-                }
-            }
+    const auto expected_dialog = [expected_text, expected_title]() -> QMessageBox* {
+        auto* dialog = qobject_cast<QMessageBox*>(QApplication::activeModalWidget());
+        if (!dialog || !dialog->isVisible()) return nullptr;
+        if (!expected_title.isEmpty()) {
+#ifdef Q_OS_MAC
+            // Qt intentionally ignores QMessageBox titles on macOS. Still require
+            // the platform's empty title and the caller's identifying body text.
+            if (!dialog->windowTitle().isEmpty() || expected_text.isEmpty()) return nullptr;
+#else
+            if (dialog->windowTitle() != expected_title) return nullptr;
+#endif
         }
-        return false;
-    });
+        if (!expected_text.isEmpty() && !dialog->text().contains(expected_text)) return nullptr;
+        return dialog;
+    };
+    WaitForModal(QStringLiteral("visible active message box %1").arg(expected_title),
+        [confirm_type, expected_dialog]() {
+            auto* dialog = expected_dialog();
+            if (!dialog) return false;
+            QAbstractButton* button = dialog->button(confirm_type);
+            if (!button || !button->isEnabled()) return false;
+            button->click();
+            return true;
+        },
+        [expected_dialog]() {
+            // Never dismiss an unrelated active prompt after a failed match.
+            if (auto* dialog = expected_dialog()) dialog->reject();
+        });
 }
+
+// The asynchronous miner start opens a page-owned QMessageBox from a worker
+// completion. Observe its Show event before relying on the native modal loop.
+class OwnedQuestionResponder final : public QObject
+{
+public:
+    OwnedQuestionResponder(QWidget& owner, QString title, QString body, int timeout_ms = 5000)
+        : m_owner{&owner}, m_title{std::move(title)}, m_body{std::move(body)},
+          m_deadline{timeout_ms, Qt::PreciseTimer}
+    {
+        qApp->installEventFilter(this);
+        m_timeout.setSingleShot(true);
+        m_timeout.setTimerType(Qt::PreciseTimer);
+        connect(&m_timeout, &QTimer::timeout, this, [this] {
+            m_timed_out = true;
+            if (m_dialog && m_dialog->isVisible()) m_dialog->reject();
+        });
+        m_timeout.start(timeout_ms);
+    }
+
+    bool finished() const { return m_finished; }
+    bool timedOut() const { return m_timed_out; }
+    bool approved() const { return m_approved; }
+
+protected:
+    bool eventFilter(QObject* object, QEvent* event) override
+    {
+        if (event->type() != QEvent::Show || m_seen) return false;
+        auto* dialog = qobject_cast<QMessageBox*>(object);
+        if (!dialog || !m_owner || dialog->parentWidget() != m_owner ||
+            dialog->icon() != QMessageBox::Question ||
+            dialog->standardButtons() != (QMessageBox::Yes | QMessageBox::No) ||
+            !dialog->text().contains(m_body)) return false;
+#ifndef Q_OS_MAC
+        if (dialog->windowTitle() != m_title) return false;
+#endif
+
+        m_seen = true;
+        m_dialog = dialog;
+        connect(dialog, &QDialog::finished, this, [this](int result) {
+            m_finished = true;
+            m_timeout.stop();
+            m_approved = m_dialog && !m_timed_out && result == QMessageBox::Yes &&
+                m_dialog->clickedButton() == m_dialog->button(QMessageBox::Yes);
+        });
+        // Defer the response until QDialog::exec has entered its event loop.
+        QMetaObject::invokeMethod(this, [this] {
+            if (!m_dialog || !m_dialog->isVisible() || m_finished) return;
+            if (m_deadline.hasExpired()) {
+                m_timed_out = true;
+                m_dialog->reject();
+                return;
+            }
+            if (auto* button = m_dialog->button(QMessageBox::Yes); button && button->isEnabled()) button->click();
+        }, Qt::QueuedConnection);
+        return false;
+    }
+
+private:
+    const QPointer<QWidget> m_owner;
+    const QString m_title;
+    const QString m_body;
+    const QDeadlineTimer m_deadline;
+    QTimer m_timeout;
+    QPointer<QMessageBox> m_dialog;
+    bool m_seen{false};
+    bool m_finished{false};
+    bool m_timed_out{false};
+    bool m_approved{false};
+};
 
 void AnswerPowClaimRecoveryConsent(bool enable, bool use_escape = false,
                                    const QString& expected_wallet = {},
@@ -600,9 +800,64 @@ public:
     }
 };
 
+//! Let the chain finish announcing the blocks this test already made: drain the
+//! validation callback queue and wait until the GUI's cached tip (the tip every
+//! detail snapshot is checked against) equals the active chain tip. This
+//! removes the lag between the GUI's cached tip and the chain, so a result is
+//! labelled with the block the test expects; a tip advance no longer discards a
+//! detail snapshot, and only a reorganization does (WaitForDetailPanels).
+void SettleChainTip(MiniGUI& mini_gui, const std::shared_ptr<CWallet>& core_wallet)
+{
+    SyncWithValidationInterfaceQueue();
+    const auto active_tip = [&] {
+        return WITH_LOCK(::cs_main, return core_wallet->chain().chainman().ActiveChain().Tip()->GetBlockHash());
+    };
+    QTRY_VERIFY_WITH_TIMEOUT(mini_gui.clientModel->getBestBlockHash() == active_tip(), 20000);
+}
+
+//! Whether the Staking and Mining page's hint reports a detail refresh that ended without a result and waits for the
+//! user to press Refresh again: a start block that was reorganized out, try-locks that stayed busy past the bounded
+//! retry, a cancelled or stopped pass, or an error.
+bool DetailRefreshEndedWithoutResult(const QLabel* hint)
+{
+    const QString text = hint->text();
+    return text.contains(QStringLiteral("The chain reorganized during refresh")) ||
+           text.contains(QStringLiteral("Press Refresh to retry")) ||
+           text.contains(QStringLiteral("Detail refresh was cancelled")) ||
+           text.contains(QStringLiteral("Detail refresh failed"));
+}
+
+//! Wait until done() holds, pressing Refresh the way a user would.
+//! The page applies a detail snapshot taken while the chain tip advanced and
+//! labels it with its block; it discards one only when its start block was
+//! reorganized out, showing "The chain reorganized during refresh" and waiting
+//! for Refresh. When that hint is up, press Refresh again, at most max_refreshes
+//! times, and give each attempt the full timeout. Returns whether done() held;
+//! call sites keep their original assertions after it, so it never weakens them.
+bool WaitForDetailPanels(QPushButton* refresh, const QLabel* hint, const std::function<bool()>& done,
+                         int timeout_ms, int max_refreshes = 20)
+{
+    int refreshes{0};
+    QElapsedTimer attempt;
+    attempt.start();
+    while (!done()) {
+        if (attempt.elapsed() >= timeout_ms) return false;
+        if (refreshes < max_refreshes && DetailRefreshEndedWithoutResult(hint)) {
+            ++refreshes;
+            qInfo() << "Detail refresh ended without a result; pressing Refresh again" << refreshes << "of" << max_refreshes << hint->text();
+            refresh->click();
+            attempt.restart();
+        }
+        QTest::qWait(10);
+    }
+    return true;
+}
+
 void TestStakingMiningPageControls(MiniGUI& mini_gui, const std::shared_ptr<CWallet>& core_wallet, const PlatformStyle* platformStyle)
 {
     WalletModel& walletModel = *mini_gui.walletModel;
+    const auto snapshot_trace = WalletTests::traceStakingSnapshots(walletModel);
+    auto stop_trace = interfaces::MakeCleanupHandler([&] { QObject::disconnect(snapshot_trace); });
     struct PowMiningCleanup {
         WalletModel& wallet_model;
         std::shared_ptr<CWallet> wallet;
@@ -815,7 +1070,10 @@ void TestStakingMiningPageControls(MiniGUI& mini_gui, const std::shared_ptr<CWal
     QVERIFY(coldstake_withdraw);
     QVERIFY(coldstake_status);
 
+    SettleChainTip(mini_gui, core_wallet);
     refresh_details->click();
+    WaitForDetailPanels(refresh_details, refresh_hint,
+        [&] { return refresh_hint->text().contains(QString("Detail panels updated")); }, 10000);
     QTRY_VERIFY_WITH_TIMEOUT(refresh_hint->text().contains(QString("Detail panels updated")), 10000);
 
     // The completed detail snapshot has released the page's update guard.
@@ -885,8 +1143,11 @@ void TestStakingMiningPageControls(MiniGUI& mini_gui, const std::shared_ptr<CWal
     QCOMPARE(quantum_address_count->text(), QString("0"));
 
     ConfirmMessageBox(QMessageBox::Yes);
+    SettleChainTip(mini_gui, core_wallet);
     quantum_new->click();
-    QTRY_COMPARE_WITH_TIMEOUT(quantum_address_count->text(), QString("1"), 10000);
+    WaitForDetailPanels(refresh_details, refresh_hint,
+        [&] { return quantum_address_count->text() == QString("1"); }, 60000);
+    QTRY_COMPARE_WITH_TIMEOUT(quantum_address_count->text(), QString("1"), 60000);
     const CTxDestination gui_quantum_dest = DecodeDestination(quantum_address->text().toStdString());
     QVERIFY(IsValidDestination(gui_quantum_dest));
     QVERIFY(IsQuantumMigrationDestination(gui_quantum_dest));
@@ -904,6 +1165,8 @@ void TestStakingMiningPageControls(MiniGUI& mini_gui, const std::shared_ptr<CWal
     selfstake_lock_period->setCurrentIndex(5);
     ConfirmMessageBox(QMessageBox::Yes);
     selfstake_new->click();
+    WaitForDetailPanels(refresh_details, refresh_hint,
+        [&] { return selfstake_selector->findData(selfstake_address->text()) >= 0; }, 10000);
     QTRY_VERIFY_WITH_TIMEOUT(selfstake_selector->findData(selfstake_address->text()) >= 0, 10000);
     const CTxDestination gui_selfstake_dest = DecodeDestination(selfstake_address->text().toStdString());
     QVERIFY(IsValidDestination(gui_selfstake_dest));
@@ -922,6 +1185,8 @@ void TestStakingMiningPageControls(MiniGUI& mini_gui, const std::shared_ptr<CWal
 
     ConfirmMessageBox(QMessageBox::Yes);
     coldstake_operator_new->click();
+    WaitForDetailPanels(refresh_details, refresh_hint,
+        [&] { return coldstake_operator_address_selector->findData(coldstake_operator_address->text()) >= 0; }, 10000);
     QTRY_VERIFY_WITH_TIMEOUT(coldstake_operator_address_selector->findData(coldstake_operator_address->text()) >= 0, 10000);
     const CTxDestination gui_operator_dest = DecodeDestination(coldstake_operator_address->text().toStdString());
     QVERIFY(IsValidDestination(gui_operator_dest));
@@ -946,7 +1211,18 @@ void TestStakingMiningPageControls(MiniGUI& mini_gui, const std::shared_ptr<CWal
     coldstake_lock_period->setCurrentIndex(5);
     QVERIFY(coldstake_new->isEnabled());
     ConfirmMessageBox(QMessageBox::Yes);
+    int coldstake_results{0};
+    const auto coldstake_trace = QObject::connect(&walletModel, &WalletModel::stakingMiningSnapshotReady,
+        &page, [&](quint64 id, quint64 generation) {
+            if (++coldstake_results > 16) return;
+            qInfo().noquote() << "Cold-stake refresh result" << id << generation
+                << "count" << quantum_coldstake_count->text()
+                << "hint" << refresh_hint->text().left(256);
+        });
+    auto stop_coldstake_trace = interfaces::MakeCleanupHandler([&] { QObject::disconnect(coldstake_trace); });
     coldstake_new->click();
+    WaitForDetailPanels(refresh_details, refresh_hint,
+        [&] { return quantum_coldstake_count->text() == QString("1"); }, 10000);
     QTRY_COMPARE_WITH_TIMEOUT(quantum_coldstake_count->text(), QString("1"), 10000);
 
     const CTxDestination gui_coldstake_dest = DecodeDestination(coldstake_address->text().toStdString());
@@ -967,7 +1243,12 @@ void TestStakingMiningPageControls(MiniGUI& mini_gui, const std::shared_ptr<CWal
 
     staking_enable->click();
     QVERIFY(walletModel.wallet().getEnabledStaking());
-    QVERIFY(staking_status->text().startsWith(QString("Staking: syncing")));
+    // The state shown is the one the staking thread last published. While that thread is still in the sleep of
+    // its idle loop this is "syncing", the state it publishes while staking is off; once it has woken it is
+    // whatever its search reports. Which of them a click meets is a race the page does not decide, so require what
+    // the click does decide: the status presents staking as on.
+    QVERIFY2(staking_status->text().startsWith(QString("Staking: ")) || staking_status->text() == QString("Staking is searching"),
+             qPrintable(staking_status->text()));
 
     staking_enable->click();
     QVERIFY(!walletModel.wallet().getEnabledStaking());
@@ -1014,8 +1295,13 @@ void TestStakingMiningPageControls(MiniGUI& mini_gui, const std::shared_ptr<CWal
     const bool staking_only_before_policy = walletModel.getWalletUnlockStakingOnly();
     AnswerInitialPowClaimRecoveryChoice(
         InitialPowClaimRecoveryChoice::PAUSE_AND_ASK);
-    ConfirmMessageBox(QMessageBox::Yes);
-    pow_enable->click();
+    {
+        OwnedQuestionResponder confirm_start(page, QStringLiteral("Start Gold Rush PoW mining"),
+            QStringLiteral("This will start the built-in Gold Rush PoW miner"));
+        pow_enable->click();
+        QTRY_VERIFY_WITH_TIMEOUT(confirm_start.finished() || confirm_start.timedOut(), 6000);
+        QVERIFY2(confirm_start.approved(), "Expected page-owned Gold Rush PoW start confirmation was not answered");
+    }
     QTRY_COMPARE_WITH_TIMEOUT(
         walletModel.wallet().getPowClaimRecoveryPolicy().mode,
         interfaces::WalletPowClaimRecoveryMode::PAUSE_AND_ASK, 5000);
@@ -1033,6 +1319,31 @@ void TestStakingMiningPageControls(MiniGUI& mini_gui, const std::shared_ptr<CWal
     QVERIFY(info.enabled);
     QCOMPARE(info.threads, requested_threads);
     QCOMPARE(info.cpu_percent, 25);
+
+    {
+        // The App Nap poll runs on the UI thread every few seconds for every open
+        // wallet. It must read flags only: with cs_main and cs_wallet held by
+        // another thread it still answers at once, and it never goes through the
+        // chainstate-reading getPowMiningInfo()/getStakingInfo() snapshots.
+        QVERIFY(walletModel.wallet().isStakingOrPowMiningRequested());
+        std::promise<void> locks_held;
+        std::promise<void> release;
+        std::shared_future<void> release_future{release.get_future()};
+        std::thread holder([&] {
+            LOCK2(cs_main, core_wallet->cs_wallet);
+            locks_held.set_value();
+            release_future.wait();
+        });
+        locks_held.get_future().wait();
+        auto poll = std::async(std::launch::async, [&] {
+            return walletModel.wallet().isStakingOrPowMiningRequested();
+        });
+        const bool answered = poll.wait_for(std::chrono::seconds{2}) == std::future_status::ready;
+        release.set_value();
+        holder.join();
+        QVERIFY2(answered, "isStakingOrPowMiningRequested() blocked on a wallet or chainstate lock");
+        QVERIFY(poll.get());
+    }
     QVERIFY(info.payout_address_available);
     QVERIFY(!info.payout_address.empty());
 
@@ -1044,39 +1355,57 @@ void TestStakingMiningPageControls(MiniGUI& mini_gui, const std::shared_ptr<CWal
     // queues the refresh and applies one immutable result.
     QSignalSpy payout_snapshot_ready(
         &walletModel, &WalletModel::stakingMiningSnapshotReady);
-    std::promise<void> payout_main_lock_held;
+    // Probe the unavailable direct PoW read while cs_main is held. A full
+    // detail snapshot has an earlier nonblocking tip check, so queuing it
+    // under this lock may correctly reject before reaching any PoW sub-read.
+    // Establish a released-lock precondition for the successful refresh below;
+    // this fixture does not claim to force an internal PoW resampling branch.
+    std::promise<bool> payout_main_lock_held;
+    auto payout_main_lock_ready = payout_main_lock_held.get_future();
     std::promise<void> release_payout_main_lock;
     std::shared_future<void> payout_main_lock_release =
         release_payout_main_lock.get_future().share();
+    std::atomic<bool> payout_main_lock_expired{false};
     std::thread payout_main_lock_holder([&] {
-        LOCK(cs_main);
-        payout_main_lock_held.set_value();
-        payout_main_lock_release.wait();
+        const auto acquire_deadline = std::chrono::steady_clock::now() + std::chrono::seconds{1};
+        do {
+            TRY_LOCK(cs_main, main_lock);
+            if (main_lock) {
+                payout_main_lock_held.set_value(true);
+                payout_main_lock_expired = payout_main_lock_release.wait_for(std::chrono::seconds{10}) ==
+                    std::future_status::timeout;
+                return;
+            }
+            std::this_thread::yield();
+        } while (std::chrono::steady_clock::now() < acquire_deadline);
+        payout_main_lock_held.set_value(false);
     });
-    payout_main_lock_held.get_future().wait();
+    auto release_payout_holder = interfaces::MakeCleanupHandler([&] {
+        release_payout_main_lock.set_value();
+        payout_main_lock_holder.join();
+    });
+    QVERIFY(payout_main_lock_ready.wait_for(std::chrono::seconds{2}) == std::future_status::ready);
+    QVERIFY(payout_main_lock_ready.get());
     const interfaces::WalletPowMiningInfo unavailable_info =
         walletModel.wallet().getPowMiningInfo();
+    QVERIFY(!unavailable_info.payout_address_available);
+    QVERIFY(!unavailable_info.wallet_goldrush_status_available);
+    release_payout_holder.reset();
+    QVERIFY(!payout_main_lock_expired.load());
+    qInfo() << "Payout snapshot precondition: direct unavailable probe completed and fixture locks released";
+    SettleChainTip(mini_gui, core_wallet);
     refresh_details->click();
 
-    // Queue while cs_main is unavailable, then acquire cs_wallet before
-    // releasing cs_main. This overlapping lock handoff forces the worker's
-    // first PoW sub-read to be incomplete without delaying the GUI thread.
-    std::promise<void> payout_wallet_lock_held;
-    std::promise<void> release_payout_wallet_lock;
-    std::shared_future<void> payout_wallet_lock_release =
-        release_payout_wallet_lock.get_future().share();
-    std::thread payout_wallet_lock_holder([&] {
-        LOCK(core_wallet->cs_wallet);
-        payout_wallet_lock_held.set_value();
-        payout_wallet_lock_release.wait();
-    });
-    payout_wallet_lock_held.get_future().wait();
-    release_payout_main_lock.set_value();
-    payout_main_lock_holder.join();
-    release_payout_wallet_lock.set_value();
-    payout_wallet_lock_holder.join();
-    QVERIFY(!unavailable_info.payout_address_available);
-    QTRY_COMPARE_WITH_TIMEOUT(payout_snapshot_ready.count(), 1, 20000);
+    // A press can legitimately yield a stale result first (the page then asks
+    // for another Refresh), so a retry may add one more snapshot signal than
+    // the single one this click produced. Require at least one signal and the
+    // applied-snapshot state, not an exact count.
+    WaitForDetailPanels(refresh_details, refresh_hint,
+        [&] {
+            return payout_snapshot_ready.count() >= 1 &&
+                   refresh_hint->text().contains(QStringLiteral("Detail panels updated"));
+        }, 20000);
+    QTRY_VERIFY_WITH_TIMEOUT(payout_snapshot_ready.count() >= 1, 20000);
     QVERIFY(refresh_hint->text().contains(QStringLiteral("Detail panels updated")));
     QCOMPARE(pow_payout->text(), expected_payout);
     QVERIFY(pow_copy->isEnabled());
@@ -1099,10 +1428,9 @@ void TestStakingMiningPageControls(MiniGUI& mini_gui, const std::shared_ptr<CWal
         "does not alter a retained family's authenticated payout")));
 
     pow_enable->click();
-    qApp->processEvents();
-    QVERIFY(!walletModel.wallet().getPowMiningInfo().enabled);
-    QCOMPARE(walletModel.wallet().getPowMiningInfo().state, interfaces::WalletPowMiningState::DISABLED);
-    QCOMPARE(pow_status->text(), QString("Gold Rush PoW mining is off."));
+    QTRY_VERIFY_WITH_TIMEOUT(!walletModel.wallet().getPowMiningInfo().enabled, 5000);
+    QTRY_COMPARE_WITH_TIMEOUT(walletModel.wallet().getPowMiningInfo().state, interfaces::WalletPowMiningState::DISABLED, 5000);
+    QTRY_COMPARE_WITH_TIMEOUT(pow_status->text(), QString("Gold Rush PoW mining is off."), 5000);
 
     {
         LOCK2(::cs_main, core_wallet->cs_wallet);
@@ -1122,8 +1450,13 @@ void TestStakingMiningPageControls(MiniGUI& mini_gui, const std::shared_ptr<CWal
     auto stop_before_schedule_restore = interfaces::MakeCleanupHandler(
         [core_wallet] { core_wallet->StopPowMining(); });
 
-    ConfirmMessageBox(QMessageBox::Yes);
-    pow_enable->click();
+    {
+        OwnedQuestionResponder confirm_start(page, QStringLiteral("Start Gold Rush PoW mining"),
+            QStringLiteral("This will start the built-in Gold Rush PoW miner"));
+        pow_enable->click();
+        QTRY_VERIFY_WITH_TIMEOUT(confirm_start.finished() || confirm_start.timedOut(), 6000);
+        QVERIFY2(confirm_start.approved(), "Expected page-owned Gold Rush PoW start confirmation was not answered");
+    }
     const auto locked_input_wait_diagnostic = [&] {
         const interfaces::WalletPowMiningInfo current = walletModel.wallet().getPowMiningInfo();
         const auto gate = WITH_LOCK(core_wallet->m_pow_miner_mutex, return core_wallet->m_pow_mining_gate);
@@ -1143,13 +1476,17 @@ void TestStakingMiningPageControls(MiniGUI& mini_gui, const std::shared_ptr<CWal
     QCOMPARE(walletModel.wallet().getPowMiningInfo().hashrate, 0.0);
 
     refresh_details->click();
+    WaitForDetailPanels(refresh_details, refresh_hint,
+        [&] {
+            return pow_status->text().contains(QString("legacy BLK UTXO")) &&
+                   pow_dashboard->text().contains(QString("waiting for a spendable legacy fee UTXO"));
+        }, 10000);
     QTRY_VERIFY_WITH_TIMEOUT(pow_status->text().contains(QString("legacy BLK UTXO")), 10000);
     QTRY_VERIFY_WITH_TIMEOUT(pow_dashboard->text().contains(QString("waiting for a spendable legacy fee UTXO")), 10000);
     QVERIFY(!pow_dashboard->text().contains(QString("running at 0")));
 
     pow_enable->click();
-    qApp->processEvents();
-    QCOMPARE(walletModel.wallet().getPowMiningInfo().state, interfaces::WalletPowMiningState::DISABLED);
+    QTRY_COMPARE_WITH_TIMEOUT(walletModel.wallet().getPowMiningInfo().state, interfaces::WalletPowMiningState::DISABLED, 5000);
 }
 
 void TestPowClaimRecoveryPolicyControls(
@@ -1265,6 +1602,16 @@ void TestPowClaimRecoveryPolicyControls(
     QTRY_VERIFY_WITH_TIMEOUT(second_result != nullptr, 5000);
     QVERIFY(second_result->success);
     QVERIFY(!second_result->cancelled);
+    QVERIFY(!second_result->mutation.detail.empty());
+    QVERIFY(second_result->error.empty());
+    second_result.reset();
+    second_request.operation = WalletModel::PowClaimRecoveryPolicyRequest::Operation::SET_POLICY;
+    second_request.policy = wallet_interface.getPowClaimRecoveryPolicy();
+    second_id = wallet_model.requestPowClaimRecoveryPolicy(second_request);
+    QTRY_VERIFY_WITH_TIMEOUT(second_result != nullptr, 5000);
+    QVERIFY(second_result->success);
+    QVERIFY(!second_result->mutation.detail.empty());
+    QVERIFY(second_result->error.empty());
     if (first_result) QCOMPARE(first_result->request.request_id, first_id);
     QObject::disconnect(request_connection);
 
@@ -1926,8 +2273,6 @@ void TestPowClaimRecoveryStakingOnlyRequiresFullUnlock(
     // The Staking & Mining page uses a separate normal-unlock helper. A
     // cancelled dialog must preserve the same locked staking-only preference
     // as the generic WalletModel path.
-    QVERIFY(model.setWalletLocked(false, passphrase,
-                                  /*staking_only=*/true));
     {
         StakingMiningPage unlock_page(platform_style);
         unlock_page.setClientModel(mini_gui.clientModel.get());
@@ -1939,8 +2284,51 @@ void TestPowClaimRecoveryStakingOnlyRequiresFullUnlock(
         QTRY_VERIFY_WITH_TIMEOUT(pow_unlock->isVisible(), 5000);
         QTRY_VERIFY_WITH_TIMEOUT(pow_unlock->isEnabled(), 5000);
         QTRY_VERIFY_WITH_TIMEOUT(!pow_unlock->isChecked(), 5000);
+        QCOMPARE(model.getCachedEncryptionStatus(), WalletModel::Locked);
+        {
+            // The unlock helper reads the wallet's state by try-lock. With the
+            // wallet lock held for longer than its bounded retry the click must
+            // end in a visible notice, not in nothing, and must change nothing.
+            std::promise<void> locked, release;
+            const auto release_future = release.get_future().share();
+            std::atomic<bool> expired{false};
+            std::thread holder([&] {
+                LOCK(wallet->cs_wallet);
+                locked.set_value();
+                expired = release_future.wait_for(std::chrono::seconds{20}) == std::future_status::timeout;
+            });
+            auto release_holder = interfaces::MakeCleanupHandler([&] { release.set_value(); holder.join(); });
+            locked.get_future().wait();
+            bool busy_notice{false}, passphrase_asked{false};
+            WaitForModal(QStringLiteral("wallet busy notice"), [&] {
+                QWidget* modal = QApplication::activeModalWidget();
+                if (!modal) return false;
+                if (modal->inherits("AskPassphraseDialog")) passphrase_asked = true;
+                auto* box = qobject_cast<QMessageBox*>(modal);
+                busy_notice = box && box->text().contains(QStringLiteral("wallet is busy"));
+                qobject_cast<QDialog*>(modal)->reject();
+                return true;
+            });
+            pow_unlock->click();
+            QVERIFY(busy_notice);
+            QVERIFY(!passphrase_asked);
+            QVERIFY(!expired.load());
+            release_holder.reset();
+            QCOMPARE(model.getEncryptionStatus(), WalletModel::Locked);
+            QVERIFY(model.getWalletUnlockStakingOnly());
+            QTRY_VERIFY_WITH_TIMEOUT(pow_unlock->isEnabled() && !pow_unlock->isChecked(), 5000);
+            // The status read that met the held lock is retried on a 50 ms timer: let it land first.
+            QTest::qWait(150);
+            QCOMPARE(model.getCachedEncryptionStatus(), WalletModel::Locked);
+        }
+        QVERIFY(model.setWalletLocked(false, passphrase,
+                                      /*staking_only=*/true));
+        // No event processing between this Core unlock and the click: force
+        // the presentation cache to lag while an actual staking-only key exists.
+        QCOMPARE(model.getCachedEncryptionStatus(), WalletModel::Locked);
         QCOMPARE(model.getEncryptionStatus(), WalletModel::Unlocked);
         QVERIFY(model.getWalletUnlockStakingOnly());
+        QVERIFY(!wallet->HasNormalPowMiningWalletAuthority());
         bool normal_unlock_rejected{false};
         WaitForModal(QStringLiteral("normal wallet unlock dialog"), [&normal_unlock_rejected] {
             QWidget* modal = QApplication::activeModalWidget();
@@ -1977,7 +2365,12 @@ void TestPowClaimRecoveryStakingOnlyRequiresFullUnlock(
         QVERIFY(scope_refresh);
         QVERIFY(scope_checkbox);
         QVERIFY(scope_summary);
+        auto* scope_hint =
+            scope_page.findChild<QLabel*>("stakingMiningRefreshHint");
+        QVERIFY(scope_hint);
         scope_refresh->click();
+        WaitForDetailPanels(scope_refresh, scope_hint,
+            [&] { return scope_summary->text().contains(QStringLiteral("Unlock mode: locked")); }, 5000);
         QTRY_VERIFY_WITH_TIMEOUT(!scope_checkbox->isChecked(), 5000);
         QTRY_VERIFY_WITH_TIMEOUT(
             scope_summary->text().contains(QStringLiteral("Unlock mode: locked")),
@@ -2292,6 +2685,96 @@ void TestPowClaimRecoveryJoinCancelsQueuedMutation(
     QVERIFY(!policy_result->policy_available);
 }
 
+void TestRecoveryShutdownRestorationBusy(
+    interfaces::Node& node, const PlatformStyle* style, bool hold_relock_mutex)
+{
+    auto wallet = std::make_shared<CWallet>(node.context()->chain.get(), "qt-recovery-shutdown-busy", CreateMockableWalletDatabase());
+    QCOMPARE(wallet->LoadWallet(), wallet::DBErrors::LOAD_OK);
+    MiniGUI gui(node, style);
+    gui.initModelForWallet(node, wallet, style);
+    WalletModel& model = *gui.walletModel;
+    SyncRecoveryReviewWalletTip(wallet, node);
+    const SecureString passphrase{"qt-recovery-shutdown-passphrase"};
+    QVERIFY(wallet->EncryptWallet(passphrase));
+    model.setWalletUnlockStakingOnly(true); // Initially locked, with the scope marker retained.
+    const auto preview = model.wallet().getPowClaimRecoveryReview({});
+    QVERIFY(preview.consistent);
+
+    std::promise<void> release_worker;
+    const auto worker_release = release_worker.get_future().share();
+    auto worker_expired = std::make_shared<std::atomic<bool>>(false);
+    wallet->m_pow_mining_enabled = true;
+    wallet->threadPowMinerGroup = std::make_unique<std::vector<std::thread>>();
+    wallet->threadPowMinerGroup->emplace_back([worker_release, worker_expired] {
+        worker_expired->store(worker_release.wait_for(std::chrono::seconds{10}) == std::future_status::timeout);
+    });
+    auto release_backend = interfaces::MakeCleanupHandler([&] { release_worker.set_value(); });
+    WalletModel::PowMiningControlRequest stop;
+    stop.lock_wallet = true; // No synthetic owner-settings persistence.
+    model.requestPowMiningControl(stop);
+    QTRY_VERIFY_WITH_TIMEOUT(!wallet->m_pow_mining_enabled.load(), 3000);
+
+    bool unlocked{false};
+    const auto prompt = QObject::connect(&model, &WalletModel::requireUnlock, &model, [&] {
+        unlocked = model.setWalletLocked(false, passphrase, false);
+    });
+    WalletModel::PowClaimRecoveryOperationRequest request;
+    request.generation = 1;
+    request.operation = WalletModel::PowClaimRecoveryOperationRequest::Operation::EXECUTE;
+    request.recovery.mode = interfaces::WalletPowClaimRecoveryRequestMode::COMMIT_AND_BROADCAST;
+    request.recovery.acknowledge_fee_and_conflict_risk = true;
+    request.recovery.max_fee_per_resolution = preview.plan.max_fee_per_resolution;
+    request.recovery.aggregate_batch_fee_cap = preview.plan.aggregate_batch_fee_cap;
+    request.recovery.expected_plan_id = preview.plan.plan_id;
+    const uint64_t request_id = model.requestPowClaimRecoveryOperation(std::move(request));
+    QTRY_VERIFY_WITH_TIMEOUT(unlocked, 3000);
+    QObject::disconnect(prompt);
+    QVERIFY(!wallet->IsLocked());
+    QVERIFY(!model.getWalletUnlockStakingOnly());
+
+    std::promise<void> locked, release_lock;
+    const auto lock_release = release_lock.get_future().share();
+    std::atomic<bool> lock_expired{false};
+    std::thread holder([&] {
+        // Test each lock separately: either must keep readiness false without
+        // stalling the GUI. Deadlines release a regressed blocking call.
+        auto& mutex = hold_relock_mutex ? wallet->m_relock_mutex : wallet->cs_wallet;
+        LOCK(mutex);
+        locked.set_value();
+        lock_expired.store(lock_release.wait_for(std::chrono::seconds{10}) == std::future_status::timeout);
+    });
+    auto release_holder = interfaces::MakeCleanupHandler([&] { release_lock.set_value(); holder.join(); });
+    locked.get_future().wait();
+    int ticks{0};
+    QTimer heartbeat;
+    QObject::connect(&heartbeat, &QTimer::timeout, &model, [&] { ++ticks; });
+    heartbeat.start(10);
+    QElapsedTimer dispatch;
+    dispatch.start();
+    model.beginShutdown();
+    QVERIFY(!lock_expired.load());
+    QVERIFY(!worker_expired->load());
+    QVERIFY(dispatch.elapsed() < 100);
+    QVERIFY(!model.shutdownReady());
+    QTRY_VERIFY_WITH_TIMEOUT(ticks >= 2, 3000);
+    QVERIFY(!lock_expired.load());
+    // Exercise readiness while restoration remains busy; no result can be
+    // published with the temporary unlock still held.
+    QVERIFY(!model.shutdownReady());
+    QVERIFY(!model.takePowClaimRecoveryOperationResult(request_id));
+    release_holder.reset();
+    release_backend.reset();
+    QTRY_VERIFY_WITH_TIMEOUT(model.shutdownReady(), 5000);
+    model.join();
+    QVERIFY(wallet->IsLocked());
+    QVERIFY(model.getWalletUnlockStakingOnly());
+    const auto result = model.takePowClaimRecoveryOperationResult(request_id);
+    if (result) { QVERIFY(result->cancelled); QVERIFY(!result->core_entered); }
+    // The cancelled queued operation must leave the exact plan unchanged.
+    QCOMPARE(QString::fromStdString(model.wallet().getPowClaimRecoveryReview({}).plan.plan_id),
+             QString::fromStdString(preview.plan.plan_id));
+}
+
 void TestPowClaimRecoveryModelDestructionRestoresStakingScope(
     interfaces::Node& node, const PlatformStyle* platform_style)
 {
@@ -2423,6 +2906,7 @@ void TestPowClaimRecoveryAmbiguousDatabaseDisablesActions(
     QVERIFY(policy_result->mutation.durable_state_ambiguous);
     QVERIFY(!policy_result->mutation.authoritative_state_available);
     QVERIFY(!policy_result->policy_available);
+    QVERIFY(!policy_result->error.empty() && policy_result->error == policy_result->mutation.detail);
 
     policy_result.reset();
     WalletModel::PowClaimRecoveryPolicyRequest policy_read;
@@ -2436,6 +2920,7 @@ void TestPowClaimRecoveryAmbiguousDatabaseDisablesActions(
     QVERIFY(!policy_result->success);
     QVERIFY(policy_result->mutation.durable_state_ambiguous);
     QVERIFY(!policy_result->policy_available);
+    QVERIFY(!policy_result->error.empty() && policy_result->error == policy_result->mutation.detail);
     QObject::disconnect(policy_ready);
 
     // Adoption uses the same typed distinction: ambiguity is not collapsed
@@ -2659,6 +3144,8 @@ void TestStakingMiningPayoutClearsAcrossWalletIdentity(
         &page, "updateStatus", Qt::DirectConnection));
     QVERIFY(pow_copy->isEnabled());
     refresh->click();
+    WaitForDetailPanels(refresh, refresh_hint,
+        [&] { return refresh_hint->text().contains(QStringLiteral("Detail panels updated")); }, 20000);
     QTRY_VERIFY_WITH_TIMEOUT(
         refresh_hint->text().contains(QStringLiteral("Detail panels updated")),
         20000);
@@ -2728,6 +3215,678 @@ void TestStakingMiningHeartbeatDoesNotWaitForWalletMutex(interfaces::Node& node,
              qPrintable(QStringLiteral("Staking page heartbeat waited %1 ms for cs_wallet").arg(heartbeat_elapsed_ms)));
 }
 
+void TestPowMiningAsyncControlLifecycle(interfaces::Node& node, const PlatformStyle* style)
+{
+    common::Settings saved_settings;
+    gArgs.LockSettings([&](common::Settings& settings) {
+        saved_settings = settings;
+        for (const auto* key : {"powminingthreads", "powminingcpu"}) {
+            settings.forced_settings.erase(key);
+            settings.command_line_options.erase(key);
+            for (auto& section : settings.ro_config) section.second.erase(key);
+        }
+        settings.rw_settings["powmining"] = false;
+    });
+    auto restore = interfaces::MakeCleanupHandler([&] {
+        gArgs.LockSettings([&](common::Settings& settings) { settings = saved_settings; });
+        gArgs.WriteSettingsFile();
+    });
+    auto wallet = std::make_shared<CWallet>(node.context()->chain.get(), "qt-pow-control-a", CreateMockableWalletDatabase());
+    QCOMPARE(wallet->LoadWallet(), wallet::DBErrors::LOAD_OK);
+    MiniGUI gui(node, style);
+    gui.initModelForWallet(node, wallet, style);
+    WalletModel& model = *gui.walletModel;
+    QSignalSpy ready(&model, &WalletModel::powMiningControlReady);
+    auto token = std::make_shared<std::atomic<bool>>(true);
+    WalletModel::PowMiningControlRequest request;
+    request.generation = 73;
+    request.threads = 2;
+    request.cpu_percent = 60;
+    request.view_current = token;
+
+    // A stop blocked joining an existing worker must leave Qt timers running.
+    std::promise<void> release_worker;
+    auto worker_release = release_worker.get_future().share();
+    wallet->m_pow_mining_enabled = true;
+    wallet->threadPowMinerGroup = std::make_unique<std::vector<std::thread>>();
+    wallet->threadPowMinerGroup->emplace_back([worker_release] { worker_release.wait(); });
+    QElapsedTimer dispatch;
+    dispatch.start();
+    const auto stopped_id = model.requestPowMiningControl(request);
+    const auto dispatch_ms = dispatch.elapsed();
+    int ticks{0};
+    QTimer heartbeat;
+    QObject::connect(&heartbeat, &QTimer::timeout, &model, [&] { ++ticks; });
+    heartbeat.start(10);
+    // Do not infer responsiveness from a fixed number of coalescible 1 ms
+    // timer firings in 75 ms. Hold the backend until Qt has serviced a timer
+    // while the stop is in progress, with an external deadline for failure.
+    QElapsedTimer observation;
+    observation.start();
+    int ticks_at_join{-1};
+    while (observation.elapsed() < 5000) {
+        QTest::qWait(10);
+        if (!wallet->m_pow_mining_enabled.load() && ready.count() == 0) {
+            if (ticks_at_join < 0) ticks_at_join = ticks;
+            if (ticks > ticks_at_join) break;
+        }
+    }
+    const bool joining = !wallet->m_pow_mining_enabled.load() && ready.count() == 0;
+    const bool heartbeat_while_joining = ticks_at_join >= 0 && ticks > ticks_at_join;
+    release_worker.set_value();
+    QTRY_COMPARE_WITH_TIMEOUT(ready.count(), 1, 5000);
+    const auto stopped = model.takePowMiningControlResult(stopped_id);
+    QVERIFY(stopped);
+    QVERIFY(stopped->success);
+    QVERIFY(stopped->preferences_saved);
+    QCOMPARE(stopped->request.generation, uint64_t{73});
+    QCOMPARE(stopped->request.wallet_name, std::string{"qt-pow-control-a"});
+    QVERIFY(dispatch_ms < 100);
+    QVERIFY(joining);
+    QVERIFY(heartbeat_while_joining);
+    QVERIFY(!gArgs.GetBoolArg("-powmining", false));
+    QCOMPARE(gArgs.GetIntArg("-powminingthreads", 1), int64_t{2});
+    QCOMPARE(gArgs.GetIntArg("-powminingcpu", 1), int64_t{60});
+    // Reload settings from the fixture's disk, as a process restart would.
+    gArgs.LockSettings([](common::Settings& settings) { settings.rw_settings.clear(); });
+    QVERIFY(gArgs.ReadSettingsFile());
+    QCOMPARE(gArgs.GetIntArg("-powminingthreads", 1), int64_t{2});
+    QCOMPARE(gArgs.GetIntArg("-powminingcpu", 1), int64_t{60});
+    QVERIFY(!gArgs.GetBoolArg("-powmining", false));
+    // Recreating the page must show saved resources before a detail refresh.
+    {
+        StakingMiningPage recreated(style);
+        recreated.setClientModel(gui.clientModel.get());
+        recreated.setWalletModel(&model);
+        QCOMPARE(recreated.findChild<QSpinBox*>("powCores")->value(),
+                 std::min(2, recreated.findChild<QSpinBox*>("powCores")->maximum()));
+        QCOMPARE(recreated.findChild<QSpinBox*>("powPercent")->value(), 60);
+        QVERIFY(recreated.findChild<QPushButton*>("powApply")->isEnabled());
+    }
+    auto wallet_b = std::make_shared<CWallet>(node.context()->chain.get(), "qt-pow-control-b", CreateMockableWalletDatabase());
+    QCOMPARE(wallet_b->LoadWallet(), wallet::DBErrors::LOAD_OK);
+    MiniGUI gui_b(node, style);
+    gui_b.initModelForWallet(node, wallet_b, style);
+    WalletModel& model_b = *gui_b.walletModel;
+    QSignalSpy ready_b(&model_b, &WalletModel::powMiningControlReady);
+
+    // Queued control cancellation at an actual Core lifecycle lock cannot
+    // apply a superseded resource selection or cross to another wallet.
+    std::promise<void> held;
+    std::promise<void> release;
+    auto release_future = release.get_future().share();
+    std::thread holder([&] {
+        LOCK(wallet->m_pow_recovery_authority_mutex);
+        held.set_value();
+        release_future.wait();
+    });
+    held.get_future().wait();
+    request.threads = 3;
+    const auto cancelled_id = model.requestPowMiningControl(request);
+    auto request_b = request;
+    request_b.threads = 2;
+    const auto other_wallet_id = model_b.requestPowMiningControl(request_b);
+    for (int wait = 0; wait < 100 && ready_b.count() == 0; ++wait) QTest::qWait(10);
+    const bool other_wallet_completed_independently = ready_b.count() == 1;
+    model.cancelPowMiningControl(cancelled_id);
+    const int before = ticks;
+    // The GUI heartbeat must keep running while the authority mutex is held.
+    // Wait for the ticks instead of sampling a fixed 30 ms window, which a
+    // loaded machine can stretch past the tick interval.
+    QTRY_VERIFY_WITH_TIMEOUT(ticks - before > 2, 5000);
+    const int during_lock = ticks - before;
+    release.set_value();
+    holder.join();
+    QTRY_COMPARE_WITH_TIMEOUT(ready.count(), 2, 5000);
+    const auto cancelled = model.takePowMiningControlResult(cancelled_id);
+    QVERIFY(cancelled);
+    QVERIFY(cancelled->cancelled);
+    QVERIFY(!cancelled->success);
+    QVERIFY(during_lock > 2);
+    QVERIFY(other_wallet_completed_independently);
+    const auto other_wallet_result = model_b.takePowMiningControlResult(other_wallet_id);
+    QVERIFY(other_wallet_result);
+    QVERIFY(other_wallet_result->success);
+    QCOMPARE(other_wallet_result->request.wallet_name, std::string{"qt-pow-control-b"});
+    QCOMPARE(gArgs.GetIntArg("-powminingthreads", 1), int64_t{2});
+
+    // A removed view receives no completion. A later request is a worker
+    // barrier and proves the stale request was consumed before the assertion.
+    token->store(false);
+    model.requestPowMiningControl(request);
+    request.view_current = std::make_shared<std::atomic<bool>>(true);
+    request.threads = 2;
+    ++request.generation;
+    const auto barrier_id = model.requestPowMiningControl(request);
+    QTRY_COMPARE_WITH_TIMEOUT(ready.count(), 3, 5000);
+    QVERIFY(model.takePowMiningControlResult(barrier_id)->success);
+
+    // CLI resource overrides retain precedence and their saved preferences.
+    gArgs.LockSettings([](common::Settings& settings) {
+        settings.command_line_options["powminingthreads"] = {common::SettingsValue{7}};
+        settings.command_line_options["powminingcpu"] = {common::SettingsValue{35}};
+    });
+    const auto cli_id = model.requestPowMiningControl(request);
+    QTRY_COMPARE_WITH_TIMEOUT(ready.count(), 4, 5000);
+    QVERIFY(model.takePowMiningControlResult(cli_id)->success);
+    QCOMPARE(gArgs.GetIntArg("-powminingthreads", 1), int64_t{7});
+    QCOMPARE(gArgs.GetIntArg("-powminingcpu", 1), int64_t{35});
+    gArgs.LockSettings([](common::Settings& settings) {
+        QCOMPARE(settings.rw_settings.at("powminingthreads").getInt<int>(), 2);
+        QCOMPARE(settings.rw_settings.at("powminingcpu").getInt<int>(), 60);
+    });
+    heartbeat.stop();
+}
+
+// Containment only: synchronization below uses promises, never elapsed-time races.
+class WalletCallbackTestWatchdog {
+    std::promise<void> m_done;
+    std::thread m_thread;
+public:
+    WalletCallbackTestWatchdog() : m_thread([done = m_done.get_future()]() mutable {
+        if (done.wait_for(std::chrono::seconds{20}) != std::future_status::ready) {
+            qFatal("Wallet callback regression exceeded its cleanup deadline");
+        }
+    }) {}
+    ~WalletCallbackTestWatchdog() { m_done.set_value(); m_thread.join(); }
+};
+
+std::shared_ptr<CWallet> CallbackTestWallet(interfaces::Node& node, const std::string& name)
+{
+    bilingual_str error;
+    std::vector<bilingual_str> warnings;
+    auto wallet = CWallet::Create(*node.walletLoader().context(), name,
+        CreateMockableWalletDatabase(), wallet::WALLET_FLAG_DESCRIPTORS |
+        wallet::WALLET_FLAG_BLANK_WALLET | wallet::WALLET_FLAG_DISABLE_PRIVATE_KEYS,
+        error, warnings);
+    if (wallet) SyncRecoveryReviewWalletTip(wallet, node);
+    return wallet;
+}
+
+// Mirrors the real NotifyWalletLoaded -> AddWallet publication order, without
+// starting miners, writing load-on-start settings, or processing any GUI event.
+bool PublishCallbackWithoutGui(WalletContext& context, WalletController* controller,
+                               const std::shared_ptr<CWallet>& wallet)
+{
+    std::promise<void> started, returned;
+    auto entered = started.get_future();
+    auto done = returned.get_future();
+    std::exception_ptr error;
+    std::thread notifier([&] {
+        started.set_value();
+        try {
+            wallet::NotifyWalletLoaded(context, wallet);
+            AddWallet(context, wallet);
+        } catch (...) { error = std::current_exception(); }
+        returned.set_value();
+    });
+    if (entered.wait_for(std::chrono::seconds{5}) != std::future_status::ready) {
+        qFatal("Notifier did not enter the controlled callback test");
+    }
+    const bool returned_without_gui = done.wait_for(std::chrono::seconds{5}) == std::future_status::ready;
+    if (!returned_without_gui && controller) {
+        // Old-source negative cleanup: deliver only its parenting call. The
+        // earlier transaction/registry event targets another receiver and must
+        // remain queued until the notifier has released wallets_mutex.
+        QElapsedTimer cleanup;
+        cleanup.start();
+        while (done.wait_for(std::chrono::milliseconds{0}) != std::future_status::ready && cleanup.elapsed() < 5000) {
+            QCoreApplication::sendPostedEvents(controller, QEvent::MetaCall);
+            std::this_thread::yield();
+        }
+    }
+    if (done.wait_for(std::chrono::seconds{5}) != std::future_status::ready) {
+        qFatal("Notifier did not finish after selective old-source cleanup");
+    }
+    notifier.join();
+    return returned_without_gui && !error;
+}
+
+void TestWalletLoadCallbackTransactionInterleaving(interfaces::Node& node, const PlatformStyle* style, bool& passed)
+{
+    WalletCallbackTestWatchdog watchdog;
+    MiniGUI gui(node, style);
+    WalletController controller(*gui.clientModel, style, nullptr);
+    auto& context = *node.walletLoader().context();
+    auto first = CallbackTestWallet(node, "callback-first");
+    auto second = CallbackTestWallet(node, "callback-second");
+    QVERIFY(first && second);
+    auto cleanup = interfaces::MakeCleanupHandler([&] {
+        RemoveWallet(context, first, std::nullopt);
+        RemoveWallet(context, second, std::nullopt);
+    });
+    QVERIFY(AddWallet(context, first));
+    QVERIFY(controller.getOrCreateWallet(interfaces::MakeWallet(context, first)));
+    QObject transaction_receiver;
+    bool transaction_finished{false};
+    size_t transaction_wallet_count{0};
+    int added{0};
+    QObject::connect(&controller, &WalletController::walletAdded, &transaction_receiver,
+        [&](WalletModel*) { ++added; }, Qt::QueuedConnection);
+    // This is the actual blocking operation in incomingTransaction's named
+    // stack, queued before the loader posts any GUI-parenting/publication work.
+    QVERIFY(QMetaObject::invokeMethod(&transaction_receiver, [&] {
+        transaction_wallet_count = node.walletLoader().getWallets().size();
+        transaction_finished = true;
+    }, Qt::QueuedConnection));
+    const bool nonblocking = PublishCallbackWithoutGui(context, &controller, second);
+    // Always drain/join before reporting the old-source failure.
+    qApp->processEvents();
+    QVERIFY2(nonblocking, "NotifyWalletLoaded waited for GUI event service while holding wallets_mutex");
+    QTRY_VERIFY_WITH_TIMEOUT(transaction_finished, 5000);
+    QCOMPARE(transaction_wallet_count, size_t{2});
+    QTRY_COMPARE_WITH_TIMEOUT(added, 1, 5000);
+    QCOMPARE(controller.getOpenWallets().size(), size_t{2});
+    for (auto* model : controller.getOpenWallets()) {
+        QCOMPARE(model->thread(), controller.thread());
+        QCOMPARE(model->parent(), static_cast<QObject*>(&controller));
+    }
+    // A second callback and the activity's normal direct acquisition deduplicate.
+    QVERIFY(PublishCallbackWithoutGui(context, &controller, second));
+    qApp->processEvents();
+    QCOMPARE(controller.getOpenWallets().size(), size_t{2});
+    QCOMPARE(added, 1);
+    passed = true;
+}
+
+void TestWalletCallbackPendingParentDestruction(interfaces::Node& node, const PlatformStyle* style)
+{
+    WalletCallbackTestWatchdog watchdog;
+    MiniGUI gui(node, style);
+    auto& context = *node.walletLoader().context();
+    const auto registrations = WITH_LOCK(context.wallets_mutex, return context.wallet_load_fns.size());
+    auto controller = std::make_unique<WalletController>(*gui.clientModel, style, nullptr);
+    auto wallet = CallbackTestWallet(node, "callback-pending-destroy");
+    QVERIFY(wallet);
+    auto cleanup = interfaces::MakeCleanupHandler([&] { RemoveWallet(context, wallet, std::nullopt); });
+    QVERIFY(PublishCallbackWithoutGui(context, controller.get(), wallet));
+    const auto models = controller->getOpenWallets();
+    QCOMPARE(models.size(), size_t{1});
+    QPointer<WalletModel> model{models.front()};
+    QVERIFY(!model->parent()); // GUI queue is deliberately still withheld.
+    controller.reset();
+    QVERIFY(model.isNull());
+    QCOMPARE(WITH_LOCK(context.wallets_mutex, return context.wallet_load_fns.size()), registrations);
+    qApp->processEvents(); // Canceled parenting/publication cannot use raw pointers.
+    // Real notification after teardown must find no old raw-this callback.
+    QVERIFY(PublishCallbackWithoutGui(context, nullptr, wallet));
+    qApp->processEvents();
+    QVERIFY(model.isNull());
+}
+
+void TestWalletCallbackUnloadBeforeParentDelivery(interfaces::Node& node, const PlatformStyle* style)
+{
+    WalletCallbackTestWatchdog watchdog;
+    MiniGUI gui(node, style);
+    auto controller = std::make_unique<WalletController>(*gui.clientModel, style, nullptr);
+    auto& context = *node.walletLoader().context();
+    auto wallet = CallbackTestWallet(node, "callback-pending-unload");
+    QVERIFY(wallet);
+    auto cleanup = interfaces::MakeCleanupHandler([&] { if (wallet) RemoveWallet(context, wallet, std::nullopt); });
+    QVERIFY(PublishCallbackWithoutGui(context, controller.get(), wallet));
+    const auto models = controller->getOpenWallets();
+    QCOMPARE(models.size(), size_t{1});
+    QPointer<WalletModel> model{models.front()};
+    QVERIFY(!model->parent());
+    QVERIFY(RemoveWallet(context, wallet, std::nullopt));
+    std::weak_ptr<CWallet> weak{wallet};
+    std::promise<void> unload_intent, unloaded;
+    auto intent = unload_intent.get_future();
+    auto done = unloaded.get_future();
+    boost::signals2::scoped_connection notice;
+    notice = wallet->NotifyUnload.connect([&] {
+        // The real CWallet deleter requires every notification hook removed.
+        // Retire this test observer before publishing the unload barrier.
+        notice.disconnect();
+        unload_intent.set_value();
+    });
+    std::thread unloader([wallet = std::move(wallet), &unloaded]() mutable {
+        wallet::UnloadWallet(std::move(wallet));
+        unloaded.set_value();
+    });
+    // The unload signal must happen before any parenting event is delivered.
+    const bool notified = intent.wait_for(std::chrono::seconds{5}) == std::future_status::ready;
+    QElapsedTimer wait;
+    wait.start();
+    while (done.wait_for(std::chrono::milliseconds{0}) != std::future_status::ready && wait.elapsed() < 5000) {
+        qApp->processEvents();
+        std::this_thread::yield();
+    }
+    const bool completed = done.wait_for(std::chrono::milliseconds{0}) == std::future_status::ready;
+    // A broken queued-callback implementation must still release its payload
+    // before the test reports failure and joins the real UnloadWallet worker.
+    if (!completed) controller.reset();
+    if (done.wait_for(std::chrono::seconds{5}) != std::future_status::ready) qFatal("Wallet unload test could not clean up");
+    unloader.join();
+    QVERIFY(notified);
+    QVERIFY2(completed, "Unload was missed before pending GUI parenting was delivered");
+    QVERIFY(model.isNull());
+    QVERIFY(weak.expired());
+    QVERIFY(controller->getOpenWallets().empty());
+}
+
+void TestWalletAddedAllowsSynchronousRegistryRead(interfaces::Node& node, const PlatformStyle* style)
+{
+    WalletCallbackTestWatchdog watchdog;
+    std::weak_ptr<CWallet> weak;
+    {
+        MiniGUI gui(node, style);
+        WalletController controller(*gui.clientModel, style, nullptr);
+        auto& context = *node.walletLoader().context();
+        auto wallet = CallbackTestWallet(node, "callback-added-reentry");
+        QVERIFY(wallet);
+        weak = wallet;
+        // CWallet::Create subscribes before publication; even this unregistered
+        // mock must drop its validation subscription to break the shared cycle.
+        auto cleanup = interfaces::MakeCleanupHandler([&] { RemoveWallet(context, wallet, std::nullopt); });
+        bool entered{false};
+        size_t count{0};
+        QObject::connect(&controller, &WalletController::walletAdded, &controller,
+            [&](WalletModel*) { entered = true; count = controller.getOpenWallets().size(); }, Qt::DirectConnection);
+        QVERIFY(controller.getOrCreateWallet(interfaces::MakeWallet(context, wallet)));
+        QVERIFY(entered);
+        QCOMPARE(count, size_t{1});
+    }
+    SyncWithValidationInterfaceQueue();
+    QVERIFY2(weak.expired(), "Callback test wallet retained its validation subscription");
+}
+
+void TestWalletAddedMayRetireModelBeforeReturn(interfaces::Node& node, const PlatformStyle* style)
+{
+    WalletCallbackTestWatchdog watchdog;
+    std::weak_ptr<CWallet> weak;
+    {
+        MiniGUI gui(node, style);
+        WalletController controller(*gui.clientModel, style, nullptr);
+        auto& context = *node.walletLoader().context();
+        auto wallet = CallbackTestWallet(node, "callback-retire-during-added");
+        QVERIFY(wallet);
+        weak = wallet;
+        // CWallet::Create subscribes before publication; even this unregistered
+        // mock must drop its validation subscription to break the shared cycle.
+        auto cleanup = interfaces::MakeCleanupHandler([&] { RemoveWallet(context, wallet, std::nullopt); });
+        QPointer<WalletModel> announced;
+        bool unload_invoked{false};
+        QObject::connect(&controller, &WalletController::walletAdded, &controller,
+            [&](WalletModel* model) {
+                announced = model;
+                unload_invoked = QMetaObject::invokeMethod(model, "unload", Qt::DirectConnection);
+                // Deliver the real queued controller unload route before the
+                // creation/publication call returns to its activity caller.
+                QCoreApplication::sendPostedEvents(&controller, QEvent::MetaCall);
+            }, Qt::DirectConnection);
+        QPointer<WalletModel> returned = controller.getOrCreateWallet(interfaces::MakeWallet(context, wallet));
+        QVERIFY(unload_invoked);
+        QVERIFY(announced.isNull());
+        QVERIFY(returned.isNull());
+        QVERIFY(controller.getOpenWallets().empty());
+    }
+    SyncWithValidationInterfaceQueue();
+    QVERIFY2(weak.expired(), "Callback test wallet retained its validation subscription");
+}
+
+void TestCloseAllWalletsCallbackLockOrder(interfaces::Node& node, const PlatformStyle* style)
+{
+    WalletCallbackTestWatchdog watchdog;
+    MiniGUI gui(node, style);
+    auto& context = *node.walletLoader().context();
+    auto first = CallbackTestWallet(node, "callback-close-first");
+    auto second = CallbackTestWallet(node, "callback-close-second");
+    QVERIFY(first && second);
+    std::promise<void> callback_entered, remove_entered, probe_done, marker_finished, notification_done;
+    auto entered = callback_entered.get_future();
+    const auto removing = remove_entered.get_future().share();
+    const auto probed = probe_done.get_future().share();
+    const auto marker = marker_finished.get_future().share();
+    auto notification = notification_done.get_future();
+    std::atomic<bool> queried{false};
+    std::exception_ptr notification_error;
+    // Register before the controller: this callback owns wallets_mutex before
+    // GUI close-all reaches its real RemoveWallet cleanup boundary.
+    auto gate = wallet::HandleLoadWallet(context, [&](std::unique_ptr<interfaces::Wallet>) {
+        callback_entered.set_value();
+        removing.wait();
+        const bool accessible = probed.wait_for(std::chrono::seconds{5}) == std::future_status::ready;
+        marker_finished.set_value();
+        if (!accessible) throw std::runtime_error("controller mutex held across Core wallet removal");
+    });
+    WalletController controller(*gui.clientModel, style, nullptr);
+    auto cleanup = interfaces::MakeCleanupHandler([&] {
+        RemoveWallet(context, first, std::nullopt);
+        RemoveWallet(context, second, std::nullopt);
+    });
+    QVERIFY(AddWallet(context, first));
+    QPointer<WalletModel> first_model{controller.getOrCreateWallet(interfaces::MakeWallet(context, first))};
+    QVERIFY(first_model);
+    int removed{0};
+    QObject::connect(&controller, &WalletController::walletRemoved, &controller,
+        [&](WalletModel*) { ++removed; }, Qt::DirectConnection);
+    first->m_chain_notifications_handler = interfaces::MakeCleanupHandler([&] {
+        // RemoveWallet resets this handler before it acquires wallets_mutex.
+        remove_entered.set_value();
+        first->NotifyUnload();
+        first->NotifyUnload(); // queued duplicates must not delete twice later.
+        marker.wait();
+    });
+    std::thread probe([&] {
+        removing.wait();
+        (void)controller.getOpenWallets();
+        queried.store(true);
+        probe_done.set_value();
+    });
+    std::thread notifier([&] {
+        try { wallet::NotifyWalletLoaded(context, second); AddWallet(context, second); }
+        catch (...) { notification_error = std::current_exception(); }
+        notification_done.set_value();
+    });
+    if (entered.wait_for(std::chrono::seconds{5}) != std::future_status::ready) qFatal("Close-all callback did not enter");
+    // Use the existing bounded helper to click the actual standard button;
+    // QMessageBox::question resolves clickedButton, not QDialog's result alone.
+    ConfirmMessageBox(QMessageBox::Yes);
+    controller.closeAllWallets();
+    if (notification.wait_for(std::chrono::seconds{5}) != std::future_status::ready) qFatal("Close-all notifier did not release after controlled failure");
+    notifier.join();
+    probe.join();
+    // On old lock-order failure, return before delivering its known dangling
+    // duplicate unload callbacks; controller destruction cancels those events.
+    QVERIFY2(!notification_error, "GUI held controller mutex while Core wallet removal waited for callback registry");
+    qApp->processEvents();
+    QVERIFY(queried.load());
+    QVERIFY(first_model.isNull());
+    QCOMPARE(removed, 1);
+    QCOMPARE(controller.getOpenWallets().size(), size_t{1}); // New concurrent wallet was outside the close snapshot.
+}
+
+// An async question must be matched by owner and content even when other
+// questions are visible, and a matching question after the deadline is refused.
+void TestOwnedQuestionResponder()
+{
+    QWidget owner;
+    QWidget other_owner;
+    const QString title = QStringLiteral("Delayed confirmation regression");
+    const QString body = QStringLiteral("Expected delayed question for confirmation regression");
+    QMessageBox hidden(QMessageBox::Question, title, body,
+        QMessageBox::Yes | QMessageBox::No, &owner);
+    QMessageBox wrong_body(QMessageBox::Question, title, QStringLiteral("Unrelated question"),
+        QMessageBox::Yes | QMessageBox::No, &owner);
+    QMessageBox wrong_owner(QMessageBox::Question, title, body,
+        QMessageBox::Yes | QMessageBox::No, &other_owner);
+    QSignalSpy hidden_finished(&hidden, &QDialog::finished);
+    QSignalSpy wrong_body_finished(&wrong_body, &QDialog::finished);
+    QSignalSpy wrong_owner_finished(&wrong_owner, &QDialog::finished);
+    for (const bool late : {false, true}) {
+        OwnedQuestionResponder responder(owner, title, body, late ? 0 : 1000);
+        if (!late) {
+            wrong_body.show();
+            wrong_owner.show();
+            QVERIFY(wrong_body.isVisible());
+            QVERIFY(wrong_owner.isVisible());
+        }
+        QPointer<QMessageBox> real;
+        bool finished{false};
+        int result{QDialog::Rejected};
+        QTimer cleanup;
+        cleanup.setSingleShot(true);
+        QObject::connect(&cleanup, &QTimer::timeout, &cleanup, [&] {
+            if (real) real->reject(); // Only this regression's exact owned dialog.
+        });
+        cleanup.start(2000);
+        QTimer::singleShot(50, &cleanup, [&] {
+            QMessageBox question(QMessageBox::Question, title, body,
+                QMessageBox::Yes | QMessageBox::No, &owner);
+            real = &question;
+            result = question.exec();
+            finished = true;
+        });
+        QTRY_VERIFY_WITH_TIMEOUT(finished, 3000);
+        cleanup.stop();
+        QVERIFY(real.isNull());
+        QVERIFY(responder.finished());
+        QCOMPARE(responder.approved(), !late);
+        QCOMPARE(responder.timedOut(), late);
+        QCOMPARE(result, late ? int{QDialog::Rejected} : int{QMessageBox::Yes});
+    }
+    QCOMPARE(hidden_finished.count(), 0);
+    QCOMPARE(wrong_body_finished.count(), 0);
+    QCOMPARE(wrong_owner_finished.count(), 0);
+}
+
+void TestWalletControllerCallbacks(interfaces::Node& node)
+{
+    TestOwnedQuestionResponder();
+    // Explicitly enable a private settings path: closeAllWallets removes startup
+    // settings through the real backend; -nosettings would invalidate that API.
+    TestingSetup test{ChainType::REGTEST, {"-settings=wallet-callback-tests.json", "-staking=0", "-powmining=0"}};
+    auto* previous = node.context();
+    auto restore = interfaces::MakeCleanupHandler([&] { node.setContext(previous); });
+    auto loader = interfaces::MakeWalletLoader(*test.m_node.chain, *Assert(test.m_node.args));
+    test.m_node.wallet_loader = loader.get();
+    node.setContext(&test.m_node);
+    const std::unique_ptr<const PlatformStyle> style{PlatformStyle::instantiate("other")};
+    bool callback_passed{false};
+    TestWalletLoadCallbackTransactionInterleaving(node, style.get(), callback_passed);
+    if (!callback_passed) return; // Baseline failure already recorded and cleaned up.
+    TestWalletCallbackPendingParentDestruction(node, style.get());
+    TestWalletCallbackUnloadBeforeParentDelivery(node, style.get());
+    TestWalletAddedAllowsSynchronousRegistryRead(node, style.get());
+    TestWalletAddedMayRetireModelBeforeReturn(node, style.get());
+    TestCloseAllWalletsCallbackLockOrder(node, style.get());
+}
+
+void TestWalletWorkerShutdownDrain(interfaces::Node& node, const PlatformStyle* style)
+{
+    auto wallet = std::make_shared<CWallet>(node.context()->chain.get(), "qt-worker-drain", CreateMockableWalletDatabase());
+    QCOMPARE(wallet->LoadWallet(), wallet::DBErrors::LOAD_OK);
+    MiniGUI gui(node, style);
+    gui.initModelForWallet(node, wallet, style);
+    WalletModel& model = *gui.walletModel;
+    std::promise<void> release_worker;
+    auto release = release_worker.get_future().share();
+    bool released{false};
+    wallet->m_pow_mining_enabled = true;
+    wallet->threadPowMinerGroup = std::make_unique<std::vector<std::thread>>();
+    auto deadline_expired = std::make_shared<std::atomic<bool>>(false);
+    wallet->threadPowMinerGroup->emplace_back([release, deadline_expired] {
+        deadline_expired->store(release.wait_for(std::chrono::seconds{10}) == std::future_status::timeout);
+    });
+    // The independent deadline also releases a regressed synchronous join.
+    // Release before model destruction even when a QVERIFY returns early.
+    auto cleanup = interfaces::MakeCleanupHandler([&] {
+        if (!released) { released = true; release_worker.set_value(); }
+    });
+    WalletModel::PowMiningControlRequest stop;
+    stop.lock_wallet = true; // Never persist settings in this synthetic test.
+    model.requestPowMiningControl(stop);
+    QTRY_VERIFY_WITH_TIMEOUT(!wallet->m_pow_mining_enabled.load(), 5000);
+    int ticks{0};
+    QTimer heartbeat;
+    QObject::connect(&heartbeat, &QTimer::timeout, &model, [&] { ++ticks; });
+    heartbeat.start(10);
+    QElapsedTimer dispatch;
+    dispatch.start();
+    model.beginShutdown();
+    QVERIFY(!deadline_expired->load());
+    QVERIFY(dispatch.elapsed() < 100);
+    QVERIFY(!model.shutdownReady());
+    QTRY_VERIFY_WITH_TIMEOUT(ticks >= 2, 3000);
+    QVERIFY(!model.shutdownReady()); // Backend remains held; GUI still advances.
+    released = true;
+    release_worker.set_value();
+    QTRY_VERIFY_WITH_TIMEOUT(model.shutdownReady(), 5000);
+    model.join(); // Final receipt/unlock cleanup only after worker completion.
+    QVERIFY(!wallet->m_pow_mining_enabled.load());
+}
+
+void TestPowMiningBackupWarningSurvivesUnload(interfaces::Node& node, const PlatformStyle* style)
+{
+    auto wallet = std::make_shared<CWallet>(node.context()->chain.get(), "qt-pow-backup-unload", CreateMockableWalletDatabase());
+    QCOMPARE(wallet->LoadWallet(), wallet::DBErrors::LOAD_OK);
+    SyncRecoveryReviewWalletTip(wallet, node);
+    MiniGUI gui(node, style);
+    WalletController controller(*gui.clientModel, style, nullptr);
+    WalletContext& context = *node.walletLoader().context();
+    AddWallet(context, wallet);
+    QPointer<WalletModel> model = controller.getOrCreateWallet(interfaces::MakeWallet(context, wallet));
+    RemoveWallet(context, wallet, std::nullopt);
+    auto view = std::make_unique<WalletView>(model, style, nullptr);
+    QObject::connect(&controller, &WalletController::walletRemoved, &controller,
+        [&](WalletModel*) { view.reset(); });
+    // This receiver represents the longer-lived GUI connection, rather than
+    // spying on the model signal whose actual forwarder is deleted first.
+    QObject surviving_gui;
+    int notices{0};
+    bool delivered_after_view_removal{false};
+    QString delivered_title;
+    QObject::connect(&controller, &WalletController::walletBackupWarning, &surviving_gui,
+        [&](const QString& title, const QString&, unsigned int) {
+            ++notices;
+            delivered_after_view_removal = !view;
+            delivered_title = title;
+        });
+    std::promise<void> key_committed;
+    std::promise<void> release_key_notification;
+    const auto release = release_key_notification.get_future().share();
+    boost::signals2::scoped_connection observer(wallet->NotifyAddressBookChanged.connect(
+        [&](const CTxDestination&, const std::string& label, bool, wallet::AddressPurpose, ChangeType) {
+            if (label == "PoW - Quantum Claim Address") {
+                key_committed.set_value();
+                release.wait();
+            }
+        }));
+    auto reset_worker_failure = interfaces::MakeCleanupHandler([] {
+        wallet::SetPowMinerWorkerCreationFailureAfterForTesting(-1);
+    });
+    wallet::SetPowMinerWorkerCreationFailureAfterForTesting(0);
+    WalletModel::PowMiningControlRequest request;
+    request.enabled = true;
+    request.allow_new_payout_key = true;
+    model->requestPowMiningControl(request);
+    // Keep the GUI queue paused: no queued completion may deliver the warning
+    // before the real controller removes its view and destroys its model.
+    const bool committed = key_committed.get_future().wait_for(std::chrono::seconds{10}) == std::future_status::ready;
+    if (!committed) {
+        release_key_notification.set_value();
+        model->join();
+        QVERIFY2(committed, "Miner control did not reach a committed payout key");
+    }
+    std::thread releaser([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds{30});
+        release_key_notification.set_value();
+    });
+    QMetaObject::invokeMethod(model, "unload", Qt::DirectConnection);
+    QCoreApplication::sendPostedEvents(&controller, QEvent::MetaCall);
+    releaser.join();
+    QVERIFY(!model);
+    QVERIFY(!view);
+    QCOMPARE(notices, 1);
+    QVERIFY(delivered_after_view_removal);
+    QVERIFY(delivered_title.contains(QStringLiteral("qt-pow-backup-unload")));
+    qApp->processEvents();
+    QCOMPARE(notices, 1);
+    QCOMPARE(wallet->m_pow_claims_submitted.load(), int64_t{0});
+    QCOMPARE(WITH_LOCK(wallet->cs_wallet, return wallet->ListQuantumKeyInfos().size()), size_t{1});
+}
+
 void TestStakingMiningAsyncRefreshLifecycle(interfaces::Node& node, const PlatformStyle* platformStyle)
 {
     auto wallet = std::make_shared<CWallet>(node.context()->chain.get(), "qt-staking-async-refresh", CreateMockableWalletDatabase());
@@ -2752,18 +3911,31 @@ void TestStakingMiningAsyncRefreshLifecycle(interfaces::Node& node, const Platfo
 
     QSignalSpy ready_spy(&wallet_model, &WalletModel::stakingMiningSnapshotReady);
 
-    // A result built for any other tip must be marked stale before wallet
-    // detail calls run, and must remain an immutable, inspectable result.
+    // The requested tip is only the page's label. A request made against a tip
+    // the chain no longer has (or has not yet announced) still yields a usable,
+    // immutable result labelled with the tip the worker saw; only a
+    // reorganized-out start block sets stale_tip.
     WalletModel::StakingMiningSnapshotRequest stale_request;
     stale_request.request_id = 1000000;
     stale_request.generation = 1000000;
     stale_request.expected_tip = std::string(64, 'f');
-    wallet_model.requestStakingMiningSnapshot(stale_request);
-    QTRY_COMPARE_WITH_TIMEOUT(ready_spy.count(), 1, 5000);
-    const std::shared_ptr<const WalletModel::StakingMiningSnapshot> stale_snapshot =
-        wallet_model.takeStakingMiningSnapshot(stale_request.request_id);
-    QVERIFY(stale_snapshot);
-    QVERIFY(stale_snapshot->stale_tip);
+    // The worker reads the tip and its height by try-lock and, while cs_main is busy (the display balance worker
+    // takes it in slices), labels the result with the requested tip instead. Ask again until it saw the chain.
+    std::shared_ptr<const WalletModel::StakingMiningSnapshot> stale_snapshot;
+    for (int attempt = 0; attempt < 50; ++attempt) {
+        ready_spy.clear();
+        ++stale_request.request_id;
+        wallet_model.requestStakingMiningSnapshot(stale_request);
+        QTRY_COMPARE_WITH_TIMEOUT(ready_spy.count(), 1, 5000);
+        stale_snapshot = wallet_model.takeStakingMiningSnapshot(stale_request.request_id);
+        QVERIFY(stale_snapshot);
+        QVERIFY(!stale_snapshot->stale_tip);
+        QVERIFY(!stale_snapshot->start_tip.empty());
+        if (stale_snapshot->start_tip != stale_request.expected_tip && stale_snapshot->start_height >= 0) break;
+        QTest::qWait(10);
+    }
+    QVERIFY(stale_snapshot->start_tip != stale_request.expected_tip);
+    QVERIFY(stale_snapshot->start_height >= 0);
     ready_spy.clear();
 
     std::promise<void> first_lock_held;
@@ -2851,6 +4023,1018 @@ void TestStakingMiningAsyncRefreshLifecycle(interfaces::Node& node, const Platfo
              qPrintable(QStringLiteral("Page destruction waited %1 ms for full refresh").arg(destroy_elapsed_ms)));
 }
 
+void TestHiddenSendBalanceHeartbeat(interfaces::Node& node, const std::shared_ptr<CWallet>& wallet)
+{
+    using namespace std::chrono_literals;
+    const std::unique_ptr<const PlatformStyle> style(PlatformStyle::instantiate("other"));
+    MiniGUI gui(node, style.get());
+    gui.initModelForWallet(node, wallet, style.get());
+    QVERIFY(!gui.sendCoinsDialog.isVisible());
+
+    std::promise<void> locked;
+    std::promise<void> heartbeat;
+    auto wait_for_heartbeat = heartbeat.get_future();
+    bool heartbeat_during_lock{false};
+    std::thread holder([&] {
+        LOCK(wallet->cs_wallet);
+        locked.set_value();
+        heartbeat_during_lock = wait_for_heartbeat.wait_for(LOCK_HOLD_LIMIT) == std::future_status::ready;
+    });
+    locked.get_future().wait();
+
+    QElapsedTimer timer;
+    timer.start();
+    QEventLoop loop;
+    QMetaObject::invokeMethod(&loop, [&] {
+        Q_EMIT gui.walletModel->balanceChanged(interfaces::WalletBalances{});
+    }, Qt::QueuedConnection);
+    QTimer::singleShot(0, &loop, [&] {
+        heartbeat.set_value();
+        loop.quit();
+    });
+    loop.exec();
+    holder.join();
+
+    qInfo("Hidden Send balance heartbeat: %lld ms", static_cast<long long>(timer.elapsed()));
+    QVERIFY2(heartbeat_during_lock, "Hidden Send balance update blocked behind the wallet lock");
+}
+
+class DirtyBalanceOnDelivery : public QObject
+{
+public:
+    explicit DirtyBalanceOnDelivery(WalletModel& model, bool dirty = true) : m_model(model), m_dirty(dirty) {}
+    int deliveries{0};
+
+protected:
+    bool eventFilter(QObject* object, QEvent* event) override
+    {
+        if (object == &m_model && event->type() == QEvent::MetaCall) {
+            ++deliveries;
+            if (m_dirty) m_model.updateTransaction();
+        }
+        return false;
+    }
+
+private:
+    WalletModel& m_model;
+    bool m_dirty;
+};
+
+void TestWalletDisplaySnapshots(interfaces::Node& node, const std::shared_ptr<CWallet>& wallet)
+{
+    using Family = interfaces::WalletDisplayCoinFamily;
+    const std::unique_ptr<const PlatformStyle> style(PlatformStyle::instantiate("other"));
+    MiniGUI gui(node, style.get());
+    gui.initModelForWallet(node, wallet, style.get());
+    WalletModel& model = *gui.walletModel;
+
+    wallet::CCoinControl legacy;
+    legacy.m_input_family = wallet::CCoinControl::InputFamily::LEGACY;
+    const CAmount legacy_total = model.wallet().getAvailableBalance(legacy);
+    QVERIFY(legacy_total > 0);
+    DirtyBalanceOnDelivery churn(model);
+    model.installEventFilter(&churn);
+    model.startPollBalance();
+    QTRY_VERIFY_WITH_TIMEOUT(model.getCachedBalance().balance > 0, 5000);
+    QVERIFY(churn.deliveries > 0);
+    model.removeEventFilter(&churn);
+    QVERIFY(!model.getCachedSendBalance(Family::LEGACY));
+    gui.sendCoinsDialog.show();
+    // Keep newer wallet dirtiness pending while a coherent selected-family
+    // result can still publish under the same request identity.
+    for (int i = 0; i < 64; ++i) {
+        model.updateTransaction();
+        model.pollBalanceChanged();
+    }
+    QTRY_VERIFY_WITH_TIMEOUT(model.getCachedSendBalance(Family::LEGACY).has_value(), 5000);
+    QCOMPARE(*model.getCachedSendBalance(Family::LEGACY), legacy_total);
+
+    std::optional<COutPoint> spendable;
+    {
+        LOCK2(::cs_main, wallet->cs_wallet);
+        for (const auto& coin : wallet::AvailableCoins(*wallet, &legacy).All()) {
+            if (coin.spendable) {
+                spendable = coin.outpoint;
+                break;
+            }
+        }
+    }
+    QVERIFY(spendable);
+    QVERIFY(model.wallet().lockCoin(*spendable, /*write_to_db=*/false));
+    model.refreshSendBalance();
+    const CAmount locked_total = model.wallet().getAvailableBalance(legacy);
+    QVERIFY(locked_total < legacy_total);
+    QTRY_COMPARE_WITH_TIMEOUT(model.getCachedSendBalance(Family::LEGACY).value_or(-1), locked_total, 5000);
+    QVERIFY(model.wallet().unlockCoin(*spendable));
+
+    model.setSendBalanceFamily(Family::DIRECT_QUANTUM);
+    wallet::CCoinControl quantum;
+    quantum.m_input_family = wallet::CCoinControl::InputFamily::QUANTUM_MIGRATION;
+    quantum.m_exclude_generated_quantum_inputs = true;
+    QTRY_VERIFY_WITH_TIMEOUT(model.getCachedSendBalance(Family::DIRECT_QUANTUM).has_value(), 5000);
+    QCOMPARE(*model.getCachedSendBalance(Family::DIRECT_QUANTUM), model.wallet().getAvailableBalance(quantum));
+    gui.sendCoinsDialog.hide();
+
+    bool cancelled{false};
+    auto request = model.requestAccountSnapshot([&](auto snapshot) { cancelled = snapshot->cancelled; });
+    QVERIFY(request);
+    request->store(true, std::memory_order_release);
+    QTRY_VERIFY_WITH_TIMEOUT(cancelled, 5000);
+}
+
+// Which states of the balance on screen the user is told about: only a
+// balance of an older block than the node tip (labelled "as of block N,
+// updating"); the right block with a newer wallet change on its way is not.
+void TestBalanceStateLabels()
+{
+    using State = WalletModel::BalanceState;
+    // available, exact, failed, snapshot height, node tip height
+    QVERIFY(WalletModel::ClassifyBalance(false, false, false, -1, 100) == State::None);
+    QVERIFY(WalletModel::ClassifyBalance(true, true, false, 100, 100) == State::Exact);
+    QVERIFY(WalletModel::ClassifyBalance(true, true, false, 100, -1) == State::Exact);
+    // The wallet changed since, same block: current-unverified, no label.
+    QVERIFY(WalletModel::ClassifyBalance(true, false, false, 100, 100) == State::CurrentUnverified);
+    // A block behind: labelled, whatever the wallet says.
+    QVERIFY(WalletModel::ClassifyBalance(true, true, false, 99, 100) == State::Behind);
+    QVERIFY(WalletModel::ClassifyBalance(true, false, false, 99, 100) == State::Behind);
+    QVERIFY(WalletModel::ClassifyBalance(true, false, true, 99, 100) == State::Behind);
+    // The last attempt failed at the block of the node: not labelled "updating".
+    QVERIFY(WalletModel::ClassifyBalance(true, false, true, 100, 100) == State::Failed);
+    // A reorg to another block of the same height: the snapshot is of a block the node left.
+    QVERIFY(WalletModel::ClassifyBalance(true, false, false, 100, 100, /*other_block_at_tip_height=*/true) == State::Behind);
+    QVERIFY(WalletModel::ClassifyBalance(true, true, false, 100, 100, true) == State::Behind);
+    // The node's tip is not known: not behind.
+    QVERIFY(WalletModel::ClassifyBalance(true, true, false, 100, -1, true) == State::Exact);
+    // The tip announcement lagging the wallet is not behind: a snapshot above
+    // the tip the model was told, with no regression of the tip.
+    QVERIFY(WalletModel::ClassifyBalance(true, true, false, 101, 100, true) == State::Exact);
+    // The node went to a lower tip (invalidateblock, or a reorg to a heavier
+    // but shorter chain): a snapshot above it is of a block the node left.
+    constexpr bool regressed{true};
+    QVERIFY(WalletModel::ClassifyBalance(true, true, false, 101, 100, false, regressed) == State::Behind);
+    QVERIFY(WalletModel::ClassifyBalance(true, true, false, 101, 100, true, regressed) == State::Behind);
+    QVERIFY(WalletModel::ClassifyBalance(true, false, false, 105, 100, true, regressed) == State::Behind);
+    QVERIFY(WalletModel::ClassifyBalance(true, false, true, 101, 100, false, regressed) == State::Behind);
+    // Caught up after the regression: the snapshot is of the new tip.
+    QVERIFY(WalletModel::ClassifyBalance(true, true, false, 100, 100, false, regressed) == State::Exact);
+    QVERIFY(WalletModel::ClassifyBalance(true, true, false, 101, -1, false, regressed) == State::Exact);
+}
+
+void TestWalletPollCoalescing(interfaces::Node& node, const std::shared_ptr<CWallet>& wallet)
+{
+    const std::unique_ptr<const PlatformStyle> style(PlatformStyle::instantiate("other"));
+    MiniGUI gui(node, style.get());
+    gui.initModelForWallet(node, wallet, style.get());
+    WalletModel& model = *gui.walletModel;
+    qApp->processEvents();
+
+    // Keep the timer stopped so only this explicitly offered burst can run.
+    // A poll is a read of the published display snapshot on the GUI thread:
+    // sixty-four offers cause no round trip per offer and no retries. What
+    // does reach the model is bounded: the announcement of the snapshot the
+    // display worker publishes, and the stake weight refresh.
+    DirtyBalanceOnDelivery observer(model, /*dirty=*/false);
+    model.installEventFilter(&observer);
+    for (int i = 0; i < 64; ++i) {
+        model.updateTransaction();
+        model.pollBalanceChanged();
+    }
+    QTRY_VERIFY_WITH_TIMEOUT(model.getCachedBalance().balance > 0, 5000);
+    QVERIFY(!model.balanceIsStale());
+    QTest::qWait(300);
+    const int settled = observer.deliveries;
+    QVERIFY2(settled <= 6, qPrintable(QString::number(settled)));
+    // Nothing keeps polling once the snapshot is on screen.
+    QTest::qWait(600);
+    QCOMPARE(observer.deliveries, settled);
+    // A second burst costs at most the one coalesced stake weight round trip.
+    for (int i = 0; i < 64; ++i) model.pollBalanceChanged();
+    QTest::qWait(300);
+    const int after_burst = observer.deliveries;
+    QVERIFY2(after_burst <= settled + 1, qPrintable(QString::number(after_burst - settled)));
+    QTest::qWait(600);
+    QCOMPARE(observer.deliveries, after_burst);
+    model.removeEventFilter(&observer);
+    qInfo("Wallet poll coalescing: 128 offers, %d deliveries", after_burst);
+}
+
+void TestWalletDisplayExceptionRecovery(interfaces::Node& node, const std::shared_ptr<CWallet>& wallet)
+{
+    const std::unique_ptr<const PlatformStyle> style(PlatformStyle::instantiate("other"));
+    MiniGUI gui(node, style.get());
+    gui.initModelForWallet(node, wallet, style.get());
+    WalletModel& model = *gui.walletModel;
+    qApp->processEvents();
+
+    // A valid balance first: it is what stays on screen when a later
+    // snapshot cannot be computed.
+    model.pollBalanceChanged();
+    QTRY_VERIFY_WITH_TIMEOUT(model.getCachedBalance().balance > 0, 5000);
+    const CAmount valid_balance = model.getCachedBalance().balance;
+    QVERIFY(!model.balanceIsStale());
+
+    uint256 txid;
+    CTransactionRef original;
+    {
+        LOCK2(::cs_main, wallet->cs_wallet);
+        for (auto& [id, entry] : wallet->mapWallet) {
+            if (wallet->IsTxImmature(entry) || entry.tx->vout.empty()) continue;
+            txid = id;
+            original = entry.tx;
+            CMutableTransaction invalid{*entry.tx};
+            invalid.vout.front().nValue = MAX_MONEY + 1;
+            entry.tx = MakeTransactionRef(std::move(invalid));
+            entry.MarkDirty();
+            // As every real change of a wallet transaction does.
+            wallet->BumpBalanceScanMarker();
+            break;
+        }
+    }
+    QVERIFY(original);
+    const auto restore = [&] {
+        LOCK(wallet->cs_wallet);
+        auto& entry = wallet->mapWallet.at(txid);
+        entry.tx = original;
+        entry.MarkDirty();
+        wallet->BumpBalanceScanMarker();
+    };
+    const auto cleanup = interfaces::MakeCleanupHandler(restore);
+
+    // The same native snapshot path throws on the synthetic corrupt amount.
+    bool throws{false};
+    try {
+        interfaces::WalletDisplayBalances snapshot;
+        model.wallet().tryGetDisplayBalances(snapshot, std::nullopt, std::nullopt);
+    } catch (const std::runtime_error&) {
+        throws = true;
+    }
+    QVERIFY(throws);
+
+    // The display worker failed the same way; the model says so once, keeps
+    // the last valid balance and marks it stale.
+    DirtyBalanceOnDelivery delivery(model);
+    model.installEventFilter(&delivery);
+    QTest::ignoreMessage(QtWarningMsg, "Wallet display snapshot failed");
+    model.pollBalanceChanged();
+    QTRY_VERIFY_WITH_TIMEOUT(model.balanceIsStale(), 5000);
+    // The balance is of the block the node is at: not "behind", so no label.
+    QVERIFY(!model.balanceIsBehind());
+    QCOMPARE(model.getCachedBalance().balance, valid_balance);
+    model.pollBalanceChanged();
+    model.removeEventFilter(&delivery);
+    restore();
+    model.updateTransaction();
+    model.pollBalanceChanged();
+    QTRY_VERIFY_WITH_TIMEOUT(!model.balanceIsStale(), 5000);
+    QCOMPARE(model.getCachedBalance().balance, valid_balance);
+}
+
+void TestAccountSnapshotFiltering(interfaces::Node& node, const std::shared_ptr<CWallet>& wallet)
+{
+    using namespace std::chrono_literals;
+    const std::unique_ptr<const PlatformStyle> style(PlatformStyle::instantiate("other"));
+    MiniGUI gui(node, style.get());
+    gui.initModelForWallet(node, wallet, style.get());
+    auto& wallet_interface = gui.walletModel->wallet();
+    const auto tiered = wallet_interface.createQuantumStakeAddress("account contention", 9450);
+    QVERIFY(tiered);
+    AccountPage page(style.get());
+    page.setWalletModel(gui.walletModel.get());
+    page.show();
+    QVERIFY(QMetaObject::invokeMethod(&page, "refresh", Qt::DirectConnection));
+    auto* tree = page.findChild<QTreeWidget*>();
+    auto* search = page.findChild<QLineEdit*>();
+    QVERIFY(tree);
+    QVERIFY(search);
+    const auto visible_rows = [&] {
+        int count{0};
+        for (int row = 0; row < tree->topLevelItemCount(); ++row) {
+            if (!tree->topLevelItem(row)->isHidden()) ++count;
+        }
+        return count;
+    };
+    // A snapshot that met a busy lock leaves the page asking for Refresh; press it again, as a user would.
+    const auto rows_after_refresh = [&] {
+        return QTest::qWaitFor([&] {
+            if (visible_rows() > 0) return true;
+            for (const QLabel* label : page.findChildren<QLabel*>()) {
+                if (!label->text().contains(QStringLiteral("Press Refresh to try again"))) continue;
+                QMetaObject::invokeMethod(&page, "refresh", Qt::DirectConnection);
+                break;
+            }
+            return false;
+        }, 20000);
+    };
+    QVERIFY(rows_after_refresh());
+    const QStringList card_names{QStringLiteral("accountTotalCard"), QStringLiteral("accountLegacyCard"),
+        QStringLiteral("accountQuantumCard"), QStringLiteral("accountAttentionCard")};
+    QList<QLabel*> cards;
+    QStringList wallet_card_text;
+    for (const auto& name : card_names) {
+        auto* card = page.findChild<QLabel*>(name);
+        QVERIFY(card);
+        cards.push_back(card);
+        wallet_card_text.push_back(card->text());
+    }
+
+    std::promise<void> locked;
+    std::promise<void> heartbeat;
+    auto wait_for_heartbeat = heartbeat.get_future();
+    bool heartbeat_during_lock{false};
+    std::thread holder([&] {
+        LOCK(wallet->cs_wallet);
+        locked.set_value();
+        heartbeat_during_lock = wait_for_heartbeat.wait_for(LOCK_HOLD_LIMIT) == std::future_status::ready;
+    });
+    locked.get_future().wait();
+    bool addresses_available{true};
+    bool delegations_available{true};
+    bool stake_outputs_available{true};
+    bool rgb_available{true};
+    bool eutxo_available{true};
+    wallet_interface.listQuantumAddresses(&addresses_available);
+    wallet_interface.listQuantumColdStakeDelegations(&delegations_available);
+    wallet_interface.listQuantumStakeOutputs(tiered->address, &stake_outputs_available);
+    wallet_interface.listRGBAssets(false, &rgb_available);
+    wallet_interface.listEUTXOStates(true, &eutxo_available);
+    const bool refresh_invoked = QMetaObject::invokeMethod(&page, "refresh", Qt::DirectConnection);
+    search->setText(QStringLiteral("no-matching-account-outpoint"));
+    QEventLoop loop;
+    int visible_groups{-1};
+    QTimer::singleShot(350, &loop, [&] {
+        visible_groups = visible_rows();
+        heartbeat.set_value();
+        loop.quit();
+    });
+    loop.exec();
+    holder.join();
+    QVERIFY(refresh_invoked);
+    QVERIFY(!addresses_available && !delegations_available && !stake_outputs_available && !rgb_available && !eutxo_available);
+    QVERIFY2(heartbeat_during_lock, "Account search waited for the wallet lock");
+    QVERIFY(tree->topLevelItemCount() > 0);
+    QCOMPARE(visible_groups, 0);
+
+    search->clear();
+    QTRY_VERIFY_WITH_TIMEOUT(visible_rows() > 0, 5000);
+    QVERIFY(QMetaObject::invokeMethod(&page, "refresh", Qt::DirectConnection));
+    page.setPrivacy(true);
+    QTest::qWait(75);
+    QCOMPARE(tree->topLevelItemCount(), 0);
+    for (auto* card : cards) QVERIFY(card->text().contains(QStringLiteral("hidden"), Qt::CaseInsensitive));
+    page.setPrivacy(false);
+    for (int i = 0; i < cards.size(); ++i) QVERIFY(cards[i]->text() != wallet_card_text[i]);
+
+    QVERIFY(QMetaObject::invokeMethod(&page, "refresh", Qt::DirectConnection));
+    QVERIFY(rows_after_refresh());
+    page.hide();
+    page.setWalletModel(nullptr);
+    for (int i = 0; i < cards.size(); ++i) QVERIFY(cards[i]->text() != wallet_card_text[i]);
+    QCOMPARE(tree->topLevelItemCount(), 0);
+}
+
+void TestDeferredWalletHistory(interfaces::Node& node, const std::shared_ptr<CWallet>& wallet)
+{
+    using namespace std::chrono_literals;
+    constexpr int SYNTHETIC_HISTORY_ROWS{4096};
+    const auto history_dest = wallet->GetNewDestination(OutputType::BECH32, "long history");
+    QVERIFY(history_dest);
+    const auto history_script = GetScriptForDestination(*history_dest);
+    for (int i = 0; i < SYNTHETIC_HISTORY_ROWS; ++i) {
+        CMutableTransaction tx;
+        tx.vin.emplace_back(COutPoint{uint256{18}, static_cast<uint32_t>(i)});
+        tx.vout.emplace_back(COIN, history_script);
+        QVERIFY(wallet->AddToWallet(MakeTransactionRef(std::move(tx)), wallet::TxStateInactive{}));
+    }
+    const std::unique_ptr<const PlatformStyle> style(PlatformStyle::instantiate("other"));
+    OptionsModel options(node);
+    bilingual_str error;
+    QVERIFY(options.Init(error));
+    ClientModel client(node, &options);
+    auto model = std::make_unique<WalletModel>(
+        interfaces::MakeWallet(*node.walletLoader().context(), wallet), client, style.get(), nullptr, /*defer_history=*/true);
+    auto* table = model->getTransactionTableModel();
+    TransactionView view(style.get());
+    view.setModel(model.get());
+    QVERIFY(!table->isHistoryLoaded());
+    QCOMPARE(table->rowCount({}), 0);
+    QTemporaryDir output;
+    QVERIFY(output.isValid());
+    const QString filename = output.filePath(QStringLiteral("history.csv"));
+    QVERIFY(!view.exportTransactions(filename));
+    QVERIFY(!QFile::exists(filename));
+
+    const auto dest = wallet->GetNewDestination(OutputType::BECH32, "late history transaction");
+    QVERIFY(dest);
+    CMutableTransaction tx;
+    tx.vin.emplace_back(COutPoint{uint256{17}, 0});
+    tx.vout.emplace_back(COIN, GetScriptForDestination(*dest));
+    const auto late = MakeTransactionRef(std::move(tx));
+    int chunks{0};
+    int largest_chunk{0};
+    int rows_at_publication_heartbeat{-1};
+    qint64 publication_heartbeat_ms{-1};
+    bool inserted_during_publish{false};
+    QString clicked_hash;
+    OverviewPage overview(style.get());
+    overview.setWalletModel(model.get());
+    overview.show();
+    view.show();
+    auto* recent = overview.findChild<QListView*>(QStringLiteral("listTransactions"));
+    auto* history_view = view.findChild<QTableView*>(QStringLiteral("transactionView"));
+    QVERIFY(recent);
+    QVERIFY(history_view);
+    QObject::connect(&overview, &OverviewPage::transactionClicked,
+        &view, qOverload<const QModelIndex&>(&TransactionView::focusTransaction));
+    QObject::connect(recent->model(), &QAbstractItemModel::rowsInserted, &overview, [&] {
+        if (!clicked_hash.isEmpty() || table->isHistoryLoaded()) return;
+        const auto recent_index = recent->model()->index(0, TransactionTableModel::ToAddress);
+        QVERIFY(recent_index.isValid());
+        QVERIFY(recent_index.data(TransactionTableModel::TxHashRole).isValid());
+        clicked_hash = recent_index.data(TransactionTableModel::TxHashRole).toString();
+        QVERIFY(QMetaObject::invokeMethod(&overview, "handleTransactionClicked", Qt::DirectConnection, Q_ARG(QModelIndex, recent_index)));
+        auto* status = view.findChild<QLabel*>(QStringLiteral("transactionHistoryState"));
+        QVERIFY(status && !status->isHidden());
+        QVERIFY(status->text().contains(QStringLiteral("Loading")));
+        QVERIFY(!history_view->isEnabled());
+    });
+    QElapsedTimer publication_timer;
+    QObject::connect(table, &TransactionTableModel::rowsInserted, table, [&](const QModelIndex&, int first, int last) {
+        if (table->isHistoryLoaded() || !table->processingQueuedTransactions()) return;
+        largest_chunk = std::max(largest_chunk, last - first + 1);
+        if (++chunks != 1) return;
+        publication_timer.start();
+        QMetaObject::invokeMethod(table, [&] {
+            publication_heartbeat_ms = publication_timer.elapsed();
+            rows_at_publication_heartbeat = table->rowCount({});
+            QVERIFY(!table->isHistoryLoaded());
+            QVERIFY(!view.exportTransactions(filename));
+            inserted_during_publish = wallet->AddToWallet(late, wallet::TxStateInactive{}) != nullptr;
+        }, Qt::QueuedConnection);
+    });
+
+    std::promise<void> locked;
+    std::promise<void> heartbeat;
+    auto wait_for_heartbeat = heartbeat.get_future();
+    bool heartbeat_during_lock{false};
+    std::thread holder([&] {
+        LOCK(wallet->cs_wallet);
+        locked.set_value();
+        heartbeat_during_lock = wait_for_heartbeat.wait_for(LOCK_HOLD_LIMIT) == std::future_status::ready;
+    });
+    locked.get_future().wait();
+    model->startPollBalance();
+    // History is read only for a wallet that is shown.
+    QVERIFY(!table->isHistoryRequested());
+    model->requestHistory();
+    QEventLoop loop;
+    QTimer::singleShot(0, &loop, [&] {
+        heartbeat.set_value();
+        loop.quit();
+    });
+    loop.exec();
+    holder.join();
+    QVERIFY(heartbeat_during_lock);
+
+    QTRY_VERIFY_WITH_TIMEOUT(table->isHistoryLoaded(), 5000);
+    QVERIFY(inserted_during_publish);
+    QVERIFY(!clicked_hash.isEmpty());
+    // Run the normal dispatcher while sliced history catches up; qWait polling
+    // otherwise inserts sleeps between the deliberately small model slices.
+    {
+        auto* projection = qobject_cast<TransactionPresentationProxy*>(history_view->model());
+        QVERIFY(projection);
+        QEventLoop selection_loop;
+        QTimer deadline;
+        deadline.setSingleShot(true);
+        deadline.setTimerType(Qt::PreciseTimer);
+        const auto selected = [&] { return history_view->currentIndex().data(TransactionTableModel::TxHashRole).toString() == clicked_hash; };
+        const auto completed = [&] { if (selected()) selection_loop.quit(); };
+        QObject::connect(history_view->selectionModel(), &QItemSelectionModel::currentChanged, &selection_loop, completed);
+        QObject::connect(projection, &TransactionPresentationProxy::projectionReady, &selection_loop, completed);
+        QObject::connect(&deadline, &QTimer::timeout, &selection_loop, &QEventLoop::quit);
+        QElapsedTimer elapsed;
+        elapsed.start();
+        deadline.start(5000);
+        if (!selected()) selection_loop.exec();
+        const auto duration = elapsed.elapsed();
+        qInfo("Deferred history selection: selected=%d elapsed=%lldms deadline=5000ms", selected(), static_cast<long long>(duration));
+        QCOMPARE(history_view->currentIndex().data(TransactionTableModel::TxHashRole).toString(), clicked_hash);
+        QVERIFY2(duration <= 5000, "Deferred history selection exceeded its original deadline");
+    }
+    QCOMPARE(table->rowCount({}), SYNTHETIC_HISTORY_ROWS + 106);
+    QVERIFY(chunks > 1);
+    QVERIFY(largest_chunk <= 256);
+    QVERIFY(rows_at_publication_heartbeat > 0 && rows_at_publication_heartbeat < SYNTHETIC_HISTORY_ROWS);
+    qInfo("Deferred history yielded at %d/%d rows after %lld ms, %d publication chunks",
+        rows_at_publication_heartbeat, table->rowCount({}), static_cast<long long>(publication_heartbeat_ms), chunks);
+    QVERIFY(FindTx(*table, late->GetHash()).isValid());
+    auto* overview_projection = qobject_cast<TransactionPresentationProxy*>(recent->model());
+    QVERIFY(overview_projection);
+    overview.setPrivacy(true);
+    QVERIFY(!overview_projection->isActive());
+    QCOMPARE(overview_projection->rowCount(), 0);
+    overview.setPrivacy(false);
+    QTRY_VERIFY_WITH_TIMEOUT(overview_projection->isReady(), 5000);
+    QVERIFY(overview_projection->rowCount() > 0);
+    // Exercise the real GUI source's typed lookup, including every row in the
+    // deferred publication and the live transaction replay, without data/RPCs.
+    std::set<uint64_t> row_ids;
+    for (int row = 0; row < table->rowCount({}); ++row) {
+        const auto identity = table->transactionIdentity(row);
+        QVERIFY(identity.id != 0);
+        QVERIFY(row_ids.insert(identity.id).second);
+        QCOMPARE(table->transactionRow(identity), row);
+    }
+    QCOMPARE(table->transactionRow({uint256{99}, 0}), -1);
+
+    QVERIFY(view.exportTransactions(filename));
+    QFile csv(filename);
+    QVERIFY(csv.open(QIODevice::ReadOnly));
+    const auto rows = csv.readAll().trimmed().split('\n');
+    QCOMPARE(rows.size(), SYNTHETIC_HISTORY_ROWS + 107);
+    QVERIFY(std::any_of(rows.cbegin(), rows.cend(), [&](const QByteArray& row) {
+        return row.contains(QByteArray::fromStdString(late->GetHash().ToString()));
+    }));
+
+    {
+        // A recent transaction clicked while the History table applies a new row without a scan. The projection is
+        // not ready from the row's arrival until its batch (10 ms), so the view keeps the transaction to focus, and
+        // the batch ends without projectionReady: the view must pick the transaction up when the batch is applied.
+        // The same holds for the table's enabled state when it is refreshed in that window, as it is when the
+        // history finishes loading there (the failure of this test under a thread sanitizer build).
+        auto* projection = qobject_cast<TransactionPresentationProxy*>(history_view->model());
+        auto* status = view.findChild<QLabel*>(QStringLiteral("transactionHistoryState"));
+        QVERIFY(projection && status);
+        QTRY_VERIFY_WITH_TIMEOUT(projection->isReady() && history_view->isEnabled(), 5000);
+        const QString late_hash = QString::fromStdString(late->GetHash().ToString());
+        QVERIFY(history_view->currentIndex().data(TransactionTableModel::TxHashRole).toString() != late_hash);
+        CMutableTransaction incoming;
+        incoming.vin.emplace_back(COutPoint{uint256{19}, 0});
+        incoming.vout.emplace_back(COIN, GetScriptForDestination(*dest));
+        bool clicked{false}, ready_at_click{true}, enabled_at_click{true}, selected_at_click{true};
+        const auto batches_before = projection->stats().incremental_batches;
+        const auto rebuilds_before = projection->stats().rebuilds;
+        // Connected after the projection's own handler, so the new row is already waiting for its batch.
+        const auto click = QObject::connect(table, &TransactionTableModel::rowsInserted, &view, [&] {
+            if (clicked) return;
+            clicked = true;
+            ready_at_click = projection->isReady();
+            view.focusTransaction(FindTx(*table, late->GetHash()));
+            // What the end of the history load does to the view when it falls in this window.
+            Q_EMIT table->historyLoaded();
+            enabled_at_click = history_view->isEnabled();
+            selected_at_click = history_view->currentIndex().data(TransactionTableModel::TxHashRole).toString() == late_hash;
+        });
+        QVERIFY(wallet->AddToWallet(MakeTransactionRef(std::move(incoming)), wallet::TxStateInactive{}));
+        QTRY_VERIFY_WITH_TIMEOUT(clicked, 10000);
+        QObject::disconnect(click);
+        QVERIFY(!ready_at_click);
+        QVERIFY(!enabled_at_click);
+        QVERIFY(!selected_at_click);
+        QTRY_COMPARE_WITH_TIMEOUT(history_view->currentIndex().data(TransactionTableModel::TxHashRole).toString(), late_hash, 10000);
+        QTRY_VERIFY_WITH_TIMEOUT(projection->isReady() && history_view->isEnabled() && status->isHidden(), 10000);
+        // The row was applied as a batch, not by the complete scan that ends in projectionReady.
+        QCOMPARE(projection->stats().rebuilds, rebuilds_before);
+        QVERIFY(projection->stats().incremental_batches > batches_before);
+    }
+    {
+        WalletModel identity_model(interfaces::MakeWallet(*node.walletLoader().context(), wallet), client, style.get(), nullptr, /*defer_history=*/true);
+        auto* identity_table = identity_model.getTransactionTableModel();
+        std::deque<TransactionRecord> paired(2);
+        paired[0].hash = paired[1].hash = uint256{90};
+        paired[0].idx = paired[1].idx = 1;
+        paired[0].type = TransactionRecord::SendToAddress;
+        paired[1].type = TransactionRecord::RecvWithAddress;
+        identity_table->setInitialHistory(std::move(paired));
+        QCOMPARE(identity_table->rowCount({}), 2);
+        const auto first = identity_table->transactionIdentity(0);
+        const auto second = identity_table->transactionIdentity(1);
+        QVERIFY(first.id && second.id && first.id != second.id);
+        QCOMPARE(identity_table->transactionRow(first), 0);
+        QCOMPARE(identity_table->transactionRow(second), 1);
+    }
+
+    {
+        WalletModel failed(interfaces::MakeWallet(*node.walletLoader().context(), wallet), client, style.get(), nullptr, /*defer_history=*/true);
+        TransactionView failed_view(style.get());
+        failed_view.setModel(&failed);
+        failed_view.show();
+        auto* failed_history = failed.getTransactionTableModel();
+        failed_history->reportHistoryLoadFailure();
+        auto* projected = failed_view.findChild<TransactionPresentationProxy*>();
+        QVERIFY(projected);
+        QTRY_VERIFY(projected->isReady());
+        auto* status = failed_view.findChild<QLabel*>(QStringLiteral("transactionHistoryState"));
+        QVERIFY(status && !status->isHidden());
+        QVERIFY(status->text().contains(QStringLiteral("could not be loaded")));
+        QVERIFY(!failed_view.findChild<QTableView*>(QStringLiteral("transactionView"))->isEnabled());
+    }
+
+    // Unload with history still queued behind the same held wallet lock.
+    auto closing = std::make_unique<WalletModel>(
+        interfaces::MakeWallet(*node.walletLoader().context(), wallet), client, style.get(), nullptr, /*defer_history=*/true);
+    const QPointer<TransactionTableModel> closing_table{closing->getTransactionTableModel()};
+    std::promise<void> closing_locked;
+    std::promise<void> closed;
+    auto wait_for_close = closed.get_future();
+    bool closed_during_lock{false};
+    std::thread close_holder([&] {
+        LOCK(wallet->cs_wallet);
+        closing_locked.set_value();
+        closed_during_lock = wait_for_close.wait_for(LOCK_HOLD_LIMIT) == std::future_status::ready;
+    });
+    closing_locked.get_future().wait();
+    closing->startPollBalance();
+    closing->requestHistory();
+    closing.reset();
+    closed.set_value();
+    close_holder.join();
+    QVERIFY(closed_during_lock);
+    QVERIFY(closing_table.isNull());
+    QTest::qWait(75);
+}
+
+void TestTransactionTableResponsiveUnderWalletLock(interfaces::Node& node, const std::shared_ptr<CWallet>& wallet)
+{
+    using namespace std::chrono_literals;
+    const std::unique_ptr<const PlatformStyle> style(PlatformStyle::instantiate("other"));
+    auto gui = std::make_unique<MiniGUI>(node, style.get());
+    gui->initModelForWallet(node, wallet, style.get());
+    auto* table = gui->walletModel->getTransactionTableModel();
+    const int initial_rows = table->rowCount({});
+    const auto destination = wallet->GetNewDestination(OutputType::BECH32, "test label");
+    QVERIFY(destination);
+
+    std::vector<CTransactionRef> transactions;
+    constexpr int SCANNED_TRANSACTIONS{36};
+    for (int i = 0; i <= SCANNED_TRANSACTIONS; ++i) {
+        CMutableTransaction tx;
+        tx.vin.emplace_back(COutPoint{uint256{1}, static_cast<uint32_t>(i)});
+        tx.vout.emplace_back(COIN, GetScriptForDestination(*destination));
+        transactions.push_back(MakeTransactionRef(std::move(tx)));
+    }
+    qApp->processEvents();
+
+    std::vector<std::pair<QString, bool>> inserted;
+    int rows_at_removal{-1};
+    int inserts_before_next_event{-1};
+    QObject::connect(table, &TransactionTableModel::rowsInserted, table, [&](const QModelIndex& parent, int first, int) {
+        inserted.emplace_back(table->index(first, 0, parent).data(TransactionTableModel::TxHashRole).toString(),
+                              table->processingQueuedTransactions());
+        if (inserted.size() == 1) {
+            QMetaObject::invokeMethod(table, [&] { inserts_before_next_event = int(inserted.size()); }, Qt::QueuedConnection);
+        }
+    });
+    QObject::connect(table, &TransactionTableModel::rowsRemoved, table, [&] { rows_at_removal = int(inserted.size()); });
+
+    std::promise<bool> notification_sent;
+    std::promise<void> heartbeat;
+    auto wait_for_heartbeat = heartbeat.get_future();
+    bool heartbeat_during_lock{false};
+    wallet->ShowProgress("scan", 0);
+    std::thread holder([&] {
+        LOCK(wallet->cs_wallet);
+        bool ok{true};
+        for (int i = 0; i < SCANNED_TRANSACTIONS; ++i) {
+            if (!wallet->AddToWallet(transactions[i], wallet::TxStateInactive{})) ok = false;
+        }
+        std::vector<uint256> remove{transactions.front()->GetHash()};
+        std::vector<uint256> removed;
+        wallet->NotifyTransactionChanged(remove.front(), CT_UPDATED);
+        if (wallet->ZapSelectTx(remove, removed) != wallet::DBErrors::LOAD_OK ||
+            !wallet->AddToWallet(transactions.front(), wallet::TxStateInactive{})) {
+            ok = false;
+        }
+        // An absent transaction must be consumed as well. A later update must still run.
+        wallet->NotifyTransactionChanged(uint256{0x42}, CT_UPDATED);
+        if (!wallet->AddToWallet(transactions.back(), wallet::TxStateInactive{})) ok = false;
+        notification_sent.set_value(ok);
+        heartbeat_during_lock = wait_for_heartbeat.wait_for(LOCK_HOLD_LIMIT) == std::future_status::ready;
+    });
+    const bool added = notification_sent.get_future().get();
+    wallet->ShowProgress("scan", 100);
+
+    QEventLoop loop;
+    QElapsedTimer timer;
+    timer.start();
+    int rows_at_heartbeat{-1};
+    QTimer::singleShot(0, &loop, [&] {
+        rows_at_heartbeat = table->rowCount({});
+        heartbeat.set_value();
+        loop.quit();
+    });
+    loop.exec();
+    const qint64 elapsed_ms = timer.elapsed();
+    holder.join();
+
+    QVERIFY(added);
+    qInfo("Transaction notification heartbeat: %lld ms", static_cast<long long>(elapsed_ms));
+    QVERIFY2(heartbeat_during_lock, "Queued transaction notification blocked the GUI until the wallet lock was released");
+    QCOMPARE(rows_at_heartbeat, initial_rows);
+    QTRY_COMPARE_WITH_TIMEOUT(inserted.size(), transactions.size() + 1, 5000);
+    QCOMPARE(table->rowCount({}), initial_rows + int(transactions.size()));
+    QCOMPARE(rows_at_removal, SCANNED_TRANSACTIONS);
+    QVERIFY(inserts_before_next_event > 0 && inserts_before_next_event < SCANNED_TRANSACTIONS);
+    for (int i = 0; i < SCANNED_TRANSACTIONS; ++i) {
+        QCOMPARE(inserted[i].first, QString::fromStdString(transactions[i]->GetHash().ToString()));
+        // The last 10 scan notifications include the removal, reinsert, and updates.
+        QCOMPARE(inserted[i].second, i < SCANNED_TRANSACTIONS + 5 - 10);
+    }
+    QCOMPARE(inserted[SCANNED_TRANSACTIONS].first, QString::fromStdString(transactions.front()->GetHash().ToString()));
+    QCOMPARE(inserted.back().first, QString::fromStdString(transactions.back()->GetHash().ToString()));
+    QVERIFY(!inserted[SCANNED_TRANSACTIONS].second);
+    QVERIFY(!inserted.back().second);
+    const QModelIndex row = FindTx(*table, transactions.front()->GetHash());
+    QVERIFY(row.isValid());
+    // The label is read by try-lock and retried every 25 ms while the wallet is busy.
+    QTRY_COMPARE_WITH_TIMEOUT(row.data(TransactionTableModel::LabelRole).toString(), QStringLiteral("test label"), 10000);
+
+    // An uncontended burst also shares the turn budget.
+    inserted.clear();
+    inserts_before_next_event = -1;
+    for (int i = 0; i < SCANNED_TRANSACTIONS; ++i) {
+        CMutableTransaction tx;
+        tx.vin.emplace_back(COutPoint{uint256{2}, static_cast<uint32_t>(i)});
+        tx.vout.emplace_back(COIN, GetScriptForDestination(*destination));
+        QVERIFY(wallet->AddToWallet(MakeTransactionRef(std::move(tx)), wallet::TxStateInactive{}));
+    }
+    QTRY_COMPARE_WITH_TIMEOUT(inserted.size(), size_t{SCANNED_TRANSACTIONS}, 5000);
+    QVERIFY(inserts_before_next_event > 0 && inserts_before_next_event < SCANNED_TRANSACTIONS);
+    qInfo("Uncontended burst yielded after %d inserts", inserts_before_next_event);
+
+    // Destroy a model with a retry pending while another thread still holds the wallet.
+    std::promise<void> queued;
+    std::promise<void> release;
+    auto wait_for_release = release.get_future();
+    bool destroyed_during_lock{false};
+    std::thread shutdown_holder([&] {
+        LOCK(wallet->cs_wallet);
+        wallet->NotifyTransactionChanged(transactions.back()->GetHash(), CT_UPDATED);
+        queued.set_value();
+        destroyed_during_lock = wait_for_release.wait_for(LOCK_HOLD_LIMIT) == std::future_status::ready;
+    });
+    queued.get_future().wait();
+    QCoreApplication::sendPostedEvents(table, QEvent::MetaCall);
+    QPointer<TransactionTableModel> pending_table{table};
+    gui.reset();
+    release.set_value();
+    shutdown_holder.join();
+
+    QVERIFY(destroyed_during_lock);
+    QVERIFY(pending_table.isNull());
+    QTest::qWait(75);
+}
+
+void TestTransactionLabelsResponsiveUnderWalletLock(interfaces::Node& node, const std::shared_ptr<CWallet>& wallet)
+{
+    using namespace std::chrono_literals;
+    const auto receive = wallet->GetNewDestination(OutputType::BECH32, "receiver");
+    QVERIFY(receive);
+    const CTxDestination send = WitnessV0KeyHash{};
+    QVERIFY(wallet->SetAddressBook(send, "recipient", wallet::AddressPurpose::SEND));
+    CMutableTransaction incoming;
+    incoming.vin.emplace_back(COutPoint{uint256{1}, 0});
+    incoming.vout.emplace_back(2 * COIN, GetScriptForDestination(*receive));
+    const auto received_tx = MakeTransactionRef(std::move(incoming));
+    QVERIFY(wallet->AddToWallet(received_tx, wallet::TxStateInactive{}));
+    CMutableTransaction outgoing;
+    outgoing.vin.emplace_back(COutPoint{received_tx->GetHash(), 0});
+    outgoing.vout.emplace_back(COIN, GetScriptForDestination(send));
+    const auto sent_tx = MakeTransactionRef(std::move(outgoing));
+    QVERIFY(wallet->AddToWallet(sent_tx, wallet::TxStateInactive{}));
+
+    const std::unique_ptr<const PlatformStyle> style(PlatformStyle::instantiate("other"));
+    OptionsModel options(node);
+    bilingual_str error;
+    QVERIFY(options.Init(error));
+    ClientModel client(node, &options);
+    auto model = std::make_unique<WalletModel>(
+        interfaces::MakeWallet(*node.walletLoader().context(), wallet), client, style.get());
+    // The visible address book can omit bech32 addresses.
+    model->refresh(/*pk_hash_only=*/true);
+    auto* table = model->getTransactionTableModel();
+    const QModelIndex received_row = FindTx(*table, received_tx->GetHash());
+    const QModelIndex sent_row = FindTx(*table, sent_tx->GetHash());
+    QVERIFY(received_row.isValid());
+    QVERIFY(sent_row.isValid());
+
+    std::promise<void> locked;
+    std::promise<void> heartbeat;
+    auto wait_for_heartbeat = heartbeat.get_future();
+    bool heartbeat_during_lock{false};
+    std::thread holder([&] {
+        LOCK(wallet->cs_wallet);
+        locked.set_value();
+        heartbeat_during_lock = wait_for_heartbeat.wait_for(LOCK_HOLD_LIMIT) == std::future_status::ready;
+    });
+    locked.get_future().wait();
+
+    QSignalSpy repaint(table, &TransactionTableModel::dataChanged);
+    QEventLoop loop;
+    QElapsedTimer timer;
+    timer.start();
+    QString label_during_lock;
+    QMetaObject::invokeMethod(&loop, [&] {
+        const auto address = table->index(received_row.row(), TransactionTableModel::ToAddress);
+        address.data(Qt::DisplayRole);
+        label_during_lock = received_row.data(TransactionTableModel::LabelRole).toString();
+    }, Qt::QueuedConnection);
+    QTimer::singleShot(0, &loop, [&] {
+        heartbeat.set_value();
+        loop.quit();
+    });
+    loop.exec();
+    const qint64 elapsed_ms = timer.elapsed();
+    holder.join();
+
+    qInfo("Transaction label paint heartbeat: %lld ms", static_cast<long long>(elapsed_ms));
+    QVERIFY2(heartbeat_during_lock, "Transaction label rendering blocked the GUI until the wallet lock was released");
+    QVERIFY(label_during_lock.isEmpty());
+    QTRY_VERIFY_WITH_TIMEOUT(repaint.count() > 0, 5000);
+    // The first repaint can be a status update; the label follows its own try-lock read and 25 ms retry.
+    QTRY_COMPARE_WITH_TIMEOUT(received_row.data(TransactionTableModel::LabelRole).toString(), QStringLiteral("receiver"), 10000);
+    {
+        TransactionView export_view(style.get());
+        export_view.setModel(model.get());
+        auto* view = export_view.findChild<QTableView*>();
+        QVERIFY(view);
+        auto* proxy = qobject_cast<TransactionPresentationProxy*>(view->model());
+        QVERIFY(proxy);
+        QTemporaryDir output;
+        QVERIFY(output.isValid());
+        const auto check_csv = [&](const QString& path, const QByteArray& label) {
+            QFile file(path);
+            QVERIFY(file.open(QIODevice::ReadOnly));
+            const auto lines = file.readAll().trimmed().split('\n');
+            QCOMPARE(lines.size(), 2);
+            QVERIFY(lines.back().contains(label));
+            QVERIFY(lines.back().contains(QByteArray::fromStdString(sent_tx->GetHash().ToString())));
+        };
+
+        // Force a search to encounter a cold address label while the wallet is busy.
+        std::promise<void> export_locked;
+        std::thread export_holder([&] {
+            LOCK(wallet->cs_wallet);
+            export_locked.set_value();
+            std::this_thread::sleep_for(250ms);
+        });
+        export_locked.get_future().wait();
+        proxy->setSearchString(QStringLiteral("recipient"));
+        const int cold_rows = proxy->rowCount();
+        const QString cold_path = output.filePath(QStringLiteral("cold.csv"));
+        const bool cold_written = export_view.exportTransactions(cold_path);
+        export_holder.join();
+        QCOMPARE(cold_rows, 0);
+        QVERIFY(cold_written);
+        check_csv(cold_path, "recipient");
+
+        // The detached export leaves the live label pending. The context menu
+        // should still offer Copy Label for that selected transaction.
+        proxy->setSearchString({});
+        proxy->setActive(true);
+        QTRY_VERIFY_WITH_TIMEOUT(proxy->isReady(), 5000);
+        view->selectRow(proxy->mapFromSource(sent_row).row());
+        auto* menu = export_view.findChild<QMenu*>(QStringLiteral("contextMenu"));
+        QVERIFY(menu);
+        const auto actions = menu->actions();
+        const auto copy_label = std::find_if(actions.cbegin(), actions.cend(), [](const QAction* action) {
+            return action->text() == TransactionView::tr("Copy &label");
+        });
+        QVERIFY(copy_label != actions.cend());
+        QVERIFY(QMetaObject::invokeMethod(&export_view, "contextualMenu", Qt::DirectConnection, Q_ARG(QPoint, QPoint(-1, -1))));
+        QVERIFY((*copy_label)->isEnabled());
+
+        proxy->setSearchString(QStringLiteral("recipient"));
+        QTRY_COMPARE_WITH_TIMEOUT(proxy->rowCount(), 1, 5000);
+        QCOMPARE(sent_row.data(TransactionTableModel::LabelRole).toString(), QStringLiteral("recipient"));
+        proxy->setSearchString(QStringLiteral("csv-match"));
+        QTRY_VERIFY_WITH_TIMEOUT(proxy->isReady(), 5000);
+        QCOMPARE(proxy->rowCount(), 0);
+        repaint.clear();
+        QVERIFY(wallet->SetAddressBook(send, "csv-match", wallet::AddressPurpose::SEND));
+        QCOMPARE(proxy->rowCount(), 0);
+        const QString stale_path = output.filePath(QStringLiteral("stale.csv"));
+        QVERIFY(export_view.exportTransactions(stale_path));
+        check_csv(stale_path, "csv-match");
+        QCOMPARE(proxy->rowCount(), 0);
+        proxy->setActive(true);
+        QTRY_VERIFY_WITH_TIMEOUT(proxy->isReady(), 5000);
+        QTRY_COMPARE_WITH_TIMEOUT(proxy->rowCount(), 1, 5000);
+        QVERIFY(!repaint.isEmpty());
+        for (const auto& change : repaint) {
+            QCOMPARE(qvariant_cast<QModelIndex>(change.at(0)).row(), sent_row.row());
+            QCOMPARE(qvariant_cast<QModelIndex>(change.at(1)).row(), sent_row.row());
+        }
+    }
+
+
+    QVERIFY(wallet->SetAddressBook(send, "renamed", wallet::AddressPurpose::SEND));
+    QTRY_COMPARE_WITH_TIMEOUT(sent_row.data(TransactionTableModel::LabelRole).toString(), QStringLiteral("renamed"), 5000);
+    QVERIFY(wallet->DelAddressBook(send));
+    QTRY_VERIFY_WITH_TIMEOUT(sent_row.data(TransactionTableModel::LabelRole).toString().isEmpty(), 5000);
+    QVERIFY(wallet->SetAddressBook(send, "restored", wallet::AddressPurpose::SEND));
+    wallet->NotifyAddressBookChanged(send, "stale payload", /*is_mine=*/false, wallet::AddressPurpose::SEND, CT_UPDATED);
+    QTRY_COMPARE_WITH_TIMEOUT(sent_row.data(TransactionTableModel::LabelRole).toString(), QStringLiteral("restored"), 5000);
+    QVERIFY(sent_row.data(TransactionTableModel::TxPlainTextRole).toString().contains(QStringLiteral("(restored)")));
+    QCOMPARE(sent_row.data(TransactionTableModel::ExportLabelRole).toString(), QStringLiteral("restored"));
+
+    // Reacquire the wallet mutex after the row snapshot but before the real
+    // WalletView rowsInserted handler reads the transaction label.
+    QVERIFY(!node.isInitialBlockDownload());
+    {
+        std::promise<void> start_relock;
+        auto wait_for_relock = start_relock.get_future();
+        std::promise<void> relocked;
+        auto wait_for_lock = relocked.get_future();
+        std::promise<void> insertion_heartbeat;
+        auto wait_for_insertion_heartbeat = insertion_heartbeat.get_future();
+        bool lock_reacquired{false};
+        bool insertion_heartbeat_during_lock{false};
+        QEventLoop insertion_loop;
+        QObject::connect(table, &TransactionTableModel::rowsInserted, &insertion_loop, [&] {
+            start_relock.set_value();
+            lock_reacquired = wait_for_lock.wait_for(LOCK_HOLD_LIMIT) == std::future_status::ready;
+            if (!lock_reacquired) {
+                insertion_loop.quit();
+                return;
+            }
+            QTimer::singleShot(0, &insertion_loop, [&] {
+                insertion_heartbeat.set_value();
+                insertion_loop.quit();
+            });
+        });
+        WalletView view(model.get(), style.get(), nullptr);
+        view.setClientModel(&client);
+        QSignalSpy notifications(&view, &WalletView::incomingTransaction);
+
+        CMutableTransaction next;
+        next.vin.emplace_back(COutPoint{uint256{2}, 0});
+        next.vout.emplace_back(COIN, GetScriptForDestination(*receive));
+        QVERIFY(wallet->AddToWallet(MakeTransactionRef(std::move(next)), wallet::TxStateInactive{}));
+        std::thread locker([&] {
+            if (wait_for_relock.wait_for(LOCK_HOLD_LIMIT) != std::future_status::ready) return;
+            LOCK(wallet->cs_wallet);
+            relocked.set_value();
+            insertion_heartbeat_during_lock = wait_for_insertion_heartbeat.wait_for(LOCK_HOLD_LIMIT) == std::future_status::ready;
+        });
+        QTimer::singleShot(15000, &insertion_loop, &QEventLoop::quit);
+        insertion_loop.exec();
+        locker.join();
+        QVERIFY2(lock_reacquired, "Wallet lock reacquisition handshake timed out");
+        QVERIFY2(insertion_heartbeat_during_lock, "WalletView blocked the GUI when the wallet lock was reacquired after row insertion");
+        QCOMPARE(notifications.count(), 1);
+        QCOMPARE(notifications.at(0).at(5).toString(), QStringLiteral("receiver"));
+    }
+
+
+    // Removing an observed transaction retires its label dependency. A
+    // reinserted transaction reads the updated label using its new row index.
+    std::vector<uint256> remove{sent_tx->GetHash()};
+    std::vector<uint256> removed;
+    const auto zap = WITH_LOCK(wallet->cs_wallet, return wallet->ZapSelectTx(remove, removed));
+    QCOMPARE(zap, wallet::DBErrors::LOAD_OK);
+    QTRY_VERIFY_WITH_TIMEOUT(!FindTx(*table, sent_tx->GetHash()).isValid(), 5000);
+    repaint.clear();
+    QVERIFY(wallet->SetAddressBook(send, "after removal", wallet::AddressPurpose::SEND));
+    QTest::qWait(75);
+    // Other rows may still receive a status or label read that was retried behind a busy wallet lock. What must
+    // not happen is a repaint for the renamed address, whose only row is gone.
+    {
+        const QString renamed_address = QString::fromStdString(EncodeDestination(send));
+        for (const auto& change : repaint) {
+            const int first = qvariant_cast<QModelIndex>(change.at(0)).row();
+            const int last = qvariant_cast<QModelIndex>(change.at(1)).row();
+            for (int changed = first; changed <= last; ++changed) {
+                QVERIFY(table->index(changed, 0).data(TransactionTableModel::AddressRole).toString() != renamed_address);
+            }
+        }
+    }
+    QVERIFY(wallet->AddToWallet(sent_tx, wallet::TxStateInactive{}));
+    QTRY_VERIFY_WITH_TIMEOUT(FindTx(*table, sent_tx->GetHash()).isValid(), 5000);
+    QTRY_COMPARE_WITH_TIMEOUT(FindTx(*table, sent_tx->GetHash()).data(TransactionTableModel::LabelRole).toString(), QStringLiteral("after removal"), 10000);
+
+    std::promise<bool> changed;
+    std::promise<void> release;
+    auto wait_for_release = release.get_future();
+    bool destroyed_during_lock{false};
+    std::thread shutdown_holder([&] {
+        LOCK(wallet->cs_wallet);
+        changed.set_value(wallet->SetAddressBook(*receive, "changed", wallet::AddressPurpose::RECEIVE));
+        destroyed_during_lock = wait_for_release.wait_for(LOCK_HOLD_LIMIT) == std::future_status::ready;
+    });
+    const bool change_ok = changed.get_future().get();
+    QCoreApplication::sendPostedEvents(model.get(), QEvent::MetaCall);
+    QCoreApplication::processEvents();
+    QPointer<TransactionTableModel> pending_table{table};
+    model.reset();
+    release.set_value();
+    shutdown_holder.join();
+    QVERIFY(change_ok);
+    QVERIFY(destroyed_during_lock);
+    QVERIFY(pending_table.isNull());
+    QTest::qWait(75);
+}
+
 void TestWalletPagesScale(MiniGUI& mini_gui, const PlatformStyle* platformStyle)
 {
     TransactionView& transaction_view = mini_gui.transactionView;
@@ -2862,6 +5046,25 @@ void TestWalletPagesScale(MiniGUI& mini_gui, const PlatformStyle* platformStyle)
     QVERIFY(table);
     QVERIFY(table->isVisible());
     QVERIFY(transaction_view.minimumSizeHint().width() <= 480);
+    {
+        // The history status label may be visible while history loads or
+        // updates; none of its texts may widen the page's minimum width. Force
+        // each text visible instead of depending on the model's timing.
+        auto* state = transaction_view.findChild<QLabel*>(QStringLiteral("transactionHistoryState"));
+        QVERIFY(state);
+        const bool was_hidden = state->isHidden();
+        const QString original = state->text();
+        for (const QString& text : {TransactionView::tr("Loading wallet history…"),
+                                    TransactionView::tr("Updating transaction history…"),
+                                    TransactionView::tr("Wallet history could not be loaded. Reopen the wallet to try again.")}) {
+            state->setText(text);
+            state->show();
+            QVERIFY(state->isVisible());
+            QVERIFY2(transaction_view.minimumSizeHint().width() <= 480, qPrintable(text));
+        }
+        state->setText(original);
+        state->setVisible(!was_hidden);
+    }
     transaction_view.hide();
 
     WalletView wallet_view(mini_gui.walletModel.get(), platformStyle, nullptr);
@@ -2918,11 +5121,19 @@ void TestGUI(interfaces::Node& node, const std::shared_ptr<CWallet>& wallet)
     SendCoinsDialog& sendCoinsDialog = mini_gui.sendCoinsDialog;
 
     const QString lane = qEnvironmentVariable("BLACKCOIN_QT_WALLET_TEST");
+    if (lane == QStringLiteral("miner-control")) {
+        TestPowMiningAsyncControlLifecycle(node, platformStyle.get());
+        TestPowMiningBackupWarningSurvivesUnload(node, platformStyle.get());
+        TestWalletWorkerShutdownDrain(node, platformStyle.get());
+        return;
+    }
     if (lane != QStringLiteral("recovery-ui")) TestStakingMiningPageControls(mini_gui, wallet, platformStyle.get());
     if (lane == QStringLiteral("pow-controls")) return;
     TestPowClaimRecoveryPolicyControls(node, mini_gui, wallet, platformStyle.get());
     TestPowClaimRecoveryStakingOnlyRequiresFullUnlock(node, platformStyle.get());
     TestPowClaimRecoveryJoinCancelsQueuedMutation(node, platformStyle.get());
+    TestRecoveryShutdownRestorationBusy(node, platformStyle.get(), false);
+    TestRecoveryShutdownRestorationBusy(node, platformStyle.get(), true);
     TestPowClaimRecoveryModelDestructionRestoresStakingScope(
         node, platformStyle.get());
     TestPowClaimRecoveryAmbiguousDatabaseDisablesActions(node, platformStyle.get());
@@ -2933,6 +5144,9 @@ void TestGUI(interfaces::Node& node, const std::shared_ptr<CWallet>& wallet)
         node, wallet, platformStyle.get());
     TestStakingMiningHeartbeatDoesNotWaitForWalletMutex(node, platformStyle.get());
     TestStakingMiningAsyncRefreshLifecycle(node, platformStyle.get());
+    TestPowMiningAsyncControlLifecycle(node, platformStyle.get());
+    TestPowMiningBackupWarningSurvivesUnload(node, platformStyle.get());
+    TestWalletWorkerShutdownDrain(node, platformStyle.get());
 
     // Update walletModel cached balance which will trigger an update for the 'labelBalance' QLabel.
     walletModel.pollBalanceChanged();
@@ -2948,9 +5162,10 @@ void TestGUI(interfaces::Node& node, const std::shared_ptr<CWallet>& wallet)
     // Blackcoin
     uint256 txid1 = SendCoins(*wallet.get(), sendCoinsDialog, PKHash(), 5 * COIN);
     uint256 txid2 = SendCoins(*wallet.get(), sendCoinsDialog, PKHash(), 10 * COIN);
-    // Transaction table model updates on a QueuedConnection, so process events to ensure it's updated.
-    qApp->processEvents();
-    QCOMPARE(transactionTableModel->rowCount({}), 107);
+    // The table applies a notification on a later turn of the event loop, and reads the transaction under a
+    // try-lock: while another thread (a wallet worker job, for one) holds the wallet lock, the notification stays at
+    // the head of the queue and is read again 25 ms later. One pass over the event loop is therefore not enough.
+    QTRY_COMPARE_WITH_TIMEOUT(transactionTableModel->rowCount({}), 107, 10000);
     QVERIFY(FindTx(*transactionTableModel, txid1).isValid());
     QVERIFY(FindTx(*transactionTableModel, txid2).isValid());
 
@@ -2991,6 +5206,8 @@ void TestGUI(interfaces::Node& node, const std::shared_ptr<CWallet>& wallet)
     QVERIFY(receive_type_notice->text().contains(QString("Legacy Blackcoin address")));
     int initialRowCount = requestTableModel->rowCount({});
     QPushButton* requestPaymentButton = receiveCoinsDialog.findChild<QPushButton*>("receiveButton");
+    receiveCoinsDialog.show();
+    QVERIFY(WaitForReceiveCondition(walletModel, [&] { return requestPaymentButton->isEnabled(); }));
     requestPaymentButton->click();
     QString address;
     for (QWidget* widget : QApplication::topLevelWidgets()) {
@@ -3147,6 +5364,466 @@ void TestGUIWatchOnly(interfaces::Node& node, TestChain100Setup& test)
         node, test.coinbaseKey, platformStyle.get());
 }
 
+//! Reproduces the permanent "chain tip changed during refresh" failure: a block
+//! connects after every Refresh press and before its result is delivered, as on
+//! a node whose blocks arrive faster than a refresh completes. The page must
+//! still show every result, labelled with the block it was taken at.
+void TestDetailRefreshSurvivesTipAdvance(interfaces::Node& node, TestChain100Setup& test, const std::shared_ptr<CWallet>& wallet)
+{
+    const std::unique_ptr<const PlatformStyle> style(PlatformStyle::instantiate("other"));
+    MiniGUI mini_gui(node, style.get());
+    mini_gui.initModelForWallet(node, wallet, style.get());
+    StakingMiningPage page(style.get());
+    page.setClientModel(mini_gui.clientModel.get());
+    page.setWalletModel(mini_gui.walletModel.get());
+    page.show();
+    qApp->processEvents();
+    QPushButton* refresh = page.findChild<QPushButton*>("stakingMiningRefresh");
+    QLabel* hint = page.findChild<QLabel*>("stakingMiningRefreshHint");
+    QVERIFY(refresh && hint);
+
+    SettleChainTip(mini_gui, wallet);
+    for (int round = 0; round < 3; ++round) {
+        refresh->click();
+        QVERIFY(!hint->text().contains(QStringLiteral("Detail panels updated")));
+        // The result is not delivered to the page until the event loop runs, so
+        // the tip has moved on from the one the request was made against.
+        const uint256 before = WITH_LOCK(::cs_main, return wallet->chain().chainman().ActiveChain().Tip()->GetBlockHash());
+        test.CreateAndProcessBlock({}, GetScriptForRawPubKey(test.coinbaseKey.GetPubKey()));
+        QVERIFY(WITH_LOCK(::cs_main, return wallet->chain().chainman().ActiveChain().Tip()->GetBlockHash()) != before);
+        // A pass whose try-locks stayed busy past the page's bounded retry ends in a hint that asks for Refresh;
+        // that is not what this test is about, so press it again. A tip-change or reorganization hint ends the wait.
+        bool tip_change_reported{false};
+        QVERIFY(QTest::qWaitFor([&] {
+            const QString text = hint->text();
+            if (text.contains(QStringLiteral("changed during refresh")) || text.contains(QStringLiteral("reorganized"))) {
+                tip_change_reported = true;
+                return true;
+            }
+            if (text.contains(QStringLiteral("Detail panels updated as of block"))) return true;
+            if (DetailRefreshEndedWithoutResult(hint)) refresh->click();
+            return false;
+        }, 20000));
+        QVERIFY(!tip_change_reported);
+        QTRY_VERIFY_WITH_TIMEOUT(hint->text().contains(QStringLiteral("Detail panels updated as of block")), 20000);
+        QVERIFY(!hint->text().contains(QStringLiteral("changed during refresh")));
+        QVERIFY(!hint->text().contains(QStringLiteral("reorganized")));
+    }
+}
+
+
+//! The slimmer row prints and sorts exactly as the string-keyed row did, and shares what it can.
+void TestSlimTransactionRow()
+{
+    std::mt19937 rng(7);
+    for (int i = 0; i < 20000; ++i) {
+        const int height = (i % 7 == 0) ? std::numeric_limits<int>::max() : static_cast<int>(rng() % 2000000) - (i % 5 == 0 ? 1000 : 0);
+        const bool generated = rng() & 1;
+        const unsigned received = static_cast<unsigned>(rng());
+        const int idx = static_cast<int>(rng() % 1200);
+        const int type_order = std::array<int, 3>{2, 3, 9}[rng() % 3];
+        const std::string expected = strprintf("%010d-%01d-%010u-%03d-%d", height, generated ? 1 : 0, received, idx, type_order);
+        const TransactionSortKey key(height, generated, received, idx, type_order);
+        QCOMPARE(QString::fromStdString(key.str()), QString::fromStdString(expected));
+        TransactionSortKey parsed;
+        parsed = expected;
+        QVERIFY(parsed == key);
+        QVERIFY(!key.empty());
+    }
+    TransactionSortKey never_read;
+    QVERIFY(never_read.empty());
+    QVERIFY(never_read.str().empty());
+    TransactionSortKey cleared(5, false, 1, 0, 3);
+    cleared.clear();
+    QVERIFY(cleared.empty());
+    cleared = std::string("not a key");
+    QVERIFY(cleared.empty());
+
+    // Order of the printed keys is the order of the fields' text; the compact key must not change it.
+    std::vector<TransactionSortKey> keys;
+    for (int i = 0; i < 500; ++i) keys.emplace_back(static_cast<int>(rng() % 50), rng() & 1, static_cast<unsigned>(rng() % 1000), static_cast<int>(rng() % 4), 2 + static_cast<int>(rng() % 2));
+    std::vector<std::string> texts;
+    for (const auto& key : keys) texts.push_back(key.str());
+    std::sort(texts.begin(), texts.end());
+    std::sort(keys.begin(), keys.end(), [](const auto& a, const auto& b) { return a.str() < b.str(); });
+    for (size_t i = 0; i < keys.size(); ++i) QCOMPARE(QString::fromStdString(keys[i].str()), QString::fromStdString(texts[i]));
+
+    static_assert(sizeof(TransactionRecord) <= 160, "a row is a heap node of the table: keep it small");
+    const size_t pool_before = TransactionAddress::PoolSize();
+    {
+        std::vector<TransactionRecord> rows;
+        for (int i = 0; i < 1000; ++i) rows.emplace_back(uint256{static_cast<unsigned char>(i % 250 + 1)}, i, TransactionRecord::GoldRushPowClaim, "claim address shared by many rows 0123456789", 0, i);
+        QCOMPARE(TransactionAddress::PoolSize(), pool_before + 1);
+        for (const auto& row : rows) QCOMPARE(QString::fromStdString(row.address), QStringLiteral("claim address shared by many rows 0123456789"));
+        rows.front().address = std::string("another");
+        QCOMPARE(TransactionAddress::PoolSize(), pool_before + 2);
+        QVERIFY(rows[1].address == std::string("claim address shared by many rows 0123456789"));
+    }
+    QCOMPARE(TransactionAddress::PoolSize(), pool_before);
+    TransactionAddress empty;
+    QVERIFY(empty.empty());
+    QVERIFY(empty == std::string());
+}
+
+//! Add a mix of transactions the wallet history shows: receives, sends, Gold Rush claims and payouts, control rows.
+//! Only some of them carry the notes the list reads; every one also carries notes it does not.
+void AddMixedHistory(const std::shared_ptr<CWallet>& wallet, int count, uint32_t salt, std::vector<uint256>& hashes)
+{
+    const auto dest = wallet->GetNewDestination(OutputType::BECH32, "mixed history " + ToString(salt));
+    const auto script = GetScriptForDestination(*dest);
+    const CScript external = GetScriptForDestination(WitnessV0KeyHash(uint160(std::vector<unsigned char>(20, static_cast<unsigned char>(salt + 1)))));
+    const std::array<std::string, 3> claim_addresses{"bc1qclaimaddressone", "bc1qclaimaddresstwo", "bc1qclaimaddressthree"};
+    for (int i = 0; i < count; ++i) {
+        CMutableTransaction tx;
+        tx.vin.emplace_back(COutPoint{uint256{static_cast<unsigned char>(salt + 40)}, static_cast<uint32_t>(i)});
+        tx.vout.emplace_back(COIN + i, script);
+        tx.nLockTime = static_cast<uint32_t>(salt * 100000 + i);
+        const auto ref = MakeTransactionRef(tx);
+        const int kind = i % 6;
+        std::function<bool(wallet::CWalletTx&, bool)> update = [&](wallet::CWalletTx& wtx, bool) {
+            wtx.mapValue["message"] = "note the list never reads " + ToString(i);
+            wtx.mapValue["n"] = "1";
+            if (kind == 1) { wtx.mapValue["comment"] = "PoW - Quantum Claim"; wtx.mapValue["to"] = claim_addresses[i % 3]; }
+            if (kind == 2) { wtx.mapValue["comment"] = "PoS - Quantum Stake"; wtx.mapValue["to"] = claim_addresses[(i + 1) % 3]; }
+            if (kind == 3) { wtx.mapValue["comment"] = "PoW Claim"; }
+            if (kind == 5) { wtx.mapValue["from"] = "someone " + ToString(i % 4); }
+            return true;
+        };
+        QVERIFY2(wallet->AddToWallet(ref, wallet::TxStateInactive{}, update), "add history transaction");
+        hashes.push_back(ref->GetHash());
+        if (kind == 4) {
+            // A send that spends the received output.
+            CMutableTransaction spend;
+            spend.vin.emplace_back(COutPoint{ref->GetHash(), 0});
+            spend.vout.emplace_back(COIN / 2, external);
+            const auto spend_ref = MakeTransactionRef(spend);
+            QVERIFY(wallet->AddToWallet(spend_ref, wallet::TxStateInactive{}));
+            hashes.push_back(spend_ref->GetHash());
+        }
+    }
+}
+
+struct HistoryRow {
+    QString hash, type_text, to_text, amount_text, date_text, address;
+    int type;
+    qint64 amount;
+    bool operator==(const HistoryRow& o) const
+    {
+        return hash == o.hash && type_text == o.type_text && to_text == o.to_text && amount_text == o.amount_text && date_text == o.date_text &&
+               address == o.address && type == o.type && amount == o.amount;
+    }
+};
+
+std::vector<HistoryRow> ReadRows(TransactionTableModel& table)
+{
+    std::vector<HistoryRow> rows;
+    for (int row = 0; row < table.rowCount({}); ++row) {
+        const auto cell = [&](int column, int role) { return table.data(table.index(row, column), role); };
+        rows.push_back({cell(0, TransactionTableModel::TxHashRole).toString(), cell(TransactionTableModel::Type, Qt::DisplayRole).toString(),
+                        cell(TransactionTableModel::ToAddress, Qt::DisplayRole).toString(), cell(TransactionTableModel::Amount, Qt::DisplayRole).toString(),
+                        cell(TransactionTableModel::Date, Qt::DisplayRole).toString(), cell(0, TransactionTableModel::AddressRole).toString(),
+                        cell(0, TransactionTableModel::TypeRole).toInt(), cell(0, TransactionTableModel::AmountRole).toLongLong()});
+    }
+    return rows;
+}
+
+QStringList g_captured_gui_messages;
+QtMessageHandler g_previous_message_handler{nullptr};
+void CaptureGuiMessages(QtMsgType type, const QMessageLogContext& context, const QString& message)
+{
+    g_captured_gui_messages << message;
+    if (g_previous_message_handler) g_previous_message_handler(type, context, message);
+}
+
+void TestLazyWalletHistory(interfaces::Node& node, const std::shared_ptr<CWallet>& wallet, const std::shared_ptr<CWallet>& second_wallet)
+{
+    constexpr int MIXED{4200}; // about 7000 transactions: several 2,000 transaction chunks
+    const std::unique_ptr<const PlatformStyle> style(PlatformStyle::instantiate("other"));
+    OptionsModel options(node);
+    bilingual_str error;
+    QVERIFY(options.Init(error));
+    ClientModel client(node, &options);
+    g_captured_gui_messages.clear();
+    g_previous_message_handler = qInstallMessageHandler(CaptureGuiMessages);
+    struct Restore { ~Restore() { qInstallMessageHandler(g_previous_message_handler); } } restore;
+
+    std::vector<uint256> before_hashes;
+    AddMixedHistory(wallet, MIXED, 1, before_hashes);
+    const auto context = node.walletLoader().context();
+
+    // 1. A wallet nobody has looked at reads nothing, keeps no queue, and still announces what arrives.
+    auto lazy = std::make_unique<WalletModel>(interfaces::MakeWallet(*context, wallet), client, style.get(), nullptr, /*defer_history=*/true);
+    auto* table = lazy->getTransactionTableModel();
+    lazy->startPollBalance();
+    QTest::qWait(300);
+    QVERIFY(!table->isHistoryRequested());
+    QVERIFY(!table->isHistoryLoaded());
+    QCOMPARE(table->rowCount({}), 0);
+    QVERIFY(WalletModel::historyLoadActiveForTest() == nullptr);
+    QSignalSpy incoming(table, &TransactionTableModel::incomingWhileNotLoaded);
+    {
+        const auto dest = wallet->GetNewDestination(OutputType::BECH32, "arrives while hidden");
+        CMutableTransaction tx;
+        tx.vin.emplace_back(COutPoint{uint256{77}, 0});
+        tx.vout.emplace_back(3 * COIN, GetScriptForDestination(*dest));
+        QVERIFY(wallet->AddToWallet(MakeTransactionRef(std::move(tx)), wallet::TxStateInactive{}));
+    }
+    QTRY_COMPARE_WITH_TIMEOUT(incoming.count(), 1, 5000);
+    QCOMPARE(incoming.at(0).at(1).toLongLong(), qint64(3 * COIN));
+    QVERIFY(!incoming.at(0).at(2).toString().isEmpty());
+    QCOMPARE(table->rowCount({}), 0);
+    QVERIFY(!table->isHistoryRequested());
+
+    // 2. Showing it reads it, in chunks; a transaction that arrives meanwhile appears exactly once.
+    lazy->requestHistory();
+    QVERIFY(table->isHistoryRequested());
+    CMutableTransaction during_tx;
+    during_tx.vin.emplace_back(COutPoint{uint256{78}, 0});
+    during_tx.vout.emplace_back(5 * COIN, GetScriptForDestination(*wallet->GetNewDestination(OutputType::BECH32, "arrives while loading")));
+    const auto during = MakeTransactionRef(std::move(during_tx));
+    QVERIFY(wallet->AddToWallet(during, wallet::TxStateInactive{}));
+    QVERIFY(WalletModel::historyLoadActiveForTest() == lazy.get());
+    QTRY_VERIFY_WITH_TIMEOUT(table->isHistoryLoaded(), 60000);
+    QTRY_VERIFY_WITH_TIMEOUT(WalletModel::historyLoadActiveForTest() == nullptr, 5000);
+    int during_rows{0};
+    for (int row = 0; row < table->rowCount({}); ++row) {
+        if (table->data(table->index(row, 0), TransactionTableModel::TxHashRole).toString() == QString::fromStdString(during->GetHash().ToString())) ++during_rows;
+    }
+    QCOMPARE(during_rows, 1);
+    for (const auto& message : g_captured_gui_messages) QVERIFY2(!message.contains(QStringLiteral("already in model")), qPrintable(message));
+
+    // 3. The streamed, key-filtered load equals the eager load, row for row and in order.
+    WalletModel eager(interfaces::MakeWallet(*context, wallet), client, style.get());
+    auto* eager_table = eager.getTransactionTableModel();
+    QVERIFY(eager_table->isHistoryLoaded());
+    QCOMPARE(table->rowCount({}), eager_table->rowCount({}));
+    QVERIFY(table->rowCount({}) > MIXED);
+    // A label is read under a try-lock: while another thread holds the wallet lock a row shows its bare address, and
+    // the label follows (with dataChanged) once the lock is free. Compare the tables once both have settled.
+    QTRY_VERIFY_WITH_TIMEOUT(ReadRows(*table) == ReadRows(*eager_table), 10000);
+    const auto lazy_rows = ReadRows(*table);
+    std::set<int> types;
+    for (const auto& row : lazy_rows) types.insert(row.type);
+    QString type_list;
+    for (const int type : types) type_list += QString::number(type) + QLatin1Char(' ');
+    QVERIFY2(types.count(TransactionRecord::GoldRushPowClaim) && types.count(TransactionRecord::GoldRushPosStake) &&
+             types.count(TransactionRecord::SendToAddress) && types.count(TransactionRecord::RecvWithAddress) && types.count(TransactionRecord::Other),
+             qPrintable(type_list));
+    // Claim rows show the "to" note, which the filtered load must still carry.
+    const bool claim_address_shown = std::any_of(lazy_rows.begin(), lazy_rows.end(), [](const HistoryRow& row) { return row.address == QStringLiteral("bc1qclaimaddressone"); });
+    QVERIFY(claim_address_shown);
+
+    // 4. One history read at a time in the process, and the wallet being shown goes first.
+    std::vector<uint256> second_hashes;
+    AddMixedHistory(second_wallet, 150, 2, second_hashes);
+    auto first = std::make_unique<WalletModel>(interfaces::MakeWallet(*context, wallet), client, style.get(), nullptr, /*defer_history=*/true);
+    auto shown = std::make_unique<WalletModel>(interfaces::MakeWallet(*context, second_wallet), client, style.get(), nullptr, /*defer_history=*/true);
+    first->setBalancePollForeground(false);
+    QStringList load_order;
+    QObject::connect(first->getTransactionTableModel(), &TransactionTableModel::historyLoaded, [&] { load_order << QStringLiteral("hidden"); });
+    QObject::connect(shown->getTransactionTableModel(), &TransactionTableModel::historyLoaded, [&] { load_order << QStringLiteral("shown"); });
+    first->requestHistory();
+    shown->requestHistory();
+    QVERIFY(WalletModel::historyLoadActiveForTest() == first.get());
+    QCOMPARE(WalletModel::historyLoadWaitingForTest(), size_t{1});
+    QVERIFY(shown->getTransactionTableModel()->rowCount({}) == 0);
+    QTRY_VERIFY_WITH_TIMEOUT(first->getTransactionTableModel()->isHistoryLoaded() && shown->getTransactionTableModel()->isHistoryLoaded(), 60000);
+    QCOMPARE(load_order, (QStringList{QStringLiteral("shown"), QStringLiteral("hidden")}));
+    QCOMPARE(first->getTransactionTableModel()->rowCount({}), table->rowCount({}));
+    QTRY_VERIFY_WITH_TIMEOUT(WalletModel::historyLoadActiveForTest() == nullptr, 5000);
+    QCOMPARE(WalletModel::historyLoadWaitingForTest(), size_t{0});
+    first.reset();
+    shown.reset();
+
+    // 5. A hidden wallet whose lock stays busy does not keep the turn from the wallet being shown.
+    auto stuck = std::make_unique<WalletModel>(interfaces::MakeWallet(*context, wallet), client, style.get(), nullptr, /*defer_history=*/true);
+    auto looked_at = std::make_unique<WalletModel>(interfaces::MakeWallet(*context, second_wallet), client, style.get(), nullptr, /*defer_history=*/true);
+    stuck->setBalancePollForeground(false);
+    std::promise<void> lock_taken, lock_release;
+    std::shared_future<void> release_future{lock_release.get_future().share()};
+    std::thread lock_holder([&] {
+        LOCK(wallet->cs_wallet);
+        lock_taken.set_value();
+        release_future.wait();
+    });
+    lock_taken.get_future().wait();
+    stuck->requestHistory();
+    QTest::qWait(200);
+    QVERIFY(WalletModel::historyLoadActiveForTest() == stuck.get());
+    QVERIFY(!stuck->getTransactionTableModel()->isHistoryLoaded());
+    looked_at->requestHistory();
+    QTRY_VERIFY_WITH_TIMEOUT(looked_at->getTransactionTableModel()->isHistoryLoaded(), 10000);
+    QVERIFY(!stuck->getTransactionTableModel()->isHistoryLoaded());
+    lock_release.set_value();
+    lock_holder.join();
+    QTRY_VERIFY_WITH_TIMEOUT(stuck->getTransactionTableModel()->isHistoryLoaded(), 60000);
+    QTRY_VERIFY_WITH_TIMEOUT(WalletModel::historyLoadActiveForTest() == nullptr, 5000);
+    stuck.reset();
+    looked_at.reset();
+}
+
+void TestBatchedStatusRefresh(interfaces::Node& node, TestChain100Setup& test, const std::shared_ptr<CWallet>& wallet)
+{
+    const std::unique_ptr<const PlatformStyle> style(PlatformStyle::instantiate("other"));
+    MiniGUI gui(node, style.get());
+    WalletContext& context = *node.walletLoader().context();
+    // Earlier tests may have mined: pin the standalone wallet to the chain's current tip, not the fixture's 105.
+    SyncRecoveryReviewWalletTip(wallet, node);
+    AddWallet(context, wallet);
+    auto model = std::make_unique<WalletModel>(interfaces::MakeWallet(context, wallet), *gui.clientModel, style.get(), nullptr, /*defer_history=*/true);
+    RemoveWallet(context, wallet, std::nullopt);
+    auto* table = model->getTransactionTableModel();
+    SettleChainTip(gui, wallet);
+    model->requestHistory();
+    QTRY_VERIFY_WITH_TIMEOUT(table->isHistoryLoaded(), 20000);
+    QTRY_VERIFY_WITH_TIMEOUT(table->rowCount({}) > 100, 5000);
+    QVERIFY(table->unsettledRows() > 0);
+
+    const auto depth_text = [](const QString& tip) {
+        const auto match = QRegularExpression(QStringLiteral("\\((\\d+) ")).match(tip);
+        return match.hasMatch() ? match.captured(1).toInt() : -1;
+    };
+    const auto tooltips = [&]() -> std::map<QString, std::pair<int, int>> {
+        std::map<QString, std::pair<int, int>> out; // hash -> (status, shown confirmations)
+        for (int row = 0; row < table->rowCount({}); ++row) {
+            const auto id = table->transactionIdentity(row);
+            QVariant tip, status, hash;
+            if (!table->transactionData(id, 0, Qt::ToolTipRole, tip) || !table->transactionData(id, 0, TransactionTableModel::StatusRole, status) ||
+                !table->transactionData(id, 0, TransactionTableModel::TxHashRole, hash)) continue;
+            out[hash.toString()] = {status.toInt(), depth_text(tip.toString())};
+        }
+        return out;
+    };
+
+    // One batch reads every row that can still change (and a bounded number of never-read rows) under one lock.
+    const auto start = table->statusStats();
+    table->updateConfirmations();
+    // The batch takes the wallet lock by try-lock and retries shortly when another thread holds it.
+    QTRY_COMPARE_WITH_TIMEOUT(table->statusStats().batches, start.batches + 1, 10000);
+    auto stats = table->statusStats();
+    QVERIFY(stats.rows >= start.rows + table->activeRows());
+    QCOMPARE(stats.single_reads, start.single_reads);
+    const auto first_view = tooltips();
+
+    test.CreateAndProcessBlock({}, GetScriptForRawPubKey(test.coinbaseKey.GetPubKey()));
+    SyncWithValidationInterfaceQueue();
+    SettleChainTip(gui, wallet);
+    SyncRecoveryReviewWalletTip(wallet, node); // a standalone test wallet does not follow the chain by itself
+    const auto before_block = table->statusStats();
+    table->updateConfirmations();
+    QTRY_COMPARE_WITH_TIMEOUT(table->statusStats().batches, before_block.batches + 1, 10000); // one call for the block
+    stats = table->statusStats();
+    QVERIFY(stats.rows > before_block.rows);
+    const auto second_view = tooltips();
+    QCOMPARE(table->statusStats().single_reads, before_block.single_reads); // no per-row reads were needed to show them
+    int advanced{0};
+    for (const auto& entry : first_view) {
+        // Named, not a structured binding: the lambda below captures the hash.
+        const auto& hash = entry.first;
+        const auto& shown_before = entry.second;
+        const auto& shown_after = second_view.at(hash);
+        if (shown_before.second < 0 || shown_after.second < 0) continue;
+        QVERIFY2(shown_after.second == shown_before.second + 1,
+                 qPrintable(QStringLiteral("%1 status %2->%3 shown %4->%5 tip %6 key %7").arg(hash).arg(shown_before.first).arg(shown_after.first).arg(shown_before.second).arg(shown_after.second).arg(table->tipHeight()).arg(
+                     [&] { for (int row = 0; row < table->rowCount({}); ++row) { const auto id = table->transactionIdentity(row); QVariant h, k; table->transactionData(id, 0, TransactionTableModel::TxHashRole, h); if (h.toString() == hash) { table->transactionData(id, 0, Qt::EditRole, k); return k.toString(); } } return QString(); }())));
+        ++advanced;
+    }
+    QVERIFY(advanced > 50);
+
+    // A refused lock reads nothing and leaves the rows marked: the next attempt succeeds without another block.
+    std::promise<void> locked;
+    std::promise<void> release;
+    auto wait_release = release.get_future();
+    std::thread holder([&] {
+        LOCK(wallet->cs_wallet);
+        locked.set_value();
+        wait_release.wait();
+    });
+    locked.get_future().wait();
+    const auto refused_before = table->statusStats();
+    table->updateConfirmations();
+    QCOMPARE(table->statusStats().batches, refused_before.batches);
+    QTest::qWait(120);
+    release.set_value();
+    holder.join();
+    QTRY_VERIFY_WITH_TIMEOUT(table->statusStats().batches > refused_before.batches, 5000);
+}
+
+#ifdef __APPLE__
+//! Allocation cost of a published row: the layout of release candidate 11 (reproduced from its header) against the current one.
+void TestHistoryRowAllocations()
+{
+    struct LegacyStatus {
+        bool countsForBalance{false};
+        std::string sortKey;
+        int matures_in{0};
+        int status{0};
+        qint64 depth{0};
+        uint256 m_cur_block_hash;
+        bool needsUpdate{false};
+    };
+    struct LegacyRecord {
+        uint256 hash;
+        qint64 time{0};
+        int type{0};
+        std::string address;
+        CAmount debit{0};
+        CAmount credit{0};
+        int idx{0};
+        uint64_t presentation_id{0};
+        LegacyStatus status;
+        bool involvesWatchAddress{false};
+    };
+    constexpr int ROWS{60000};
+    const std::string claim_address = "BLACKCOINQuantumClaimAddress0123456789abcdef";
+    const auto in_use = [] {
+        malloc_statistics_t stats{};
+        malloc_zone_statistics(nullptr, &stats);
+        return std::pair<size_t, size_t>{stats.blocks_in_use, stats.size_in_use};
+    };
+    const auto key_text = [](int i) { return strprintf("%010d-%01d-%010u-%03d-%d", 1000 + i / 2, 0, 1700000000u + i, 0, 9); };
+
+    const auto legacy_before = in_use();
+    auto legacy_list = std::make_unique<QList<LegacyRecord>>();
+    auto legacy_ids = std::make_unique<std::unordered_map<uint64_t, LegacyRecord*>>();
+    legacy_list->reserve(ROWS);
+    for (int i = 0; i < ROWS; ++i) {
+        LegacyRecord record;
+        record.hash = uint256{static_cast<unsigned char>(i % 250 + 1)};
+        record.address = claim_address;
+        record.status.sortKey = key_text(i);
+        record.presentation_id = i + 1;
+        legacy_list->append(record);
+        (*legacy_ids)[i + 1] = &legacy_list->last();
+    }
+    const auto legacy_after = in_use();
+
+    const auto current_before = in_use();
+    auto current_list = std::make_unique<QList<TransactionRecord>>();
+    auto current_ids = std::make_unique<std::vector<TransactionRecord*>>();
+    current_list->reserve(ROWS);
+    for (int i = 0; i < ROWS; ++i) {
+        TransactionRecord record(uint256{static_cast<unsigned char>(i % 250 + 1)}, 0, TransactionRecord::GoldRushPowClaim, claim_address, 0, 1);
+        record.status.sortKey = TransactionSortKey(1000 + i / 2, false, 1700000000u + i, 0, 9);
+        record.presentation_id = i + 1;
+        current_list->append(record);
+        if (current_ids->size() <= record.presentation_id) current_ids->resize(record.presentation_id + 1);
+        (*current_ids)[record.presentation_id] = &current_list->last();
+    }
+    const auto current_after = in_use();
+
+    const auto per_row = [](const std::pair<size_t, size_t>& before, const std::pair<size_t, size_t>& after) {
+        return std::pair<double, double>{double(after.first - before.first) / ROWS, double(after.second - before.second) / ROWS};
+    };
+    const auto legacy = per_row(legacy_before, legacy_after);
+    const auto current = per_row(current_before, current_after);
+    qInfo("History row cost (malloc zones, %d rows): rc11 layout %.2f allocations %.1f bytes per row; now %.2f allocations %.1f bytes per row; sizeof %zu -> %zu",
+        ROWS, legacy.first, legacy.second, current.first, current.second, sizeof(LegacyRecord), sizeof(TransactionRecord));
+    QVERIFY(current.first < legacy.first / 2);
+    QVERIFY(current.second < legacy.second * 0.7);
+}
+#endif
+
 void TestGUI(interfaces::Node& node)
 {
     // Set up wallet and chain with 105 blocks (5 mature blocks for spending).
@@ -3159,12 +5836,42 @@ void TestGUI(interfaces::Node& node)
     wallet_loader->registerRpcs();
     node.setContext(&test.m_node);
 
+    const QString lane = qEnvironmentVariable("BLACKCOIN_QT_WALLET_TEST");
+    if (lane.isEmpty() || lane == QStringLiteral("wallet-efficiency")) {
+        TestHiddenSendBalanceHeartbeat(node, SetupDescriptorsWallet(node, test));
+        TestWalletDisplaySnapshots(node, SetupDescriptorsWallet(node, test));
+        TestBalanceStateLabels();
+        TestWalletPollCoalescing(node, SetupDescriptorsWallet(node, test));
+        TestWalletDisplayExceptionRecovery(node, SetupDescriptorsWallet(node, test));
+        TestAccountSnapshotFiltering(node, SetupDescriptorsWallet(node, test));
+        TestDeferredWalletHistory(node, SetupDescriptorsWallet(node, test));
+        TestSlimTransactionRow();
+#ifdef __APPLE__
+        TestHistoryRowAllocations();
+#endif
+        TestLazyWalletHistory(node, SetupDescriptorsWallet(node, test), SetupDescriptorsWallet(node, test));
+        // It mines a block, which later tests of the shared chain must not see: run it last.
+        if (lane == QStringLiteral("wallet-efficiency")) {
+            TestBatchedStatusRefresh(node, test, SetupDescriptorsWallet(node, test));
+            return;
+        }
+    }
+
+    if (lane.isEmpty() || lane == QStringLiteral("transaction-contention")) {
+        TestTransactionTableResponsiveUnderWalletLock(node, SetupDescriptorsWallet(node, test));
+        if (lane == QStringLiteral("transaction-contention")) return;
+    }
+
+    if (lane.isEmpty() || lane == QStringLiteral("transaction-label-contention")) {
+        TestTransactionLabelsResponsiveUnderWalletLock(node, SetupDescriptorsWallet(node, test));
+        if (lane == QStringLiteral("transaction-label-contention")) return;
+    }
+
     // "Full" GUI tests, use descriptor wallet
     const std::shared_ptr<CWallet>& desc_wallet = SetupDescriptorsWallet(node, test);
     TestGUI(node, desc_wallet);
 
-    const QString lane = qEnvironmentVariable("BLACKCOIN_QT_WALLET_TEST");
-    if (lane == QStringLiteral("pow-controls")) return;
+    if (lane == QStringLiteral("pow-controls") || lane == QStringLiteral("miner-control")) return;
     if (lane == QStringLiteral("recovery-ui")) {
         const std::unique_ptr<const PlatformStyle> style(PlatformStyle::instantiate("other"));
         TestPowClaimRecoveryManualDialog(node, test.coinbaseKey, style.get());
@@ -3174,6 +5881,9 @@ void TestGUI(interfaces::Node& node)
     // Legacy watch-only wallet test
     // Verify PSBT creation.
     TestGUIWatchOnly(node, test);
+
+    TestDetailRefreshSurvivesTipAdvance(node, test, SetupDescriptorsWallet(node, test));
+    TestBatchedStatusRefresh(node, test, SetupDescriptorsWallet(node, test));
 }
 
 void TestQuantumFundingControlsFollowReorg(interfaces::Node& node)
@@ -3214,6 +5924,45 @@ void TestQuantumFundingControlsFollowReorg(interfaces::Node& node)
     auto tiered_coldstake_result = wallet_interface.createQuantumColdStakeAddress(
         staker_result->public_key, "reorg-tiered-coldstake", 9450);
     QVERIFY(tiered_coldstake_result);
+    const auto compare_coldstake_batch = [&](CAmount funded_liquid_amount = 0) {
+        const std::vector<std::string> addresses{
+            liquid_coldstake_result->address, tiered_coldstake_result->address, "invalid"};
+        // Both reads are try-locks and report a busy lock as unavailable.
+        // Compare a pair of reads that each got their locks. Not QTRY_VERIFY:
+        // it evaluates its condition once more after it held, and that read
+        // can meet the busy lock again.
+        std::map<std::string, interfaces::WalletQuantumColdStakeBalanceInfo> grouped, singles;
+        QVERIFY(QTest::qWaitFor([&] {
+            grouped = wallet_interface.getQuantumColdStakeBalances(addresses);
+            singles.clear();
+            bool available{true};
+            for (const auto& entry : grouped) available = available && entry.second.available;
+            for (const auto& address : addresses) {
+                const auto single = wallet_interface.getQuantumColdStakeBalanceInfo(address);
+                available = available && single.available;
+                singles.emplace(address, single);
+            }
+            return available;
+        }, 10000));
+        QCOMPARE(grouped.size(), addresses.size());
+        for (const auto& address : addresses) {
+            const auto& single = singles.at(address);
+            const auto& bulk = grouped.at(address);
+            QCOMPARE(bulk.available, single.available);
+            QCOMPARE(bulk.valid_delegation_address, single.valid_delegation_address);
+            QCOMPARE(bulk.amount, single.amount);
+            if (address == liquid_coldstake_result->address) QCOMPARE(bulk.confirmed_amount, funded_liquid_amount);
+            QCOMPARE(bulk.outputs, single.outputs);
+            QCOMPARE(bulk.confirmed_amount, single.confirmed_amount);
+            QCOMPARE(bulk.confirmed_outputs, single.confirmed_outputs);
+            QCOMPARE(bulk.unconfirmed_amount, single.unconfirmed_amount);
+            QCOMPARE(bulk.unconfirmed_outputs, single.unconfirmed_outputs);
+            QCOMPARE(bulk.spendable_amount, single.spendable_amount);
+            QCOMPARE(bulk.spendable_outputs, single.spendable_outputs);
+            QCOMPARE(bulk.current_height, single.current_height);
+        }
+    };
+    compare_coldstake_batch();
 
     StakingMiningPage page(platform_style.get());
     page.setClientModel(mini_gui.clientModel.get());
@@ -3253,16 +6002,36 @@ void TestQuantumFundingControlsFollowReorg(interfaces::Node& node)
         QVERIFY(QMetaObject::invokeMethod(&page, "updateStatus", Qt::DirectConnection));
         qApp->processEvents();
     };
+    std::optional<uint256> previous_balance_tip;
     const auto expect_controls = [&](int expected_height, bool quantum_active, bool legacy_active, bool tiers_active) {
         QCOMPARE(height(), expected_height);
-        const interfaces::WalletQuantumFundingStatus status = wallet_interface.getQuantumFundingStatus();
-        QVERIFY(status.available);
+        compare_coldstake_batch();
+        SyncRecoveryReviewWalletTip(wallet, node);
+        interfaces::WalletDisplayBalances snapshot;
+        QVERIFY(wallet_interface.tryGetDisplayBalances(snapshot, previous_balance_tip, std::nullopt));
+        QCOMPARE(snapshot.block_hash, node.getBestBlockHash());
+        previous_balance_tip = snapshot.block_hash;
+        QVERIFY(!wallet_interface.tryGetDisplayBalances(snapshot, previous_balance_tip, std::nullopt));
+        // A try-lock read: unavailable while cs_main or the wallet is busy.
+        interfaces::WalletQuantumFundingStatus status;
+        QVERIFY(QTest::qWaitFor([&] { return (status = wallet_interface.getQuantumFundingStatus()).available; }, 10000));
         QCOMPARE(status.quantum_outputs_active, quantum_active);
         QCOMPARE(status.legacy_migration_active, legacy_active);
         QCOMPARE(status.stake_tiers_active, tiers_active);
 
         coldstake_address->setText(QString::fromStdString(tiered_coldstake_result->address));
-        update_controls();
+        // The page derives these permissions from the same try-lock read on every status update and disables
+        // the controls while it is unavailable: update again, as the page's timer does, until one read lands.
+        QVERIFY(QTest::qWaitFor([&] {
+            update_controls();
+            return migration_legacy_sweep->isEnabled() == legacy_active &&
+                   migration_goldrush_sweep->isEnabled() == quantum_active &&
+                   selfstake_fund_amount->isEnabled() == tiers_active &&
+                   selfstake_fund->isEnabled() == tiers_active &&
+                   operator_bond_amount->isEnabled() == tiers_active &&
+                   operator_fund->isEnabled() == tiers_active &&
+                   coldstake_fund_amount->isEnabled() == tiers_active;
+        }, 10000));
         QCOMPARE(migration_legacy_sweep->isEnabled(), legacy_active);
         QCOMPARE(migration_goldrush_sweep->isEnabled(), quantum_active);
         QCOMPARE(selfstake_fund_amount->isEnabled(), tiers_active);
@@ -3274,13 +6043,26 @@ void TestQuantumFundingControlsFollowReorg(interfaces::Node& node)
         // Liquid cold-stake funding follows ordinary quantum-output support;
         // only tiered cold-stake addresses require stake-tier activation.
         coldstake_address->setText(QString::fromStdString(liquid_coldstake_result->address));
-        update_controls();
+        QVERIFY(QTest::qWaitFor([&] {
+            update_controls();
+            return coldstake_fund_amount->isEnabled() == quantum_active;
+        }, 10000));
         QCOMPARE(coldstake_fund_amount->isEnabled(), quantum_active);
         coldstake_address->setText(QString::fromStdString(tiered_coldstake_result->address));
     };
     const auto mine_block = [&] {
         test.CreateAndProcessBlock({}, GetScriptForRawPubKey(test.coinbaseKey.GetPubKey()));
         SyncWithValidationInterfaceQueue();
+    };
+    // The address list is a try-lock read that is empty while the wallet is busy: count a read that got the lock.
+    const auto quantum_address_count = [&] {
+        size_t count{0};
+        bool available{false};
+        const bool read = QTest::qWaitFor([&] {
+            count = wallet_interface.listQuantumAddresses(&available).size();
+            return available;
+        }, 10000);
+        return read ? count : std::numeric_limits<size_t>::max();
     };
     const auto invalidate_tip = [&] {
         CBlockIndex* tip = WITH_LOCK(test.m_node.chainman->GetMutex(), return test.m_node.chainman->ActiveChain().Tip());
@@ -3293,9 +6075,9 @@ void TestQuantumFundingControlsFollowReorg(interfaces::Node& node)
     // Tip 105 creates candidate 106, the final Gold Rush block. Both the UI
     // and the backend reject migration without allocating an unused address.
     expect_controls(105, /*quantum_active=*/false, /*legacy_active=*/false, /*tiers_active=*/false);
-    const size_t goldrush_address_count = wallet_interface.listQuantumAddresses().size();
+    const size_t goldrush_address_count = quantum_address_count();
     QVERIFY(!wallet_interface.migrateLegacyToQuantum(/*allow_new_quantum_key=*/true));
-    QCOMPARE(wallet_interface.listQuantumAddresses().size(), goldrush_address_count);
+    QCOMPARE(quantum_address_count(), goldrush_address_count);
 
     // Candidate 107 is Migration but precedes the tier activation at 108.
     mine_block();
@@ -3310,9 +6092,9 @@ void TestQuantumFundingControlsFollowReorg(interfaces::Node& node)
     // Candidate 110 is Final: ordinary quantum and tiered funding remain
     // available, but legacy migration closes. Failure must not reserve a key.
     expect_controls(109, /*quantum_active=*/true, /*legacy_active=*/false, /*tiers_active=*/true);
-    const size_t final_address_count = wallet_interface.listQuantumAddresses().size();
+    const size_t final_address_count = quantum_address_count();
     QVERIFY(!wallet_interface.migrateLegacyToQuantum(/*allow_new_quantum_key=*/true));
-    QCOMPARE(wallet_interface.listQuantumAddresses().size(), final_address_count);
+    QCOMPARE(quantum_address_count(), final_address_count);
 
     // Reorg backward across Final, tier activation, and Gold Rush. Every
     // lightweight refresh must derive permissions from the new active tip.
@@ -3334,6 +6116,39 @@ void TestQuantumFundingControlsFollowReorg(interfaces::Node& node)
     mine_block();
     mine_block();
     expect_controls(109, /*quantum_active=*/true, /*legacy_active=*/false, /*tiers_active=*/true);
+
+    // Inject confirmed fixture coins after the branch checks, matching the
+    // wallet record and regtest UTXO view for both policies.
+    const auto* funding_block = WITH_LOCK(::cs_main, return test.m_node.chainman->ActiveChain().Tip());
+    QVERIFY(funding_block);
+    CMutableTransaction funding;
+    funding.vin.emplace_back(COutPoint{uint256{0x43}, 0});
+    const auto direct_script = GetScriptForDestination(DecodeDestination(staker_result->address));
+    const auto coldstake_script = GetScriptForDestination(DecodeDestination(liquid_coldstake_result->address));
+    QVERIFY(!direct_script.empty());
+    QVERIFY(!coldstake_script.empty());
+    funding.vout.emplace_back(3 * COIN, direct_script);
+    funding.vout.emplace_back(5 * COIN, coldstake_script);
+    const auto funded = MakeTransactionRef(std::move(funding));
+    QVERIFY(wallet->AddToWallet(funded, wallet::TxStateConfirmed{
+        funding_block->GetBlockHash(), funding_block->nHeight, 1}));
+    {
+        LOCK(::cs_main);
+        for (uint32_t i = 0; i < funded->vout.size(); ++i) {
+            test.m_node.chainman->ActiveChainstate().CoinsTip().AddCoin(
+                COutPoint{funded->GetHash(), i}, Coin{funded->vout[i], funding_block->nHeight,
+                    /*coinbase=*/false, /*coinstake=*/false, funded->nTime}, /*possible_overwrite=*/false);
+        }
+    }
+    compare_coldstake_batch(5 * COIN);
+    wallet::CCoinControl quantum;
+    quantum.m_input_family = wallet::CCoinControl::InputFamily::QUANTUM_MIGRATION;
+    quantum.m_exclude_generated_quantum_inputs = true;
+    const CAmount direct_total = wallet_interface.getAvailableBalance(quantum);
+    QCOMPARE(direct_total, 3 * COIN);
+    interfaces::WalletDisplayBalances display;
+    QVERIFY(wallet_interface.tryGetDisplayBalances(display, std::nullopt, interfaces::WalletDisplayCoinFamily::DIRECT_QUANTUM));
+    QCOMPARE(display.send_family_balance.value_or(-1), direct_total);
 }
 
 } // namespace
@@ -3341,8 +6156,8 @@ void TestQuantumFundingControlsFollowReorg(interfaces::Node& node)
 void WalletTests::walletTests()
 {
     const QString lane = qEnvironmentVariable("BLACKCOIN_QT_WALLET_TEST");
-    QVERIFY2(lane.isEmpty() || lane == QStringLiteral("pow-controls") || lane == QStringLiteral("recovery-ui"),
-             "Unknown BLACKCOIN_QT_WALLET_TEST; expected pow-controls or recovery-ui");
+    QVERIFY2(lane.isEmpty() || lane == QStringLiteral("pow-controls") || lane == QStringLiteral("recovery-ui") || lane == QStringLiteral("miner-control") || lane == QStringLiteral("wallet-load-callbacks") || lane == QStringLiteral("transaction-contention") || lane == QStringLiteral("transaction-label-contention") || lane == QStringLiteral("wallet-efficiency"),
+             "Unknown BLACKCOIN_QT_WALLET_TEST");
     if (!lane.isEmpty()) qInfo("FILTERED WalletTests lane: %s (not the full wallet GUI suite)", qPrintable(lane));
 #ifdef Q_OS_MACOS
     if (QApplication::platformName() == "minimal") {
@@ -3355,7 +6170,1972 @@ void WalletTests::walletTests()
         return;
     }
 #endif
+    if (lane.isEmpty() || lane == QStringLiteral("wallet-load-callbacks")) {
+        TestWalletControllerCallbacks(m_node);
+        if (lane == QStringLiteral("wallet-load-callbacks")) return;
+    }
     TestGUI(m_node);
     if (!lane.isEmpty()) return;
     TestQuantumFundingControlsFollowReorg(m_node);
+}
+
+void WalletTests::shutdownPublicationReadyOrdering()
+{
+#ifdef Q_OS_MACOS
+    if (QApplication::platformName() == "minimal") QSKIP("Cocoa wallet fixture requires a supported platform");
+#endif
+    TestingSetup setup{ChainType::REGTEST, {"-staking=0", "-powmining=0"}};
+    auto* previous = m_node.context();
+    auto restore = interfaces::MakeCleanupHandler([&] { m_node.setContext(previous); });
+    auto loader = interfaces::MakeWalletLoader(*setup.m_node.chain, *Assert(setup.m_node.args));
+    setup.m_node.wallet_loader = loader.get();
+    m_node.setContext(&setup.m_node);
+    const std::unique_ptr<const PlatformStyle> style{PlatformStyle::instantiate("other")};
+    auto wallet = std::make_shared<CWallet>(setup.m_node.chain.get(), "qt-result-drain", CreateMockableWalletDatabase());
+    QCOMPARE(wallet->LoadWallet(), wallet::DBErrors::LOAD_OK);
+    MiniGUI gui(m_node, style.get());
+    gui.initModelForWallet(m_node, wallet, style.get());
+    WalletModel& model = *gui.walletModel;
+    model.beginShutdown();
+    QTRY_VERIFY_WITH_TIMEOUT(model.shutdownReady(), 3000);
+
+    // Inject an already-produced synthetic outcome, not a real Core mutation.
+    // This isolates exact restoration/publication/readiness ordering without
+    // making the regression depend on a race with a wallet signing operation.
+    constexpr uint64_t id{991};
+    auto control = std::make_shared<WalletModel::PowClaimRecoveryOperationControl>();
+    control->cancel_requested = true;
+    control->stage = WalletModel::PowClaimRecoveryOperationStage::FINISHED;
+    model.m_pow_claim_recovery_operation_controls.emplace(id, control);
+    model.m_pow_claim_recovery_restore_staking_only.emplace(id, true);
+    auto result = std::make_shared<WalletModel::PowClaimRecoveryOperationResult>();
+    result->request.request_id = id;
+    result->request.generation = 1;
+    result->request.operation = WalletModel::PowClaimRecoveryOperationRequest::Operation::EXECUTE;
+    result->core_entered = true;
+    result->execution.durable_state_ambiguous = true;
+    QSignalSpy warnings(&model, &WalletModel::message);
+    QSignalSpy publications(&model, &WalletModel::powClaimRecoveryOperationReady);
+    bool ready_during_warning{true}, ready_during_result{true};
+    QObject::connect(&model, &WalletModel::message, &model, [&] { ready_during_warning = model.shutdownReady(); });
+    QObject::connect(&model, &WalletModel::powClaimRecoveryOperationReady, &model, [&] { ready_during_result = model.shutdownReady(); });
+
+    std::promise<void> locked, release_lock;
+    const auto released = release_lock.get_future().share();
+    std::atomic<bool> expired{false};
+    std::thread holder([&] {
+        LOCK(wallet->cs_wallet);
+        locked.set_value();
+        expired = released.wait_for(std::chrono::seconds{3}) == std::future_status::timeout;
+    });
+    auto release_holder = interfaces::MakeCleanupHandler([&] { release_lock.set_value(); holder.join(); });
+    locked.get_future().wait();
+    model.publishPowClaimRecoveryOperationResult(result); // Must defer.
+    QVERIFY(!expired.load());
+    QCOMPARE(publications.count(), 0);
+    QVERIFY(!model.shutdownReady());
+    release_holder.reset();
+    // Deliberately call readiness before delivering the 25 ms publication timer.
+    QVERIFY(!model.shutdownReady());
+    QCOMPARE(warnings.count(), 0);
+    QCOMPARE(publications.count(), 0);
+    QTRY_COMPARE_WITH_TIMEOUT(publications.count(), 1, 3000);
+    QCOMPARE(warnings.count(), 1);
+    QVERIFY(!ready_during_warning);
+    QVERIFY(!ready_during_result);
+    QVERIFY(model.shutdownReady());
+    QVERIFY(model.getWalletUnlockStakingOnly());
+
+    // A result produced by rejecting a request after worker shutdown is also
+    // owned before its queued GUI callback can run.
+    WalletModel::PowClaimRecoveryOperationRequest rejected_request;
+    rejected_request.generation = 2;
+    const uint64_t rejected_id = model.requestPowClaimRecoveryOperation(rejected_request);
+    QVERIFY(rejected_id != 0);
+    QCOMPARE(publications.count(), 1);
+    QVERIFY(!model.shutdownReady());
+    ready_during_result = true;
+    QTRY_COMPARE_WITH_TIMEOUT(publications.count(), 2, 3000);
+    QVERIFY(!ready_during_result);
+    QCOMPARE(publications.at(1).at(0).toULongLong(), qulonglong{rejected_id});
+    QVERIFY(model.shutdownReady());
+}
+
+QMetaObject::Connection WalletTests::traceStakingSnapshots(WalletModel& model)
+{
+    // Connect before the page consumes the immutable result. This observer
+    // neither takes the result nor changes scheduling or request authority.
+    return QObject::connect(&model, &WalletModel::stakingMiningSnapshotReady, &model,
+        [&model, remaining = 32](quint64 id, quint64 generation) mutable {
+            if (remaining == 0) return;
+            --remaining;
+            const auto snapshot = model.m_completed_staking_snapshot;
+            if (!snapshot || snapshot->request.request_id != id) {
+                qInfo() << "Staking snapshot result unavailable to trace" << id << generation;
+                return;
+            }
+            qInfo().noquote() << "Staking snapshot result" << id << generation
+                << "cancelled" << snapshot->cancelled << "stale" << snapshot->stale_tip
+                << "unavailable" << snapshot->transient_unavailable
+                << "stage" << QString::fromStdString(snapshot->unavailable_stage)
+                << "error" << !snapshot->error.empty()
+                << "delegations" << snapshot->coldstake_delegations.size()
+                << "tip_matches" << (snapshot->start_tip == snapshot->end_tip &&
+                                      snapshot->end_tip == snapshot->request.expected_tip);
+        });
+}
+
+void WalletTests::stakingSnapshotContention()
+{
+#ifdef Q_OS_MACOS
+    if (QApplication::platformName() == "minimal") QSKIP("Cocoa wallet fixture requires a supported platform");
+#endif
+    common::Settings saved_settings;
+    gArgs.LockSettings([&](const common::Settings& settings) { saved_settings = settings; });
+    auto restore_settings = interfaces::MakeCleanupHandler([saved_settings] {
+        gArgs.LockSettings([&](common::Settings& settings) { settings = saved_settings; });
+        gArgs.ClearPathCache();
+    });
+    TestingSetup setup{ChainType::REGTEST, {"-staking=0", "-powmining=0"}};
+    auto* previous = m_node.context();
+    auto restore_node = interfaces::MakeCleanupHandler([&] { m_node.setContext(previous); });
+    auto loader = interfaces::MakeWalletLoader(*setup.m_node.chain, *Assert(setup.m_node.args));
+    setup.m_node.wallet_loader = loader.get();
+    m_node.setContext(&setup.m_node);
+    const std::unique_ptr<const PlatformStyle> style{PlatformStyle::instantiate("other")};
+    auto wallet = std::make_shared<CWallet>(setup.m_node.chain.get(), "qt-snapshot-contention", CreateMockableWalletDatabase());
+    QCOMPARE(wallet->LoadWallet(), wallet::DBErrors::LOAD_OK);
+    SyncRecoveryReviewWalletTip(wallet, m_node);
+    MiniGUI gui(m_node, style.get());
+    gui.initModelForWallet(m_node, wallet, style.get());
+    WalletModel& model = *gui.walletModel;
+    const auto op = model.wallet().createQuantumAddress("snapshot operator");
+    QVERIFY(op);
+    const auto delegation = model.wallet().createQuantumColdStakeAddress(op->public_key, "snapshot delegation", 9450);
+    QVERIFY(delegation);
+    bool available{false};
+    size_t delegation_count{0};
+    QVERIFY(QTest::qWaitFor([&] { delegation_count = model.wallet().listQuantumColdStakeDelegations(&available).size(); return available; }, 10000));
+    QCOMPARE(delegation_count, size_t{1});
+
+    // Keep actual immutable results before the page takes them. The trace is
+    // bounded and cannot turn an unavailable collection into an accepted one.
+    std::vector<std::shared_ptr<const WalletModel::StakingMiningSnapshot>> results;
+    bool trace_overflow{false};
+    const auto collect = QObject::connect(&model, &WalletModel::stakingMiningSnapshotReady, &model,
+        [&](quint64 id, quint64) {
+            const auto result = model.m_completed_staking_snapshot;
+            if (result && result->request.request_id == id) {
+                if (results.size() < 32) results.push_back(result);
+                else trace_overflow = true;
+            }
+        });
+    const auto trace = traceStakingSnapshots(model);
+    auto stop_trace = interfaces::MakeCleanupHandler([&] { QObject::disconnect(collect); QObject::disconnect(trace); });
+    StakingMiningPage page(style.get());
+    page.setClientModel(gui.clientModel.get());
+    page.setWalletModel(&model);
+    page.show();
+    qApp->processEvents();
+    auto* count = page.findChild<QLabel*>("quantumColdstakeCount");
+    auto* hint = page.findChild<QLabel*>("stakingMiningRefreshHint");
+    QVERIFY(count && hint);
+    const auto wait_result = [&](const std::function<bool()>& predicate, int timeout = 5000) {
+        if (predicate()) return true;
+        QEventLoop loop;
+        QTimer deadline;
+        deadline.setSingleShot(true);
+        deadline.setTimerType(Qt::PreciseTimer);
+        QObject::connect(&deadline, &QTimer::timeout, &loop, &QEventLoop::quit);
+        QObject::connect(&model, &WalletModel::stakingMiningSnapshotReady, &loop,
+            [&](quint64, quint64) { if (predicate()) loop.quit(); });
+        QElapsedTimer elapsed;
+        elapsed.start();
+        deadline.start(timeout);
+        loop.exec();
+        return elapsed.elapsed() <= timeout && predicate();
+    };
+    const auto deliver_retry_window = [] {
+        QEventLoop loop;
+        QTimer::singleShot(150, &loop, &QEventLoop::quit);
+        loop.exec();
+    };
+    // Where this fixture does not hold a lock itself, a pass can still meet one that another thread holds for a
+    // slice (the display balance worker takes cs_main and the wallet lock). The page then retries within its budget
+    // or rests on the busy hint. Wait for the page to come to rest after the results counted so far, and ask again
+    // while it rests on a busy result; true once it rests on any other result.
+    const auto settle = [&](size_t counted) {
+        for (int attempt = 0; attempt < 20; ++attempt) {
+            if (!wait_result([&] {
+                    return results.size() > counted && !page.m_detail_refresh_in_flight &&
+                           !page.m_detail_refresh_pending && !page.m_detail_retry_timer->isActive();
+                }, 20000)) return false;
+            if (!results.back()->transient_unavailable) return true;
+            counted = results.size();
+            page.queueFullDetailRefresh();
+        }
+        return false;
+    };
+    // Call the real page detail queue directly: unrelated recovery-policy
+    // refreshes are outside this collection-contention fixture.
+    page.queueFullDetailRefresh();
+    QVERIFY(settle(0));
+    QVERIFY(wait_result([&] { return count->text() == QStringLiteral("1") && !page.m_detail_refresh_in_flight; }));
+    QVERIFY(!results.empty());
+    QCOMPARE(results.back()->coldstake_delegations.size(), size_t{1});
+    {
+        QSignalSpy policy_ready(&model, &WalletModel::powClaimRecoveryPolicyReady);
+        if (page.m_claim_recovery_policy_pending) QVERIFY(policy_ready.wait(5000));
+        QVERIFY(!page.m_claim_recovery_policy_pending);
+        const auto policy_before = model.m_pow_claim_recovery_policy_request_sequence;
+        const size_t before = results.size();
+        // Force the actual action/cadence collision. The GUI cannot deliver
+        // the queued snapshot result before this direct update returns, so
+        // its cancellation flag proves the scheduling decision without a
+        // worker pause, injected result or timing race.
+        page.m_status_refresh_tick = 5;
+        page.m_force_full_refresh = true;
+        page.updateStatus();
+        QCOMPARE(page.m_status_refresh_tick, 6);
+        QVERIFY(page.m_detail_refresh_in_flight);
+        QVERIFY(model.m_staking_snapshot_cancel);
+        QVERIFY(!model.m_staking_snapshot_cancel->load(std::memory_order_acquire));
+        QCOMPARE(model.m_pow_claim_recovery_policy_request_sequence, policy_before);
+        QVERIFY(settle(before));
+        QVERIFY(!results.back()->cancelled && !results.back()->transient_unavailable &&
+                !results.back()->stale_tip && results.back()->error.empty());
+        QCOMPARE(results.back()->coldstake_delegations.size(), size_t{1});
+        QCOMPARE(count->text(), QStringLiteral("1"));
+        qInfo() << "Staking background cadence: in-flight snapshot preserved";
+
+        // Deferral must not disable the background read after details finish.
+        policy_ready.clear();
+        page.m_status_refresh_tick = 5;
+        page.updateStatus();
+        QCOMPARE(model.m_pow_claim_recovery_policy_request_sequence, policy_before + 1);
+        QVERIFY(page.m_claim_recovery_policy_pending);
+        QVERIFY(policy_ready.wait(5000));
+        QVERIFY(!page.m_claim_recovery_policy_pending);
+        QVERIFY(page.m_claim_recovery_policy);
+        QCOMPARE(count->text(), QStringLiteral("1"));
+        qInfo() << "Staking background cadence: idle policy refresh completed";
+    }
+    {
+        std::promise<void> locked, release;
+        auto locked_future = locked.get_future();
+        const auto release_future = release.get_future().share();
+        std::atomic<bool> expired{false};
+        std::thread holder([&] {
+            LOCK(wallet->cs_wallet);
+            locked.set_value();
+            expired = release_future.wait_for(std::chrono::seconds{10}) == std::future_status::timeout;
+        });
+        auto release_holder = interfaces::MakeCleanupHandler([&] { release.set_value(); holder.join(); });
+        QVERIFY(locked_future.wait_for(std::chrono::seconds{1}) == std::future_status::ready);
+        const size_t before = results.size();
+        page.queueFullDetailRefresh();
+        QVERIFY(wait_result([&] { return results.size() == before + 1; }));
+        QVERIFY(results.back()->transient_unavailable);
+        QCOMPARE(count->text(), QStringLiteral("1"));
+        QVERIFY(page.m_detail_refresh_pending && page.m_detail_retry_timer->isActive());
+        const auto policy_before = model.m_pow_claim_recovery_policy_request_sequence;
+        page.m_status_refresh_tick = 5;
+        page.updateStatus();
+        QCOMPARE(page.m_status_refresh_tick, 6);
+        QCOMPARE(model.m_pow_claim_recovery_policy_request_sequence, policy_before);
+        QVERIFY(page.m_detail_refresh_pending && page.m_detail_retry_timer->isActive());
+        qInfo() << "Staking background cadence: delayed retry preserved";
+        release_holder.reset(); // The already-scheduled retry must recover.
+        QVERIFY(!expired.load());
+        QVERIFY(settle(before + 1));
+        QVERIFY(!results.back()->transient_unavailable && !results.back()->cancelled &&
+                !results.back()->stale_tip && results.back()->error.empty());
+        QCOMPARE(results.back()->coldstake_delegations.size(), size_t{1});
+        QCOMPARE(count->text(), QStringLiteral("1"));
+        // The scheduled retry itself recovered unless it met another thread's slice of a lock.
+        if (results.size() == before + 2) QCOMPARE(page.m_detail_retries, 1U);
+        QVERIFY(!page.m_detail_refresh_pending && !page.m_detail_refresh_in_flight);
+    }
+    {
+        // Both reads of the mining details in one pass miss their try-locks,
+        // as when the chain lock is taken again and again while a block is
+        // built and connected. The collection probes had passed. This is the
+        // same busy lock the probes report: the page must retry it within its
+        // budget and show the result, not end in "Detail refresh failed" until
+        // Refresh is pressed again. The misses are reported through the test
+        // seam exactly as a failed try-lock reports them; the retry reads the
+        // wallet unhindered.
+        std::atomic<int> reads{0};
+        model.m_staking_snapshot_mining_details_read = [&reads](interfaces::WalletPowMiningInfo& info) {
+            if (reads.fetch_add(1) >= 2) return;
+            info.payout_address_available = false;
+            info.wallet_goldrush_status_available = false;
+        };
+        auto remove_seam = interfaces::MakeCleanupHandler([&] { model.m_staking_snapshot_mining_details_read = nullptr; });
+        const size_t before = results.size();
+        page.queueFullDetailRefresh();
+        QVERIFY(settle(before));
+        // The first pass that reached the mining details read them twice and missed twice; a later pass read them.
+        QVERIFY(reads.load() >= 3);
+        int busy_mining_details{0};
+        for (size_t i = before; i < results.size(); ++i) {
+            // Never the error that left the page on "Detail refresh failed" until Refresh was pressed.
+            QVERIFY(results[i]->error.empty() && !results[i]->cancelled && !results[i]->stale_tip);
+            if (!results[i]->transient_unavailable) continue;
+            if (results[i]->unavailable_stage == "pow_mining_info") ++busy_mining_details;
+        }
+        QCOMPARE(busy_mining_details, 1);
+        QVERIFY(!results.back()->transient_unavailable);
+        QVERIFY(results.back()->pow.payout_address_available && results.back()->pow.wallet_goldrush_status_available);
+        QVERIFY(page.m_detail_retries >= 1U || results.size() > before + 2);
+        QVERIFY(hint->text().contains(QStringLiteral("Detail panels updated")));
+    }
+    const size_t warm = results.size();
+    {
+        std::promise<void> locked, release;
+        auto locked_future = locked.get_future();
+        const auto release_future = release.get_future().share();
+        std::atomic<bool> expired{false};
+        std::thread holder([&] {
+            LOCK(wallet->cs_wallet);
+            locked.set_value();
+            expired = release_future.wait_for(std::chrono::seconds{10}) == std::future_status::timeout;
+        });
+        auto release_holder = interfaces::MakeCleanupHandler([&] { release.set_value(); holder.join(); });
+        QVERIFY(locked_future.wait_for(std::chrono::seconds{1}) == std::future_status::ready);
+        page.queueFullDetailRefresh();
+        QVERIFY(wait_result([&] { return results.size() >= warm + 3; }));
+        QVERIFY(!expired.load());
+        QCOMPARE(results.size(), warm + 3);
+        for (size_t i = warm; i < results.size(); ++i) {
+            QVERIFY(results[i]->transient_unavailable);
+            QCOMPARE(QString::fromStdString(results[i]->unavailable_stage), QStringLiteral("coldstake_delegations"));
+            QVERIFY(!results[i]->cancelled && !results[i]->stale_tip && results[i]->error.empty());
+        }
+        QCOMPARE(count->text(), QStringLiteral("1"));
+        QCOMPARE(page.m_detail_retries, 2U);
+        QVERIFY(!page.m_detail_refresh_pending && !page.m_detail_refresh_in_flight);
+        QVERIFY(!page.m_detail_retry_timer->isActive());
+        QVERIFY(hint->text().contains(QStringLiteral("busy")) && hint->text().contains(QStringLiteral("Press Refresh")));
+        deliver_retry_window();
+        QCOMPARE(results.size(), warm + 3); // Exhaustion cannot restart itself.
+    }
+    page.queueFullDetailRefresh();
+    QVERIFY(settle(warm + 3));
+    QVERIFY(!results.back()->transient_unavailable && results.back()->error.empty());
+    QCOMPARE(results.back()->coldstake_delegations.size(), size_t{1});
+    QCOMPARE(count->text(), QStringLiteral("1"));
+    QVERIFY(hint->text().contains(QStringLiteral("Detail panels updated")));
+    {
+        std::promise<void> locked, release;
+        auto locked_future = locked.get_future();
+        const auto release_future = release.get_future().share();
+        std::atomic<bool> expired{false};
+        std::thread holder([&] {
+            LOCK(wallet->cs_wallet);
+            locked.set_value();
+            expired = release_future.wait_for(std::chrono::seconds{10}) == std::future_status::timeout;
+        });
+        auto release_holder = interfaces::MakeCleanupHandler([&] { release.set_value(); holder.join(); });
+        QVERIFY(locked_future.wait_for(std::chrono::seconds{1}) == std::future_status::ready);
+        size_t before = results.size();
+        page.queueFullDetailRefresh();
+        QVERIFY(wait_result([&] { return results.size() == before + 1; }));
+        QVERIFY(results.back()->transient_unavailable);
+        page.hide(); // Invalidates the queued retry and logical refresh epoch.
+        deliver_retry_window();
+        QCOMPARE(results.size(), before + 1);
+        QVERIFY(!page.m_detail_refresh_pending && !page.m_detail_retry_timer->isActive());
+        QCOMPARE(count->text(), QStringLiteral("1"));
+        page.show();
+        qApp->processEvents();
+        deliver_retry_window();
+        QCOMPARE(results.size(), before + 1); // Restore alone does not retry.
+        before = results.size();
+        page.queueFullDetailRefresh();
+        QVERIFY(wait_result([&] { return results.size() == before + 1; }));
+        page.setWalletModel(nullptr);
+        deliver_retry_window();
+        QCOMPARE(results.size(), before + 1);
+        QCOMPARE(count->text(), QStringLiteral("0")); // No prior wallet detail survives.
+        QVERIFY(!page.m_detail_refresh_pending && !page.m_detail_retry_timer->isActive());
+        QVERIFY(!expired.load());
+    }
+    page.setWalletModel(&model);
+    {
+        const size_t counted = results.size();
+        page.queueFullDetailRefresh();
+        QVERIFY(settle(counted));
+    }
+    QVERIFY(wait_result([&] { return count->text() == QStringLiteral("1") && !page.m_detail_refresh_in_flight; }));
+    {
+        std::promise<void> locked, release;
+        auto locked_future = locked.get_future();
+        const auto release_future = release.get_future().share();
+        std::atomic<bool> expired{false};
+        std::thread holder([&] {
+            LOCK(wallet->cs_wallet);
+            locked.set_value();
+            expired = release_future.wait_for(std::chrono::seconds{10}) == std::future_status::timeout;
+        });
+        auto release_holder = interfaces::MakeCleanupHandler([&] { release.set_value(); holder.join(); });
+        QVERIFY(locked_future.wait_for(std::chrono::seconds{1}) == std::future_status::ready);
+        const size_t before = results.size();
+        page.queueFullDetailRefresh();
+        QVERIFY(wait_result([&] { return results.size() == before + 1; }));
+        model.beginShutdown();
+        deliver_retry_window();
+        QCOMPARE(results.size(), before + 1);
+        QVERIFY(!page.m_detail_refresh_pending && !page.m_detail_retry_timer->isActive());
+        QVERIFY(hint->text().contains(QStringLiteral("stopped")));
+        QVERIFY(!expired.load());
+    }
+    QVERIFY(!trace_overflow);
+    QTRY_VERIFY_WITH_TIMEOUT(model.shutdownReady(), 5000);
+}
+
+
+void WalletTests::receiveCapabilityContention_data()
+{
+    QTest::addColumn<QString>("held_lock");
+    QTest::newRow("wallet") << QStringLiteral("wallet");
+    QTest::newRow("legacy-manager") << QStringLiteral("legacy-manager");
+    QTest::newRow("descriptor-manager") << QStringLiteral("descriptor-manager");
+}
+
+void WalletTests::receiveCapabilityContention()
+{
+#ifdef Q_OS_MACOS
+    if (QApplication::platformName() == "minimal") QSKIP("Cocoa wallet fixture requires a supported platform");
+#endif
+    QFETCH(QString, held_lock);
+    common::Settings saved_settings;
+    gArgs.LockSettings([&](const common::Settings& settings) { saved_settings = settings; });
+    auto restore_settings = interfaces::MakeCleanupHandler([saved_settings] {
+        gArgs.LockSettings([&](common::Settings& settings) { settings = saved_settings; });
+        gArgs.ClearPathCache();
+    });
+    TestingSetup setup{ChainType::REGTEST, {"-staking=0", "-powmining=0"}};
+    auto* previous = m_node.context();
+    auto restore_node = interfaces::MakeCleanupHandler([&] { m_node.setContext(previous); });
+    auto loader = interfaces::MakeWalletLoader(*setup.m_node.chain, *Assert(setup.m_node.args));
+    setup.m_node.wallet_loader = loader.get();
+    m_node.setContext(&setup.m_node);
+    const std::unique_ptr<const PlatformStyle> style{PlatformStyle::instantiate("other")};
+    auto wallet = std::make_shared<CWallet>(setup.m_node.chain.get(), "qt-receive-contention", CreateMockableWalletDatabase());
+    QCOMPARE(wallet->LoadWallet(), wallet::DBErrors::LOAD_OK);
+    RecursiveMutex* held_mutex{&wallet->cs_wallet};
+    {
+        LOCK(wallet->cs_wallet);
+        wallet->m_keypool_size = 1;
+        if (held_lock == QStringLiteral("descriptor-manager")) {
+            wallet->SetWalletFlag(WALLET_FLAG_DESCRIPTORS);
+            wallet->SetupDescriptorScriptPubKeyMans();
+            auto* manager = dynamic_cast<wallet::DescriptorScriptPubKeyMan*>(wallet->GetScriptPubKeyMan(OUTPUT_TYPES.front(), false));
+            QVERIFY(manager);
+            held_mutex = &manager->cs_desc_man;
+        } else {
+            wallet->SetupLegacyScriptPubKeyMan();
+            auto* manager = wallet->GetLegacyScriptPubKeyMan();
+            QVERIFY(manager);
+            QVERIFY(manager->SetupGeneration(true));
+            if (held_lock == QStringLiteral("legacy-manager")) held_mutex = &manager->cs_KeyStore;
+        }
+    }
+    SyncRecoveryReviewWalletTip(wallet, m_node);
+    MiniGUI gui(m_node, style.get());
+    gui.initModelForWallet(m_node, wallet, style.get());
+    WalletModel& model = *gui.walletModel;
+    ReceiveCoinsDialog page(style.get());
+    page.setModel(&model); // Other initial metadata reads precede contention.
+    auto* button = page.findChild<QPushButton*>("receiveButton");
+    QVERIFY(button && !button->isEnabled());
+    QVERIFY(!model.getCachedAddressCapability().has_value());
+    QVERIFY(!model.m_address_capability_observed.load());
+    const bool oracle = model.wallet().canGetAddresses();
+    QVERIFY(oracle);
+    {
+        ReceiveCapabilityLockHolder holder(*held_mutex);
+        QVERIFY(holder.locked());
+        if (held_lock == QStringLiteral("wallet")) {
+            // Failure to acquire must also be bounded on assertion unwind.
+            ReceiveCapabilityLockHolder blocked_holder(*held_mutex);
+            QVERIFY(!blocked_holder.locked());
+        }
+        bool untouched{true};
+        QVERIFY(!model.wallet().tryCanGetAddresses(untouched));
+        QVERIFY(untouched); // Unavailable does not report false.
+        for (bool internal : {false, true}) {
+            // Descriptor internal uses a different manager, so only the
+            // selected external manager is deliberately contended in that row.
+            if (internal && held_lock == QStringLiteral("descriptor-manager")) continue;
+            untouched = false;
+            QVERIFY(!wallet->TryCanGetAddresses(untouched, internal));
+            QVERIFY(!untouched);
+        }
+        page.show();
+        QVERIFY(WaitForReceiveCondition(model, [&] { return model.m_address_capability_retry->isActive(); }));
+        QVERIFY(!button->isEnabled());
+        QVERIFY(!model.getCachedAddressCapability().has_value());
+        QVERIFY(!holder.expired.load());
+        // A real GUI callback must run before the lock is released, not after
+        // a timed-out holder accidentally allows a blocking getter through.
+        bool heartbeat{false};
+        QTimer::singleShot(0, &page, [&] { heartbeat = true; });
+        for (int i = 0; i < 1000; ++i) wallet->NotifyCanGetAddressesChanged();
+        QVERIFY(model.m_address_capability_notification_queued.load());
+        QVERIFY(WaitForReceiveCondition(model, [&] { return heartbeat && !model.m_address_capability_notification_queued.load(); }));
+        QVERIFY(!holder.expired.load());
+        QVERIFY(!model.getCachedAddressCapability().has_value());
+        QVERIFY(!button->isEnabled());
+        holder.release();
+        QVERIFY(!holder.expired.load());
+    }
+    QVERIFY(WaitForReceiveCondition(model, [&] { return button->isEnabled(); }));
+    QVERIFY(model.getCachedAddressCapability() == oracle);
+    for (bool internal : {false, true}) {
+        bool value{false};
+        // A try-lock read: the display balance worker can hold the wallet lock in a slice.
+        QVERIFY(QTest::qWaitFor([&] { return wallet->TryCanGetAddresses(value, internal); }, 10000));
+        QCOMPARE(value, wallet->CanGetAddresses(internal));
+    }
+    // With a known value, the same lock miss must preserve it, not flash false.
+    {
+        ReceiveCapabilityLockHolder holder(*held_mutex);
+        QVERIFY(holder.locked());
+        wallet->NotifyCanGetAddressesChanged();
+        QVERIFY(WaitForReceiveCondition(model, [&] { return model.m_address_capability_retry->isActive(); }));
+        QVERIFY(button->isEnabled());
+        QVERIFY(model.getCachedAddressCapability() == true);
+        page.hide();
+        QVERIFY(model.m_address_capability_consumers.empty());
+        QVERIFY(!model.m_address_capability_retry->isActive());
+        QVERIFY(!model.m_address_capability_observed.load());
+        const auto cancelled = model.m_address_capability_cancel;
+        QVERIFY(cancelled && cancelled->load());
+        for (int i = 0; i < 1000; ++i) wallet->NotifyCanGetAddressesChanged();
+        QVERIFY(!model.m_address_capability_notification_queued.load());
+        model.beginShutdown();
+        QVERIFY(WaitForReceiveCondition(model, [&] { return model.shutdownReady(); }));
+        QVERIFY(!holder.expired.load()); // Shutdown did not wait for this lock.
+        QVERIFY(model.getCachedAddressCapability() == true);
+    }
+}
+
+void WalletTests::receiveCapabilityLifecycle()
+{
+#ifdef Q_OS_MACOS
+    if (QApplication::platformName() == "minimal") QSKIP("Cocoa wallet fixture requires a supported platform");
+#endif
+    common::Settings saved_settings;
+    gArgs.LockSettings([&](const common::Settings& settings) { saved_settings = settings; });
+    auto restore_settings = interfaces::MakeCleanupHandler([saved_settings] {
+        gArgs.LockSettings([&](common::Settings& settings) { settings = saved_settings; });
+        gArgs.ClearPathCache();
+    });
+    TestingSetup setup{ChainType::REGTEST, {"-staking=0", "-powmining=0"}};
+    auto* previous = m_node.context();
+    auto restore_node = interfaces::MakeCleanupHandler([&] { m_node.setContext(previous); });
+    auto loader = interfaces::MakeWalletLoader(*setup.m_node.chain, *Assert(setup.m_node.args));
+    setup.m_node.wallet_loader = loader.get();
+    m_node.setContext(&setup.m_node);
+    const std::unique_ptr<const PlatformStyle> style{PlatformStyle::instantiate("other")};
+    auto wallet = std::make_shared<CWallet>(setup.m_node.chain.get(), "qt-receive-lifecycle", CreateMockableWalletDatabase());
+    QCOMPARE(wallet->LoadWallet(), wallet::DBErrors::LOAD_OK);
+    {
+        LOCK(wallet->cs_wallet);
+        wallet->m_keypool_size = 1;
+        wallet->SetWalletFlag(WALLET_FLAG_DESCRIPTORS);
+        wallet->SetupDescriptorScriptPubKeyMans();
+    }
+    SyncRecoveryReviewWalletTip(wallet, m_node);
+    MiniGUI gui(m_node, style.get());
+    gui.initModelForWallet(m_node, wallet, style.get());
+    WalletModel& model = *gui.walletModel;
+    ReceiveCoinsDialog page(style.get());
+    page.setModel(&model);
+    auto* button = page.findChild<QPushButton*>("receiveButton");
+    QVERIFY(button);
+    page.show();
+    QVERIFY(WaitForReceiveCondition(model, [&] { return button->isEnabled(); }));
+    QVERIFY(WaitForReceiveCondition(model, [&] { return !model.m_address_capability_in_flight; }));
+    QSignalSpy changed(&model, &WalletModel::canGetAddressesChanged);
+    std::vector<std::pair<OutputType, uint256>> managers;
+    for (const auto type : OUTPUT_TYPES) {
+        auto* manager = wallet->GetScriptPubKeyMan(type, false);
+        QVERIFY(manager);
+        managers.emplace_back(type, manager->GetID());
+        wallet->DeactivateScriptPubKeyMan(manager->GetID(), type, false);
+    }
+    QVERIFY(!model.wallet().canGetAddresses());
+    QVERIFY(WaitForReceiveCondition(model, [&] { return model.getCachedAddressCapability() == false; }));
+    QVERIFY(!button->isEnabled());
+    QCOMPARE(changed.count(), 1);
+    // Dispatch a false read, then change the wallet before GUI completion.
+    // An invalidation during any part of that read must survive completion.
+    model.queueAddressCapabilityChanged();
+    model.requestAddressCapability();
+    QVERIFY(model.m_address_capability_in_flight);
+    const auto read_epoch = model.m_address_capability_cancel;
+    for (const auto& entry : managers) wallet->AddActiveScriptPubKeyMan(entry.second, entry.first, false);
+    QVERIFY(model.m_address_capability_dirty.load());
+    for (int i = 0; i < 1000; ++i) wallet->NotifyCanGetAddressesChanged();
+    QVERIFY(model.m_address_capability_cancel == read_epoch); // Still one read.
+    QVERIFY(WaitForReceiveCondition(model, [&] {
+        return button->isEnabled() && !model.m_address_capability_dirty.load() && !model.m_address_capability_in_flight;
+    }));
+    QCOMPARE(changed.count(), 2);
+
+    // The shared visibility controller already has native minimize/restore
+    // coverage. Here exercise this consumer's application-hide and reentry.
+    const auto old_state = QGuiApplication::applicationState();
+    auto restore_application = interfaces::MakeCleanupHandler([&] { Q_EMIT qGuiApp->applicationStateChanged(old_state); });
+    Q_EMIT qGuiApp->applicationStateChanged(Qt::ApplicationHidden);
+    QVERIFY(model.m_address_capability_consumers.empty());
+    QVERIFY(!model.m_address_capability_retry->isActive());
+    wallet->NotifyCanGetAddressesChanged();
+    QVERIFY(!model.m_address_capability_notification_queued.load());
+    Q_EMIT qGuiApp->applicationStateChanged(Qt::ApplicationInactive);
+    QVERIFY(!model.m_address_capability_consumers.empty());
+    QVERIFY(WaitForReceiveCondition(model, [&] { return !model.m_address_capability_in_flight; }));
+    page.hide();
+    QVERIFY(model.m_address_capability_consumers.empty());
+    page.show();
+    QVERIFY(!model.m_address_capability_consumers.empty());
+
+    // Switching to a different wallet cannot publish a late old-wallet read.
+    auto other_wallet = std::make_shared<CWallet>(setup.m_node.chain.get(), "qt-receive-other", CreateMockableWalletDatabase());
+    QCOMPARE(other_wallet->LoadWallet(), wallet::DBErrors::LOAD_OK);
+    SyncRecoveryReviewWalletTip(other_wallet, m_node);
+    ReceiveCapabilityOptionsModel shared_options(m_node);
+    bilingual_str options_error;
+    QVERIFY(shared_options.Init(options_error));
+    ClientModel other_client(m_node, &shared_options);
+    const int options_without_wallet = shared_options.displayUnitReceiverCount();
+    auto other_model = std::make_unique<WalletModel>(interfaces::MakeWallet(*m_node.walletLoader().context(), other_wallet), other_client, style.get());
+    WalletModel& other = *other_model;
+    QVERIFY(!other.wallet().canGetAddresses());
+    const int old_publications = changed.count();
+    {
+        ReceiveCapabilityLockHolder holder(wallet->cs_wallet);
+        QVERIFY(holder.locked());
+        model.queueAddressCapabilityChanged();
+        const auto old_epoch = model.m_address_capability_cancel;
+        page.setModel(&other);
+        QVERIFY(!button->isEnabled());
+        QVERIFY(model.m_address_capability_consumers.empty());
+        QVERIFY(old_epoch && old_epoch->load());
+        QVERIFY(WaitForReceiveCondition(other, [&] { return other.getCachedAddressCapability() == false; }));
+        QVERIFY(!button->isEnabled());
+        QVERIFY(!holder.expired.load());
+    }
+    QVERIFY(WaitForReceiveCondition(model, [&] { return !model.m_address_capability_in_flight; }));
+    QCOMPARE(changed.count(), old_publications);
+    QVERIFY(!button->isEnabled());
+    page.setModel(nullptr);
+    QVERIFY(!button->isEnabled());
+    QVERIFY(other.m_address_capability_consumers.empty());
+    auto* requests = page.findChild<QTableView*>("recentRequestsView");
+    QVERIFY(requests && !requests->model());
+    page.setModel(&other);
+    other_model.reset(); // Guarded model destruction detaches safely.
+    QVERIFY(!button->isEnabled());
+    QVERIFY(!requests->model());
+    QCOMPARE(shared_options.displayUnitReceiverCount(), options_without_wallet);
+    // The same options object outlives both wallets. Rebinding must add one
+    // receive listener, not retain the listener of the destroyed wallet.
+    auto rebound = std::make_unique<WalletModel>(interfaces::MakeWallet(*m_node.walletLoader().context(), other_wallet), other_client, style.get());
+    const int options_with_wallet = shared_options.displayUnitReceiverCount();
+    page.setModel(rebound.get());
+    QCOMPARE(shared_options.displayUnitReceiverCount(), options_with_wallet + 1);
+    page.setModel(nullptr);
+    QCOMPARE(shared_options.displayUnitReceiverCount(), options_with_wallet);
+    rebound.reset();
+    QCOMPARE(shared_options.displayUnitReceiverCount(), options_without_wallet);
+}
+
+void WalletTests::workerOutlivesShutdownRequest()
+{
+#ifdef Q_OS_MACOS
+    if (QApplication::platformName() == "minimal") QSKIP("Cocoa wallet fixture requires a supported platform");
+#endif
+    common::Settings saved_settings;
+    gArgs.LockSettings([&](const common::Settings& settings) { saved_settings = settings; });
+    auto restore_settings = interfaces::MakeCleanupHandler([saved_settings] {
+        gArgs.LockSettings([&](common::Settings& settings) { settings = saved_settings; });
+        gArgs.ClearPathCache();
+    });
+    TestingSetup setup{ChainType::REGTEST, {"-staking=0", "-powmining=0"}};
+    auto* previous = m_node.context();
+    auto restore_node = interfaces::MakeCleanupHandler([&] { m_node.setContext(previous); });
+    auto loader = interfaces::MakeWalletLoader(*setup.m_node.chain, *Assert(setup.m_node.args));
+    setup.m_node.wallet_loader = loader.get();
+    m_node.setContext(&setup.m_node);
+    const std::unique_ptr<const PlatformStyle> style{PlatformStyle::instantiate("other")};
+    auto wallet = std::make_shared<CWallet>(setup.m_node.chain.get(), "qt-worker-lifetime", CreateMockableWalletDatabase());
+    QCOMPARE(wallet->LoadWallet(), wallet::DBErrors::LOAD_OK);
+    WalletContext& context = *m_node.walletLoader().context();
+    OptionsModel options(m_node);
+    bilingual_str error;
+    QVERIFY(options.Init(error));
+    ClientModel client(m_node, &options);
+    AddWallet(context, wallet);
+    // Regression: beginShutdown() asks the worker thread to quit; the worker
+    // must stay valid until join() deletes it, however far the thread exit
+    // has progressed when the model is destroyed.
+    for (int i = 0; i < 200; ++i) {
+        auto model = std::make_unique<WalletModel>(interfaces::MakeWallet(context, wallet), client, style.get());
+        if (i % 4 != 0) model->beginShutdown();
+        if (i % 4 == 2) QThread::yieldCurrentThread();
+        if (i % 4 == 3) QTest::qWait(1);
+        model.reset();
+    }
+    RemoveWallet(context, wallet, /* load_on_start= */ std::nullopt);
+}
+
+namespace {
+//! Synthetic wallet history. Hashes are scattered (the table keeps its cache in hash order) and times are a fixed
+//! permutation, so inserts land throughout the source and every sort has real work to do.
+double ProcessCpuSeconds()
+{
+#ifndef WIN32
+    rusage usage{};
+    getrusage(RUSAGE_SELF, &usage);
+    return usage.ru_utime.tv_sec + usage.ru_utime.tv_usec / 1e6 + usage.ru_stime.tv_sec + usage.ru_stime.tv_usec / 1e6;
+#else
+    return 0.0; // Logged for developers only; not measured on Windows.
+#endif
+}
+
+// Deterministic bit mixer for synthetic rows. Only XOR and masked shifts, so
+// it never wraps: the integer sanitizer treats unsigned wrap as an error here.
+uint64_t SplitMix(uint64_t x)
+{
+    x ^= 0x9e3779b97f4a7c15ULL;
+    for (int round = 0; round < 4; ++round) {
+        x ^= (x & (~uint64_t{0} >> 13)) << 13;
+        x ^= x >> 7;
+        x ^= (x & (~uint64_t{0} >> 17)) << 17;
+    }
+    return x;
+}
+
+//! Deterministic generator for the order tests (xorshift64): only XOR and masked shifts, so it never wraps.
+class TestRandom
+{
+public:
+    explicit TestRandom(uint64_t seed) : m_state(seed ^ 0x9e3779b97f4a7c15ULL) { if (m_state == 0) m_state = 1; }
+    uint64_t operator()()
+    {
+        m_state ^= (m_state & (~uint64_t{0} >> 13)) << 13;
+        m_state ^= m_state >> 7;
+        m_state ^= (m_state & (~uint64_t{0} >> 17)) << 17;
+        return m_state;
+    }
+private:
+    uint64_t m_state;
+};
+
+QList<TransactionRecord> SyntheticHistory(size_t first, size_t count, size_t total, bool newest = false)
+{
+    QList<TransactionRecord> records;
+    records.reserve(count);
+    for (size_t i = first; i < first + count; ++i) {
+        uint256 hash;
+        const uint64_t mixed = SplitMix(i + 1);
+        for (int b = 0; b < 8; ++b) *(hash.begin() + b) = static_cast<unsigned char>(mixed >> (8 * (7 - b)));
+        // Groups of about four rows share a second, so ordering by Date falls back to the status tie-break.
+        const qint64 time = newest ? 1600000000 + static_cast<qint64>(total + i) * 600 + 7
+                                   : 1600000000 + static_cast<qint64>(((i * 7919) % total) / 4) * 600;
+        const auto type = (i % 5 == 0) ? TransactionRecord::SendToAddress : (i % 7 == 0 ? TransactionRecord::Staked : TransactionRecord::RecvWithAddress);
+        const CAmount amount = 100000 + static_cast<CAmount>((i * 104729) % 9000000);
+        // Valid P2PKH addresses: the label column and the text search decode every address, as they do for a real wallet.
+        uint160 key_hash;
+        for (int b = 0; b < 8; ++b) *(key_hash.begin() + b) = static_cast<unsigned char>(SplitMix(i + 0x51ed) >> (8 * b));
+        const std::string address = EncodeDestination(PKHash(key_hash));
+        TransactionRecord record(hash, time, type, address, type == TransactionRecord::SendToAddress ? -amount : 0, type == TransactionRecord::SendToAddress ? 0 : amount);
+        record.involvesWatchAddress = false;
+        record.idx = static_cast<int>(i % 3);
+        record.status.status = (i % 53 == 0) ? TransactionStatus::Conflicted : (i % 11 == 0 ? TransactionStatus::Confirming : TransactionStatus::Confirmed);
+        record.status.countsForBalance = record.status.status != TransactionStatus::Conflicted;
+        // A quarter of the rows have never had their status read (empty key), the rest carry the key a refresh produces.
+        if (i % 4 != 1) {
+            record.status.sortKey = strprintf("%010d-%01d-%010u-%03d-%d", static_cast<int>((i * 31) % 97), static_cast<int>(i % 2),
+                                              static_cast<unsigned>(time), record.idx, type == TransactionRecord::SendToAddress ? 2 : 3);
+        }
+        records.append(record);
+    }
+    std::sort(records.begin(), records.end(), [](const TransactionRecord& a, const TransactionRecord& b) { return a.hash < b.hash; });
+    return records;
+}
+} // namespace
+
+void WalletTests::historyScaleBenchmark_data()
+{
+    QTest::addColumn<int>("rows");
+    QTest::addColumn<bool>("accessibility");
+    QTest::newRow("5k") << 5000 << false;
+    QTest::newRow("50k") << 50000 << false;
+    QTest::newRow("200k") << 200000 << false;
+    // With accessibility active the table holds an interface and a persistent index for every cell (macOS bridge cost).
+    QTest::newRow("50k+ax") << 50000 << true;
+    QTest::newRow("200k+ax") << 200000 << true;
+}
+
+void WalletTests::historyScaleBenchmark()
+{
+#ifdef Q_OS_MACOS
+    if (QApplication::platformName() == "minimal") QSKIP("Cocoa wallet fixture requires a supported platform");
+#endif
+    QFETCH(int, rows);
+    QFETCH(bool, accessibility);
+#ifndef Q_OS_MACOS
+    if (accessibility) QSKIP("The accessibility cost is reproduced with the macOS bridge only");
+#endif
+    if (rows > 5000 && !std::getenv("BLACKCOIN_QT_BENCH")) {
+        QSKIP("Large-wallet measurement; set BLACKCOIN_QT_BENCH=1 to run");
+    }
+    common::Settings saved_settings;
+    gArgs.LockSettings([&](const common::Settings& settings) { saved_settings = settings; });
+    auto restore_settings = interfaces::MakeCleanupHandler([saved_settings] {
+        gArgs.LockSettings([&](common::Settings& settings) { settings = saved_settings; });
+        gArgs.ClearPathCache();
+    });
+    TestingSetup setup{ChainType::REGTEST, {"-staking=0", "-powmining=0"}};
+    auto* previous = m_node.context();
+    auto restore_node = interfaces::MakeCleanupHandler([&] { m_node.setContext(previous); });
+    auto loader = interfaces::MakeWalletLoader(*setup.m_node.chain, *Assert(setup.m_node.args));
+    setup.m_node.wallet_loader = loader.get();
+    m_node.setContext(&setup.m_node);
+    const std::unique_ptr<const PlatformStyle> style{PlatformStyle::instantiate("other")};
+    auto wallet = std::make_shared<CWallet>(setup.m_node.chain.get(), "qt-history-scale", CreateMockableWalletDatabase());
+    QCOMPARE(wallet->LoadWallet(), wallet::DBErrors::LOAD_OK);
+    {
+        LOCK(wallet->cs_wallet);
+        wallet->SetWalletFlag(WALLET_FLAG_DESCRIPTORS);
+        wallet->SetupDescriptorScriptPubKeyMans();
+    }
+    SyncRecoveryReviewWalletTip(wallet, m_node);
+    MiniGUI gui(m_node, style.get());
+    gui.initModelForWallet(m_node, wallet, style.get());
+    TransactionView& view = gui.transactionView;
+    auto* proxy = view.findChild<TransactionPresentationProxy*>();
+    QVERIFY(proxy);
+    // Without an accessibility client the proxy announces row changes with insert/remove signals; with one, as a layout
+    // change. The benchmark pins the path to the row being measured (this host always has some client attached).
+    proxy->setLayoutUpdates(accessibility ? std::optional<bool>{true} : std::optional<bool>{false});
+    auto* history = gui.walletModel->getTransactionTableModel();
+    view.resize(1100, 600);
+    view.show();
+    QTRY_VERIFY_WITH_TIMEOUT(history->isHistoryLoaded() && proxy->isReady(), 10000);
+
+    // Main-thread responsiveness: a 1 ms heartbeat records the longest gap.
+    QElapsedTimer beat_clock;
+    qint64 worst_gap_ms{0};
+    QTimer heartbeat;
+    heartbeat.setInterval(1);
+    heartbeat.setTimerType(Qt::PreciseTimer);
+    beat_clock.start();
+    connect(&heartbeat, &QTimer::timeout, &heartbeat, [&] {
+        worst_gap_ms = std::max<qint64>(worst_gap_ms, beat_clock.restart());
+    });
+    heartbeat.start();
+
+    struct Row { QString action; qint64 ms; qint64 worst; int count; TransactionPresentationProxy::Stats stats; qint64 cpu_ms; };
+    std::vector<Row> table;
+    // Reference order: the synchronous QSortFilterProxyModel the projection replaced, run for the smaller sizes.
+    std::unique_ptr<TransactionFilterProxy> oracle;
+    const auto make_oracle = [&](int column, Qt::SortOrder order) {
+        auto result = std::make_unique<TransactionFilterProxy>();
+        result->setSortRole(Qt::EditRole);
+        result->setSortCaseSensitivity(Qt::CaseInsensitive);
+        result->setSourceModel(history);
+        result->sort(column, order);
+        return result;
+    };
+    const auto compare_with = [&](const TransactionFilterProxy& reference, const QString& action) {
+        QVERIFY2(reference.rowCount() == proxy->rowCount(), qPrintable(action + QStringLiteral(": row count")));
+        for (int i = 0; i < proxy->rowCount(); ++i) {
+            if (proxy->index(i, 0).data(TransactionTableModel::TxHashRole) != reference.index(i, 0).data(TransactionTableModel::TxHashRole)) {
+                QFAIL(qPrintable(action + QStringLiteral(": order differs from the synchronous oracle at row %1").arg(i)));
+            }
+        }
+    };
+    const auto check_oracle = [&](const QString& action) { if (oracle) compare_with(*oracle, action); };
+
+    // Wall-clock numbers are logged, not asserted: they depend on the host. What is asserted is algorithmic: how many
+    // scans an action causes, how many rows they visit, and that no single slice exceeds a bound calibrated against
+    // sorting a fixed array in this same process.
+    qint64 calibration_ns{0};
+    {
+        std::vector<uint64_t> values(100000);
+        for (size_t i = 0; i < values.size(); ++i) values[i] = SplitMix(i);
+        QElapsedTimer clock;
+        clock.start();
+        std::stable_sort(values.begin(), values.end());
+        calibration_ns = std::max<qint64>(clock.nsecsElapsed(), 1000000);
+    }
+    const qint64 slice_bound_ns = std::max<qint64>(100000000, 25 * calibration_ns);
+    // An accessibility client keeps walking the table, so the cell interfaces (and a persistent index per cell) are there
+    // again whenever something changes; rebuild that footprint before each measured action, outside its timing.
+    QTableView* ax_table{nullptr};
+    qint64 ax_cells{0}; // cell interfaces and persistent indexes a client holds; the layout change tears them down first
+    const auto walk_cells = [&] {
+        if (!ax_table) return;
+        QAccessibleInterface* interface = QAccessible::queryAccessibleInterface(ax_table);
+        if (!interface || !interface->tableInterface()) return;
+        auto* accessible_table = interface->tableInterface();
+        for (int row = 0; row < accessible_table->rowCount(); ++row)
+            for (int column = 0; column < accessible_table->columnCount(); ++column) accessible_table->cellAt(row, column);
+    };
+    qint64 last_cpu_ms{0};
+    const auto run_once = [&](auto&& begin, int expected_rows, qint64& ms, qint64& worst) {
+        walk_cells();
+        QCoreApplication::processEvents();
+        const double cpu_before = ProcessCpuSeconds();
+        proxy->resetStats();
+        worst_gap_ms = 0;
+        beat_clock.restart();
+        QElapsedTimer timer;
+        timer.start();
+        begin();
+        while (!(proxy->isReady() && (expected_rows < 0 || proxy->rowCount() == expected_rows)) && timer.elapsed() < 120000)
+            QCoreApplication::processEvents(QEventLoop::AllEvents, 5);
+        ms = timer.elapsed();
+        worst = worst_gap_ms;
+        QCoreApplication::processEvents();
+        last_cpu_ms = static_cast<qint64>((ProcessCpuSeconds() - cpu_before) * 1000);
+    };
+    //! scan_factor bounds rows visited as a multiple of the history size (restarts included); 0 means no scan at all.
+    const auto measure = [&](const QString& action, auto&& begin, int expected_rows, auto&& apply_to_oracle, double scan_factor = 2.0) {
+        qint64 ms{0}, worst{0};
+        run_once(begin, expected_rows, ms, worst);
+        const auto stats = proxy->stats();
+        const bool ready = proxy->isReady();
+        const int result_rows = proxy->rowCount();
+        table.push_back({action, ms, worst, result_rows, stats, last_cpu_ms});
+        QVERIFY2(ready, qPrintable(action));
+        QVERIFY2(static_cast<double>(stats.rows_scanned) <= scan_factor * (rows + 50),
+                 qPrintable(QStringLiteral("%1 scanned %2 rows (limit %3 x history)").arg(action).arg(stats.rows_scanned).arg(scan_factor)));
+        QVERIFY2(scan_factor > 0 || stats.rebuilds == 0, qPrintable(action + QStringLiteral(": rebuilt although nothing changed")));
+        // Remapping persistent indexes costs per index, and an accessibility client can hold one per cell; allow for it.
+        const qint64 allowed_ns = slice_bound_ns + std::max<qint64>(stats.persistent_indexes, ax_cells) * 6000;
+        QVERIFY2(stats.max_slice_ns <= allowed_ns,
+                 qPrintable(QStringLiteral("%1 ran a %2 ms slice (bound %3 ms, %4 persistent indexes)").arg(action).arg(stats.max_slice_ns / 1000000).arg(allowed_ns / 1000000).arg(stats.persistent_indexes)));
+        if (oracle) { apply_to_oracle(); check_oracle(action); }
+    };
+    const auto measure_plain = [&](const QString& action, auto&& begin, int expected_rows, double scan_factor = 2.0) {
+        measure(action, begin, expected_rows, [] {}, scan_factor);
+    };
+
+    const size_t total = static_cast<size_t>(rows);
+    const QList<TransactionRecord> bulk = SyntheticHistory(0, total, total);
+    std::deque<TransactionRecord> all(bulk.cbegin(), bulk.cend());
+    const int N = rows;
+    // The initial publication arrives in many source batches, each restarting the scan: only the slice bound applies.
+    measure_plain(QStringLiteral("publish"), [&] { history->setInitialHistory(std::move(all)); }, N, 1e9);
+    if (rows <= 50000) {
+        oracle = make_oracle(TransactionTableModel::Date, Qt::DescendingOrder);
+        check_oracle(QStringLiteral("initial"));
+    }
+
+    auto* table_view = view.findChild<QTableView*>(QStringLiteral("transactionView"));
+    QVERIFY(table_view);
+    // The projection is current: showing the page again must not scan.
+    measure_plain(QStringLiteral("hide_show"), [&] { view.hide(); QCoreApplication::processEvents(); view.show(); }, N, 0.0);
+    if (accessibility) {
+        // Make an accessibility client's footprint real: every cell has an interface and a persistent index.
+        QAccessible::setActive(true);
+        QElapsedTimer ax_clock;
+        ax_clock.start();
+        ax_table = table_view;
+        walk_cells();
+        const qint64 setup_ms = ax_clock.elapsed();
+        const size_t persistent_count = proxy->persistentIndexCount();
+        ax_cells = static_cast<qint64>(persistent_count);
+        // Qt's own floor: tearing down that many cell interfaces and persistent indexes.
+        QElapsedTimer teardown_clock;
+        teardown_clock.start();
+        QAccessibleTableModelChangeEvent reset(table_view, QAccessibleTableModelChangeEvent::ModelReset);
+        QAccessible::updateAccessibility(&reset);
+        const qint64 teardown_ms = teardown_clock.elapsed();
+        walk_cells();
+        qInfo().noquote() << QStringLiteral("HSB rows=%1 accessibility_setup_ms=%2 persistent_indexes=%3 accessibility_teardown_ms=%4").arg(rows).arg(setup_ms).arg(persistent_count).arg(teardown_ms);
+    }
+    static const char* const names[] = {"status", "watch", "date", "type", "label", "amount"};
+    for (int column : {2, 3, 4, 5, 0}) {
+        for (Qt::SortOrder order : {Qt::AscendingOrder, Qt::DescendingOrder}) {
+            measure(QStringLiteral("sort_%1_%2").arg(names[column]).arg(order == Qt::AscendingOrder ? "asc" : "desc"),
+                    [&] { table_view->sortByColumn(column, order); }, N, [&] { oracle->sort(-1); oracle->sort(column, order); });
+        }
+    }
+    measure(QStringLiteral("sort_date_desc"), [&] { table_view->sortByColumn(TransactionTableModel::Date, Qt::DescendingOrder); }, N,
+            [&] { oracle->sort(-1); oracle->sort(TransactionTableModel::Date, Qt::DescendingOrder); });
+    // Type change and filters (model level, i.e. after the page's typing debounce).
+    const auto count_if = [&](auto&& predicate) { return static_cast<int>(std::count_if(bulk.cbegin(), bulk.cend(), predicate)); };
+    const quint32 send_only = TransactionFilterProxy::TYPE(TransactionRecord::SendToAddress);
+    measure(QStringLiteral("type_send"), [&] { proxy->setTypeFilter(send_only); },
+            count_if([](const TransactionRecord& r) { return r.type == TransactionRecord::SendToAddress; }), [&] { oracle->setTypeFilter(send_only); });
+    measure(QStringLiteral("type_all"), [&] { proxy->setTypeFilter(TransactionFilterProxy::ALL_TYPES); }, N, [&] { oracle->setTypeFilter(TransactionFilterProxy::ALL_TYPES); });
+    measure(QStringLiteral("inactive_hidden"), [&] { proxy->setShowInactive(false); },
+            count_if([](const TransactionRecord& r) { return r.status.status != TransactionStatus::Conflicted; }), [&] { oracle->setShowInactive(false); });
+    measure(QStringLiteral("inactive_shown"), [&] { proxy->setShowInactive(true); }, N, [&] { oracle->setShowInactive(true); });
+    const QString common = QStringLiteral("1a");
+    const auto matches = [&](const TransactionRecord& r, const QString& needle) {
+        return QString::fromStdString(r.address).contains(needle, Qt::CaseInsensitive) || QString::fromStdString(r.hash.ToString()).contains(needle, Qt::CaseInsensitive);
+    };
+    measure(QStringLiteral("filter_common"), [&] { proxy->setSearchString(common); }, count_if([&](const TransactionRecord& r) { return matches(r, common); }), [&] { oracle->setSearchString(common); });
+    const QString rare = QString::fromStdString(bulk[bulk.size() / 3].address);
+    measure(QStringLiteral("filter_rare"), [&] { proxy->setSearchString(rare); }, count_if([&](const TransactionRecord& r) { return matches(r, rare); }), [&] { oracle->setSearchString(rare); });
+    measure(QStringLiteral("filter_clear"), [&] { proxy->setSearchString({}); }, N, [&] { oracle->setSearchString({}); });
+
+    // A confirmation refresh changes status keys of rows that may never have been displayed. The Status order must
+    // follow, and a fresh scan must order Date ties by the new keys, exactly as the synchronous proxy reading every
+    // row does.
+    if (rows <= 50000) {
+        oracle.reset();
+        measure_plain(QStringLiteral("sort_status_before_refresh"), [&] { table_view->sortByColumn(TransactionTableModel::Status, Qt::AscendingOrder); }, N);
+        compare_with(*make_oracle(TransactionTableModel::Status, Qt::AscendingOrder), QStringLiteral("status sort before refresh"));
+        measure_plain(QStringLiteral("refresh_keys_status_sorted"), [&] {
+            history->mutateRecords([](TransactionRecord& record) {
+                const unsigned char b = *record.hash.begin();
+                if (b % 3 == 0) record.status.sortKey = strprintf("%010d-%01d-%010u-%03d-%d", 5 + (b % 50), 1, 9u, record.idx, 3);
+                else if (b % 3 == 1 && !record.status.sortKey.empty()) record.status.sortKey.clear();
+            });
+        }, N, 2.0);
+        QVERIFY2(proxy->stats().rebuilds + proxy->stats().restarts >= 1, "a status refresh did not rebuild a Status-sorted projection");
+        compare_with(*make_oracle(TransactionTableModel::Status, Qt::AscendingOrder), QStringLiteral("status sort after refresh"));
+        measure_plain(QStringLiteral("sort_date_after_refresh"), [&] { table_view->sortByColumn(TransactionTableModel::Date, Qt::DescendingOrder); }, N);
+        compare_with(*make_oracle(TransactionTableModel::Date, Qt::DescendingOrder), QStringLiteral("date sort after refresh"));
+        measure_plain(QStringLiteral("sort_date_asc_after_refresh"), [&] { table_view->sortByColumn(TransactionTableModel::Date, Qt::AscendingOrder); }, N);
+        compare_with(*make_oracle(TransactionTableModel::Date, Qt::AscendingOrder), QStringLiteral("date ascending sort after refresh"));
+        measure_plain(QStringLiteral("sort_date_desc_again"), [&] { table_view->sortByColumn(TransactionTableModel::Date, Qt::DescendingOrder); }, N);
+    }
+
+    // From here the history behaves like a settled wallet: nearly every row is confirmed to its final depth and a few
+    // dozen are still confirming, so a block announces only those.
+    measure_plain(QStringLiteral("settle_statuses"), [&] {
+        history->mutateRecords([](TransactionRecord& record) {
+            const unsigned char b0 = record.hash.begin()[0];
+            const unsigned char b1 = record.hash.begin()[1];
+            if (record.status.sortKey.empty()) {
+                record.status.sortKey = strprintf("%010d-%01d-%010u-%03d-%d", 5 + (b0 % 50), 0, static_cast<unsigned>(record.time), record.idx, 3);
+            }
+            record.status.status = (b0 == 0 && b1 < 8) ? TransactionStatus::Confirming : TransactionStatus::Confirmed;
+        });
+    }, N, 1e9);
+    if (rows <= 50000) compare_with(*make_oracle(TransactionTableModel::Date, Qt::DescendingOrder), QStringLiteral("after settling statuses"));
+    // Block burst: ten notifications of five rows each, then the status refresh a new block causes.
+    const auto burst = SyntheticHistory(total, 50, total, /*newest=*/true);
+    measure_plain(QStringLiteral("block_burst"), [&] {
+        for (int group = 0; group < 10; ++group) {
+            QList<TransactionRecord> part;
+            for (int i = 0; i < 5; ++i) part.append(burst[group * 5 + i]);
+            history->insertRecords(part);
+        }
+        history->updateConfirmations();
+    }, N + 50, 0.0);
+    QVERIFY2(proxy->stats().incremental_batches >= 1, "a block was not applied incrementally");
+    if (rows <= 50000) compare_with(*make_oracle(TransactionTableModel::Date, Qt::DescendingOrder), QStringLiteral("after block burst"));
+    // A new block alone (Date sort, inactive rows shown) re-sorts nothing.
+    measure_plain(QStringLiteral("block_status_only"), [&] {
+        QElapsedTimer announce;
+        announce.start();
+        history->updateConfirmations();
+        qInfo().noquote() << QStringLiteral("HSB rows=%1 status_announcement_ms=%2 unsettled_rows=%3").arg(rows).arg(announce.elapsed()).arg(history->unsettledRows());
+    }, N + 50, 0.0);
+    heartbeat.stop();
+    for (const auto& row : table) {
+        qInfo().noquote() << QStringLiteral("HSB rows=%1 action=%2 ms=%3 cpu_ms=%11 worst_main_gap_ms=%4 result_rows=%5 rebuilds=%6 restarts=%7 slices=%8 max_slice_ms=%9 scanned=%10")
+            .arg(rows).arg(row.action).arg(row.ms).arg(row.worst).arg(row.count).arg(row.stats.rebuilds).arg(row.stats.restarts)
+            .arg(row.stats.slices).arg(row.stats.max_slice_ns / 1000000.0, 0, 'f', 2).arg(row.stats.rows_scanned).arg(row.cpu_ms)
+            + QStringLiteral(" incremental_batches=%1 incremental_ms=%2").arg(row.stats.incremental_batches).arg(row.stats.incremental_ns / 1e6, 0, 'f', 2)
+            + QStringLiteral(" persistent=%1 accessibility_active=%2").arg(row.stats.persistent_indexes).arg(QAccessible::isActive())
+            + QStringLiteral(" layout_ms[about,remap,changed]=%1,%2,%3").arg(row.stats.max_layout_ns[0] / 1e6, 0, 'f', 2).arg(row.stats.max_layout_ns[1] / 1e6, 0, 'f', 2).arg(row.stats.max_layout_ns[2] / 1e6, 0, 'f', 2)
+            + QStringLiteral(" op_max_ms[scan,sort,map,old,add,reorder,interim,publish,retire]=") + [&] {
+                QStringList parts;
+                for (int64_t ns : row.stats.max_op_ns) parts << QString::number(ns / 1000000.0, 'f', 2);
+                return parts.join(',');
+            }();
+    }
+}
+
+namespace {
+//! CPU seconds consumed so far by each thread of this process, keyed by thread name (macOS), or one process total.
+std::map<std::string, double> ThreadCpuSeconds()
+{
+    std::map<std::string, double> result;
+#ifdef __APPLE__
+    thread_act_array_t threads;
+    mach_msg_type_number_t count{0};
+    if (task_threads(mach_task_self(), &threads, &count) == KERN_SUCCESS) {
+        for (mach_msg_type_number_t i = 0; i < count; ++i) {
+            thread_basic_info_data_t info;
+            mach_msg_type_number_t size = THREAD_BASIC_INFO_COUNT;
+            if (thread_info(threads[i], THREAD_BASIC_INFO, reinterpret_cast<thread_info_t>(&info), &size) != KERN_SUCCESS) continue;
+            char name[64] = {};
+            if (pthread_t thread = pthread_from_mach_thread_np(threads[i])) pthread_getname_np(thread, name, sizeof(name));
+            const double seconds = info.user_time.seconds + info.user_time.microseconds / 1e6 + info.system_time.seconds + info.system_time.microseconds / 1e6;
+            result[strprintf("%s#%u", name[0] ? name : "unnamed", i)] = seconds;
+            mach_port_deallocate(mach_task_self(), threads[i]);
+        }
+        vm_deallocate(mach_task_self(), reinterpret_cast<vm_address_t>(threads), count * sizeof(thread_t));
+    }
+#endif
+    result["process"] = ProcessCpuSeconds();
+    return result;
+}
+} // namespace
+
+void WalletTests::historyInitialLoad()
+{
+#ifdef Q_OS_MACOS
+    if (QApplication::platformName() == "minimal") QSKIP("Cocoa wallet fixture requires a supported platform");
+#endif
+    // Developer measurement with multi-second settle waits and no assertions beyond a completed load: it runs only
+    // on request so the default test run stays short and free of timing dependence.
+    if (!std::getenv("BLACKCOIN_QT_BENCH") && !std::getenv("BLACKCOIN_QT_SEED_WALLET")) {
+        QSKIP("Developer measurement; set BLACKCOIN_QT_BENCH=1 or BLACKCOIN_QT_SEED_WALLET=<datadir> to run");
+    }
+    // Without BLACKCOIN_QT_SEED_WALLET (a datadir holding regtest/wallets/<name>) this measures the mock wallet only.
+    const char* seed = std::getenv("BLACKCOIN_QT_SEED_WALLET");
+    common::Settings saved_settings;
+    gArgs.LockSettings([&](const common::Settings& settings) { saved_settings = settings; });
+    auto restore_settings = interfaces::MakeCleanupHandler([saved_settings] {
+        gArgs.LockSettings([&](common::Settings& settings) { settings = saved_settings; });
+        gArgs.ClearPathCache();
+    });
+    TestingSetup setup{ChainType::REGTEST, {"-staking=0", "-powmining=0"}};
+    auto* previous = m_node.context();
+    auto restore_node = interfaces::MakeCleanupHandler([&] { m_node.setContext(previous); });
+    auto loader = interfaces::MakeWalletLoader(*setup.m_node.chain, *Assert(setup.m_node.args));
+    setup.m_node.wallet_loader = loader.get();
+    m_node.setContext(&setup.m_node);
+    const std::unique_ptr<const PlatformStyle> style{PlatformStyle::instantiate("other")};
+    WalletContext& context = *m_node.walletLoader().context();
+
+    QElapsedTimer wall;
+    const auto before_all = ThreadCpuSeconds();
+    wall.start();
+    const auto report = [&](const char* stage) {
+        const auto now = ThreadCpuSeconds();
+        QString threads;
+        for (const auto& [name, seconds] : now) {
+            const double delta = seconds - (before_all.count(name) ? before_all.at(name) : 0.0);
+            if (name != "process" && delta >= 0.05) threads += QStringLiteral(" %1=%2").arg(QString::fromStdString(name)).arg(delta, 0, 'f', 2);
+        }
+        qInfo().noquote() << QStringLiteral("HIL variant=%1 stage=%2 wall_ms=%3 process_cpu_ms=%4 threads:%5")
+            .arg(seed ? "seed-wallet" : "mock").arg(stage).arg(wall.elapsed()).arg(static_cast<int>((now.at("process") - before_all.at("process")) * 1000)).arg(threads);
+    };
+
+    std::shared_ptr<CWallet> wallet;
+    if (seed) {
+        const std::string name = "rc5_synthetic_baseline";
+        const fs::path source = fs::path(seed) / "regtest" / "wallets" / fs::PathFromString(name);
+        const fs::path target = wallet::GetWalletDir() / fs::PathFromString(name);
+        std::filesystem::create_directories(target.parent_path());
+        std::filesystem::copy(source, target, std::filesystem::copy_options::recursive);
+        wallet::DatabaseOptions options;
+        options.require_existing = true;
+        wallet::DatabaseStatus status;
+        bilingual_str error;
+        std::vector<bilingual_str> warnings;
+        wallet = wallet::LoadWallet(context, name, std::nullopt, options, status, error, warnings);
+        QVERIFY2(wallet, qPrintable(QString::fromStdString(error.original)));
+    } else {
+        wallet = std::make_shared<CWallet>(setup.m_node.chain.get(), "qt-history-initial", CreateMockableWalletDatabase());
+        QCOMPARE(wallet->LoadWallet(), wallet::DBErrors::LOAD_OK);
+        LOCK(wallet->cs_wallet);
+        wallet->SetWalletFlag(WALLET_FLAG_DESCRIPTORS);
+        wallet->SetupDescriptorScriptPubKeyMans();
+        AddWallet(context, wallet);
+    }
+    report("wallet_loaded");
+    OptionsModel options_model(m_node);
+    bilingual_str error;
+    QVERIFY(options_model.Init(error));
+    ClientModel client(m_node, &options_model);
+    auto model = std::make_unique<WalletModel>(interfaces::MakeWallet(context, wallet), client, style.get(), nullptr, /*defer_history=*/true);
+    // As initModelForWallet does: the model keeps its own wallet reference, the registry must not outlive the test.
+    wallet::RemoveWallet(context, wallet, std::nullopt);
+    // The whole wallet view, as the application builds it: Overview (recent rows), History, Send, Receive, Staking, Account.
+    WalletView wallet_view(model.get(), style.get(), nullptr);
+    wallet_view.setClientModel(&client);
+    wallet_view.resize(1100, 700);
+    wallet_view.show();
+    auto* view = wallet_view.findChild<TransactionView*>();
+    QVERIFY(view);
+    auto* proxy = view->findChild<TransactionPresentationProxy*>();
+    auto* history = model->getTransactionTableModel();
+    QVERIFY(proxy && history);
+    report("model_created");
+    model->startPollBalance();
+    model->requestHistory();
+    qint64 loaded_ms{-1};
+    QElapsedTimer settle;
+    settle.start();
+    // The History page is hidden behind Overview, so its projection is dormant; only the model's load is awaited.
+    while (!history->isHistoryLoaded() && settle.elapsed() < 240000) {
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 5);
+        if (loaded_ms < 0 && history->isHistoryLoaded()) { loaded_ms = wall.elapsed(); report("history_published"); }
+    }
+    QVERIFY(history->isHistoryLoaded());
+    report("history_loaded");
+    qInfo().noquote() << QStringLiteral("HIL rows=%1").arg(history->rowCount({}));
+    // Idle: nothing should keep a core busy once the pages are loaded. Settled = two consecutive seconds under 5% of a core.
+    int quiet{0};
+    double last_cpu = ThreadCpuSeconds().at("process");
+    QElapsedTimer settle_clock;
+    settle_clock.start();
+    const qint64 first_ms = wall.elapsed();
+    while (quiet < 2 && settle_clock.elapsed() < 120000) {
+        QTest::qWait(1000);
+        const double cpu = ThreadCpuSeconds().at("process");
+        quiet = (cpu - last_cpu < 0.05) ? quiet + 1 : 0;
+        last_cpu = cpu;
+    }
+    qInfo().noquote() << QStringLiteral("HIL cpu_settled_after_ms=%1 (history ready at %2)").arg(wall.elapsed() - 2000).arg(first_ms);
+    report("cpu_settled");
+    const auto idle_start = ThreadCpuSeconds();
+    QTest::qWait(5000);
+    const auto idle_end = ThreadCpuSeconds();
+    qInfo().noquote() << QStringLiteral("HIL idle_cpu_percent_of_core=%1 accessibility_active=%2").arg((idle_end.at("process") - idle_start.at("process")) / 5.0 * 100.0, 0, 'f', 2).arg(QAccessible::isActive());
+    // Blocks with 40 wallet transactions every 5 seconds, as in the soak: CPU spent per block with Overview showing.
+    {
+        const size_t base = 1000000;
+        const auto before = ThreadCpuSeconds();
+        for (int block = 0; block < 6; ++block) {
+            history->insertRecords(SyntheticHistory(base + block * 40, 40, 100000, /*newest=*/true));
+            history->updateConfirmations();
+            QTest::qWait(500);
+        }
+        const auto after = ThreadCpuSeconds();
+        QString threads;
+        for (const auto& [name, seconds] : after) {
+            const double delta = seconds - (before.count(name) ? before.at(name) : 0.0);
+            if (name != "process" && delta >= 0.01) threads += QStringLiteral(" %1=%2").arg(QString::fromStdString(name)).arg(delta, 0, 'f', 3);
+        }
+        qInfo().noquote() << QStringLiteral("HIL per_block_cpu_ms=%1 (6 blocks x 40 rows, includes 500 ms event loop) threads:%2")
+            .arg((after.at("process") - before.at("process")) / 6.0 * 1000.0, 0, 'f', 1).arg(threads);
+    }
+    wallet_view.hide();
+}
+
+//! The always-on rows are small (400 rows) and one sort configuration each, so every row is a short function that
+//! stays far inside the per-function limit of a sanitizer build. The 5k and 50k rows run all configurations in one
+//! function and only with BLACKCOIN_QT_BENCH.
+void WalletTests::historyIncrementalUpdates_data()
+{
+    QTest::addColumn<int>("rows");
+    QTest::addColumn<int>("config_index");
+    for (int config = 0; config < 7; ++config) QTest::newRow(qPrintable(QStringLiteral("small-%1").arg(config))) << 400 << config;
+    QTest::newRow("5k") << 5000 << -1;
+    QTest::newRow("50k") << 50000 << -1;
+}
+
+//! Random interleavings of inserts, removals and status changes, each batch followed by a comparison, row for row,
+//! with a freshly built synchronous proxy. Persistent indexes and the selection must keep pointing at the same rows.
+void WalletTests::historyIncrementalUpdates()
+{
+#ifdef Q_OS_MACOS
+    if (QApplication::platformName() == "minimal") QSKIP("Cocoa wallet fixture requires a supported platform");
+#endif
+    QFETCH(int, rows);
+    QFETCH(int, config_index);
+    if (rows > 400 && !std::getenv("BLACKCOIN_QT_BENCH")) QSKIP("Large-wallet oracle; set BLACKCOIN_QT_BENCH=1 to run");
+    common::Settings saved_settings;
+    gArgs.LockSettings([&](const common::Settings& settings) { saved_settings = settings; });
+    auto restore_settings = interfaces::MakeCleanupHandler([saved_settings] {
+        gArgs.LockSettings([&](common::Settings& settings) { settings = saved_settings; });
+        gArgs.ClearPathCache();
+    });
+    TestingSetup setup{ChainType::REGTEST, {"-staking=0", "-powmining=0"}};
+    auto* previous = m_node.context();
+    auto restore_node = interfaces::MakeCleanupHandler([&] { m_node.setContext(previous); });
+    auto loader = interfaces::MakeWalletLoader(*setup.m_node.chain, *Assert(setup.m_node.args));
+    setup.m_node.wallet_loader = loader.get();
+    m_node.setContext(&setup.m_node);
+    const std::unique_ptr<const PlatformStyle> style{PlatformStyle::instantiate("other")};
+    auto wallet = std::make_shared<CWallet>(setup.m_node.chain.get(), "qt-history-incremental", CreateMockableWalletDatabase());
+    QCOMPARE(wallet->LoadWallet(), wallet::DBErrors::LOAD_OK);
+    {
+        LOCK(wallet->cs_wallet);
+        wallet->SetWalletFlag(WALLET_FLAG_DESCRIPTORS);
+        wallet->SetupDescriptorScriptPubKeyMans();
+    }
+    SyncRecoveryReviewWalletTip(wallet, m_node);
+    MiniGUI gui(m_node, style.get());
+    gui.initModelForWallet(m_node, wallet, style.get());
+    auto* history = gui.walletModel->getTransactionTableModel();
+
+    // A settled history: confirmed and keyed, except a few rows that are still confirming.
+    QList<TransactionRecord> bulk = SyntheticHistory(0, static_cast<size_t>(rows), static_cast<size_t>(rows));
+    for (auto& record : bulk) {
+        const unsigned char b0 = record.hash.begin()[0];
+        if (record.status.sortKey.empty()) record.status.sortKey = strprintf("%010d-%01d-%010u-%03d-%d", 5 + (b0 % 50), 0, static_cast<unsigned>(record.time), record.idx, 3);
+        record.status.status = (b0 < 2) ? TransactionStatus::Confirming : TransactionStatus::Confirmed;
+    }
+    std::vector<uint256> live;
+    for (const auto& record : bulk) live.push_back(record.hash);
+    history->setInitialHistory(std::deque<TransactionRecord>(bulk.cbegin(), bulk.cend()));
+    QTRY_VERIFY_WITH_TIMEOUT(history->rowCount({}) == rows, 60000);
+
+    TransactionPresentationProxy proxy;
+    // The structural tester checks every signal against the model but is slow: it watches only the first batches.
+    std::unique_ptr<QAbstractItemModelTester> tester;
+    if (rows <= 5000) tester = std::make_unique<QAbstractItemModelTester>(&proxy, QAbstractItemModelTester::FailureReportingMode::QtTest);
+    proxy.setSortCaseSensitivity(Qt::CaseInsensitive);
+    proxy.setSourceModel(history);
+    QItemSelectionModel selection(&proxy);
+    bool layout_mode{false};
+    TestRandom random(0xb10c + static_cast<uint64_t>(rows));
+    size_t next_first = static_cast<size_t>(rows) + 1000;
+
+    struct Config { int column; Qt::SortOrder order; bool show_inactive; };
+    std::vector<Config> configs{{TransactionTableModel::Date, Qt::DescendingOrder, true}, {TransactionTableModel::Status, Qt::AscendingOrder, true}};
+    if (rows <= 5000) {
+        configs.push_back({TransactionTableModel::Date, Qt::AscendingOrder, true});
+        configs.push_back({TransactionTableModel::Amount, Qt::AscendingOrder, true});
+        configs.push_back({TransactionTableModel::Type, Qt::DescendingOrder, true});
+        configs.push_back({TransactionTableModel::ToAddress, Qt::AscendingOrder, true});
+        configs.push_back({TransactionTableModel::Date, Qt::DescendingOrder, false});
+    }
+    const int batches = rows <= 400 ? 12 : (rows <= 5000 ? 24 : 8);
+    size_t first_config{0};
+    if (config_index >= 0) {
+        QVERIFY(static_cast<size_t>(config_index) < configs.size());
+        first_config = static_cast<size_t>(config_index);
+        configs = {configs[first_config]};
+    }
+    const auto settle = [&] {
+        QCoreApplication::processEvents();
+        QTRY_VERIFY_WITH_TIMEOUT(proxy.isReady(), 60000);
+        QCoreApplication::processEvents();
+        QVERIFY(proxy.isReady());
+    };
+    const auto matches_fresh = [&](const Config& config, const QString& what) {
+        TransactionFilterProxy reference;
+        reference.setSortRole(Qt::EditRole);
+        reference.setSortCaseSensitivity(Qt::CaseInsensitive);
+        reference.setShowInactive(config.show_inactive);
+        reference.setSourceModel(history);
+        reference.sort(config.column, config.order);
+        QVERIFY2(reference.rowCount() == proxy.rowCount(), qPrintable(QStringLiteral("%1: %2 rows, rebuild has %3").arg(what).arg(proxy.rowCount()).arg(reference.rowCount())));
+        for (int i = 0; i < proxy.rowCount(); ++i) {
+            if (proxy.index(i, 0).data(TransactionTableModel::TxHashRole) != reference.index(i, 0).data(TransactionTableModel::TxHashRole))
+                QFAIL(qPrintable(QStringLiteral("%1: row %2 differs from a fresh rebuild").arg(what).arg(i)));
+        }
+    };
+
+    for (size_t c = 0; c < configs.size(); ++c) {
+        const Config& config = configs[c];
+        // Alternate how row changes are announced: insert/remove signals, or one layout change (accessibility active).
+        layout_mode = ((first_config + c) % 2) == 1;
+        proxy.setLayoutUpdates(layout_mode);
+        proxy.setShowInactive(config.show_inactive);
+        proxy.sort(config.column, config.order);
+        settle();
+        // Persistent indexes and a selection on rows that are visible now.
+        std::vector<std::pair<QPersistentModelIndex, QString>> tracked;
+        for (int k = 0; k < 24 && proxy.rowCount() > 0; ++k) {
+            const int row = static_cast<int>(random() % static_cast<uint64_t>(proxy.rowCount()));
+            const QModelIndex index = proxy.index(row, 0);
+            tracked.emplace_back(QPersistentModelIndex(index), index.data(TransactionTableModel::TxHashRole).toString());
+            if (k < 6) selection.select(index, QItemSelectionModel::Select | QItemSelectionModel::Rows);
+        }
+        std::set<QString> removed_total;
+        for (int batch = 0; batch < batches; ++batch) {
+            if (c == 0 && batch == 6) tester.reset();
+            proxy.resetStats();
+            const int kind = static_cast<int>(random() % 3);
+            QString what = QStringLiteral("config %1 batch %2").arg(c).arg(batch);
+            bool expect_incremental = !(config.column == TransactionTableModel::Status) || kind != 2;
+            std::set<QString> gone;
+            if (kind == 0) {
+                const size_t count = 1 + random() % 40;
+                QList<TransactionRecord> fresh = SyntheticHistory(next_first, count, static_cast<size_t>(rows));
+                next_first += count;
+                for (auto& record : fresh) {
+                    record.status.status = TransactionStatus::Confirmed;
+                    if (record.status.sortKey.empty()) record.status.sortKey = strprintf("%010d-%01d-%010u-%03d-%d", static_cast<int>(random() % 60), 0, static_cast<unsigned>(record.time), record.idx, 3);
+                    live.push_back(record.hash);
+                }
+                history->insertRecords(fresh);
+                what += QStringLiteral(" insert %1").arg(count);
+            } else if (kind == 1) {
+                std::vector<uint256> victims;
+                const size_t count = 1 + random() % 20;
+                for (size_t k = 0; k < count && live.size() > 1; ++k) {
+                    const size_t at = random() % live.size();
+                    victims.push_back(live[at]);
+                    gone.insert(QString::fromStdString(live[at].ToString()));
+                    live[at] = live.back();
+                    live.pop_back();
+                }
+                history->removeRecords(victims);
+                what += QStringLiteral(" remove %1").arg(victims.size());
+            } else {
+                std::set<uint256> chosen;
+                const size_t count = 1 + random() % 10;
+                for (size_t k = 0; k < count; ++k) chosen.insert(live[random() % live.size()]);
+                const uint64_t salt = random();
+                history->mutateRecords([&](TransactionRecord& record) {
+                    if (!chosen.count(record.hash)) return;
+                    const uint64_t mixed = SplitMix(salt ^ static_cast<uint64_t>(record.presentation_id));
+                    record.status.sortKey = strprintf("%010d-%01d-%010u-%03d-%d", static_cast<int>(mixed % 60), static_cast<int>((mixed >> 8) % 2), static_cast<unsigned>(record.time), record.idx, static_cast<int>(2 + (mixed >> 16) % 2));
+                    record.status.status = (mixed >> 24) % 7 == 0 ? TransactionStatus::Conflicted : ((mixed >> 32) % 2 ? TransactionStatus::Confirming : TransactionStatus::Confirmed);
+                });
+                what += QStringLiteral(" status %1").arg(count);
+                expect_incremental = expect_incremental && config.show_inactive;
+            }
+            removed_total.insert(gone.begin(), gone.end());
+            settle();
+            if (expect_incremental) {
+                QVERIFY2(proxy.stats().rebuilds == 0 && proxy.stats().rows_scanned == 0, qPrintable(what + QStringLiteral(": needed a scan")));
+            }
+            matches_fresh(config, what);
+            for (const auto& [index, hash] : tracked) {
+                if (removed_total.count(hash)) continue;
+                QVERIFY2(index.isValid() && index.data(TransactionTableModel::TxHashRole).toString() == hash,
+                         qPrintable(what + QStringLiteral(": a persistent index moved to another transaction (valid=%1 row=%2 now=%3 want=%4 rebuilds=%5 restarts=%6 incremental=%7)")
+                             .arg(index.isValid()).arg(index.row()).arg(index.data(TransactionTableModel::TxHashRole).toString().left(10)).arg(hash.left(10))
+                             .arg(proxy.stats().rebuilds).arg(proxy.stats().restarts).arg(proxy.stats().incremental_batches)));
+            }
+            for (const auto& [index, hash] : tracked) {
+                if (removed_total.count(hash) || !index.isValid()) continue;
+                // Rows selected at the start of this configuration stay selected while they survive.
+            }
+        }
+        for (size_t k = 0; k < 6 && k < tracked.size(); ++k) {
+            const auto& [index, hash] = tracked[k];
+            if (index.isValid()) QVERIFY2(selection.isSelected(index), "a surviving selected row lost its selection");
+        }
+        selection.clear();
+        // The batches above may have removed rows that later configurations track; start each with a fresh sample.
+    }
+}
+
+//! One row per sort configuration. The always-on rows use 300 rows, so each is a short function that stays far inside
+//! the per-function limit of a sanitizer build; the 3k and 50k rows need BLACKCOIN_QT_BENCH.
+void WalletTests::historyOrderOracle_data()
+{
+    QTest::addColumn<int>("rows");
+    QTest::addColumn<int>("config_index");
+    for (int config = 0; config < 30; ++config) QTest::newRow(qPrintable(QStringLiteral("small-%1").arg(config))) << 300 << config;
+    for (int config = 0; config < 30; ++config) QTest::newRow(qPrintable(QStringLiteral("3k-%1").arg(config))) << 3000 << config;
+    for (int config = 0; config < 6; ++config) QTest::newRow(qPrintable(QStringLiteral("50k-%1").arg(config))) << 50000 << config;
+}
+
+//! Targeted and randomized changes to many rows at once (clustered, interleaved, large fractions, with inserts and
+//! removals in the same flush), every sort column in both directions, with row announcements and with a layout change.
+//! The oracle is a fresh synchronous rebuild; row order must be identical after every step.
+void WalletTests::historyOrderOracle()
+{
+#ifdef Q_OS_MACOS
+    if (QApplication::platformName() == "minimal") QSKIP("Cocoa wallet fixture requires a supported platform");
+#endif
+    QFETCH(int, rows);
+    QFETCH(int, config_index);
+    if (rows > 300 && !std::getenv("BLACKCOIN_QT_BENCH")) QSKIP("Large-wallet oracle; set BLACKCOIN_QT_BENCH=1 to run");
+    common::Settings saved_settings;
+    gArgs.LockSettings([&](const common::Settings& settings) { saved_settings = settings; });
+    auto restore_settings = interfaces::MakeCleanupHandler([saved_settings] {
+        gArgs.LockSettings([&](common::Settings& settings) { settings = saved_settings; });
+        gArgs.ClearPathCache();
+    });
+    TestingSetup setup{ChainType::REGTEST, {"-staking=0", "-powmining=0"}};
+    auto* previous = m_node.context();
+    auto restore_node = interfaces::MakeCleanupHandler([&] { m_node.setContext(previous); });
+    auto loader = interfaces::MakeWalletLoader(*setup.m_node.chain, *Assert(setup.m_node.args));
+    setup.m_node.wallet_loader = loader.get();
+    m_node.setContext(&setup.m_node);
+    const std::unique_ptr<const PlatformStyle> style{PlatformStyle::instantiate("other")};
+    auto wallet = std::make_shared<CWallet>(setup.m_node.chain.get(), "qt-history-order", CreateMockableWalletDatabase());
+    QCOMPARE(wallet->LoadWallet(), wallet::DBErrors::LOAD_OK);
+    {
+        LOCK(wallet->cs_wallet);
+        wallet->SetWalletFlag(WALLET_FLAG_DESCRIPTORS);
+        wallet->SetupDescriptorScriptPubKeyMans();
+    }
+    SyncRecoveryReviewWalletTip(wallet, m_node);
+    MiniGUI gui(m_node, style.get());
+    gui.initModelForWallet(m_node, wallet, style.get());
+    auto* history = gui.walletModel->getTransactionTableModel();
+
+    QList<TransactionRecord> bulk = SyntheticHistory(0, static_cast<size_t>(rows), static_cast<size_t>(rows));
+    for (auto& record : bulk) {
+        const unsigned char b0 = record.hash.begin()[0];
+        if (record.status.sortKey.empty()) record.status.sortKey = strprintf("%010d-%01d-%010u-%03d-%d", 5 + (b0 % 50), 0, static_cast<unsigned>(record.time), record.idx, 3);
+        record.status.status = (b0 < 2) ? TransactionStatus::Confirming : TransactionStatus::Confirmed;
+        record.involvesWatchAddress = (b0 % 5) == 0;
+    }
+    std::vector<uint256> live;
+    for (const auto& record : bulk) live.push_back(record.hash);
+    history->setInitialHistory(std::deque<TransactionRecord>(bulk.cbegin(), bulk.cend()));
+    QTRY_VERIFY_WITH_TIMEOUT(history->rowCount({}) == rows, 60000);
+
+    TransactionPresentationProxy proxy;
+    proxy.setSortCaseSensitivity(Qt::CaseInsensitive);
+    proxy.setSourceModel(history);
+    std::unique_ptr<QAbstractItemModelTester> tester;
+    if (rows <= 300) tester = std::make_unique<QAbstractItemModelTester>(&proxy, QAbstractItemModelTester::FailureReportingMode::QtTest);
+    TestRandom random(0x0dd5eed + static_cast<uint64_t>(rows));
+    size_t next_first = static_cast<size_t>(rows) + 5000;
+
+    const auto name_of = [](const uint256& hash) { return QString::fromStdString(hash.ToString()); };
+    const auto settle = [&] {
+        QCoreApplication::processEvents();
+        QTRY_VERIFY_WITH_TIMEOUT(proxy.isReady(), 60000);
+        QCoreApplication::processEvents();
+        QVERIFY(proxy.isReady());
+    };
+    // Filters: 0 none; 1 hides inactive; 2 type, minimum amount, hides inactive; 3 date range and search text;
+    // 4 watch-only; 5 not watch-only, search text, hides inactive. Rows whose status changes enter or leave 1, 2, 5.
+    const auto apply_filter = [&](auto& target, int filter) {
+        target.setShowInactive(filter == 1 || filter == 2 || filter == 5 ? false : true);
+        target.setTypeFilter(filter == 2 ? (TransactionFilterProxy::TYPE(TransactionRecord::SendToAddress) | TransactionFilterProxy::TYPE(TransactionRecord::Staked)) : TransactionFilterProxy::ALL_TYPES);
+        target.setMinAmount(filter == 2 ? 2000000 : 0);
+        if (filter == 3) target.setDateRange(QDateTime::fromSecsSinceEpoch(1600000000 + 600 * (rows / 16)), QDateTime::fromSecsSinceEpoch(1600000000 + 600 * (rows / 5)));
+        else target.setDateRange(std::nullopt, std::nullopt);
+        target.setSearchString(filter == 3 ? QStringLiteral("a") : (filter == 5 ? QStringLiteral("1") : QString()));
+        target.setWatchOnlyFilter(filter == 4 ? TransactionFilterProxy::WatchOnlyFilter_Yes : (filter == 5 ? TransactionFilterProxy::WatchOnlyFilter_No : TransactionFilterProxy::WatchOnlyFilter_All));
+    };
+    const auto compare = [&](int column, Qt::SortOrder order, int filter, const QString& what) {
+        TransactionFilterProxy reference;
+        reference.setSortRole(Qt::EditRole);
+        reference.setSortCaseSensitivity(Qt::CaseInsensitive);
+        apply_filter(reference, filter);
+        reference.setSourceModel(history);
+        reference.sort(column, order);
+        QVERIFY2(reference.rowCount() == proxy.rowCount(), qPrintable(QStringLiteral("%1: %2 rows, rebuild has %3").arg(what).arg(proxy.rowCount()).arg(reference.rowCount())));
+        for (int i = 0; i < proxy.rowCount(); ++i) {
+            if (proxy.index(i, 0).data(TransactionTableModel::TxHashRole) != reference.index(i, 0).data(TransactionTableModel::TxHashRole))
+                QFAIL(qPrintable(QStringLiteral("%1: row %2 differs from a fresh rebuild").arg(what).arg(i)));
+        }
+    };
+    const auto key_for = [](const TransactionRecord& record, int major, int minor) {
+        return strprintf("%010d-%01d-%010u-%03d-%d", major, minor, static_cast<unsigned>(record.time), record.idx, 3);
+    };
+    //! Give a record a new status key and status from one random word: what a block changes in an existing row.
+    //! Type, amount and address never change after a row exists, so only a new row gets them (reroll_new).
+    const auto reroll = [&](TransactionRecord& record, uint64_t mixed) {
+        record.status.sortKey = key_for(record, static_cast<int>(mixed % 60), static_cast<int>((mixed >> 8) % 2));
+        record.status.status = (mixed >> 24) % 9 == 0 ? TransactionStatus::Conflicted : ((mixed >> 32) % 2 ? TransactionStatus::Confirming : TransactionStatus::Confirmed);
+    };
+    const auto reroll_new = [&](TransactionRecord& record, uint64_t mixed) {
+        reroll(record, mixed);
+        const CAmount amount = 100000 + static_cast<CAmount>((mixed >> 20) % 9000000);
+        const unsigned kind = static_cast<unsigned>((mixed >> 44) % 3);
+        record.involvesWatchAddress = (mixed >> 52) % 4 == 0;
+        record.type = kind == 0 ? TransactionRecord::SendToAddress : (kind == 1 ? TransactionRecord::Staked : TransactionRecord::RecvWithAddress);
+        record.debit = kind == 0 ? -amount : 0;
+        record.credit = kind == 0 ? 0 : amount;
+    };
+    const auto mutate = [&](const std::set<QString>& chosen, const std::function<void(TransactionRecord&)>& change) {
+        history->mutateRecords([&](TransactionRecord& record) {
+            if (chosen.count(name_of(record.hash))) change(record);
+        });
+    };
+    //! The transactions on proxy rows [start, start + length), in the order shown.
+    const auto run_of = [&](int start, int length) {
+        std::vector<QString> run;
+        for (int i = start; i < start + length && i < proxy.rowCount(); ++i) run.push_back(proxy.index(i, 0).data(TransactionTableModel::TxHashRole).toString());
+        return run;
+    };
+    const auto pick_live = [&](size_t count) {
+        std::set<QString> chosen;
+        for (size_t k = 0; k < count && !live.empty(); ++k) chosen.insert(name_of(live[random() % live.size()]));
+        return chosen;
+    };
+
+    struct Config { int column; Qt::SortOrder order; bool layout; int filter{0}; };
+    std::vector<Config> configs;
+    if (rows <= 3000) {
+        for (int column : {TransactionTableModel::Status, TransactionTableModel::Date, TransactionTableModel::Amount, TransactionTableModel::Type, TransactionTableModel::ToAddress})
+            for (Qt::SortOrder order : {Qt::AscendingOrder, Qt::DescendingOrder})
+                for (bool layout : {false, true}) configs.push_back({column, order, layout});
+        // Filtered projections, with and without a layout change: rows enter and leave the filter in one flush.
+        for (int filter = 1; filter <= 5; ++filter)
+            for (bool layout : {false, true})
+                configs.push_back({filter % 2 ? TransactionTableModel::Status : TransactionTableModel::Date, filter % 3 ? Qt::AscendingOrder : Qt::DescendingOrder, layout, filter});
+    } else {
+        configs = {{TransactionTableModel::Status, Qt::AscendingOrder, false}, {TransactionTableModel::Status, Qt::DescendingOrder, false},
+                   {TransactionTableModel::Date, Qt::DescendingOrder, true}, {TransactionTableModel::Amount, Qt::AscendingOrder, false},
+                   {TransactionTableModel::Status, Qt::AscendingOrder, false, 1}, {TransactionTableModel::Date, Qt::DescendingOrder, false, 2}};
+    }
+    const int random_batches = rows <= 300 ? 4 : (rows <= 3000 ? 10 : 3);
+    QVERIFY(config_index >= 0 && static_cast<size_t>(config_index) < configs.size());
+    configs = {configs[static_cast<size_t>(config_index)]};
+    // A run of rows starting somewhere in the projection, never before its start or past its end.
+    const auto run_start = [&](int length) {
+        const int span = proxy.rowCount() - length;
+        return span > 0 ? static_cast<int>(random() % static_cast<uint64_t>(span)) : 0;
+    };
+
+    for (size_t c = 0; c < configs.size(); ++c) {
+        const Config config = configs[c];
+        proxy.setLayoutUpdates(config.layout);
+        apply_filter(proxy, config.filter);
+        proxy.sort(config.column, config.order);
+        settle();
+        std::vector<std::pair<QPersistentModelIndex, QString>> tracked;
+        for (int k = 0; k < 24 && proxy.rowCount() > 0; ++k) {
+            const QModelIndex index = proxy.index(static_cast<int>(random() % static_cast<uint64_t>(proxy.rowCount())), 0);
+            tracked.emplace_back(QPersistentModelIndex(index), index.data(TransactionTableModel::TxHashRole).toString());
+        }
+        std::set<QString> removed_total;
+        const auto step = [&](const QString& label, const std::function<void()>& action, bool expect_no_scan = false) {
+            const QString what = QStringLiteral("column %1 order %2 layout %3: %4").arg(config.column).arg(config.order).arg(config.layout).arg(label);
+            proxy.resetStats();
+            action();
+            settle();
+            if (expect_no_scan) QVERIFY2(proxy.stats().rebuilds == 0 && proxy.stats().rows_scanned == 0, qPrintable(what + QStringLiteral(": needed a scan")));
+            compare(config.column, config.order, config.filter, what);
+            for (const auto& [index, hash] : tracked) {
+                if (removed_total.count(hash)) continue;
+                if (config.filter != 0 && !index.isValid()) {
+                    // A row whose status changed may have left the filter; then it must be absent from the projection.
+                    for (int i = 0; i < proxy.rowCount(); ++i)
+                        QVERIFY2(proxy.index(i, 0).data(TransactionTableModel::TxHashRole).toString() != hash, qPrintable(what + QStringLiteral(": a row in the projection has an invalid persistent index")));
+                    removed_total.insert(hash); // it may re-enter later, with a new index; this one stays dead
+                    continue;
+                }
+                QVERIFY2(index.isValid() && index.data(TransactionTableModel::TxHashRole).toString() == hash,
+                         qPrintable(what + QStringLiteral(": a persistent index moved to another transaction")));
+            }
+        };
+        const auto remove_some = [&](size_t count) {
+            std::vector<uint256> victims;
+            for (size_t k = 0; k < count && live.size() > 100; ++k) {
+                const size_t at = random() % live.size();
+                victims.push_back(live[at]);
+                removed_total.insert(name_of(live[at]));
+                live[at] = live.back();
+                live.pop_back();
+            }
+            history->removeRecords(victims);
+        };
+        const auto add_some = [&](size_t count) {
+            QList<TransactionRecord> fresh = SyntheticHistory(next_first, count, static_cast<size_t>(rows));
+            next_first += count;
+            for (auto& record : fresh) {
+                reroll_new(record, random());
+                live.push_back(record.hash);
+            }
+            history->insertRecords(fresh);
+        };
+
+        // The reviewer's case: three unconfirmed rows on top (Status ascending), a block confirms the first two, which
+        // keep a key that is still above every confirmed row but below the third.
+        const std::vector<uint256> top(live.begin(), live.begin() + 3);
+        std::set<QString> u123{name_of(top[0]), name_of(top[1]), name_of(top[2])};
+        step(QStringLiteral("U1 U2 U3 unconfirmed"), [&] {
+            mutate(u123, [&](TransactionRecord& r) {
+                const int n = r.hash == top[0] ? 1 : (r.hash == top[1] ? 2 : 3);
+                r.status.status = TransactionStatus::Unconfirmed;
+                r.status.sortKey = key_for(r, n, 0);
+            });
+        });
+        step(QStringLiteral("block confirms U1 and U2"), [&] {
+            mutate(u123, [&](TransactionRecord& r) {
+                if (r.hash == top[2]) return;
+                r.status.status = TransactionStatus::Confirming;
+                r.status.sortKey = key_for(r, 4, r.hash == top[0] ? 0 : 1);
+            });
+        }, /*expect_no_scan=*/!config.layout);
+        // Clustered: a run of adjacent rows all change at once.
+        step(QStringLiteral("40 adjacent rows"), [&] {
+            const auto run = run_of(run_start(40), 40);
+            const std::set<QString> chosen(run.begin(), run.end());
+            const uint64_t salt = random();
+            mutate(chosen, [&](TransactionRecord& r) { reroll(r, SplitMix(salt ^ r.presentation_id)); });
+        });
+        // A run whose members swap places: the first becomes the last.
+        step(QStringLiteral("25 adjacent rows reversed"), [&] {
+            const auto run = run_of(run_start(25), 25);
+            std::map<QString, size_t> place;
+            for (size_t k = 0; k < run.size(); ++k) place[run[k]] = k;
+            mutate(std::set<QString>(run.begin(), run.end()), [&](TransactionRecord& r) {
+                const size_t k = place.at(name_of(r.hash));
+                const size_t m = run.size() - 1 - k;
+                r.status.sortKey = key_for(r, 10 + static_cast<int>(m), 0);
+                r.status.status = TransactionStatus::Confirmed;
+            });
+        });
+        // Several rows far apart take each other's place, so their targets interleave with their old positions.
+        step(QStringLiteral("8 rows rotate through each other's keys"), [&] {
+            const auto chosen = pick_live(8);
+            struct Saved { std::string key; TransactionStatus::Status status; };
+            std::vector<QString> order(chosen.begin(), chosen.end());
+            std::map<QString, Saved> saved;
+            mutate(chosen, [&](TransactionRecord& r) { saved[name_of(r.hash)] = {r.status.sortKey, r.status.status}; });
+            std::map<QString, QString> from;
+            for (size_t k = 0; k < order.size(); ++k) from[order[k]] = order[(k + 3) % order.size()];
+            mutate(chosen, [&](TransactionRecord& r) {
+                const Saved& s = saved.at(from.at(name_of(r.hash)));
+                r.status.sortKey = s.key;
+                r.status.status = s.status;
+            });
+        });
+        // Inserts, removals and changes of existing rows announced in the same flush.
+        // New rows are placed among rows that are themselves moving, so this runs several times with a run of adjacent
+        // rows changing as well.
+        for (int round = 0; round < 4; ++round) {
+            step(QStringLiteral("insert, remove and change in one flush %1").arg(round), [&] {
+                add_some(20);
+                remove_some(5);
+                auto chosen = pick_live(6);
+                const auto run = run_of(run_start(12), 12);
+                chosen.insert(run.begin(), run.end());
+                const uint64_t salt = random();
+                mutate(chosen, [&](TransactionRecord& r) { reroll(r, SplitMix(salt ^ r.presentation_id)); });
+            });
+        }
+        // Large fractions of the table.
+        for (int percent : {10, 35, 70}) {
+            step(QStringLiteral("%1 percent of all rows").arg(percent), [&] {
+                std::set<QString> chosen;
+                for (const auto& hash : live) if (static_cast<int>(random() % 100) < percent) chosen.insert(name_of(hash));
+                const uint64_t salt = random();
+                mutate(chosen, [&](TransactionRecord& r) { reroll(r, SplitMix(salt ^ r.presentation_id)); });
+            });
+        }
+        for (int batch = 0; batch < random_batches; ++batch) {
+            step(QStringLiteral("random batch %1").arg(batch), [&] {
+                const uint64_t shape = random() % 4;
+                if (shape == 0) {
+                    const int length = 1 + static_cast<int>(random() % 300);
+                    const auto run = run_of(run_start(length), length);
+                    const uint64_t salt = random();
+                    mutate(std::set<QString>(run.begin(), run.end()), [&](TransactionRecord& r) { reroll(r, SplitMix(salt ^ r.presentation_id)); });
+                } else if (shape == 1) {
+                    const auto chosen = pick_live(1 + random() % 10);
+                    const uint64_t salt = random();
+                    mutate(chosen, [&](TransactionRecord& r) { reroll(r, SplitMix(salt ^ r.presentation_id)); });
+                } else if (shape == 2) {
+                    add_some(1 + random() % 30);
+                    remove_some(random() % 20);
+                } else {
+                    std::set<QString> chosen;
+                    const int percent = 1 + static_cast<int>(random() % 50);
+                    for (const auto& hash : live) if (static_cast<int>(random() % 100) < percent) chosen.insert(name_of(hash));
+                    const uint64_t salt = random();
+                    mutate(chosen, [&](TransactionRecord& r) { reroll(r, SplitMix(salt ^ r.presentation_id)); });
+                }
+            });
+        }
+    }
+}
+
+//! A block on a large history that was never shown must not announce the table: only the rows one block can
+//! refresh (a fixed budget), and nothing at all reaches a dormant presentation proxy.
+void WalletTests::historyBlockAnnouncementBounded_data()
+{
+    QTest::addColumn<int>("rows");
+    QTest::newRow("5k") << 5000;
+    QTest::newRow("50k") << 50000;
+}
+
+void WalletTests::historyBlockAnnouncementBounded()
+{
+#ifdef Q_OS_MACOS
+    if (QApplication::platformName() == "minimal") QSKIP("Cocoa wallet fixture requires a supported platform");
+#endif
+    QFETCH(int, rows);
+    if (rows > 5000 && !std::getenv("BLACKCOIN_QT_BENCH")) QSKIP("Large-wallet measurement; set BLACKCOIN_QT_BENCH=1 to run");
+    common::Settings saved_settings;
+    gArgs.LockSettings([&](const common::Settings& settings) { saved_settings = settings; });
+    auto restore_settings = interfaces::MakeCleanupHandler([saved_settings] {
+        gArgs.LockSettings([&](common::Settings& settings) { settings = saved_settings; });
+        gArgs.ClearPathCache();
+    });
+    TestingSetup setup{ChainType::REGTEST, {"-staking=0", "-powmining=0"}};
+    auto* previous = m_node.context();
+    auto restore_node = interfaces::MakeCleanupHandler([&] { m_node.setContext(previous); });
+    auto loader = interfaces::MakeWalletLoader(*setup.m_node.chain, *Assert(setup.m_node.args));
+    setup.m_node.wallet_loader = loader.get();
+    m_node.setContext(&setup.m_node);
+    const std::unique_ptr<const PlatformStyle> style{PlatformStyle::instantiate("other")};
+    auto wallet = std::make_shared<CWallet>(setup.m_node.chain.get(), "qt-history-bounded", CreateMockableWalletDatabase());
+    QCOMPARE(wallet->LoadWallet(), wallet::DBErrors::LOAD_OK);
+    {
+        LOCK(wallet->cs_wallet);
+        wallet->SetWalletFlag(WALLET_FLAG_DESCRIPTORS);
+        wallet->SetupDescriptorScriptPubKeyMans();
+    }
+    SyncRecoveryReviewWalletTip(wallet, m_node);
+    MiniGUI gui(m_node, style.get());
+    gui.initModelForWallet(m_node, wallet, style.get());
+    auto* history = gui.walletModel->getTransactionTableModel();
+
+    // As the application leaves a loaded history: a quarter of the rows were never refreshed (empty key), some confirm.
+    const QList<TransactionRecord> bulk = SyntheticHistory(0, static_cast<size_t>(rows), static_cast<size_t>(rows));
+    history->setInitialHistory(std::deque<TransactionRecord>(bulk.cbegin(), bulk.cend()));
+    QTRY_VERIFY_WITH_TIMEOUT(history->rowCount({}) == rows, 120000);
+    QVERIFY2(history->unsettledRows() >= static_cast<size_t>(rows / 5), "premise: many rows are unsettled");
+
+    // History is not shown: its projection exists, sorted by Date, but is dormant.
+    TransactionPresentationProxy proxy;
+    proxy.setSourceModel(history);
+    proxy.sort(TransactionTableModel::Date, Qt::DescendingOrder);
+    QTRY_VERIFY_WITH_TIMEOUT(proxy.isReady(), 120000);
+    proxy.setActive(false);
+
+    QSignalSpy source_changes(history, &QAbstractItemModel::dataChanged);
+    QSignalSpy proxy_changes(&proxy, &QAbstractItemModel::dataChanged);
+    const auto rows_announced = [](const QSignalSpy& spy) {
+        size_t total{0};
+        for (const auto& call : spy) total += static_cast<size_t>(call.at(1).toModelIndex().row() - call.at(0).toModelIndex().row() + 1);
+        return total;
+    };
+    constexpr int blocks = 5;
+    for (int block = 0; block < blocks; ++block) {
+        history->updateConfirmations();
+        QCoreApplication::processEvents();
+        QTest::qWait(30);
+    }
+    QVERIFY2(rows_announced(source_changes) <= blocks * TransactionTableModel::MaxRefreshPerBlock,
+             qPrintable(QStringLiteral("%1 rows announced by %2 blocks").arg(rows_announced(source_changes)).arg(blocks)));
+    QCOMPARE(rows_announced(proxy_changes), size_t{0});
+}
+
+void WalletTests::historyConfirmationNotStarved_data()
+{
+    QTest::addColumn<int>("rows");
+    QTest::newRow("3k") << 3000;
+    QTest::newRow("50k") << 50000;
+}
+
+//! More than a block's budget of rows never settle (conflicted) and many more were never read from the wallet, and one
+//! recent confirming transaction must still be re-evaluated and announced by every block, and a Status-sorted
+//! projection must equal a fresh rebuild after each block. Never-read rows are reached round-robin within the budget.
+void WalletTests::historyConfirmationNotStarved()
+{
+#ifdef Q_OS_MACOS
+    if (QApplication::platformName() == "minimal") QSKIP("Cocoa wallet fixture requires a supported platform");
+#endif
+    QFETCH(int, rows);
+    if (rows > 5000 && !std::getenv("BLACKCOIN_QT_BENCH")) QSKIP("Large-wallet measurement; set BLACKCOIN_QT_BENCH=1 to run");
+    common::Settings saved_settings;
+    gArgs.LockSettings([&](const common::Settings& settings) { saved_settings = settings; });
+    auto restore_settings = interfaces::MakeCleanupHandler([saved_settings] {
+        gArgs.LockSettings([&](common::Settings& settings) { settings = saved_settings; });
+        gArgs.ClearPathCache();
+    });
+    TestingSetup setup{ChainType::REGTEST, {"-staking=0", "-powmining=0"}};
+    auto* previous = m_node.context();
+    auto restore_node = interfaces::MakeCleanupHandler([&] { m_node.setContext(previous); });
+    auto loader = interfaces::MakeWalletLoader(*setup.m_node.chain, *Assert(setup.m_node.args));
+    setup.m_node.wallet_loader = loader.get();
+    m_node.setContext(&setup.m_node);
+    const std::unique_ptr<const PlatformStyle> style{PlatformStyle::instantiate("other")};
+    auto wallet = std::make_shared<CWallet>(setup.m_node.chain.get(), "qt-history-starved", CreateMockableWalletDatabase());
+    QCOMPARE(wallet->LoadWallet(), wallet::DBErrors::LOAD_OK);
+    {
+        LOCK(wallet->cs_wallet);
+        wallet->SetWalletFlag(WALLET_FLAG_DESCRIPTORS);
+        wallet->SetupDescriptorScriptPubKeyMans();
+    }
+    SyncRecoveryReviewWalletTip(wallet, m_node);
+    MiniGUI gui(m_node, style.get());
+    gui.initModelForWallet(m_node, wallet, style.get());
+    auto* history = gui.walletModel->getTransactionTableModel();
+
+    const auto key_of = [](const TransactionRecord& record, int major) {
+        return strprintf("%010d-%01d-%010u-%03d-%d", major, 0, static_cast<unsigned>(record.time), record.idx, 3);
+    };
+    QList<TransactionRecord> bulk = SyntheticHistory(0, static_cast<size_t>(rows), static_cast<size_t>(rows));
+    uint256 target;
+    int target_index = rows / 2;
+    while (target_index % 5 == 0 || target_index % 3 == 1) ++target_index;
+    for (int k = 0; k < bulk.size(); ++k) {
+        TransactionRecord& record = bulk[k];
+        const unsigned char b0 = record.hash.begin()[0];
+        record.status.status = TransactionStatus::Confirmed;
+        record.status.sortKey = key_of(record, 5 + (b0 % 50));
+        if (k % 5 == 0) record.status.status = TransactionStatus::Conflicted;       // never settles
+        else if (k % 3 == 1) record.status.sortKey.clear();                         // never read from the wallet
+        if (k == target_index) {
+            target = record.hash;
+            record.status.status = TransactionStatus::Confirming;
+            record.status.depth = 1;
+            record.status.sortKey = key_of(record, 80);
+        }
+    }
+    history->setInitialHistory(std::deque<TransactionRecord>(bulk.cbegin(), bulk.cend()));
+    QTRY_VERIFY_WITH_TIMEOUT(history->rowCount({}) == rows, 60000);
+    QVERIFY2(history->activeRows() > TransactionTableModel::MaxRefreshPerBlock, "premise: more permanent rows than a block's budget");
+    const size_t unrefreshed_start = history->unsettledRows() - history->activeRows();
+    QVERIFY2(unrefreshed_start > 2 * TransactionTableModel::MaxRefreshPerBlock, "premise: many never-read rows");
+
+    // The wallet's answer: the target gains a confirmation per block and a lower key; a never-read row gets its key.
+    int block{0};
+    history->setRefreshHook([&](TransactionRecord& record) {
+        if (record.hash == target) {
+            record.status.status = TransactionStatus::Confirming;
+            record.status.depth = block + 1;
+            record.status.sortKey = key_of(record, 400 - 30 * block);
+        } else if (record.status.sortKey.empty()) {
+            record.status.status = TransactionStatus::Confirmed;
+            record.status.sortKey = key_of(record, 5 + (record.hash.begin()[0] % 50));
+        }
+    });
+    QSignalSpy changes(history, &QAbstractItemModel::dataChanged);
+    const auto target_row = [&] {
+        for (int r = 0; r < history->rowCount({}); ++r) {
+            if (history->index(r, 0).data(TransactionTableModel::TxHashRole).toString() == QString::fromStdString(target.ToString())) return r;
+        }
+        return -1;
+    };
+    const auto announced = [&](int row) {
+        for (const auto& call : changes) {
+            if (call.at(0).toModelIndex().row() <= row && row <= call.at(1).toModelIndex().row()) return true;
+        }
+        return false;
+    };
+    const auto one_block = [&](const QString& what) {
+        ++block;
+        changes.clear();
+        history->updateConfirmations();
+        QCoreApplication::processEvents();
+        const int row = target_row();
+        QVERIFY2(row >= 0, "target row vanished");
+        QVERIFY2(announced(row), qPrintable(what + QStringLiteral(": the confirming row was not announced by the block")));
+    };
+    // Part one: no projection exists, so nothing but the blocks reads the never-read rows.
+    const size_t blocks_to_read = (unrefreshed_start + TransactionTableModel::MaxRefreshPerBlock - 1) / TransactionTableModel::MaxRefreshPerBlock;
+    for (size_t b = 1; b <= blocks_to_read + 1; ++b) {
+        one_block(QStringLiteral("block %1").arg(b));
+        const size_t left = history->unsettledRows() - history->activeRows();
+        const size_t read_at_least = std::min(unrefreshed_start, b * TransactionTableModel::MaxRefreshPerBlock);
+        QVERIFY2(left <= unrefreshed_start - read_at_least, qPrintable(QStringLiteral("block %1 left %2 never-read rows").arg(b).arg(left)));
+    }
+    QCOMPARE(history->unsettledRows() - history->activeRows(), size_t{0});
+
+    // Part two: a Status-sorted projection follows the target's rising confirmations exactly.
+    TransactionPresentationProxy proxy;
+    proxy.setSortCaseSensitivity(Qt::CaseInsensitive);
+    proxy.setSourceModel(history);
+    proxy.sort(TransactionTableModel::Status, Qt::AscendingOrder);
+    const auto settle = [&] {
+        QCoreApplication::processEvents();
+        QTRY_VERIFY_WITH_TIMEOUT(proxy.isReady(), 60000);
+        QCoreApplication::processEvents();
+    };
+    settle();
+    for (int b = 0; b < 4; ++b) {
+        one_block(QStringLiteral("projected block %1").arg(b));
+        settle();
+        TransactionFilterProxy reference;
+        reference.setSortRole(Qt::EditRole);
+        reference.setSortCaseSensitivity(Qt::CaseInsensitive);
+        reference.setSourceModel(history);
+        reference.sort(TransactionTableModel::Status, Qt::AscendingOrder);
+        QCOMPARE(proxy.rowCount(), reference.rowCount());
+        for (int i = 0; i < proxy.rowCount(); ++i) {
+            if (proxy.index(i, 0).data(TransactionTableModel::TxHashRole) != reference.index(i, 0).data(TransactionTableModel::TxHashRole))
+                QFAIL(qPrintable(QStringLiteral("block %1: row %2 differs from a fresh rebuild").arg(b).arg(i)));
+        }
+    }
+    history->setRefreshHook({});
 }

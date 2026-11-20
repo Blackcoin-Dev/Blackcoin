@@ -10,6 +10,7 @@
 
 #include <QDialog>
 #include <QMessageBox>
+#include <QPointer>
 #include <QString>
 #include <QTimer>
 
@@ -27,6 +28,8 @@ namespace Ui {
 
 QT_BEGIN_NAMESPACE
 class QComboBox;
+class QHideEvent;
+class QShowEvent;
 class QLabel;
 class QUrl;
 QT_END_NAMESPACE
@@ -65,10 +68,14 @@ public Q_SLOTS:
 Q_SIGNALS:
     void coinsSent(const uint256& txid);
 
+protected:
+    void showEvent(QShowEvent* event) override;
+    void hideEvent(QHideEvent* event) override;
+
 private:
     Ui::SendCoinsDialog *ui;
     ClientModel* clientModel{nullptr};
-    WalletModel* model{nullptr};
+    QPointer<WalletModel> model;
     std::unique_ptr<wallet::CCoinControl> m_coin_control;
     std::unique_ptr<WalletModelTransaction> m_current_transaction;
     QComboBox* m_spend_source_combo{nullptr};
@@ -97,6 +104,8 @@ private:
     void updateCoinControlState();
     bool validateSpendSourceRecipients(const QList<SendCoinsRecipient>& recipients);
     bool ensureSpendSourceChange(wallet::CCoinControl& coin_control);
+    interfaces::WalletDisplayCoinFamily spendBalanceFamily() const;
+    void updateSpendBalanceRequest();
     void updateSpendSourceBalance();
 
 private Q_SLOTS:

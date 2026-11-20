@@ -11,8 +11,9 @@
 #include <memory>
 
 class ClientModel;
-class TransactionFilterProxy;
+class TransactionPresentationProxy;
 class TxViewDelegate;
+class VisibilityController;
 class PlatformStyle;
 class WalletModel;
 
@@ -40,6 +41,7 @@ public:
 
 public Q_SLOTS:
     void setBalance(const interfaces::WalletBalances& balances);
+    void setBalanceStale(bool stale, int height);
     void setPrivacy(bool privacy);
 
 Q_SIGNALS:
@@ -48,12 +50,18 @@ Q_SIGNALS:
 
 protected:
     void changeEvent(QEvent* e) override;
+    void showEvent(QShowEvent* event) override;
+    void hideEvent(QHideEvent* event) override;
 
 private:
+    std::unique_ptr<VisibilityController> m_visibility;
     Ui::OverviewPage *ui;
     ClientModel* clientModel{nullptr};
     WalletModel* walletModel{nullptr};
     bool m_privacy{false};
+    //! Shown in place of the recent list while the wallet's history is being read.
+    QLabel* m_history_state{nullptr};
+    void updateHistoryState();
     QLabel* m_label_legacy_balance_text{nullptr};
     QLabel* m_label_legacy_balance{nullptr};
     QLabel* m_label_quantum_balance_text{nullptr};
@@ -64,10 +72,9 @@ private:
     const PlatformStyle* m_platform_style;
 
     TxViewDelegate *txdelegate;
-    std::unique_ptr<TransactionFilterProxy> filter;
+    std::unique_ptr<TransactionPresentationProxy> filter;
 
 private Q_SLOTS:
-    void LimitTransactionRows();
     void updateDisplayUnit();
     void handleTransactionClicked(const QModelIndex &index);
     void updateAlerts(const QString &warnings);

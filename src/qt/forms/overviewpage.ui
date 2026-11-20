@@ -92,6 +92,19 @@
              </widget>
             </item>
             <item>
+             <widget class="QLabel" name="labelBalanceStale">
+              <property name="visible">
+               <bool>false</bool>
+              </property>
+              <property name="toolTip">
+               <string>The balances shown are those of an earlier block. The wallet is computing the current ones in the background.</string>
+              </property>
+              <property name="text">
+               <string/>
+              </property>
+             </widget>
+            </item>
+            <item>
              <spacer name="horizontalSpacer_3">
               <property name="orientation">
                <enum>Qt::Horizontal</enum>

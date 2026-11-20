@@ -287,8 +287,10 @@ struct QuantumWitnessIndexRecord {
  * The index is deliberately separate from consensus chainstate. It may be
  * wiped and rebuilt without changing block validity or synthetic payout IDs.
  */
-class ShadowIndex final : public BaseIndex
+class ShadowIndex : public BaseIndex
 {
+    friend struct ShadowIndexTestAccess;
+
 protected:
     class DB;
 
@@ -297,18 +299,24 @@ private:
     ShadowIndexEventCallback m_event_callback;
     std::atomic<uint64_t> m_revision{0};
     bool m_event_stream_suppressed{false};
+    /** Test-only interruption after a committed rewind batch, before BaseIndex commits. */
+    std::function<void()> m_after_rewind_batch_for_testing;
 
     bool BuildBlockEvent(const CBlock& block, const CBlockIndex* pindex,
                          ShadowIndexBlockEvent& event) const;
     bool IndexMatchesActiveTip(const IndexSummary& summary) const;
 
 protected:
+    virtual bool AppendPrepared(const interfaces::BlockInfo& block, const CBlockIndex* pindex,
+                                int64_t block_mtp,
+                                const std::vector<ShadowSyntheticPayoutTransaction>& payouts,
+                                const ShadowPowAccountingContext& pow_accounting_context);
     void BlockConnected(ChainstateRole role, const std::shared_ptr<const CBlock>& block,
                         const CBlockIndex* pindex) override;
     void BlockDisconnected(const std::shared_ptr<const CBlock>& block,
                            const CBlockIndex* pindex) override;
     bool CustomInit(const std::optional<interfaces::BlockKey>& block) override;
-    bool CustomAppend(const interfaces::BlockInfo& block) override;
+    AppendResult CustomAppendWithStatus(const interfaces::BlockInfo& block) override;
     bool CustomRewind(const interfaces::BlockKey& current_tip,
                       const interfaces::BlockKey& new_tip) override;
     BaseIndex::DB& GetDB() const override;

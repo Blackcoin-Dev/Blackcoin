@@ -4222,7 +4222,9 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
     // a parallel shadow ledger, but they do not enlarge the base coinstake subsidy.
     const int64_t shadow_mtp = pindex->pprev ? pindex->pprev->GetMedianTimePast() : pindex->GetBlockTime();
     const bool shadow_gold_rush_active = IsShadowGoldRushRewardActive(params.GetConsensus(), shadow_mtp, pindex->nHeight);
-    if (ApplyShadowBlockResult(view, block, pindex, &blockundo, shadow_gold_rush_active) == ShadowApplyResult::LOCAL_INTERNAL_ERROR) {
+    ShadowReplayProofWindow proof_window;
+    if (ApplyShadowBlockResult(view, block, pindex, &blockundo, shadow_gold_rush_active,
+                               fJustCheck ? nullptr : &proof_window) == ShadowApplyResult::LOCAL_INTERNAL_ERROR) {
         return FatalError(m_chainman.GetNotifications(), state,
             strprintf("Local Quantum Quasar shadow-state evaluation failed at height %d; the base block was not marked invalid", pindex->nHeight),
             _("A local Quantum Quasar shadow-state evaluation failed. Blackcoin has stopped without rejecting the base-chain block; restart after checking system memory and logs."));
@@ -4342,7 +4344,7 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
             _("Blackcoin could not update the authenticated Gold Rush inventory checkpoint."));
     }
     if (pindex->nHeight >= SHADOW_WHITELIST_HEIGHT) {
-        WriteShadowReplayStateMarker(view, pindex, params.GetConsensus());
+        WriteShadowReplayStateMarker(view, pindex, params.GetConsensus(), &proof_window);
     }
 
     if (!m_blockman.WriteUndoDataForBlock(blockundo, state, *pindex)) {
@@ -5066,11 +5068,40 @@ static bool NotifyHeaderTip(ChainstateManager& chainman) LOCKS_EXCLUDED(cs_main)
     return fNotify;
 }
 
-static void LimitValidationInterfaceQueue() LOCKS_EXCLUDED(cs_main) {
+//! Maximum validation callbacks pending before block connection waits during
+//! initial block download or reindex (bounds memory while running far ahead).
+static constexpr int MAX_CALLBACKS_PENDING_IBD{10};
+//! Once synced, block connection only waits when this many callbacks are pending.
+static constexpr int MAX_CALLBACKS_PENDING_SYNCED{1000};
+//! A wait on the validation queue at least this long is always logged.
+static constexpr auto QUEUE_WAIT_LOG_THRESHOLD{1s};
+
+static void LimitValidationInterfaceQueue(ChainstateManager& chainman) LOCKS_EXCLUDED(cs_main) {
     AssertLockNotHeld(cs_main);
 
-    if (GetMainSignals().CallbacksPending() > 10) {
-        SyncWithValidationInterfaceQueue();
+    const size_t pending{GetMainSignals().CallbacksPending()};
+    if (pending <= static_cast<size_t>(MAX_CALLBACKS_PENDING_IBD)) return;
+
+    // cs_main is not held here, so IsInitialBlockDownload() may take it.
+    const bool ibd{chainman.IsInitialBlockDownload()};
+    if (!ibd && pending <= static_cast<size_t>(MAX_CALLBACKS_PENDING_SYNCED)) {
+        // Rate limit this line to one per 10 seconds.
+        static std::atomic<int64_t> last_log_ms{std::numeric_limits<int64_t>::min()};
+        const int64_t now_ms{Ticks<std::chrono::milliseconds>(SteadyClock::now().time_since_epoch())};
+        int64_t last{last_log_ms.load()};
+        if ((last == std::numeric_limits<int64_t>::min() || now_ms - last >= 10000) &&
+            last_log_ms.compare_exchange_strong(last, now_ms)) {
+            LogPrintf("Validation queue: pending=%d, not waiting (synced)\n", pending);
+        }
+        return;
+    }
+
+    const auto start{SteadyClock::now()};
+    SyncWithValidationInterfaceQueue();
+    const auto waited{SteadyClock::now() - start};
+    if (waited >= QUEUE_WAIT_LOG_THRESHOLD) {
+        LogPrintf("Validation queue wait: pending=%d waited=%dms ibd=%d\n", pending,
+                  Ticks<std::chrono::milliseconds>(waited), ibd);
     }
 }
 
@@ -5113,13 +5144,15 @@ bool Chainstate::ActivateBestChain(BlockValidationState& state, std::shared_ptr<
     CBlockIndex *pindexNewTip = nullptr;
     bool exited_ibd{false};
     do {
-        // Block until the validation queue drains. This should largely
-        // never happen in normal operation, however may happen during
-        // reindex, causing memory blowup if we run too far ahead.
+        // During initial block download and reindex, block until the
+        // validation queue drains (more than 10 callbacks pending), so we do
+        // not run far ahead and blow up memory. Once synced the limit is
+        // relaxed to 1000: a caught-up node with many wallets must not stall
+        // block connection behind per-wallet mempool callbacks.
         // Note that if a validationinterface callback ends up calling
         // ActivateBestChain this may lead to a deadlock! We should
         // probably have a DEBUG_LOCKORDER test for this in the future.
-        LimitValidationInterfaceQueue();
+        LimitValidationInterfaceQueue(m_chainman);
 
         {
             LOCK(cs_main);
@@ -5322,7 +5355,7 @@ bool Chainstate::InvalidateBlock(BlockValidationState& state, CBlockIndex* pinde
         if (m_chainman.m_interrupt) break;
 
         // Make sure the queue of validation callbacks doesn't grow unboundedly.
-        LimitValidationInterfaceQueue();
+        LimitValidationInterfaceQueue(m_chainman);
 
         LOCK(cs_main);
         // Lock for as long as disconnectpool is in scope to make sure MaybeUpdateMempoolForReorg is
@@ -6765,7 +6798,9 @@ bool Chainstate::RollforwardBlock(const CBlockIndex* pindex, CCoinsViewCache& in
         }
         const int64_t shadow_mtp = pindex->pprev ? pindex->pprev->GetMedianTimePast() : pindex->GetBlockTime();
         const bool shadow_gold_rush_active = IsShadowGoldRushRewardActive(m_chainman.GetConsensus(), shadow_mtp, pindex->nHeight);
-        if (ApplyShadowBlockResult(inputs, block, pindex, &block_undo, shadow_gold_rush_active) == ShadowApplyResult::LOCAL_INTERNAL_ERROR) {
+        ShadowReplayProofWindow proof_window;
+        if (ApplyShadowBlockResult(inputs, block, pindex, &block_undo, shadow_gold_rush_active,
+                                   &proof_window) == ShadowApplyResult::LOCAL_INTERNAL_ERROR) {
             return error("RollforwardBlock(): failed to apply Quantum Quasar shadow state at height %d", pindex->nHeight);
         }
         if (!Consensus::RollforwardDemurrageBlock(inputs, block, pindex, m_chainman.GetConsensus())) {
@@ -6775,7 +6810,7 @@ bool Chainstate::RollforwardBlock(const CBlockIndex* pindex, CCoinsViewCache& in
             return error("RollforwardBlock(): failed to advance Gold Rush inventory checkpoint at height %d", pindex->nHeight);
         }
         if (pindex->nHeight >= SHADOW_WHITELIST_HEIGHT) {
-            WriteShadowReplayStateMarker(inputs, pindex, m_chainman.GetConsensus());
+            WriteShadowReplayStateMarker(inputs, pindex, m_chainman.GetConsensus(), &proof_window);
         }
     }
     return true;
@@ -7597,11 +7632,14 @@ bool Chainstate::ResizeCoinsCaches(size_t coinstip_size, size_t coinsdb_size)
     }
     size_t old_coinstip_size = m_coinstip_cache_size_bytes;
     m_coinstip_cache_size_bytes = coinstip_size;
-    m_coinsdb_cache_size_bytes = coinsdb_size;
-    CoinsDB().ResizeCache(coinsdb_size);
-
-    LogPrintf("[%s] resized coinsdb cache to %.1f MiB\n",
-        this->ToString(), coinsdb_size * (1.0 / 1024 / 1024));
+    if (CoinsDB().ResizeCache(coinsdb_size)) {
+        m_coinsdb_cache_size_bytes = coinsdb_size;
+        LogPrintf("[%s] resized coinsdb cache to %.1f MiB\n",
+            this->ToString(), coinsdb_size * (1.0 / 1024 / 1024));
+    } else {
+        LogPrintf("[%s] deferred coinsdb cache resize to %.1f MiB while cursors are active\n",
+            this->ToString(), coinsdb_size * (1.0 / 1024 / 1024));
+    }
     LogPrintf("[%s] resized coinstip cache to %.1f MiB\n",
         this->ToString(), coinstip_size * (1.0 / 1024 / 1024));
 

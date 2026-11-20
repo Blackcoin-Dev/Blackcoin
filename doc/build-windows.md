@@ -29,7 +29,7 @@ First, install the general dependencies:
 
     sudo apt update
     sudo apt upgrade
-    sudo apt install build-essential libtool autotools-dev automake cmake pkg-config bsdmainutils curl git
+    sudo apt install build-essential libtool autotools-dev automake cmake perl pkg-config bsdmainutils curl git
 
 A host toolchain (`build-essential`) is necessary because some dependency
 packages need to build host utilities that are used in the build process.
@@ -100,3 +100,11 @@ way. This will install to `c:\workspace\blackcoin`, for example:
 You can also create an installer using:
 
     make deploy
+
+### Native HTTPS bootstrap dependencies
+
+The MinGW depends build includes pinned static libcurl and OpenSSL, using the
+same OpenSSL backend and compiled Mozilla CA snapshot as Linux and macOS.
+OpenSSL requires Perl 5.10 or newer on the build host. No Windows DLL, system
+certificate-store import, or installed CA file is needed by this bootstrap
+path. See [trust maintenance](../share/httpsseed/README.md).

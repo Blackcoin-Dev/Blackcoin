@@ -7,19 +7,38 @@
 #include <wallet/sqlite.h>
 
 #include <chainparams.h>
+#include <common/system.h>
 #include <crypto/common.h>
 #include <logging.h>
 #include <sync.h>
 #include <util/fs_helpers.h>
+#include <util/readahead.h>
 #include <util/check.h>
+#include <util/io_counters.h>
 #include <util/strencodings.h>
+#include <util/time.h>
 #include <util/translation.h>
 #include <wallet/db.h>
+#include <wallet/scheduler_stats.h>
+#include <warnings.h>
 
 #include <sqlite3.h>
 #include <stdint.h>
 
+#ifdef __APPLE__
+#include <pthread/qos.h>
+#elif !defined(WIN32)
+#include <sys/resource.h>
+#endif
+
+#include <algorithm>
+#include <atomic>
+#include <deque>
+#include <functional>
+#include <thread>
+#include <chrono>
 #include <optional>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -127,11 +146,16 @@ static void SetPragma(sqlite3* db, const std::string& key, const std::string& va
     }
 }
 
+int SQLitePageCacheKiB(const std::optional<uint64_t>& total_ram)
+{
+    return total_ram && *total_ram <= (uint64_t{4} << 30) ? 4 * 1024 : 16 * 1024;
+}
+
 Mutex SQLiteDatabase::g_sqlite_mutex;
 int SQLiteDatabase::g_sqlite_count = 0;
 
 SQLiteDatabase::SQLiteDatabase(const fs::path& dir_path, const fs::path& file_path, const DatabaseOptions& options, bool mock)
-    : WalletDatabase(), m_mock(mock), m_dir_path(fs::PathToString(dir_path)), m_file_path(fs::PathToString(file_path)), m_use_unsafe_sync(options.use_unsafe_sync)
+    : WalletDatabase(), m_mock(mock), m_full_check(options.full_integrity_check), m_dir_path(fs::PathToString(dir_path)), m_file_path(fs::PathToString(file_path)), m_use_unsafe_sync(options.use_unsafe_sync)
 {
     {
         LOCK(g_sqlite_mutex);
@@ -204,34 +228,11 @@ void SQLiteDatabase::Cleanup() noexcept
     }
 }
 
-bool SQLiteDatabase::Verify(bilingual_str& error)
+/** Run PRAGMA integrity_check or quick_check; fills error with every finding. */
+static bool RunIntegrityPragma(sqlite3* db, const char* pragma, bilingual_str& error)
 {
-    assert(m_db);
-    SQLiteConnectionLock lock(m_db);
-    if (m_transaction_poisoned) {
-        error = _("SQLiteDatabase: Transaction rollback failed; reload the wallet before database access.");
-        return false;
-    }
-
-    auto read_result = ReadPragmaInteger(m_db, "application_id", "the application id", error);
-    if (!read_result.has_value()) return false;
-    uint32_t app_id = static_cast<uint32_t>(read_result.value());
-    uint32_t net_magic = ReadBE32(Params().MessageStart().data());
-    if (app_id != net_magic) {
-        error = strprintf(_("SQLiteDatabase: Unexpected application id. Expected %u, got %u"), net_magic, app_id);
-        return false;
-    }
-
-    read_result = ReadPragmaInteger(m_db, "user_version", "sqlite wallet schema version", error);
-    if (!read_result.has_value()) return false;
-    int32_t user_ver = read_result.value();
-    if (user_ver != WALLET_SCHEMA_VERSION) {
-        error = strprintf(_("SQLiteDatabase: Unknown sqlite wallet schema version %d. Only version %d is supported"), user_ver, WALLET_SCHEMA_VERSION);
-        return false;
-    }
-
     sqlite3_stmt* stmt{nullptr};
-    int ret = sqlite3_prepare_v2(m_db, "PRAGMA integrity_check", -1, &stmt, nullptr);
+    int ret = sqlite3_prepare_v2(db, strprintf("PRAGMA %s", pragma).c_str(), -1, &stmt, nullptr);
     if (ret != SQLITE_OK) {
         sqlite3_finalize(stmt);
         error = strprintf(_("SQLiteDatabase: Failed to prepare statement to verify database: %s"), sqlite3_errstr(ret));
@@ -264,6 +265,38 @@ bool SQLiteDatabase::Verify(bilingual_str& error)
     return error.empty();
 }
 
+bool SQLiteDatabase::Verify(bilingual_str& error)
+{
+    assert(m_db);
+    SQLiteConnectionLock lock(m_db);
+    if (m_transaction_poisoned) {
+        error = _("SQLiteDatabase: Transaction rollback failed; reload the wallet before database access.");
+        return false;
+    }
+
+    auto read_result = ReadPragmaInteger(m_db, "application_id", "the application id", error);
+    if (!read_result.has_value()) return false;
+    uint32_t app_id = static_cast<uint32_t>(read_result.value());
+    uint32_t net_magic = ReadBE32(Params().MessageStart().data());
+    if (app_id != net_magic) {
+        error = strprintf(_("SQLiteDatabase: Unexpected application id. Expected %u, got %u"), net_magic, app_id);
+        return false;
+    }
+
+    read_result = ReadPragmaInteger(m_db, "user_version", "sqlite wallet schema version", error);
+    if (!read_result.has_value()) return false;
+    int32_t user_ver = read_result.value();
+    if (user_ver != WALLET_SCHEMA_VERSION) {
+        error = strprintf(_("SQLiteDatabase: Unknown sqlite wallet schema version %d. Only version %d is supported"), user_ver, WALLET_SCHEMA_VERSION);
+        return false;
+    }
+
+    // The start-up check is the quick one unless the full one was asked for:
+    // it reads the same pages but skips matching index rows to table rows.
+    // The full check then runs in the background (StartBackgroundIntegrityCheck).
+    return RunIntegrityPragma(m_db, m_full_check ? "integrity_check" : "quick_check", error);
+}
+
 void SQLiteDatabase::Open()
 {
     int flags = SQLITE_OPEN_FULLMUTEX | SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE;
@@ -274,6 +307,7 @@ void SQLiteDatabase::Open()
     if (m_db == nullptr) {
         m_transaction_poisoned = false;
         m_transaction_owner = nullptr;
+        m_bulk_active = false;
         if (!m_mock) {
             TryCreateDirectories(fs::PathFromString(m_dir_path));
         }
@@ -311,6 +345,12 @@ void SQLiteDatabase::Open()
 
     // Enable fullfsync for the platforms that use it
     SetPragma(m_db, "fullfsync", "true", "Failed to enable fullfsync");
+
+    // SQLite keeps about 2 MiB of pages by default, far less than the b-tree
+    // of a wallet with a long history, so lookups went to the disk. A negative
+    // cache_size is a size in KiB. The journal mode and the synchronous level
+    // are left alone.
+    SetPragma(m_db, "cache_size", strprintf("-%d", SQLitePageCacheKiB(GetTotalRAM())), "Failed to set the page cache size");
 
     if (m_use_unsafe_sync) {
         LogPrintf("WARNING SQLite is configured to not wait for data to be flushed to disk. Data loss and corruption may occur.\n");
@@ -351,8 +391,342 @@ void SQLiteDatabase::Open()
     }
 }
 
+// Result codes that mean the file itself is damaged, as opposed to a problem
+// with the copy (full disk, unwritable directory).
+static bool IsCorruptionCode(int rc)
+{
+    const int primary = rc & 0xff;
+    return primary == SQLITE_CORRUPT || primary == SQLITE_NOTADB;
+}
+
+static void LowerCurrentThreadPriority()
+{
+#ifdef __APPLE__
+    pthread_set_qos_class_self_np(QOS_CLASS_BACKGROUND, 0);
+#elif !defined(WIN32)
+    // On Linux this affects the calling thread only.
+    (void)setpriority(PRIO_PROCESS, 0, 10);
+#endif
+}
+
+bool SQLiteDatabase::CheckWaitStopped(std::chrono::milliseconds delay)
+{
+    WAIT_LOCK(m_check_mutex, lock);
+    m_check_cv.wait_for(lock, delay, [this]() EXCLUSIVE_LOCKS_REQUIRED(m_check_mutex) { return m_check_stop; });
+    return m_check_stop;
+}
+
+static std::atomic<int> g_checks_active{0};
+static std::atomic<int> g_checks_max{0};
+
+/** The one worker that runs every database's background check, one at a time. */
+class IntegrityCheckQueue
+{
+public:
+    static IntegrityCheckQueue& Get()
+    {
+        static IntegrityCheckQueue queue;
+        return queue;
+    }
+
+    ~IntegrityCheckQueue()
+    {
+        std::thread t;
+        {
+            LOCK(m_mutex);
+            t = std::move(m_worker);
+        }
+        if (t.joinable()) t.join();
+    }
+
+    void Configure(std::chrono::milliseconds delay, std::chrono::milliseconds pause, std::function<bool()> ready)
+    {
+        LOCK(m_mutex);
+        m_deadline = std::chrono::steady_clock::now() + delay;
+        m_pause = pause;
+        m_ready = std::move(ready);
+    }
+
+    void Enqueue(SQLiteDatabase* db)
+    {
+        std::thread old;
+        {
+            LOCK(m_mutex);
+            db->m_check_state = static_cast<int>(SQLiteDatabase::BackgroundCheckState::QUEUED);
+            m_queue.push_back(db);
+            if (!m_worker_alive) {
+                old = std::move(m_worker);
+                m_worker_alive = true;
+                m_started = false;
+                m_checked = 0;
+                m_worker = std::thread([this] { Work(); });
+            }
+        }
+        if (old.joinable()) old.join();
+        m_cv.notify_all();
+    }
+
+    /** Take a database out of the queue, or stop its running check, and wait until it is out. */
+    void Remove(SQLiteDatabase* db) noexcept
+    {
+        std::thread to_join;
+        {
+            WAIT_LOCK(m_mutex, lock);
+            auto it = std::find(m_queue.begin(), m_queue.end(), db);
+            if (it != m_queue.end()) {
+                m_queue.erase(it);
+                db->m_check_state = static_cast<int>(SQLiteDatabase::BackgroundCheckState::CANCELLED);
+            }
+            if (m_running == db) {
+                {
+                    LOCK(db->m_check_mutex);
+                    db->m_check_stop = true;
+                    // Interrupts the full check on the copy; the pointer is cleared under this mutex before the copy closes.
+                    if (db->m_check_copy) sqlite3_interrupt(db->m_check_copy);
+                }
+                db->m_check_cv.notify_all();
+                m_cv.wait(lock, [&]() EXCLUSIVE_LOCKS_REQUIRED(m_mutex) { return m_running != db; });
+            }
+            // With nothing left, end the worker now: it may be inside the
+            // readiness callback, which must not outlive the node.
+            if (m_queue.empty() && m_running == nullptr && m_worker.joinable()) to_join = std::move(m_worker);
+        }
+        m_cv.notify_all();
+        if (to_join.joinable()) to_join.join();
+    }
+
+    void WaitDone(SQLiteDatabase* db)
+    {
+        WAIT_LOCK(m_mutex, lock);
+        m_cv.wait(lock, [&]() EXCLUSIVE_LOCKS_REQUIRED(m_mutex) {
+            const auto state = db->GetBackgroundCheckState();
+            return state != SQLiteDatabase::BackgroundCheckState::QUEUED && state != SQLiteDatabase::BackgroundCheckState::RUNNING;
+        });
+    }
+
+private:
+    Mutex m_mutex;
+    std::condition_variable m_cv;
+    std::deque<SQLiteDatabase*> m_queue GUARDED_BY(m_mutex);
+    SQLiteDatabase* m_running GUARDED_BY(m_mutex){nullptr};
+    std::thread m_worker GUARDED_BY(m_mutex);
+    bool m_worker_alive GUARDED_BY(m_mutex){false};
+    bool m_started GUARDED_BY(m_mutex){false};
+    unsigned m_checked GUARDED_BY(m_mutex){0};
+    std::chrono::steady_clock::time_point m_deadline GUARDED_BY(m_mutex){};
+    std::chrono::steady_clock::time_point m_t0 GUARDED_BY(m_mutex){};
+    std::chrono::milliseconds m_pause GUARDED_BY(m_mutex){0};
+    std::function<bool()> m_ready GUARDED_BY(m_mutex);
+
+    void Work() EXCLUSIVE_LOCKS_REQUIRED(!m_mutex)
+    {
+        LowerCurrentThreadPriority();
+        WAIT_LOCK(m_mutex, lock);
+        while (true) {
+            if (m_queue.empty()) {
+                if (m_started) {
+                    LogPrintf("Background wallet integrity checks finished: %u wallets checked in %d ms\n", m_checked,
+                              std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - m_t0).count());
+                }
+                m_worker_alive = false;
+                return;
+            }
+            // Wait for the quiet delay, then for the node to be past start-up.
+            if (std::chrono::steady_clock::now() < m_deadline) {
+                m_cv.wait_until(lock, m_deadline);
+                continue;
+            }
+            if (m_ready) {
+                const std::function<bool()> ready{m_ready};
+                lock.unlock();
+                const bool ok{ready()};
+                lock.lock();
+                if (!ok) {
+                    m_cv.wait_for(lock, std::chrono::seconds{5});
+                    continue;
+                }
+            }
+            if (m_queue.empty()) continue;
+            SQLiteDatabase* db = m_queue.front();
+            m_queue.pop_front();
+            if (!m_started) {
+                m_started = true;
+                m_t0 = std::chrono::steady_clock::now();
+                LogPrintf("Background wallet integrity checks started: %u wallets queued\n", m_queue.size() + 1);
+            }
+            m_running = db;
+            db->m_check_state = static_cast<int>(SQLiteDatabase::BackgroundCheckState::RUNNING);
+            lock.unlock();
+            const int now_active = ++g_checks_active;
+            int seen = g_checks_max.load();
+            while (now_active > seen && !g_checks_max.compare_exchange_weak(seen, now_active)) {}
+            db->RunBackgroundIntegrityCheck();
+            --g_checks_active;
+            lock.lock();
+            m_running = nullptr;
+            ++m_checked;
+            m_cv.notify_all();
+            if (!m_queue.empty()) {
+                const auto resume = std::chrono::steady_clock::now() + m_pause;
+                m_cv.wait_until(lock, resume, [&]() EXCLUSIVE_LOCKS_REQUIRED(m_mutex) { return m_queue.empty(); });
+            }
+        }
+    }
+};
+
+void SQLiteDatabase::ConfigureBackgroundChecks(std::chrono::milliseconds delay, std::chrono::milliseconds pause, std::function<bool()> ready)
+{
+    IntegrityCheckQueue::Get().Configure(delay, pause, std::move(ready));
+}
+
+int SQLiteDatabase::BackgroundChecksMaxConcurrent(bool reset)
+{
+    return reset ? g_checks_max.exchange(0) : g_checks_max.load();
+}
+
+void SQLiteDatabase::StartBackgroundIntegrityCheck()
+{
+    if (m_mock || !m_db) return;
+    const auto state = GetBackgroundCheckState();
+    if (state == BackgroundCheckState::QUEUED || state == BackgroundCheckState::RUNNING) return;
+    {
+        LOCK(m_check_mutex);
+        m_check_stop = false;
+    }
+    IntegrityCheckQueue::Get().Enqueue(this);
+}
+
+void SQLiteDatabase::StopBackgroundIntegrityCheck() noexcept
+{
+    // Also reaps a worker that has finished, so no thread outlives the databases.
+    IntegrityCheckQueue::Get().Remove(this);
+}
+
+void SQLiteDatabase::JoinBackgroundIntegrityCheck()
+{
+    IntegrityCheckQueue::Get().WaitDone(this);
+}
+
+void SQLiteDatabase::RunBackgroundIntegrityCheck()
+{
+    const auto start = std::chrono::steady_clock::now();
+    const std::string copy_file = m_file_path + ".fullcheck";
+    const fs::path copy_path = fs::PathFromString(copy_file);
+    const fs::path journal_path = fs::PathFromString(copy_file + "-journal");
+
+    auto finish = [&](BackgroundCheckState state) { m_check_state = static_cast<int>(state); };
+    auto stopped = [&]() { return CheckWaitStopped(std::chrono::milliseconds{0}); };
+    auto elapsed_ms = [&]() { return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count(); };
+    auto fail = [&](const std::string& what) {
+        LogPrintf("ERROR: background wallet integrity check of %s found damage: %s\n", m_file_path, what);
+        SetWalletIntegrityWarning(strprintf(
+            _("Warning: the wallet file %s failed the full integrity check that runs after start-up. Back it up and restore from a recent backup or recover the wallet. First finding: %s"),
+            m_file_path, what));
+        finish(BackgroundCheckState::FAILED);
+    };
+    auto skip = [&](const std::string& why) {
+        LogPrintf("Background wallet integrity check of %s skipped: %s\n", m_file_path, why);
+        finish(BackgroundCheckState::SKIPPED);
+    };
+
+    std::error_code ec;
+    fs::remove(copy_path, ec);
+    fs::remove(journal_path, ec);
+
+    // The copy needs room for the whole file.
+    const uintmax_t wallet_size = fs::file_size(fs::PathFromString(m_file_path), ec);
+    if (ec) return skip("cannot read the wallet file size");
+    const auto space = fs::space(fs::PathFromString(m_dir_path), ec);
+    if (ec || space.available < wallet_size + (uintmax_t{64} << 20)) return skip("not enough free disk space for a private copy");
+
+    LogPrintf("Background wallet integrity check of %s started (%u MiB)\n", m_file_path, wallet_size >> 20);
+
+    sqlite3* copy{nullptr};
+    int rc = sqlite3_open_v2(copy_file.c_str(), &copy, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_NOMUTEX, nullptr);
+    if (rc != SQLITE_OK) {
+        sqlite3_close(copy);
+        fs::remove(copy_path, ec);
+        return skip(strprintf("cannot create the copy: %s", sqlite3_errstr(rc)));
+    }
+    // The copy holds the same data as the wallet: keep it private.
+    fs::permissions(copy_path, fs::perms::owner_read | fs::perms::owner_write, fs::perm_options::replace, ec);
+    sqlite3_exec(copy, "PRAGMA journal_mode=OFF", nullptr, nullptr, nullptr);
+    sqlite3_exec(copy, "PRAGMA synchronous=OFF", nullptr, nullptr, nullptr);
+    {
+        LOCK(m_check_mutex);
+        m_check_copy = copy;
+    }
+
+    // Copy in small steps. The online backup takes the wallet connection's lock
+    // for one step only; a write made through the wallet connection while the
+    // copy is in progress is mirrored into the copy by SQLite.
+    bool cancelled{false};
+    std::string damage;     // set when reading the wallet file hit corruption
+    std::string copy_error; // set when the copy failed for another reason
+    bool copy_ok{false};
+    sqlite3_backup* backup = sqlite3_backup_init(copy, "main", m_db, "main");
+    if (backup) {
+        while (true) {
+            if (stopped()) { cancelled = true; break; }
+            rc = sqlite3_backup_step(backup, std::max(1, m_check_step_pages.load()));
+            if (rc == SQLITE_DONE) { copy_ok = true; break; }
+            if (rc == SQLITE_OK || rc == SQLITE_BUSY || rc == SQLITE_LOCKED) {
+                if (CheckWaitStopped(std::chrono::milliseconds{std::max(1, m_check_step_delay_ms.load())})) { cancelled = true; break; }
+                continue;
+            }
+            if (IsCorruptionCode(rc)) damage = strprintf("reading the wallet file failed: %s", sqlite3_errstr(rc));
+            else copy_error = sqlite3_errstr(rc); // not a finding about the wallet file
+            break;
+        }
+        sqlite3_backup_finish(backup);
+    }
+
+    BackgroundCheckState end_state{BackgroundCheckState::PASSED};
+    if (cancelled) {
+        end_state = BackgroundCheckState::CANCELLED;
+    } else if (!backup) {
+        end_state = BackgroundCheckState::SKIPPED;
+        LogPrintf("Background wallet integrity check of %s skipped: cannot start the copy\n", m_file_path);
+    } else if (!copy_error.empty()) {
+        end_state = BackgroundCheckState::SKIPPED;
+        LogPrintf("Background wallet integrity check of %s skipped: copy failed: %s\n", m_file_path, copy_error);
+    } else if (!damage.empty()) {
+        fail(damage);
+        end_state = BackgroundCheckState::FAILED;
+    } else if (copy_ok) {
+        bilingual_str error;
+        if (RunIntegrityPragma(copy, "integrity_check", error)) {
+            LogPrintf("Background wallet integrity check of %s passed in %u ms\n", m_file_path, elapsed_ms());
+        } else if (stopped()) {
+            end_state = BackgroundCheckState::CANCELLED;
+        } else {
+            std::string first_lines = error.original;
+            // Keep the warning short; the full list goes to the log.
+            LogPrintf("Background wallet integrity check findings for %s:\n%s", m_file_path, first_lines);
+            const size_t nl = first_lines.find('\n');
+            const size_t nl2 = nl == std::string::npos ? nl : first_lines.find('\n', nl + 1);
+            fail(nl2 == std::string::npos ? first_lines : first_lines.substr(0, nl2));
+            end_state = BackgroundCheckState::FAILED;
+        }
+    }
+    if (end_state == BackgroundCheckState::CANCELLED) {
+        LogPrintf("Background wallet integrity check of %s cancelled\n", m_file_path);
+    }
+
+    {
+        LOCK(m_check_mutex);
+        m_check_copy = nullptr;
+    }
+    sqlite3_close(copy);
+    fs::remove(copy_path, ec);
+    fs::remove(journal_path, ec);
+    m_check_state = static_cast<int>(end_state);
+}
+
 bool SQLiteDatabase::Rewrite(const char* skip)
 {
+    // VACUUM replaces the file the background check is reading.
+    StopBackgroundIntegrityCheck();
     if (!m_db) return false;
     SQLiteConnectionLock lock(m_db);
     if (m_transaction_poisoned) return false;
@@ -391,8 +765,30 @@ bool SQLiteDatabase::Backup(const std::string& dest) const
     return res == SQLITE_OK;
 }
 
+void SQLiteDatabase::RecordCommit(SqliteCommitKind kind, std::chrono::microseconds duration)
+{
+    iocounters::OnWalletCommit(InWalletCallback(), kind == SqliteCommitKind::AUTOCOMMIT);
+    m_commit_counters.Record(kind, duration);
+    ProcessSqliteCommits().Record(kind, duration);
+}
+
 void SQLiteDatabase::Close()
 {
+    // The check thread uses m_db: end it first.
+    StopBackgroundIntegrityCheck();
+    if (m_db) {
+        const SqliteCommitSnapshot commits = m_commit_counters.Snapshot();
+        uint64_t n{0}, total_us{0}, max_us{0};
+        for (const SqliteCommitCounts& c : commits) {
+            n += c.count;
+            total_us += c.total_us;
+            max_us = std::max(max_us, c.max_us);
+        }
+        if (n > 0) {
+            LogPrintf("SQLite commits for %s over its lifetime: n=%u total=%u ms max=%u ms (grouped write scopes: %u)\n", m_file_path, n, total_us / 1000, max_us / 1000,
+                      commits[static_cast<size_t>(SqliteCommitKind::BULK_SCOPE)].count);
+        }
+    }
     int res = sqlite3_close(m_db);
     if (res != SQLITE_OK) {
         throw std::runtime_error(strprintf("SQLiteDatabase: Failed to close database: %s\n", sqlite3_errstr(res)));
@@ -497,7 +893,14 @@ bool SQLiteBatch::WriteKey(DataStream&& key, DataStream&& value, bool overwrite)
     if (!BindBlobToStatement(stmt, 1, key, "key")) return false;
     if (!BindBlobToStatement(stmt, 2, value, "value")) return false;
 
+    // Outside a transaction SQLite commits this statement by itself.
+    const bool implicit_commit = sqlite3_get_autocommit(m_database.m_db) != 0;
+    const auto step_start = implicit_commit ? SteadyClock::now() : SteadyClock::time_point{};
     int res = sqlite3_step(stmt);
+    if (implicit_commit) {
+        m_database.RecordCommit(SqliteCommitKind::AUTOCOMMIT,
+                                std::chrono::duration_cast<std::chrono::microseconds>(SteadyClock::now() - step_start));
+    }
     sqlite3_clear_bindings(stmt);
     sqlite3_reset(stmt);
     if (res != SQLITE_DONE) {
@@ -516,7 +919,14 @@ bool SQLiteBatch::ExecStatement(sqlite3_stmt* stmt, Span<const std::byte> blob)
 
     if (!BindBlobToStatement(stmt, 1, blob, "key")) return false;
 
+    // Outside a transaction SQLite commits this statement by itself.
+    const bool implicit_commit = sqlite3_get_autocommit(m_database.m_db) != 0;
+    const auto step_start = implicit_commit ? SteadyClock::now() : SteadyClock::time_point{};
     int res = sqlite3_step(stmt);
+    if (implicit_commit) {
+        m_database.RecordCommit(SqliteCommitKind::AUTOCOMMIT,
+                                std::chrono::duration_cast<std::chrono::microseconds>(SteadyClock::now() - step_start));
+    }
     sqlite3_clear_bindings(stmt);
     sqlite3_reset(stmt);
     if (res != SQLITE_DONE) {
@@ -643,10 +1053,30 @@ std::unique_ptr<DatabaseCursor> SQLiteBatch::GetNewPrefixCursor(Span<const std::
     return cursor;
 }
 
+static constexpr const char* NESTED_SAVEPOINT{"bitcoin_nested_txn"};
+
 bool SQLiteBatch::TxnBegin(bool durable)
 {
     if (!m_database.m_db || m_txn_mutex) return false;
     SQLiteConnectionLock lock(m_database.m_db);
+    if (m_database.m_bulk_active) {
+        // A bulk scope already holds the connection's only transaction. Its
+        // atomic units nest as a SAVEPOINT; the durable flag cannot change the
+        // synchronous mode inside a transaction, and durability is reached
+        // when the scope commits, before any other thread can observe it.
+        if (m_database.m_transaction_poisoned || m_database.m_transaction_owner ||
+            sqlite3_get_autocommit(m_database.m_db) != 0) return false;
+        const std::string begin = strprintf("SAVEPOINT %s", NESTED_SAVEPOINT);
+        if (sqlite3_exec(m_database.m_db, begin.c_str(), nullptr, nullptr, nullptr) != SQLITE_OK) {
+            LogPrintf("SQLiteBatch: Failed to begin the nested transaction\n");
+            return false;
+        }
+        m_savepoint_txn = true;
+        m_durable_txn = false;
+        m_database.m_transaction_owner = this;
+        m_txn_mutex = lock.Release();
+        return true;
+    }
     if (m_database.m_transaction_poisoned ||
         m_database.m_transaction_owner || sqlite3_get_autocommit(m_database.m_db) == 0) return false;
     if (durable && m_database.m_use_unsafe_sync) {
@@ -674,7 +1104,9 @@ void SQLiteBatch::ReleaseTransaction()
 {
     assert(m_txn_mutex);
     assert(m_database.m_transaction_owner == this);
-    assert(sqlite3_get_autocommit(m_database.m_db) != 0);
+    // A nested SAVEPOINT leaves the scope's own transaction open.
+    assert(m_savepoint_txn || sqlite3_get_autocommit(m_database.m_db) != 0);
+    m_savepoint_txn = false;
     if (m_durable_txn && m_database.m_use_unsafe_sync) {
         if (sqlite3_exec(m_database.m_db, "PRAGMA synchronous=OFF", nullptr, nullptr, nullptr) != SQLITE_OK) {
             LogPrintf("SQLiteBatch: Failed to restore unsafe synchronous mode after transaction\n");
@@ -688,13 +1120,30 @@ void SQLiteBatch::ReleaseTransaction()
 bool SQLiteBatch::TxnCommit()
 {
     if (!m_txn_mutex) return false;
+    if (m_savepoint_txn) {
+        // Inside a bulk scope the connection stays in a transaction. If SQLite
+        // rolled the scope back by itself (an I/O or full-disk error), this
+        // unit is lost and the caller must treat it as failed.
+        if (sqlite3_get_autocommit(m_database.m_db) != 0) {
+            ReleaseTransaction();
+            return false;
+        }
+        const std::string release = strprintf("RELEASE %s", NESTED_SAVEPOINT);
+        const bool released = sqlite3_exec(m_database.m_db, release.c_str(), nullptr, nullptr, nullptr) == SQLITE_OK;
+        if (!released) LogPrintf("SQLiteBatch: Failed to commit the nested transaction\n");
+        ReleaseTransaction();
+        return released;
+    }
     if (sqlite3_get_autocommit(m_database.m_db) != 0) {
         // SQLite may itself roll back on an I/O or constraint failure. Only
         // the owner releases its lock and durability state in that case.
         ReleaseTransaction();
         return false;
     }
+    const auto commit_start = SteadyClock::now();
     int res = sqlite3_exec(m_database.m_db, "COMMIT TRANSACTION", nullptr, nullptr, nullptr);
+    m_database.RecordCommit(m_durable_txn ? SqliteCommitKind::DURABLE : SqliteCommitKind::NON_DURABLE,
+                            std::chrono::duration_cast<std::chrono::microseconds>(SteadyClock::now() - commit_start));
     if (res != SQLITE_OK) {
         LogPrintf("SQLiteBatch: Failed to commit the transaction\n");
         // A failed COMMIT can leave the connection inside the transaction.
@@ -717,6 +1166,22 @@ bool SQLiteBatch::TxnCommit()
 bool SQLiteBatch::TxnAbort()
 {
     if (!m_txn_mutex) return false;
+    if (m_savepoint_txn) {
+        if (sqlite3_get_autocommit(m_database.m_db) != 0) {
+            ReleaseTransaction();
+            return false;
+        }
+        const std::string rollback = strprintf("ROLLBACK TO %s", NESTED_SAVEPOINT);
+        const std::string release = strprintf("RELEASE %s", NESTED_SAVEPOINT);
+        const bool aborted =
+            sqlite3_exec(m_database.m_db, rollback.c_str(), nullptr, nullptr, nullptr) == SQLITE_OK &&
+            sqlite3_exec(m_database.m_db, release.c_str(), nullptr, nullptr, nullptr) == SQLITE_OK;
+        if (!aborted) LogPrintf("SQLiteBatch: Failed to abort the nested transaction\n");
+        // The savepoint is gone, or the scope's transaction already ended.
+        // Either way the scope, not this batch, owns what is left.
+        if (aborted || sqlite3_get_autocommit(m_database.m_db) != 0) ReleaseTransaction();
+        return aborted;
+    }
     if (sqlite3_get_autocommit(m_database.m_db) != 0) {
         ReleaseTransaction();
         return false;
@@ -732,10 +1197,93 @@ bool SQLiteBatch::TxnAbort()
     return aborted;
 }
 
+namespace {
+/**
+ * One SQLite transaction shared by every batch of the connection, held by the
+ * creating thread. The recursive connection mutex stays held, so no other
+ * thread can read or write the wallet database until Commit (the same
+ * exclusion an ordinary TxnBegin gives).
+ */
+class SQLiteBulkScope : public DatabaseBulkScope
+{
+    SQLiteDatabase& m_database;
+    sqlite3_mutex* m_mutex;
+    //! Row changes of the connection when the scope began.
+    const int m_changes_at_begin;
+    bool m_done{false};
+
+public:
+    SQLiteBulkScope(SQLiteDatabase& database, sqlite3_mutex* mutex)
+        : m_database(database), m_mutex(mutex), m_changes_at_begin(sqlite3_total_changes(database.m_db)) {}
+    ~SQLiteBulkScope() override { Commit(); }
+
+    bool Commit() override
+    {
+        if (m_done) return true;
+        m_done = true;
+        // A nested batch that outlived its call would leave a savepoint open.
+        // Its unit is already counted failed; the scope still ends here.
+        bool committed{false};
+        if (sqlite3_get_autocommit(m_database.m_db) == 0) {
+            const auto commit_start = SteadyClock::now();
+            // A scope in which no row was written ends without touching the
+            // disk, so it is not counted as a commit.
+            const bool wrote_rows{sqlite3_total_changes(m_database.m_db) != m_changes_at_begin};
+            committed = sqlite3_exec(m_database.m_db, "COMMIT TRANSACTION", nullptr, nullptr, nullptr) == SQLITE_OK;
+            if (wrote_rows) {
+                m_database.RecordCommit(SqliteCommitKind::BULK_SCOPE,
+                                        std::chrono::duration_cast<std::chrono::microseconds>(SteadyClock::now() - commit_start));
+            }
+            if (!committed) {
+                LogPrintf("SQLiteDatabase: Failed to commit the grouped wallet writes\n");
+                if (sqlite3_get_autocommit(m_database.m_db) == 0 &&
+                    sqlite3_exec(m_database.m_db, "ROLLBACK TRANSACTION", nullptr, nullptr, nullptr) != SQLITE_OK) {
+                    LogPrintf("SQLiteDatabase: Failed to roll back the grouped wallet writes\n");
+                    m_database.m_transaction_poisoned = true;
+                }
+            }
+        } else {
+            LogPrintf("SQLiteDatabase: The grouped wallet writes were rolled back by SQLite\n");
+        }
+        m_database.m_bulk_active = false;
+        sqlite3_mutex_leave(m_mutex);
+        return committed;
+    }
+};
+} // namespace
+
+std::unique_ptr<DatabaseBulkScope> SQLiteDatabase::MakeBulkScope()
+{
+    if (!m_db) return nullptr;
+    SQLiteConnectionLock lock(m_db);
+    if (m_transaction_poisoned || m_transaction_owner || m_bulk_active ||
+        sqlite3_get_autocommit(m_db) == 0) return nullptr;
+    if (sqlite3_exec(m_db, "BEGIN TRANSACTION", nullptr, nullptr, nullptr) != SQLITE_OK) {
+        LogPrintf("SQLiteDatabase: Failed to begin the grouped wallet writes\n");
+        return nullptr;
+    }
+    m_bulk_active = true;
+    return std::make_unique<SQLiteBulkScope>(*this, lock.Release());
+}
+
 std::unique_ptr<SQLiteDatabase> MakeSQLiteDatabase(const fs::path& path, const DatabaseOptions& options, DatabaseStatus& status, bilingual_str& error)
 {
     try {
         fs::path data_file = SQLiteDataFile(path);
+        if (options.verify && options.read_ahead) {
+            // SQLite reads the file page by page in b-tree order, which is
+            // random access on a hard disk. One sequential pass first puts it
+            // in the OS cache.
+            const auto start{std::chrono::steady_clock::now()};
+            const uint64_t max_bytes{util::ReadAheadMaxBytesFromRam(GetTotalRAM().value_or(0))};
+            const util::ReadAheadStats ra{util::ReadAheadFiles({data_file, fs::PathFromString(fs::PathToString(data_file) + "-journal")}, max_bytes)};
+            const auto ms{std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count()};
+            if (ra.skipped_too_large) {
+                LogPrintf("Wallet read-ahead of %s skipped: %u MiB is more than a quarter of the memory\n", fs::PathToString(data_file), ra.dir_bytes >> 20);
+            } else if (!ra.skipped_missing) {
+                LogPrintf("Wallet read-ahead of %s: read %u bytes (%u MiB) in %d ms\n", fs::PathToString(data_file), ra.bytes_read, ra.bytes_read >> 20, ms);
+            }
+        }
         auto db = std::make_unique<SQLiteDatabase>(data_file.parent_path(), data_file, options);
         if (options.verify && !db->Verify(error)) {
             status = DatabaseStatus::FAILED_VERIFY;

@@ -30,6 +30,9 @@ elif [ "$CI_OS_NAME" != "macos" ]; then
   fi
   ${CI_RETRY_EXE} apt-get update
   ${CI_RETRY_EXE} bash -c "apt-get install --no-install-recommends --no-upgrade -y $PACKAGES $CI_BASE_PACKAGES"
+else
+  # Apple system curl does not provide the required OpenSSL backend.
+  brew install curl openssl@3
 fi
 
 if [ -n "$PIP_PACKAGES" ]; then

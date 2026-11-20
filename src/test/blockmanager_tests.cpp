@@ -7,14 +7,18 @@
 #include <chainparams.h>
 #include <clientversion.h>
 #include <common/args.h>
+#include <hash.h>
 #include <node/blockmanager_args.h>
 #include <node/blockstorage.h>
 #include <node/context.h>
 #include <node/kernel_notifications.h>
 #include <primitives/block.h>
 #include <script/solver.h>
+#include <streams.h>
+#include <undo.h>
 #include <util/chaintype.h>
 #include <util/result.h>
+#include <util/strencodings.h>
 #include <validation.h>
 
 #include <boost/test/unit_test.hpp>
@@ -55,6 +59,61 @@ BOOST_AUTO_TEST_CASE(blockmanager_find_block_pos)
     // add another 8 bytes for the second block's serialization header and we get 293 + 8 = 301
     FlatFilePos actual{blockman.SaveBlockToDisk(params->GenesisBlock(), 1, nullptr)};
     BOOST_CHECK_EQUAL(actual.nPos, BLOCK_SERIALIZATION_HEADER_SIZE + ::GetSerializeSize(TX_WITH_WITNESS(params->GenesisBlock())) + BLOCK_SERIALIZATION_HEADER_SIZE);
+}
+
+BOOST_AUTO_TEST_CASE(blockmanager_preserves_block_and_undo_framing)
+{
+    const auto params{CreateChainParams(ArgsManager{}, ChainType::MAIN)};
+    KernelNotifications notifications{m_node.exit_status};
+    const BlockManager::Options options{
+        .chainparams = *params,
+        .blocks_dir = m_args.GetBlocksDirPath(),
+        .notifications = notifications,
+    };
+    BlockManager blockman{m_node.kernel->interrupt, options};
+    const CBlock& block = params->GenesisBlock();
+    const FlatFilePos block_pos = blockman.SaveBlockToDisk(block, 0, nullptr);
+    BOOST_REQUIRE_EQUAL(block_pos.nPos, BLOCK_SERIALIZATION_HEADER_SIZE);
+
+    const auto check_bytes = [](CAutoFile file, const DataStream& expected) {
+        BOOST_REQUIRE(!file.IsNull());
+        std::vector<std::byte> actual(expected.size());
+        file.read(actual);
+        BOOST_CHECK_EQUAL(HexStr(actual), HexStr(expected));
+    };
+    CDataStream expected_block{SER_DISK};
+    expected_block << params->MessageStart() << static_cast<unsigned int>(GetSerializeSize(TX_WITH_WITNESS(block)))
+                   << TX_WITH_WITNESS(block);
+    check_bytes(CAutoFile{blockman.OpenBlockFile(FlatFilePos{block_pos.nFile, 0}, true)}, expected_block);
+
+    const uint256 parent_hash = block.GetHash();
+    CBlockIndex parent;
+    parent.phashBlock = &parent_hash;
+    CBlockIndex index;
+    index.pprev = &parent;
+    index.nHeight = 1;
+    index.nFile = block_pos.nFile;
+
+    CBlockUndo undo;
+    undo.vtxundo.emplace_back().vprevout.emplace_back(
+        CTxOut{123, CScript{} << OP_TRUE}, 7, false, false, 123456);
+    BlockValidationState state;
+    BOOST_REQUIRE(WITH_LOCK(cs_main, return blockman.WriteUndoDataForBlock(undo, state, index)));
+    BOOST_CHECK_EQUAL(index.nUndoPos, BLOCK_SERIALIZATION_HEADER_SIZE);
+
+    HashWriter checksum;
+    checksum << parent_hash << undo;
+    DataStream expected_undo;
+    expected_undo << params->MessageStart() << static_cast<unsigned int>(GetSerializeSize(undo))
+                  << undo << checksum.GetHash();
+    check_bytes(CAutoFile{fsbridge::fopen(options.blocks_dir / "rev00000.dat", "rb")}, expected_undo);
+
+    CBlockUndo decoded;
+    BOOST_REQUIRE(blockman.UndoReadFromDisk(decoded, index));
+    DataStream expected_payload, decoded_payload;
+    expected_payload << undo;
+    decoded_payload << decoded;
+    BOOST_CHECK_EQUAL(HexStr(decoded_payload), HexStr(expected_payload));
 }
 
 BOOST_AUTO_TEST_CASE(blockmanager_pruning_is_regtest_only)

@@ -550,6 +550,10 @@ const CBlockIndex* GetLastBlockIndex(const CBlockIndex* pindex, bool fProofOfSta
 
 /** Get a locator for a block index entry. */
 CBlockLocator GetLocator(const CBlockIndex* index);
+/** A locator that stays close to the block for thousands of blocks, so that a reader which only
+ * finds part of it on its chain still resumes within a few blocks. Same format as GetLocator. */
+CBlockLocator GetDenseLocator(const CBlockIndex* index);
+constexpr size_t DENSE_LOCATOR_ESTIMATE{160};
 
 /** Construct a list of hash entries to put in a locator.  */
 std::vector<uint256> LocatorEntries(const CBlockIndex* index);

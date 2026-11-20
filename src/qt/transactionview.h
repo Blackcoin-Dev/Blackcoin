@@ -9,20 +9,27 @@
 
 #include <uint256.h>
 
-#include <QWidget>
 #include <QKeyEvent>
+#include <QPersistentModelIndex>
+#include <QWidget>
+#include <memory>
 
+#include <variant>
+
+class VisibilityController;
 class PlatformStyle;
 class TransactionDescDialog;
-class TransactionFilterProxy;
+class TransactionPresentationProxy;
 class WalletModel;
 
 QT_BEGIN_NAMESPACE
 class QComboBox;
 class QDateTimeEdit;
 class QFrame;
+class QLabel;
 class QLineEdit;
 class QMenu;
+class QShowEvent;
 class QModelIndex;
 class QTableView;
 QT_END_NAMESPACE
@@ -39,6 +46,7 @@ public:
     ~TransactionView();
 
     void setModel(WalletModel *model);
+    bool exportTransactions(const QString& filename);
 
     // Date ranges for filter
     enum DateEnum
@@ -63,16 +71,21 @@ public:
 
 protected:
     void changeEvent(QEvent* e) override;
+    void showEvent(QShowEvent* event) override;
+    void hideEvent(QHideEvent* event) override;
 
 private:
+    std::unique_ptr<VisibilityController> m_visibility;
     WalletModel *model{nullptr};
-    TransactionFilterProxy *transactionProxyModel{nullptr};
+    TransactionPresentationProxy *transactionProxyModel{nullptr};
     QTableView *transactionView{nullptr};
 
     QComboBox *dateWidget;
     QComboBox *typeWidget;
     QComboBox *watchOnlyWidget;
     QLineEdit *search_widget;
+    QLabel* m_history_state{nullptr};
+    std::variant<std::monostate, QPersistentModelIndex, uint256> m_pending_focus;
     QLineEdit *amountWidget;
 
     QMenu *contextMenu;
@@ -85,6 +98,8 @@ private:
     QAction *copyLabelAction{nullptr};
 
     QWidget *createDateRangeWidget();
+    bool ensureHistorySource();
+    void updateHistoryState();
 
     bool eventFilter(QObject *obj, QEvent *event) override;
 

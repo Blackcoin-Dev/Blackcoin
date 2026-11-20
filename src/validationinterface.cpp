@@ -15,6 +15,7 @@
 #include <primitives/block.h>
 #include <primitives/transaction.h>
 #include <scheduler.h>
+#include <util/time.h>
 
 #include <future>
 #include <unordered_map>
@@ -119,6 +120,12 @@ size_t CMainSignals::CallbacksPending()
 {
     if (!m_internals) return 0;
     return m_internals->m_schedulerClient.CallbacksPending();
+}
+
+bool CMainSignals::CallbacksBusy()
+{
+    if (!m_internals) return false;
+    return m_internals->m_schedulerClient.CallbacksBusy();
 }
 
 CMainSignals& GetMainSignals()
@@ -228,7 +235,17 @@ void CMainSignals::TransactionRemovedFromMempool(const CTransactionRef& tx, MemP
 
 void CMainSignals::BlockConnected(ChainstateRole role, const std::shared_ptr<const CBlock> &pblock, const CBlockIndex *pindex) {
     auto event = [role, pblock, pindex, this] {
-        m_internals->Iterate([&](CValidationInterface& callbacks) { callbacks.BlockConnected(role, pblock, pindex); });
+        const auto start{SteadyClock::now()};
+        size_t listeners{0};
+        m_internals->Iterate([&](CValidationInterface& callbacks) {
+            ++listeners;
+            callbacks.BlockConnected(role, pblock, pindex);
+        });
+        const auto took{SteadyClock::now() - start};
+        if (took >= 1s) {
+            LogPrintf("BlockConnected callbacks: height=%d listeners=%d took=%dms\n", pindex->nHeight, listeners,
+                      Ticks<std::chrono::milliseconds>(took));
+        }
     };
     ENQUEUE_AND_LOG_EVENT(event, "%s: block hash=%s block height=%d", __func__,
                           pblock->GetHash().ToString(),

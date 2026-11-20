@@ -22,8 +22,38 @@ from test_framework.util import (
     assert_greater_than,
     assert_raises_rpc_error,
     count_bytes,
+    get_fee,
 )
 from test_framework.wallet_util import generate_keypair
+
+
+# The wallet sizes every ECDSA signature it will add at its maximum length
+# (low-R, 70 byte DER signature plus the sighash byte). A real signature is
+# shorter whenever R or S has a leading zero byte, so the signed transaction
+# can be a few bytes smaller than the size the fee was computed for.
+MAX_WALLET_ECDSA_SIG_LEN = 71
+
+
+def input_weight_of(vin):
+    """Weight of one input of a decoded transaction (outpoint, scriptSig,
+    sequence and witness stack, without the segwit marker and flag)."""
+    script_sig = len(bytes.fromhex(vin["scriptSig"]["hex"]))
+    weight = (36 + len(ser_compact_size(script_sig)) + script_sig + 4) * WITNESS_SCALE_FACTOR
+    stack = [bytes.fromhex(item) for item in vin.get("txinwitness", [])]
+    if stack:
+        weight += len(ser_compact_size(len(stack))) + sum(len(ser_compact_size(len(item))) + len(item) for item in stack)
+    return weight
+
+
+def unused_signature_weight(vin):
+    """Weight the wallet reserved for the signature of one of its own inputs
+    that the signature did not end up using."""
+    if vin.get("txinwitness"):
+        sig_len = len(bytes.fromhex(vin["txinwitness"][0]))
+        return MAX_WALLET_ECDSA_SIG_LEN - sig_len
+    # The first byte of a P2PKH scriptSig is the push opcode of the signature.
+    sig_len = bytes.fromhex(vin["scriptSig"]["hex"])[0]
+    return (MAX_WALLET_ECDSA_SIG_LEN - sig_len) * WITNESS_SCALE_FACTOR
 
 
 class WalletSendTest(BitcoinTestFramework):
@@ -638,7 +668,31 @@ class WalletSendTest(BitcoinTestFramework):
         assert signed["complete"]
         testres = self.nodes[0].testmempoolaccept([signed["hex"]])[0]
         assert_equal(testres["allowed"], True)
-        assert_fee_amount(testres["fees"]["base"], testres["vsize"], Decimal("0.001"))
+
+        # The wallet cannot know the final size, so it prices the transaction
+        # at the weight it had to estimate: the weight handed in for the
+        # external input, plus the maximum signature length for every input it
+        # signs itself. The fee must never be below the target rate applied to
+        # the real size, and never above the target rate applied to that
+        # estimate. Both are rebuilt from the signed transaction, so a
+        # signature that happens to be a byte shorter moves the real size and
+        # the estimate by the same amount instead of tripping a fixed margin.
+        signed_tx = self.nodes[0].decoderawtransaction(signed["hex"])
+        ext_inputs = [vin for vin in signed_tx["vin"] if vin["txid"] == ext_utxo["txid"] and vin["vout"] == ext_utxo["vout"]]
+        assert_equal(len(ext_inputs), 1)
+        wallet_inputs = [vin for vin in signed_tx["vin"] if vin not in ext_inputs]
+        assert len(wallet_inputs) > 0
+        estimated_weight = (
+            signed_tx["weight"]
+            + (input_weight - input_weight_of(ext_inputs[0]))
+            + sum(unused_signature_weight(vin) for vin in wallet_inputs)
+        )
+        assert_equal(testres["vsize"], -(-signed_tx["weight"] // WITNESS_SCALE_FACTOR))
+        feerate = Decimal("0.001")
+        fee = testres["fees"]["base"]
+        assert fee >= get_fee(testres["vsize"], feerate), "Fee %s is below the target rate for the real size %s" % (fee, testres["vsize"])
+        estimated_vsize = -(-estimated_weight // WITNESS_SCALE_FACTOR)
+        assert fee <= get_fee(estimated_vsize, feerate), "Fee %s is above the target rate for the estimated size %s" % (fee, estimated_vsize)
 
 if __name__ == '__main__':
     WalletSendTest().main()

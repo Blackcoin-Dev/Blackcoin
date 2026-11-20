@@ -20,6 +20,8 @@
 #include <consensus/consensus.h>
 #include <crypto/sha256.h>
 #include <i2p.h>
+#include <https_seed_client.h>
+#include <net_https_seed.h>
 #include <logging.h>
 #include <memusage.h>
 #include <net_permissions.h>
@@ -37,7 +39,9 @@
 #include <util/threadinterrupt.h>
 #include <util/trace.h>
 #include <util/translation.h>
+#include <util/time.h>
 #include <util/vector.h>
+#include <univalue.h>
 
 #ifdef WIN32
 #include <string.h>
@@ -47,9 +51,16 @@
 #include <ifaddrs.h>
 #endif
 
+#ifndef WIN32
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
+
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <fstream>
 #include <functional>
 #include <optional>
 #include <unordered_map>
@@ -130,6 +141,18 @@ size_t CSerializedNetMsg::GetMemoryUsage() const noexcept
 void CConnman::AddAddrFetch(const std::string& strDest)
 {
     LOCK(m_addr_fetches_mutex);
+    // Deduplicate names without changing an absolute name into a resolver
+    // search-list name when the queued destination is actually used.
+    const auto canonical = [](const std::string& input) {
+        std::string result = ToLower(input);
+        if (!result.empty() && result.back() == '.') result.pop_back();
+        return result;
+    };
+    const std::string destination = canonical(strDest);
+    if (m_addr_fetches.size() >= qq::MAX_ADDR_FETCHES ||
+        std::any_of(m_addr_fetches.begin(), m_addr_fetches.end(), [&](const std::string& queued) {
+            return canonical(queued) == destination;
+        })) return;
     m_addr_fetches.push_back(strDest);
 }
 
@@ -238,6 +261,17 @@ static int GetnScore(const CService& addr)
 
 std::optional<CService> GetLocalAddrForPeer(CNode& node)
 {
+    if (publicendpoint::Enabled()) {
+        // Runtime public endpoint: advertise exactly the active pair, or nothing.
+        // Never mix in discovered, configured or peer-observed addresses and
+        // ports, so the internal listening port is not advertised in any state.
+        if (!fListen) return std::nullopt;
+        const std::optional<CService> pair{publicendpoint::Active()};
+        if (!pair || !g_reachable_nets.Contains(*pair)) return std::nullopt;
+        if (pair->GetNetwork() != node.ConnectedThroughNetwork() && node.IsConnectedThroughPrivacyNet()) return std::nullopt;
+        LogPrint(BCLog::NET, "Advertising address %s to peer=%d\n", pair->ToStringAddrPort(), node.GetId());
+        return pair;
+    }
     CService addrLocal{GetLocalAddress(node)};
     if (gArgs.GetBoolArg("-addrmantest", false)) {
         // use IPv4 loopback during addrmantest
@@ -311,6 +345,268 @@ void RemoveLocal(const CService& addr)
     LogPrintf("RemoveLocal(%s)\n", addr.ToStringAddrPort());
     mapLocalHost.erase(addr);
 }
+
+namespace publicendpoint {
+namespace {
+struct State {
+    bool enabled{false};
+    std::optional<CService> wanted;   //!< poller -> socket handler
+    int64_t wanted_observed_at{0};
+    std::string status;               //!< latest poller reason or note, for operators
+    std::string apply_error;          //!< latest bind or local-address failure of the socket handler
+    uint64_t wanted_gen{0};           //!< bumped whenever work (change or retry) is due
+    std::optional<CService> active;   //!< socket handler: bound, local address added, advertised
+    bool via_configured{false};       //!< active pair is served by a configured listener, no runtime socket
+    int64_t active_observed_at{0};
+    uint64_t change_seq{0};
+};
+GlobalMutex g_mutex;
+State g_state GUARDED_BY(g_mutex);
+} // namespace
+
+bool ValidFileName(const std::string& name)
+{
+    if (name.empty() || name.size() > 255 || name == "." || name == "..") return false;
+    for (const char c : name) {
+        if (c == '/' || c == '\\' || c == '\0' || c == ':' || static_cast<unsigned char>(c) < 0x20) return false;
+    }
+    return true;
+}
+
+static bool AllDigits(const std::string& text, size_t max_len)
+{
+    if (text.empty() || text.size() > max_len || text[0] == '0') return false;
+    return std::all_of(text.begin(), text.end(), [](char c) { return c >= '0' && c <= '9'; });
+}
+
+std::optional<Tuple> Parse(std::string_view text, std::string& reason)
+{
+    if (text.empty()) { reason = "empty file"; return std::nullopt; }
+    if (text.size() > MAX_FILE_SIZE) { reason = "file larger than 256 bytes"; return std::nullopt; }
+    for (const char c : text) {
+        const unsigned char u = static_cast<unsigned char>(c);
+        if (u >= 0x80 || (u < 0x20 && c != '\n' && c != '\r' && c != '\t')) { reason = "file is not plain ASCII text"; return std::nullopt; }
+    }
+    UniValue root;
+    if (!root.read(text) || !root.isObject()) { reason = "file is not a JSON object"; return std::nullopt; }
+    if (root.size() != 4) { reason = "unexpected keys"; return std::nullopt; }
+    const UniValue& schema = root.find_value("schema");
+    const UniValue& address = root.find_value("address");
+    const UniValue& port = root.find_value("port");
+    const UniValue& observed_at = root.find_value("observed_at");
+    // Four entries, each of the four names present once: no extra or duplicate key.
+    if (schema.isNull() && !root.exists("schema")) { reason = "unexpected keys"; return std::nullopt; }
+    if (!root.exists("address") || !root.exists("port") || !root.exists("observed_at")) { reason = "unexpected keys"; return std::nullopt; }
+    if (!schema.isStr() || schema.get_str() != SCHEMA) { reason = "unknown schema"; return std::nullopt; }
+    if (!address.isStr() || !port.isNum() || !observed_at.isNum()) { reason = "wrong value type"; return std::nullopt; }
+    Tuple tuple;
+    if (!httpsseed::ParsePublicAddress(address.get_str(), tuple.address) || !tuple.address.IsIPv4()) {
+        reason = "address is not a canonical public IPv4 address";
+        return std::nullopt;
+    }
+    const std::string port_text{port.getValStr()};
+    const std::string time_text{observed_at.getValStr()};
+    if (!AllDigits(port_text, 5)) { reason = "port is not a plain integer"; return std::nullopt; }
+    const auto port_value = ToIntegral<uint32_t>(port_text);
+    if (!port_value || *port_value < 1 || *port_value > 65535) { reason = "port out of range"; return std::nullopt; }
+    if (!AllDigits(time_text, 15)) { reason = "observed_at is not a plain integer"; return std::nullopt; }
+    const auto time_value = ToIntegral<int64_t>(time_text);
+    if (!time_value) { reason = "observed_at out of range"; return std::nullopt; }
+    tuple.port = static_cast<uint16_t>(*port_value);
+    tuple.observed_at = *time_value;
+    return tuple;
+}
+
+std::optional<std::string> ReadFile(const fs::path& datadir, const std::string& name, std::string& reason)
+{
+    if (!ValidFileName(name)) { reason = "invalid file name"; return std::nullopt; }
+    // A bare name joined to the datadir cannot leave it.
+    const fs::path path{datadir / fs::PathFromString(name)};
+    std::string data;
+#ifndef WIN32
+    const std::string native{fs::PathToString(path)};
+    const int fd = open(native.c_str(), O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+    if (fd < 0) {
+        const int err = errno;
+        if (err == ELOOP || err == EMLINK) reason = "file is a symbolic link";
+        else if (err == ENOENT) reason = "file not found";
+        else reason = "file not readable";
+        return std::nullopt;
+    }
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+        close(fd);
+        reason = "not a regular file";
+        return std::nullopt;
+    }
+    if (st.st_size < 0 || static_cast<uint64_t>(st.st_size) > MAX_FILE_SIZE) {
+        close(fd);
+        reason = "file larger than 256 bytes";
+        return std::nullopt;
+    }
+    char buf[MAX_FILE_SIZE + 1];
+    size_t got = 0;
+    while (got < sizeof(buf)) {
+        const ssize_t n = read(fd, buf + got, sizeof(buf) - got);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            close(fd);
+            reason = "file not readable";
+            return std::nullopt;
+        }
+        if (n == 0) break;
+        got += static_cast<size_t>(n);
+    }
+    close(fd);
+    if (got > MAX_FILE_SIZE) { reason = "file larger than 256 bytes"; return std::nullopt; }
+    data.assign(buf, got);
+#else
+    std::error_code ec;
+    const auto status = fs::symlink_status(path, ec);
+    // fs::exists only takes a path; test the status we already have.
+    if (ec || !std::filesystem::exists(status)) { reason = "file not found"; return std::nullopt; }
+    if (fs::is_symlink(status)) { reason = "file is a symbolic link"; return std::nullopt; }
+    if (!fs::is_regular_file(status)) { reason = "not a regular file"; return std::nullopt; }
+    const auto size = fs::file_size(path, ec);
+    if (ec) { reason = "file not readable"; return std::nullopt; }
+    if (size > MAX_FILE_SIZE) { reason = "file larger than 256 bytes"; return std::nullopt; }
+    std::ifstream file{path, std::ios::binary};
+    if (!file) { reason = "file not readable"; return std::nullopt; }
+    data.resize(MAX_FILE_SIZE + 1);
+    file.read(data.data(), data.size());
+    data.resize(static_cast<size_t>(file.gcount()));
+    if (data.size() > MAX_FILE_SIZE) { reason = "file larger than 256 bytes"; return std::nullopt; }
+#endif
+    return data;
+}
+
+Tracker::Decision Tracker::Observe(const std::optional<Tuple>& reading, const std::string& reason, int64_t now)
+{
+    Decision out;
+    const auto reject = [&](const std::string& why) {
+        // Anything unusable ends the run of identical reads and withdraws at once.
+        m_candidate.reset();
+        m_wanted.reset();
+        out.status = why;
+        return out;
+    };
+    if (!reading) return reject(reason.empty() ? "no usable tuple" : reason);
+    if (reading->observed_at > now + MAX_FUTURE_SKEW) return reject("observed_at is in the future");
+    if (now - reading->observed_at > m_max_age) return reject("observed_at is older than the maximum age");
+    if (m_excluded_ports.count(reading->port)) return reject("port is reserved by this node");
+    const CService pair{reading->address, reading->port};
+    if (m_wanted && *m_wanted == pair) {
+        m_candidate = pair;
+        m_wanted_observed_at = reading->observed_at;
+    } else if (m_candidate && *m_candidate == pair) {
+        // Second consecutive identical read: apply.
+        m_wanted = pair;
+        m_wanted_observed_at = reading->observed_at;
+    } else {
+        m_candidate = pair;
+        out.wanted = m_wanted; // keep what is applied until the new pair is confirmed
+        out.observed_at = m_wanted_observed_at;
+        out.status = "awaiting a second identical read";
+        return out;
+    }
+    out.wanted = m_wanted;
+    out.observed_at = m_wanted_observed_at;
+    return out;
+}
+
+void Reset()
+{
+    LOCK(g_mutex);
+    g_state = State{};
+}
+
+void SetEnabled(bool enabled)
+{
+    LOCK(g_mutex);
+    g_state.enabled = enabled;
+    if (enabled) g_state.status = "waiting for the first read";
+}
+
+bool Enabled()
+{
+    LOCK(g_mutex);
+    return g_state.enabled;
+}
+
+void Submit(const Tracker::Decision& decision)
+{
+    LOCK(g_mutex);
+    g_state.status = decision.status;
+    g_state.wanted_observed_at = decision.observed_at;
+    if (!decision.wanted) g_state.apply_error.clear();
+    if (decision.wanted != g_state.wanted) {
+        g_state.wanted = decision.wanted;
+        ++g_state.wanted_gen;
+    } else if (g_state.wanted && g_state.active != g_state.wanted) {
+        ++g_state.wanted_gen; // retry after a failed bind or local-address step
+    } else if (g_state.active) {
+        g_state.active_observed_at = decision.observed_at; // refreshed read of the same pair
+    }
+}
+
+bool TakeWork(uint64_t& applied_gen, std::optional<CService>& wanted, int64_t& observed_at, std::string& status)
+{
+    LOCK(g_mutex);
+    if (g_state.wanted_gen == applied_gen) return false;
+    applied_gen = g_state.wanted_gen;
+    wanted = g_state.wanted;
+    observed_at = g_state.wanted_observed_at;
+    status = g_state.status;
+    return true;
+}
+
+void Activate(const CService& pair, int64_t observed_at, bool via_configured_listener)
+{
+    LOCK(g_mutex);
+    g_state.via_configured = via_configured_listener;
+    if (g_state.active != pair) ++g_state.change_seq;
+    g_state.active = pair;
+    g_state.active_observed_at = observed_at;
+    g_state.apply_error.clear();
+}
+
+void Withdraw(const std::string& reason)
+{
+    LOCK(g_mutex);
+    g_state.active.reset();
+    g_state.apply_error = reason;
+}
+
+std::optional<CService> Active()
+{
+    LOCK(g_mutex);
+    return g_state.active;
+}
+
+uint64_t ChangeSeq()
+{
+    LOCK(g_mutex);
+    return g_state.change_seq;
+}
+
+Info GetInfo()
+{
+    LOCK(g_mutex);
+    Info info;
+    info.enabled = g_state.enabled;
+    info.active = g_state.active.has_value();
+    info.listening = info.active; // the pair is active only while its socket is bound
+    if (g_state.active) {
+        info.address = g_state.active->ToStringAddr();
+        info.port = g_state.active->GetPort();
+        info.via = g_state.via_configured ? "configured" : "runtime";
+        info.observed_at = g_state.active_observed_at;
+        info.age = std::max<int64_t>(0, GetTime() - g_state.active_observed_at);
+    }
+    info.status = info.active ? std::string{"active"} : (g_state.apply_error.empty() ? g_state.status : g_state.apply_error);
+    return info;
+}
+} // namespace publicendpoint
 
 /** vote for a local address */
 bool SeenLocal(const CService& addr)
@@ -392,8 +688,9 @@ static CAddress GetBindAddress(const Sock& sock)
     return addr_bind;
 }
 
-CNode* CConnman::ConnectNode(CAddress addrConnect, const char *pszDest, bool fCountFailure, ConnectionType conn_type, bool use_v2transport)
+CNode* CConnman::ConnectNode(CAddress addrConnect, const char *pszDest, bool fCountFailure, ConnectionType conn_type, bool use_v2transport, bool& attempted)
 {
+    attempted = false;
     AssertLockNotHeld(m_unused_i2p_sessions_mutex);
     assert(conn_type != ConnectionType::INBOUND);
 
@@ -454,7 +751,7 @@ CNode* CConnman::ConnectNode(CAddress addrConnect, const char *pszDest, bool fCo
             i2p::Connection conn;
 
             if (m_i2p_sam_session) {
-                connected = m_i2p_sam_session->Connect(addrConnect, conn, proxyConnectionFailed);
+                connected = m_i2p_sam_session->Connect(addrConnect, conn, proxyConnectionFailed, &attempted);
             } else {
                 {
                     LOCK(m_unused_i2p_sessions_mutex);
@@ -466,7 +763,7 @@ CNode* CConnman::ConnectNode(CAddress addrConnect, const char *pszDest, bool fCo
                         m_unused_i2p_sessions.pop();
                     }
                 }
-                connected = i2p_transient_session->Connect(addrConnect, conn, proxyConnectionFailed);
+                connected = i2p_transient_session->Connect(addrConnect, conn, proxyConnectionFailed, &attempted);
                 if (!connected) {
                     LOCK(m_unused_i2p_sessions_mutex);
                     if (m_unused_i2p_sessions.size() < MAX_UNUSED_I2P_SESSIONS_SIZE) {
@@ -485,7 +782,7 @@ CNode* CConnman::ConnectNode(CAddress addrConnect, const char *pszDest, bool fCo
                 return nullptr;
             }
             connected = ConnectThroughProxy(proxy, addrConnect.ToStringAddr(), addrConnect.GetPort(),
-                                            *sock, nConnectTimeout, proxyConnectionFailed);
+                                            *sock, nConnectTimeout, proxyConnectionFailed, &attempted);
         } else {
             // no proxy needed (none set for target network)
             sock = CreateSock(addrConnect);
@@ -493,11 +790,11 @@ CNode* CConnman::ConnectNode(CAddress addrConnect, const char *pszDest, bool fCo
                 return nullptr;
             }
             connected = ConnectSocketDirectly(addrConnect, *sock, nConnectTimeout,
-                                              conn_type == ConnectionType::MANUAL);
+                                              conn_type == ConnectionType::MANUAL, &attempted);
         }
+        // Keep addrman's proxy-failure accounting separate from the transport's
+        // report that a destination request was sent.
         if (!proxyConnectionFailed) {
-            // If a connection to the node was attempted, and failure (if any) is not caused by a problem connecting to
-            // the proxy, mark this as an attempt.
             addrman.Attempt(addrConnect, fCountFailure);
         }
     } else if (pszDest && GetNameProxy(proxy)) {
@@ -542,6 +839,95 @@ CNode* CConnman::ConnectNode(CAddress addrConnect, const char *pszDest, bool fCo
     RandAddEvent((uint32_t)id);
 
     return pnode;
+}
+
+namespace {
+/** Lowercase an errno text for a log token: letters, digits and single spaces only. */
+std::string SanitizeErrorText(const std::string& text)
+{
+    std::string out;
+    for (const char c : text) {
+        if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) {
+            out += c;
+        } else if (c >= 'A' && c <= 'Z') {
+            out += static_cast<char>(c - 'A' + 'a');
+        } else if ((c == ' ' || c == '_' || c == '-' || c == ':' || c == ',' || c == '(') && !out.empty() && out.back() != ' ') {
+            out += ' ';
+        }
+    }
+    while (!out.empty() && out.back() == ' ') out.pop_back();
+    return out.empty() ? "unknown" : out;
+}
+
+/** Classes of failed outbound dials, indexes into CConnman::m_dial_fail_by_class. */
+enum DialFailClass : uint8_t { FAIL_TIMEOUT, FAIL_REFUSED, FAIL_UNREACHABLE, FAIL_ADDRNOTAVAIL, FAIL_OTHER };
+static_assert(FAIL_OTHER + 1 == DIAL_FAIL_CLASSES);
+
+DialFailClass ClassifyConnectError(int err)
+{
+    if (err == CONNECT_ERROR_TIMEOUT) return FAIL_TIMEOUT;
+    if (err == 0) return FAIL_OTHER;
+#ifdef WIN32
+    switch (err) {
+    case WSAETIMEDOUT: return FAIL_TIMEOUT;
+    case WSAECONNREFUSED: return FAIL_REFUSED;
+    case WSAENETUNREACH: case WSAEHOSTUNREACH: case WSAENETDOWN: return FAIL_UNREACHABLE;
+    case WSAEADDRNOTAVAIL: return FAIL_ADDRNOTAVAIL;
+    default: return FAIL_OTHER;
+    }
+#else
+    switch (err) {
+    case ETIMEDOUT: return FAIL_TIMEOUT;
+    case ECONNREFUSED: return FAIL_REFUSED;
+    case ENETUNREACH: case EHOSTUNREACH: case ENETDOWN: return FAIL_UNREACHABLE;
+    case EADDRNOTAVAIL: return FAIL_ADDRNOTAVAIL;
+    default: return FAIL_OTHER;
+    }
+#endif
+}
+
+const char* DialFailClassToken(uint8_t cls)
+{
+    switch (cls) {
+    case FAIL_TIMEOUT: return "timeout";
+    case FAIL_REFUSED: return "refused";
+    case FAIL_UNREACHABLE: return "unreachable";
+    case FAIL_ADDRNOTAVAIL: return "addrnotavail";
+    case FAIL_OTHER: return "other";
+    }
+    return "none";
+}
+} // namespace
+
+std::string DisconnectReasonToString(DisconnectReason reason, int err)
+{
+    switch (reason) {
+    case DisconnectReason::NONE: return "local_other";
+    case DisconnectReason::REMOTE_CLOSED: return "remote_closed";
+    case DisconnectReason::RECV_ERROR: return "recv_error:" + SanitizeErrorText(NetworkErrorString(err));
+    case DisconnectReason::SEND_ERROR: return "send_error:" + SanitizeErrorText(NetworkErrorString(err));
+    case DisconnectReason::TRANSPORT_ERROR: return "transport_error";
+    case DisconnectReason::TIMEOUT_NO_MESSAGE: return "timeout_no_message";
+    case DisconnectReason::TIMEOUT_SEND: return "timeout_send";
+    case DisconnectReason::TIMEOUT_RECV: return "timeout_recv";
+    case DisconnectReason::TIMEOUT_HANDSHAKE: return "timeout_handshake";
+    case DisconnectReason::TIMEOUT_PING: return "timeout_ping";
+    case DisconnectReason::TIMEOUT_BLOCK_STALL: return "timeout_block_stall";
+    case DisconnectReason::TIMEOUT_BLOCK_DOWNLOAD: return "timeout_block_download";
+    case DisconnectReason::TIMEOUT_HEADERS: return "timeout_headers";
+    case DisconnectReason::LOCAL_MISBEHAVIOR: return "local_misbehavior";
+    case DisconnectReason::LOCAL_PROTOCOL: return "local_protocol";
+    case DisconnectReason::LOCAL_EVICTION: return "local_eviction";
+    case DisconnectReason::LOCAL_STALE_TIP: return "local_stale_tip";
+    case DisconnectReason::LOCAL_NETWORK_INACTIVE: return "local_network_inactive";
+    case DisconnectReason::LOCAL_SHUTDOWN: return "local_shutdown";
+    case DisconnectReason::LOCAL_RPC: return "local_rpc";
+    case DisconnectReason::LOCAL_BANNED: return "local_banned";
+    case DisconnectReason::LOCAL_TASK_DONE: return "local_task_done";
+    case DisconnectReason::LOCAL_PROBE_EXPIRED: return "local_probe_expired";
+    case DisconnectReason::LOCAL_OTHER: return "local_other";
+    }
+    return "local_other";
 }
 
 void CNode::CloseSocketDisconnect()
@@ -1631,6 +2017,7 @@ std::pair<size_t, bool> CConnman::SocketSendData(CNode& node) const
                 int nErr = WSAGetLastError();
                 if (nErr != WSAEWOULDBLOCK && nErr != WSAEMSGSIZE && nErr != WSAEINTR && nErr != WSAEINPROGRESS) {
                     LogPrint(BCLog::NET, "socket send error for peer=%d: %s\n", node.GetId(), NetworkErrorString(nErr));
+                    if (!node.fDisconnect) node.SetDisconnectReason(DisconnectReason::SEND_ERROR, nErr);
                     node.CloseSocketDisconnect();
                 }
             }
@@ -1691,7 +2078,7 @@ bool CConnman::AttemptToEvictConnection()
     for (CNode* pnode : m_nodes) {
         if (pnode->GetId() == *node_id_to_evict) {
             LogPrint(BCLog::NET, "selected %s connection for eviction peer=%d; disconnecting\n", pnode->ConnectionTypeAsString(), pnode->GetId());
-            pnode->fDisconnect = true;
+            pnode->Disconnect(DisconnectReason::LOCAL_EVICTION);
             return true;
         }
     }
@@ -1889,7 +2276,7 @@ void CConnman::DisconnectNodes()
             for (CNode* pnode : m_nodes) {
                 if (!pnode->fDisconnect) {
                     LogPrint(BCLog::NET, "Network not active, dropping peer=%d\n", pnode->GetId());
-                    pnode->fDisconnect = true;
+                    pnode->Disconnect(DisconnectReason::LOCAL_NETWORK_INACTIVE);
                 }
             }
         }
@@ -1898,6 +2285,8 @@ void CConnman::DisconnectNodes()
         std::vector<CNode*> nodes_copy = m_nodes;
         for (CNode* pnode : nodes_copy)
         {
+            const bool expired_probe = pnode->m_qq_probe && pnode->m_qq_probe->Expired(qq::Clock::now());
+            if (expired_probe) pnode->Disconnect(DisconnectReason::LOCAL_PROBE_EXPIRED);
             if (pnode->fDisconnect)
             {
                 // remove from m_nodes
@@ -1906,14 +2295,60 @@ void CConnman::DisconnectNodes()
                 // Add to reconnection list if appropriate. We don't reconnect right here, because
                 // the creation of a connection is a blocking operation (up to several seconds),
                 // and we don't want to hold up the socket handler thread for that long.
-                if (pnode->m_transport->ShouldReconnectV1()) {
+                if (!expired_probe && fNetworkActive && pnode->m_transport->ShouldReconnectV1()) {
                     reconnections_to_add.push_back({
                         .addr_connect = pnode->addr,
                         .grant = std::move(pnode->grantOutbound),
                         .destination = pnode->m_dest,
                         .conn_type = pnode->m_conn_type,
-                        .use_v2transport = false});
+                        .use_v2transport = false,
+                        .qq_probe = pnode->m_qq_probe});
                     LogPrint(BCLog::NET, "retrying with v1 transport protocol for peer=%d\n", pnode->GetId());
+                }
+
+                // An outbound connection that reached TCP but ended before verack because the
+                // remote closed or reset it: how a node that refuses us looks from here.
+                if (!pnode->IsInboundConn() && !pnode->fSuccessfullyConnected && !expired_probe) {
+                    switch (pnode->GetDisconnectReason()) {
+                    case DisconnectReason::REMOTE_CLOSED:
+                    case DisconnectReason::RECV_ERROR:
+                    case DisconnectReason::SEND_ERROR:
+                        ++m_handshake_failures;
+                        break;
+                    default: break;
+                    }
+                }
+
+                // One line per lost peer that had completed the handshake. Addresses only with -logips.
+                if (pnode->fSuccessfullyConnected) {
+                    size_t remaining{0};
+                    for (const CNode* other : m_nodes) remaining += other->fSuccessfullyConnected ? 1 : 0;
+                    // Peers lost within the last ten seconds, inbound ones too.
+                    size_t lost_together{0};
+                    {
+                        const auto steady_now{std::chrono::steady_clock::now()};
+                        LOCK(m_lost_peers_mutex);
+                        m_lost_peer_times.push_back(steady_now);
+                        while (!m_lost_peer_times.empty() && steady_now - m_lost_peer_times.front() > std::chrono::seconds{10}) {
+                            m_lost_peer_times.pop_front();
+                        }
+                        lost_together = m_lost_peer_times.size();
+                    }
+                    if (!pnode->IsInboundConn() || LogAcceptCategory(BCLog::NET, BCLog::Level::Debug)) {
+                        std::string subver;
+                        {
+                            LOCK(pnode->m_subver_mutex);
+                            subver = pnode->cleanSubVer;
+                        }
+                        // reason comes last because a recv or send error token contains spaces.
+                        LogPrintf("Peer lost: peer=%d type=%s direction=%s transport=%s subver=%s connected_for=%ds peers_remaining=%u%s%s reason=%s\n",
+                                  pnode->GetId(), pnode->ConnectionTypeAsString(), pnode->IsInboundConn() ? "inbound" : "outbound",
+                                  TransportTypeAsString(pnode->m_transport->GetInfo().transport_type), subver,
+                                  (GetTime<std::chrono::seconds>() - pnode->m_connected).count(), remaining,
+                                  remaining == 0 ? strprintf(" lost_together=%u", lost_together) : "",
+                                  fLogIPs ? strprintf(" addr=%s", pnode->addr.ToStringAddrPort()) : "",
+                                  pnode->GetDisconnectReasonString());
+                    }
                 }
 
                 // release outbound grant (if any)
@@ -1970,8 +2405,9 @@ bool CConnman::ShouldRunInactivityChecks(const CNode& node, std::chrono::seconds
     return node.m_connected + m_peer_connect_timeout < now;
 }
 
-bool CConnman::InactivityCheck(const CNode& node) const
+bool CConnman::InactivityCheck(const CNode& node, DisconnectReason* reason) const
 {
+    const auto set_reason = [&](DisconnectReason r) { if (reason) *reason = r; };
     // Tests that see disconnects after using mocktime can start nodes with a
     // large timeout. For example, -peertimeout=999999999.
     const auto now{GetTime<std::chrono::seconds>()};
@@ -1982,21 +2418,25 @@ bool CConnman::InactivityCheck(const CNode& node) const
 
     if (last_recv.count() == 0 || last_send.count() == 0) {
         LogPrint(BCLog::NET, "socket no message in first %i seconds, %d %d peer=%d\n", count_seconds(m_peer_connect_timeout), last_recv.count() != 0, last_send.count() != 0, node.GetId());
+        set_reason(DisconnectReason::TIMEOUT_NO_MESSAGE);
         return true;
     }
 
     if (now > last_send + TIMEOUT_INTERVAL) {
         LogPrint(BCLog::NET, "socket sending timeout: %is peer=%d\n", count_seconds(now - last_send), node.GetId());
+        set_reason(DisconnectReason::TIMEOUT_SEND);
         return true;
     }
 
     if (now > last_recv + TIMEOUT_INTERVAL) {
         LogPrint(BCLog::NET, "socket receive timeout: %is peer=%d\n", count_seconds(now - last_recv), node.GetId());
+        set_reason(DisconnectReason::TIMEOUT_RECV);
         return true;
     }
 
     if (!node.fSuccessfullyConnected) {
         LogPrint(BCLog::NET, "version handshake timeout peer=%d\n", node.GetId());
+        set_reason(DisconnectReason::TIMEOUT_HANDSHAKE);
         return true;
     }
 
@@ -2009,6 +2449,9 @@ Sock::EventsPerSock CConnman::GenerateWaitSockets(Span<CNode* const> nodes)
 
     for (const ListenSocket& hListenSocket : vhListenSocket) {
         events_per_sock.emplace(hListenSocket.sock, Sock::Events{Sock::RECV});
+    }
+    if (m_pe_listen_socket) {
+        events_per_sock.emplace(m_pe_listen_socket->sock, Sock::Events{Sock::RECV});
     }
 
     for (CNode* pnode : nodes) {
@@ -2123,6 +2566,7 @@ void CConnman::SocketHandlerConnected(const std::vector<CNode*>& nodes,
             {
                 bool notify = false;
                 if (!pnode->ReceiveMsgBytes({pchBuf, (size_t)nBytes}, notify)) {
+                    if (!pnode->fDisconnect) pnode->SetDisconnectReason(DisconnectReason::TRANSPORT_ERROR);
                     pnode->CloseSocketDisconnect();
                 }
                 RecordBytesRecv(nBytes);
@@ -2136,6 +2580,7 @@ void CConnman::SocketHandlerConnected(const std::vector<CNode*>& nodes,
                 // socket closed gracefully
                 if (!pnode->fDisconnect) {
                     LogPrint(BCLog::NET, "socket closed for peer=%d\n", pnode->GetId());
+                    pnode->SetDisconnectReason(DisconnectReason::REMOTE_CLOSED);
                 }
                 pnode->CloseSocketDisconnect();
             }
@@ -2147,13 +2592,15 @@ void CConnman::SocketHandlerConnected(const std::vector<CNode*>& nodes,
                 {
                     if (!pnode->fDisconnect) {
                         LogPrint(BCLog::NET, "socket recv error for peer=%d: %s\n", pnode->GetId(), NetworkErrorString(nErr));
+                        pnode->SetDisconnectReason(DisconnectReason::RECV_ERROR, nErr);
                     }
                     pnode->CloseSocketDisconnect();
                 }
             }
         }
 
-        if (InactivityCheck(*pnode)) pnode->fDisconnect = true;
+        DisconnectReason inactivity_reason{DisconnectReason::NONE};
+        if (InactivityCheck(*pnode, &inactivity_reason)) pnode->Disconnect(inactivity_reason);
     }
 }
 
@@ -2168,6 +2615,12 @@ void CConnman::SocketHandlerListening(const Sock::EventsPerSock& events_per_sock
             AcceptConnection(listen_socket);
         }
     }
+    if (m_pe_listen_socket && !interruptNet) {
+        const auto it = events_per_sock.find(m_pe_listen_socket->sock);
+        if (it != events_per_sock.end() && it->second.occurred & Sock::RECV) {
+            AcceptConnection(*m_pe_listen_socket);
+        }
+    }
 }
 
 void CConnman::ThreadSocketHandler()
@@ -2176,10 +2629,114 @@ void CConnman::ThreadSocketHandler()
 
     while (!interruptNet)
     {
+        ApplyPublicEndpoint();
         DisconnectNodes();
         NotifyNumConnectionsChanged();
         SocketHandler();
     }
+}
+
+void CConnman::ApplyPublicEndpoint()
+{
+    if (m_public_endpoint_file.empty()) return;
+    std::optional<CService> wanted;
+    int64_t observed_at{0};
+    std::string status;
+    if (!publicendpoint::TakeWork(m_pe_applied_gen, wanted, observed_at, status)) return;
+
+    const std::optional<CService> previous{publicendpoint::Active()};
+    const auto withdraw = [&](const std::string& reason) {
+        const bool was_active = previous.has_value();
+        const bool was_listening = m_pe_listen_socket != nullptr;
+        m_pe_listen_socket.reset(); // closes the runtime socket
+        m_pe_listen_port = 0;
+        if (previous) RemoveLocal(*previous);
+        publicendpoint::Withdraw(reason);
+        // One line per withdrawal; a repeated identical failure is not logged again.
+        if (was_active || was_listening || m_pe_last_logged_failure != reason) {
+            LogPrintf("Public endpoint withdrawn: %s\n", reason);
+        }
+        m_pe_last_logged_failure = reason;
+    };
+
+    if (!wanted) {
+        withdraw(status.empty() ? "no usable tuple" : status);
+        return;
+    }
+    const uint16_t port{wanted->GetPort()};
+    // A configured listener that already accepts IPv4 on every address at this port serves the pair:
+    // open nothing, and never close the configured socket.
+    const bool covered{ConfiguredListenerCoversIPv4(port)};
+    if (previous && *previous == *wanted && (covered ? !m_pe_listen_socket : m_pe_listen_socket != nullptr)) return;
+
+    std::shared_ptr<Sock> new_sock;
+    const bool same_port{!covered && m_pe_listen_socket && m_pe_listen_port == port};
+    if (!covered && !same_port) {
+        bilingual_str error;
+        if (!BindListenSocket(CService{CNetAddr{in_addr{htonl(INADDR_ANY)}}, port}, error, new_sock, /*quiet=*/true)) {
+            withdraw(strprintf("cannot listen on 0.0.0.0:%u (%s)", port, error.original));
+            return;
+        }
+    }
+    // The local-address map is keyed by address only: take the old entry out before adding the new.
+    if (previous) RemoveLocal(*previous);
+    if (!AddLocal(*wanted, LOCAL_MANUAL)) {
+        new_sock.reset();
+        const std::string reason{strprintf("%s is not usable as a local address on this node", wanted->ToStringAddrPort())};
+        m_pe_listen_socket.reset();
+        m_pe_listen_port = 0;
+        publicendpoint::Withdraw(reason);
+        LogPrintf("Public endpoint withdrawn: %s\n", reason);
+        m_pe_last_logged_failure = reason;
+        return;
+    }
+    if (covered) {
+        m_pe_listen_socket.reset(); // moving back onto a configured port closes the runtime socket
+        m_pe_listen_port = 0;
+    } else if (!same_port) {
+        m_pe_listen_socket = std::make_unique<ListenSocket>(std::move(new_sock), NetPermissionFlags::None,
+                                                            CService{CNetAddr{in_addr{htonl(INADDR_ANY)}}, port});
+        m_pe_listen_port = port;
+    }
+    publicendpoint::Activate(*wanted, observed_at, covered);
+    m_pe_last_logged_failure.clear();
+    const std::string served{covered ? strprintf("served by the configured listener on port %u", port) : strprintf("listening on 0.0.0.0:%u", port)};
+    LogPrintf("Public endpoint now %s%s (%s)\n", wanted->ToStringAddrPort(),
+              previous ? strprintf(", was %s", previous->ToStringAddrPort()) : "", served);
+}
+
+bool CConnman::ConfiguredListenerCoversIPv4(uint16_t port) const
+{
+    for (const ListenSocket& listener : vhListenSocket) {
+        const CService& bound{listener.BindAddress()};
+        if (bound.GetPort() != port) continue;
+        if (bound.IsIPv4()) {
+            if (bound.ToStringAddr() == "0.0.0.0") return true;
+        } else if (bound.IsIPv6() && bound.ToStringAddr() == "::") {
+            // [::] accepts IPv4 only when the socket is really dual-stack (IPV6_V6ONLY off).
+            int v6only{1};
+            socklen_t len{sizeof(v6only)};
+#ifdef IPV6_V6ONLY
+            if (listener.sock->GetSockOpt(IPPROTO_IPV6, IPV6_V6ONLY, &v6only, &len) == 0 && v6only == 0) return true;
+#endif
+        }
+    }
+    return false;
+}
+
+void CConnman::ThreadPublicEndpoint()
+{
+    publicendpoint::Tracker tracker{m_public_endpoint_max_age, m_public_endpoint_excluded_ports};
+    const auto datadir = gArgs.GetDataDirNet();
+    const std::chrono::seconds interval{m_public_endpoint_poll_interval};
+    do {
+        std::string reason;
+        std::optional<publicendpoint::Tuple> reading;
+        if (const auto content = publicendpoint::ReadFile(datadir, m_public_endpoint_file, reason)) {
+            reading = publicendpoint::Parse(*content, reason);
+        }
+        publicendpoint::Submit(tracker.Observe(reading, reason, GetTime()));
+    } while (interruptNet.sleep_for(interval));
 }
 
 void CConnman::WakeMessageHandler()
@@ -2191,116 +2748,204 @@ void CConnman::WakeMessageHandler()
     condMsgProc.notify_one();
 }
 
+void CConnman::ThreadHTTPSAddressSeed()
+{
+    FastRandomContext rng;
+    const auto* hooks = m_https_seed_test_hooks;
+    const auto worker_now = [&] { return hooks && hooks->now ? hooks->now() : qq::Clock::now(); };
+    auto next_round = worker_now();
+    if (addrman.Size()) {
+        next_round += addrman.Size() >= DNSSEEDS_DELAY_PEER_THRESHOLD ?
+            std::chrono::seconds{DNSSEEDS_DELAY_MANY_PEERS} : DNSSEEDS_DELAY_FEW_PEERS;
+    }
+    // Consecutive unproductive rounds (failed fetch, rejected body, no usable hint).
+    size_t unproductive_rounds{0};
+    // A round that ends without a usable hint is retried sooner (qq::HTTPS_BACKOFF),
+    // then the normal cadence resumes. A round with at least one hint resets this.
+    const auto unproductive = [&](const char* outcome) {
+        auto retry = std::chrono::seconds{0};
+        if (unproductive_rounds < qq::HTTPS_BACKOFF_STEPS) {
+            retry = qq::HTTPS_BACKOFF[unproductive_rounds];
+            next_round = worker_now() + retry;
+        }
+        ++unproductive_rounds;
+        LogPrintf("HTTPS seed round: outcome=%s hints=0 retry_in=%ds\n", outcome,
+                  retry.count() ? retry.count() : std::chrono::duration_cast<std::chrono::seconds>(next_round - worker_now()).count());
+    };
+    while (!interruptNet) {
+        if (!(hooks && hooks->wait ? hooks->wait() : interruptNet.sleep_for(1s))) return;
+        const bool ipv4 = g_reachable_nets.Contains(NET_IPV4);
+        const bool ipv6 = g_reachable_nets.Contains(NET_IPV6);
+        httpsseed::Policy policy{m_params.GetChainType() == ChainType::MAIN,
+            m_https_seed_enabled, gArgs.GetBoolArg("-dnsseed", DEFAULT_DNSSEED),
+            gArgs.GetBoolArg("-dns", DEFAULT_NAME_LOOKUP), m_use_addrman_outgoing,
+            fNetworkActive, nMaxConnections, ipv4, ipv6};
+        if (!httpsseed::Enabled(policy)) continue;
+        const auto now = worker_now();
+        if (now < next_round) continue;
+        int connected{0};
+        ForEachNode([&](CNode* node) { if (node->IsFullOutboundConn()) ++connected; });
+        const bool deficit = GetQQStatus().deficit > 0;
+        // Each provider owns its startup and refresh rounds. Healthy peers,
+        // including peers found by DNS, must not suppress this source.
+        next_round = now + qq::DNS_COOLDOWN + std::chrono::seconds{rng.randrange(300)};
+        httpsseed::TransportOptions options;
+        options.ipv4 = ipv4;
+        options.ipv6 = ipv6;
+        options.user_agent = "Blackcoin-Core/" + FormatFullVersion() + " HTTPSSeed/1";
+        Proxy proxy, proxy4, proxy6;
+        if (GetNameProxy(proxy)) {
+            options.proxy = proxy;
+        } else {
+            const bool via4 = ipv4 && GetProxy(NET_IPV4, proxy4);
+            const bool via6 = ipv6 && GetProxy(NET_IPV6, proxy6);
+            // Do not invent a direct route for an ambiguous proxy topology.
+            if (ipv4 && ipv6 && (via4 != via6 || (via4 &&
+                (proxy4.proxy != proxy6.proxy || proxy4.randomize_credentials != proxy6.randomize_credentials)))) {
+                LogPrint(BCLog::NET, "HTTPS discovery skipped: mixed proxy routes\n");
+                continue;
+            }
+            if (via4 || via6) options.proxy = via4 ? proxy4 : proxy6;
+        }
+        policy.explicit_onlynet = gArgs.IsArgSet("-onlynet");
+        policy.hostname_proxy = options.proxy.has_value();
+        if (!httpsseed::Enabled(policy)) {
+            LogPrint(BCLog::NET, "HTTPS discovery skipped: proxy cannot enforce explicit origin IP family\n");
+            continue;
+        }
+        const auto generation = m_https_seed_generation.load();
+        const auto cancelled = [&] { return interruptNet || !fNetworkActive ||
+            m_https_seed_generation.load() != generation; };
+        const auto response = hooks && hooks->fetch ? hooks->fetch(options, cancelled) : httpsseed::Fetch(options, cancelled);
+        if (!response.success) {
+            LogPrint(BCLog::NET, "HTTPS discovery failed: %s\n", response.error);
+            if (!cancelled()) unproductive("fetch-failed");
+            continue;
+        }
+        const auto parsed = httpsseed::Parse(response.body, TicksSinceEpoch<std::chrono::seconds>(NodeClock::now()),
+            m_netgroupman, ipv4, ipv6, [](const CNetAddr& address) { return IsLocal(CService{address, 0}); });
+        if (!parsed.valid) {
+            LogPrint(BCLog::NET, "HTTPS discovery rejected: %s\n", parsed.error);
+            unproductive("rejected");
+            continue;
+        }
+        CNetAddr source;
+        if (!source.SetInternal("httpsseed.projectblackcoin.org/v1")) continue;
+        {
+            LOCK(m_https_seed_mutex);
+            if (cancelled()) continue;
+            // Only address hints enter addrman. Live QQ state is P2P-owned.
+            addrman.Add(parsed.peers, source);
+        }
+        LogPrint(BCLog::NET, "HTTPS discovery round: hints=%u qq_deficit=%d outage=%d\n",
+            parsed.peers.size(), deficit, connected == 0);
+        if (parsed.peers.empty()) {
+            NoteQQSeedHints(0);
+            unproductive("accepted-empty");
+        } else {
+            unproductive_rounds = 0;
+            NoteQQSeedHints(parsed.peers.size());
+            LogPrintf("HTTPS seed round: outcome=accepted hints=%u retry_in=%ds\n", parsed.peers.size(),
+                      std::chrono::duration_cast<std::chrono::seconds>(next_round - worker_now()).count());
+        }
+    }
+}
+
 void CConnman::ThreadDNSAddressSeed()
 {
     FastRandomContext rng;
-    std::vector<std::string> seeds = m_params.DNSSeeds();
-    Shuffle(seeds.begin(), seeds.end(), rng);
-    int seeds_right_now = 0; // Number of seeds left before testing if we have enough connections
-    int found = 0;
-
-    if (gArgs.GetBoolArg("-forcednsseed", DEFAULT_FORCEDNSSEED)) {
-        // When -forcednsseed is provided, query all.
-        seeds_right_now = seeds.size();
-    } else if (addrman.Size() == 0) {
-        // If we have no known peers, query all.
-        // This will occur on the first run, or if peers.dat has been
-        // deleted.
-        seeds_right_now = seeds.size();
+    const auto* hooks = m_dns_seed_test_hooks;
+    const auto worker_now = [&] { return hooks && hooks->now ? hooks->now() : qq::Clock::now(); };
+    auto next_round = worker_now();
+    const bool independent_mainnet = m_params.GetChainType() == ChainType::MAIN;
+    const bool forced = gArgs.GetBoolArg("-forcednsseed", DEFAULT_FORCEDNSSEED);
+    if (addrman.Size() && !forced) {
+        const auto delay = addrman.Size() >= DNSSEEDS_DELAY_PEER_THRESHOLD ? DNSSEEDS_DELAY_MANY_PEERS : DNSSEEDS_DELAY_FEW_PEERS;
+        next_round += delay;
+        LogPrint(BCLog::NET, "Waiting %d seconds before querying DNS seeds.\n", delay.count());
     }
-
-    // goal: only query DNS seed if address need is acute
-    // * If we have a reasonable number of peers in addrman, spend
-    //   some time trying them first. This improves user privacy by
-    //   creating fewer identifying DNS requests, reduces trust by
-    //   giving seeds less influence on the network topology, and
-    //   reduces traffic to the seeds.
-    // * When querying DNS seeds query a few at once, this ensures
-    //   that we don't give DNS seeds the ability to eclipse nodes
-    //   that query them.
-    // * If we continue having problems, eventually query all the
-    //   DNS seeds, and if that fails too, also try the fixed seeds.
-    //   (done in ThreadOpenConnections)
-    const std::chrono::seconds seeds_wait_time = (addrman.Size() >= DNSSEEDS_DELAY_PEER_THRESHOLD ? DNSSEEDS_DELAY_MANY_PEERS : DNSSEEDS_DELAY_FEW_PEERS);
-
-    for (const std::string& seed : seeds) {
-        if (seeds_right_now == 0) {
-            seeds_right_now += DNSSEEDS_TO_QUERY_AT_ONCE;
-
-            if (addrman.Size() > 0) {
-                LogPrintf("Waiting %d seconds before querying DNS seeds.\n", seeds_wait_time.count());
-                std::chrono::seconds to_wait = seeds_wait_time;
-                while (to_wait.count() > 0) {
-                    // if sleeping for the MANY_PEERS interval, wake up
-                    // early to see if we have enough peers and can stop
-                    // this thread entirely freeing up its resources
-                    std::chrono::seconds w = std::min(DNSSEEDS_DELAY_FEW_PEERS, to_wait);
-                    if (!interruptNet.sleep_for(w)) return;
-                    to_wait -= w;
-
-                    int nRelevant = 0;
-                    {
-                        LOCK(m_nodes_mutex);
-                        for (const CNode* pnode : m_nodes) {
-                            if (pnode->fSuccessfullyConnected && pnode->IsFullOutboundConn()) ++nRelevant;
-                        }
-                    }
-                    if (nRelevant >= 2) {
-                        if (found > 0) {
-                            LogPrintf("%d addresses found from DNS seeds\n", found);
-                            LogPrintf("P2P peers available. Finished DNS seeding.\n");
-                        } else {
-                            LogPrintf("P2P peers available. Skipped DNS seeding.\n");
-                        }
-                        return;
-                    }
-                }
-            }
+    bool startup = true;
+    while (!interruptNet) {
+        if (!(hooks && hooks->wait ? hooks->wait() : interruptNet.sleep_for(1s))) return;
+        if (!fNetworkActive || !m_use_addrman_outgoing ||
+            !gArgs.GetBoolArg("-dnsseed", DEFAULT_DNSSEED) ||
+            (independent_mainnet && nMaxConnections <= 0)) continue;
+        const auto now = worker_now();
+        if (now < next_round) continue;
+        const auto status = GetQQStatus();
+        int connected = 0;
+        ForEachNode([&](CNode* node) { if (node->IsFullOutboundConn()) ++connected; });
+        const bool deficit = status.deficit > 0;
+        const bool outage = connected == 0;
+        if (!independent_mainnet && !(startup && forced) && !outage && !deficit && (!startup || connected >= 2)) {
+            if (startup) LogPrint(BCLog::NET, "P2P peers available. Skipped DNS seeding.\n");
+            startup = false;
+            continue;
         }
-
-        if (interruptNet) return;
-
-        // hold off on querying seeds if P2P network deactivated
-        if (!fNetworkActive) {
-            LogPrintf("Waiting for network to be reactivated before querying DNS seeds.\n");
-            do {
-                if (!interruptNet.sleep_for(std::chrono::seconds{1})) return;
-            } while (!fNetworkActive);
-        }
-
-        LogPrintf("Loading addresses from DNS seed %s\n", seed);
-        // If -proxy is in use, we make an ADDR_FETCH connection to the DNS resolved peer address
-        // for the base dns seed domain in chainparams
-        if (HaveNameProxy()) {
-            AddAddrFetch(seed);
-        } else {
-            std::vector<CAddress> vAdd;
-            ServiceFlags requiredServiceBits = GetDesirableServiceFlags(NODE_NONE);
-            std::string host = strprintf("x%x.%s", requiredServiceBits, seed);
-            CNetAddr resolveSource;
-            if (!resolveSource.SetInternal(host)) {
+        // Coalesce overdue causes after suspension. Cooldown is never reset by a signal.
+        next_round = now + qq::DNS_COOLDOWN + std::chrono::seconds{rng.randrange(300)};
+        startup = false;
+        if (deficit) RecordQQDNSRound();
+        const auto generation = m_https_seed_generation.load();
+        const auto cancelled = [&] { return interruptNet || !fNetworkActive || !m_use_addrman_outgoing ||
+            !gArgs.GetBoolArg("-dnsseed", DEFAULT_DNSSEED) ||
+            (independent_mainnet && m_https_seed_generation.load() != generation); };
+        auto seeds = m_params.DNSSeeds();
+        Shuffle(seeds.begin(), seeds.end(), rng);
+        size_t queried = 0;
+        for (const auto& seed : seeds) {
+            if (queried >= DNSSEEDS_TO_QUERY_AT_ONCE || cancelled()) break;
+            LogPrint(BCLog::NET, "Loading addresses from DNS seed %s\n", seed);
+            // Name-proxy mode never performs local seed resolution, including QQ filters.
+            if (HaveNameProxy()) {
+                AddAddrFetch(seed);
+                ++queried;
                 continue;
             }
-            unsigned int nMaxIPs = 256; // Limits number of IPs learned from a DNS seed
-            const auto addresses{LookupHost(host, nMaxIPs, true)};
-            if (!addresses.empty()) {
-                for (const CNetAddr& ip : addresses) {
-                    CAddress addr = CAddress(CService(ip, m_params.GetDefaultPort()), requiredServiceBits);
-                    addr.nTime = rng.rand_uniform_delay(Now<NodeSeconds>() - 3 * 24h, -4 * 24h); // use a random age between 3 and 7 days old
-                    vAdd.push_back(addr);
-                    found++;
+            // Do not leak direct seed queries in privacy-only configurations.
+            if (!g_reachable_nets.Contains(NET_IPV4) && !g_reachable_nets.Contains(NET_IPV6)) break;
+            ++queried;
+            const auto base_services = GetDesirableServiceFlags(NODE_NONE);
+            const auto query = [&](const std::string& host, ServiceFlags services) {
+                CNetAddr source;
+                if (!source.SetInternal(host)) return false;
+                // -dns controls destination lookup; explicit -dnsseed controls
+                // this resolver. No Core lock is held during system resolution.
+                const auto addresses = LookupHost(host, 256, true);
+                if (cancelled()) return false;
+                std::vector<CAddress> addrs;
+                for (const auto& ip : addresses) {
+                    if (!g_reachable_nets.Contains(ip)) continue;
+                    CAddress addr{CService(ip, m_params.GetDefaultPort()), services};
+                    addr.nTime = rng.rand_uniform_delay(Now<NodeSeconds>() - 3 * 24h, -4 * 24h);
+                    addrs.push_back(addr);
                 }
-                addrman.Add(vAdd, resolveSource);
+                if (!addrs.empty()) {
+                    LOCK(m_https_seed_mutex);
+                    if (cancelled()) return false;
+                    addrman.Add(addrs, source);
+                }
+                return !addrs.empty();
+            };
+            if (independent_mainnet) {
+                // Always retain legacy-compatible discovery. QQ-filter misses
+                // cannot replace or starve the base source. The plain hostname
+                // is a legacy fallback when the service-filtered seed is empty.
+                const bool base_found = query(strprintf("x%x.%s", base_services, seed), base_services);
+                if (cancelled()) break;
+                if (!base_found) query(seed, base_services);
+                if (cancelled()) break;
+                if (deficit) {
+                    const auto qq_services = ServiceFlags(base_services | NODE_QUANTUM_QUASAR);
+                    query(strprintf("x%x.%s", qq_services, seed), qq_services);
+                }
             } else {
-                // If the seed does not support a subdomain with our desired service bits,
-                // we make an ADDR_FETCH connection to the DNS resolved peer address for the
-                // base dns seed domain in chainparams
-                AddAddrFetch(seed);
+                const auto services = ServiceFlags(base_services | (deficit ? NODE_QUANTUM_QUASAR : NODE_NONE));
+                if (!query(strprintf("x%x.%s", services, seed), services) && !interruptNet && fNetworkActive && m_use_addrman_outgoing) AddAddrFetch(seed);
             }
         }
-        --seeds_right_now;
+        LogPrint(BCLog::NET, "DNS discovery round: providers=%u qq_deficit=%d outage=%d\n", queried, deficit, outage);
     }
-    LogPrintf("%d addresses found from DNS seeds\n", found);
 }
 
 void CConnman::DumpAddresses()
@@ -2316,10 +2961,16 @@ void CConnman::DumpAddresses()
 void CConnman::ProcessAddrFetch()
 {
     AssertLockNotHeld(m_unused_i2p_sessions_mutex);
+    if (interruptNet || !fNetworkActive) return;
+
+    // Keep discovery work queued until there is capacity to attempt it.
+    CSemaphoreGrant grant(*semOutbound, /*fTry=*/true);
+    if (!grant) return;
+
     std::string strDest;
     {
         LOCK(m_addr_fetches_mutex);
-        if (m_addr_fetches.empty())
+        if (interruptNet || !fNetworkActive || m_addr_fetches.empty())
             return;
         strDest = m_addr_fetches.front();
         m_addr_fetches.pop_front();
@@ -2328,10 +2979,7 @@ void CConnman::ProcessAddrFetch()
     // peer doesn't support it or immediately disconnects us for another reason.
     const bool use_v2transport(GetLocalServices() & NODE_P2P_V2);
     CAddress addr;
-    CSemaphoreGrant grant(*semOutbound, /*fTry=*/true);
-    if (grant) {
-        OpenNetworkConnection(addr, false, std::move(grant), strDest.c_str(), ConnectionType::ADDR_FETCH, use_v2transport);
-    }
+    OpenNetworkConnection(addr, false, std::move(grant), strDest.c_str(), ConnectionType::ADDR_FETCH, use_v2transport);
 }
 
 bool CConnman::GetTryNewOutboundPeer() const
@@ -2357,6 +3005,14 @@ void CConnman::StartExtraBlockRelayPeers()
 // Also exclude peers that haven't finished initial connection handshake yet
 // (so that we don't decide we're over our desired connection limit, and then
 // evict some peer that has finished the handshake)
+int CConnman::GetFullOutboundCount() const
+{
+    LOCK(m_nodes_mutex);
+    return std::count_if(m_nodes.begin(), m_nodes.end(), [](const CNode* node) {
+        return node->IsFullOutboundConn() && !node->fDisconnect;
+    });
+}
+
 int CConnman::GetExtraFullOutboundCount() const
 {
     int full_outbound_peers = 0;
@@ -2458,6 +3114,26 @@ void CConnman::ThreadOpenConnections(const std::vector<std::string> connect)
     auto next_extra_network_peer{GetExponentialRand(start, EXTRA_NETWORK_PEER_INTERVAL)};
     const bool dnsseed = gArgs.GetBoolArg("-dnsseed", DEFAULT_DNSSEED);
     bool add_fixed_seeds = gArgs.GetBoolArg("-fixedseeds", DEFAULT_FIXEDSEEDS);
+    qq::Arbiter transient_arbiter;
+    std::weak_ptr<qq::Probe> outstanding_qq;
+    bool recovery_addr_fetch_turn{true};
+    unsigned preferred_qq_attempts{0};
+    // Consecutive failed legacy-first full-relay dials to non-QQ addresses; two earn QQ hints a turn.
+    unsigned legacy_first_streak{0};
+    bool tried_legacy_at_target{false};
+    // Legacy-first dials that did not connect, with the time of the failure.
+    std::map<CService, std::chrono::microseconds> legacy_failed;
+    // QQ hints dialed on a QQ turn; they are not offered again for LEGACY_FIRST_FAILED_MEMORY.
+    std::map<CService, std::chrono::microseconds> qq_turn_tried;
+    // Zero-peer diagnostics: window start and the dial counters at that moment.
+    std::optional<std::chrono::microseconds> zero_peers_since;
+    std::optional<std::chrono::microseconds> zero_peers_last_log;
+    uint64_t zero_peers_attempts{0}, zero_peers_failures{0}, zero_peers_qq_attempts{0}, zero_peers_handshake_failures{0};
+    std::array<uint64_t, DIAL_FAIL_CLASSES> zero_peers_fail_by_class{};
+    const auto is_legacy_full_relay = [](const CNode& node) {
+        return node.IsFullOutboundConn() && !node.IsQQProbe() && !(node.m_accepted_services & NODE_QUANTUM_QUASAR);
+    };
+    auto next_qq_probe = qq::Clock::now();
     const bool use_seednodes{gArgs.IsArgSet("-seednode")};
 
     if (!add_fixed_seeds) {
@@ -2466,16 +3142,61 @@ void CConnman::ThreadOpenConnections(const std::vector<std::string> connect)
 
     while (!interruptNet)
     {
-        ProcessAddrFetch();
-
         if (!interruptNet.sleep_for(std::chrono::milliseconds(500)))
             return;
 
         PerformReconnections();
 
-        CSemaphoreGrant grant(*semOutbound);
+        {
+            // One unconditional line when the node has had no peer for a minute,
+            // at most once per ten minutes. No addresses.
+            int live_peers{0};
+            ForEachNode([&](const CNode* node) { if (node->fSuccessfullyConnected) ++live_peers; });
+            const auto clock_now = GetTime<std::chrono::microseconds>();
+            if (live_peers > 0) {
+                zero_peers_since.reset();
+            } else if (!zero_peers_since) {
+                zero_peers_since = clock_now;
+                zero_peers_attempts = m_dial_attempts;
+                zero_peers_failures = m_dial_failures;
+                zero_peers_qq_attempts = m_qq_dial_attempts;
+                zero_peers_handshake_failures = m_handshake_failures;
+                for (size_t i{0}; i < DIAL_FAIL_CLASSES; ++i) zero_peers_fail_by_class[i] = m_dial_fail_by_class[i];
+                m_last_dial_fail_class = DIAL_FAIL_CLASSES;
+            } else if (clock_now - *zero_peers_since >= qq::ZERO_PEER_LOG_AFTER &&
+                       (!zero_peers_last_log || clock_now - *zero_peers_last_log >= qq::ZERO_PEER_LOG_EVERY)) {
+                zero_peers_last_log = clock_now;
+                // Dial failures and refusals since the peers reached zero, by class.
+                LogPrintf("No peers for %d seconds: addrman=%u dial_attempts=%u dial_failures=%u qq_hints=%u qq_dials=%u fail_timeout=%u fail_refused=%u fail_unreachable=%u fail_addrnotavail=%u fail_other=%u last_fail=%s handshake_fail=%u network_active=%d\n",
+                          std::chrono::duration_cast<std::chrono::seconds>(clock_now - *zero_peers_since).count(),
+                          addrman.Size(), m_dial_attempts - zero_peers_attempts, m_dial_failures - zero_peers_failures,
+                          m_last_qq_seed_hints_count.load(), m_qq_dial_attempts - zero_peers_qq_attempts,
+                          m_dial_fail_by_class[FAIL_TIMEOUT] - zero_peers_fail_by_class[FAIL_TIMEOUT],
+                          m_dial_fail_by_class[FAIL_REFUSED] - zero_peers_fail_by_class[FAIL_REFUSED],
+                          m_dial_fail_by_class[FAIL_UNREACHABLE] - zero_peers_fail_by_class[FAIL_UNREACHABLE],
+                          m_dial_fail_by_class[FAIL_ADDRNOTAVAIL] - zero_peers_fail_by_class[FAIL_ADDRNOTAVAIL],
+                          m_dial_fail_by_class[FAIL_OTHER] - zero_peers_fail_by_class[FAIL_OTHER],
+                          DialFailClassToken(m_last_dial_fail_class), m_handshake_failures - zero_peers_handshake_failures,
+                          fNetworkActive ? 1 : 0);
+            }
+        }
+
+        // Queued v1 fallbacks retain their permits. Keep draining them even
+        // when every outbound permit is held by a node or queued fallback.
+        CSemaphoreGrant grant(*semOutbound, /*fTry=*/true);
         if (interruptNet)
             return;
+        if (!fNetworkActive) continue;
+        if (!grant) {
+            // A successful legacy handshake can fill the final permit. Observe
+            // that recovery so a subsequent loss gets a fresh legacy-first turn.
+            if (tried_legacy_at_target) {
+                ForEachNode([&](const CNode* node) {
+                    if (is_legacy_full_relay(*node)) tried_legacy_at_target = false;
+                });
+            }
+            continue;
+        }
 
         const std::unordered_set<Network> fixed_seed_networks{GetReachableEmptyNetworks()};
         if (add_fixed_seeds && !fixed_seed_networks.empty()) {
@@ -2526,13 +3247,23 @@ void CConnman::ThreadOpenConnections(const std::vector<std::string> connect)
         // Only connect out to one peer per ipv4/ipv6 network group (/16 for IPv4).
         int nOutboundFullRelay = 0;
         int nOutboundBlockRelay = 0;
+        int connected_full_relay{0};
+        bool qq_peer_connected{false};
+        bool has_legacy_full_relay{false};
         int outbound_privacy_network_peers = 0;
         std::set<std::vector<unsigned char>> outbound_ipv46_peer_netgroups;
 
         {
             LOCK(m_nodes_mutex);
             for (const CNode* pnode : m_nodes) {
-                if (pnode->IsFullOutboundConn()) nOutboundFullRelay++;
+                if (pnode->IsFullOutboundConn()) {
+                    nOutboundFullRelay++;
+                    has_legacy_full_relay |= NodeFullyConnected(pnode) && is_legacy_full_relay(*pnode);
+                    if (NodeFullyConnected(pnode)) {
+                        if (!pnode->IsQQProbe()) ++connected_full_relay;
+                        qq_peer_connected |= static_cast<bool>(pnode->m_accepted_services & NODE_QUANTUM_QUASAR);
+                    }
+                }
                 if (pnode->IsBlockOnlyConn()) nOutboundBlockRelay++;
 
                 // Make sure our persistent outbound slots to ipv4/ipv6 peers belong to different netgroups.
@@ -2571,6 +3302,34 @@ void CConnman::ThreadOpenConnections(const std::vector<std::string> connect)
         bool anchor = false;
         bool fFeeler = false;
         std::optional<Network> preferred_net;
+        const auto qq_status = GetQQStatus();
+        const auto steady_now = qq::Clock::now();
+        const auto pending = outstanding_qq.lock();
+        // The deficit cannot be met while the chain is not ready (IBD), so it
+        // does not steer dialing unless a QQ peer is already connected.
+        const bool chain_ready = qq_status.constraint != "chain-not-ready" && qq_status.constraint != "initializing";
+        const bool qq_deficit = qq::EffectiveDeficit(qq_status.deficit, chain_ready, qq_peer_connected) > 0;
+        if (!qq_deficit) preferred_qq_attempts = 0;
+        const bool full_relay_vacancy = nOutboundFullRelay < m_max_outbound_full_relay;
+        // Without recent proof that QQ peers are reachable, or below the floor
+        // of connected full-relay peers, legacy addresses go first and QQ
+        // pursuit does not shape the draws. Above the floor it may use only
+        // the remaining vacancies; it never disconnects an established peer.
+        const bool legacy_first = full_relay_vacancy &&
+            qq::LegacyFirst(qq_status.target, connected_full_relay, m_max_outbound_full_relay,
+                            qq_peer_connected || HasQQEvidence(steady_now));
+        const bool prefer_qq_for_vacancy = qq_deficit && full_relay_vacancy && !legacy_first;
+        const bool seek_legacy_at_target = qq_status.target > 0 && !qq_deficit && !has_legacy_full_relay;
+        if (!seek_legacy_at_target) tried_legacy_at_target = false;
+        const bool legacy_turn = full_relay_vacancy &&
+            ((prefer_qq_for_vacancy && preferred_qq_attempts >= 2) || (seek_legacy_at_target && !tried_legacy_at_target));
+        const bool qq_probe_allowed = HasQQProbeHeadroom() &&
+            qq_status.constraint != "chain-not-ready" && qq_status.constraint != "initializing";
+        bool qq_probe = false;
+        bool prefer_qq = prefer_qq_for_vacancy;
+        if (!legacy_first) legacy_first_streak = 0;
+        bool addr_fetch_due;
+        { LOCK(m_addr_fetches_mutex); addr_fetch_due = !m_addr_fetches.empty(); }
 
         // Determine what type of connection to open. Opening
         // BLOCK_RELAY connections to addresses from anchors.dat gets the highest
@@ -2586,60 +3345,84 @@ void CConnman::ThreadOpenConnections(const std::vector<std::string> connect)
         if (!m_anchors.empty() && (nOutboundBlockRelay < m_max_outbound_block_relay)) {
             conn_type = ConnectionType::BLOCK_RELAY;
             anchor = true;
+        } else if (addr_fetch_due && recovery_addr_fetch_turn &&
+                   (nOutboundFullRelay < m_max_outbound_full_relay ||
+                    nOutboundBlockRelay < m_max_outbound_block_relay)) {
+            // Seed connections must also run before ordinary slots are full:
+            // an empty addrman may depend on their response to fill any slot.
+            // Alternate with ordinary recovery so neither class monopolizes it.
+            recovery_addr_fetch_turn = false;
+            grant.Release();
+            ProcessAddrFetch();
+            continue;
         } else if (nOutboundFullRelay < m_max_outbound_full_relay) {
+            recovery_addr_fetch_turn = true;
             // OUTBOUND_FULL_RELAY
         } else if (nOutboundBlockRelay < m_max_outbound_block_relay) {
+            recovery_addr_fetch_turn = true;
             conn_type = ConnectionType::BLOCK_RELAY;
-        } else if (GetTryNewOutboundPeer()) {
-            // OUTBOUND_FULL_RELAY
-        } else if (now > next_extra_block_relay && m_start_extra_block_relay_peers) {
-            // Periodically connect to a peer (using regular outbound selection
-            // methodology from addrman) and stay connected long enough to sync
-            // headers, but not much else.
-            //
-            // Then disconnect the peer, if we haven't learned anything new.
-            //
-            // The idea is to make eclipse attacks very difficult to pull off,
-            // because every few minutes we're finding a new peer to learn headers
-            // from.
-            //
-            // This is similar to the logic for trying extra outbound (full-relay)
-            // peers, except:
-            // - we do this all the time on an exponential timer, rather than just when
-            //   our tip is stale
-            // - we potentially disconnect our next-youngest block-relay-only peer, if our
-            //   newest block-relay-only peer delivers a block more recently.
-            //   See the eviction logic in net_processing.cpp.
-            //
-            // Because we can promote these connections to block-relay-only
-            // connections, they do not get their own ConnectionType enum
-            // (similar to how we deal with extra outbound peers).
-            next_extra_block_relay = GetExponentialRand(now, EXTRA_BLOCK_RELAY_ONLY_PEER_INTERVAL);
-            conn_type = ConnectionType::BLOCK_RELAY;
-        } else if (now > next_feeler) {
-            next_feeler = GetExponentialRand(now, FEELER_INTERVAL);
-            conn_type = ConnectionType::FEELER;
-            fFeeler = true;
-        } else if (nOutboundFullRelay == m_max_outbound_full_relay &&
-                   m_max_outbound_full_relay == MAX_OUTBOUND_FULL_RELAY_CONNECTIONS &&
-                   now > next_extra_network_peer &&
-                   MaybePickPreferredNetwork(preferred_net)) {
-            // Full outbound connection management: Attempt to get at least one
-            // outbound peer from each reachable network by making extra connections
-            // and then protecting "only" peers from a network during outbound eviction.
-            // This is not attempted if the user changed -maxconnections to a value
-            // so low that less than MAX_OUTBOUND_FULL_RELAY_CONNECTIONS are made,
-            // to prevent interactions with otherwise protected outbound peers.
-            next_extra_network_peer = GetExponentialRand(now, EXTRA_NETWORK_PEER_INTERVAL);
         } else {
-            // skip to next iteration of while loop
-            continue;
+            // Six transient classes share existing semaphore headroom. Periodic
+            // deadlines are consumed only when their class receives a permit.
+            const bool network_due = nOutboundFullRelay == m_max_outbound_full_relay &&
+                m_max_outbound_full_relay == MAX_OUTBOUND_FULL_RELAY_CONNECTIONS && now > next_extra_network_peer;
+            const std::array<bool, qq::Arbiter::CLASSES> due{{
+                now > next_feeler, addr_fetch_due, GetTryNewOutboundPeer(),
+                now > next_extra_block_relay && m_start_extra_block_relay_peers,
+                network_due, qq_deficit && qq_probe_allowed && steady_now >= next_qq_probe && (!pending || !pending->active)}};
+            const int admitted = transient_arbiter.Pick(due);
+            if (admitted < 0) continue;
+            switch (admitted) {
+            case 0:
+                next_feeler = GetExponentialRand(now, FEELER_INTERVAL);
+                conn_type = ConnectionType::FEELER;
+                fFeeler = true;
+                break;
+            case 1:
+                grant.Release();
+                ProcessAddrFetch();
+                continue;
+            case 2: break; // Existing stale-tip request remains independently owned.
+            case 3:
+                next_extra_block_relay = GetExponentialRand(now, EXTRA_BLOCK_RELAY_ONLY_PEER_INTERVAL);
+                conn_type = ConnectionType::BLOCK_RELAY;
+                break;
+            case 4:
+                next_extra_network_peer = GetExponentialRand(now, EXTRA_NETWORK_PEER_INTERVAL);
+                if (!MaybePickPreferredNetwork(preferred_net)) continue;
+                break;
+            case 5:
+                qq_probe = prefer_qq = true;
+                next_qq_probe = steady_now + qq::RETRY_INTERVAL + std::chrono::seconds{rng.randrange(30)};
+                break;
+            }
+        }
+
+        // Guaranteed turn for QQ hints: legacy-first would otherwise never reach
+        // them while the pool holds enough (mostly dead) legacy addresses, and
+        // without a QQ handshake there is never any evidence to end legacy-first.
+        const bool qq_turn = conn_type == ConnectionType::OUTBOUND_FULL_RELAY && !fFeeler && !anchor && !qq_probe &&
+            qq::LegacyFirstQQTurn(legacy_first, legacy_first_streak);
+
+        // Random draws find a handful of hints among thousands of legacy
+        // entries only a few percent of the time, so a QQ turn first walks the
+        // QQ-flagged addresses themselves, least recently offered first.
+        std::vector<CAddress> qq_turn_candidates;
+        if (qq_turn) {
+            for (const CAddress& candidate : addrman.GetAddr(/*max_addresses=*/0, /*max_pct=*/0, /*network=*/std::nullopt)) {
+                if (!(candidate.nServices & NODE_QUANTUM_QUASAR)) continue;
+                const auto tried = qq_turn_tried.find(candidate);
+                if (tried != qq_turn_tried.end() && now - tried->second < qq::LEGACY_FIRST_FAILED_MEMORY) continue;
+                qq_turn_candidates.push_back(candidate);
+                if (qq_turn_candidates.size() >= static_cast<size_t>(qq::MAX_CANDIDATE_DRAWS / 4)) break;
+            }
         }
 
         addrman.ResolveCollisions();
 
         const auto current_time{NodeClock::now()};
         int nTries = 0;
+        CAddress qq_recovery_fallback;
         while (!interruptNet)
         {
             if (anchor && !m_anchors.empty()) {
@@ -2657,7 +3440,7 @@ void CConnman::ThreadOpenConnections(const std::vector<std::string> connect)
             // stop this loop, and let the outer loop run again (which sleeps, adds seed nodes, recalculates
             // already-connected network ranges, ...) before trying new addrman addresses.
             nTries++;
-            if (nTries > 100)
+            if (nTries > qq::MAX_CANDIDATE_DRAWS)
                 break;
 
             CAddress addr;
@@ -2687,7 +3470,12 @@ void CConnman::ThreadOpenConnections(const std::vector<std::string> connect)
                 // If preferred_net has a value set, pick an extra outbound
                 // peer from that network. The eviction logic in net_processing
                 // ensures that a peer from another network will be evicted.
-                std::tie(addr, addr_last_try) = addrman.Select(false, preferred_net);
+                if (qq_turn && !qq_turn_candidates.empty()) {
+                    addr = qq_turn_candidates.back();
+                    qq_turn_candidates.pop_back();
+                } else {
+                    std::tie(addr, addr_last_try) = addrman.Select(false, preferred_net);
+                }
             }
 
             // Require outbound IPv4/IPv6 connections, other than feelers, to be to distinct network groups
@@ -2734,10 +3522,31 @@ void CConnman::ThreadOpenConnections(const std::vector<std::string> connect)
                 continue;
             }
 
+            // Legacy-first: QQ-flagged hints wait until the later draws, and a legacy
+            // address that just failed a dial yields to them, so one dead legacy entry
+            // cannot monopolize a vacancy.
+            if (legacy_first && !qq_turn && conn_type == ConnectionType::OUTBOUND_FULL_RELAY && !qq_probe &&
+                nTries <= qq::MAX_CANDIDATE_DRAWS / 2) {
+                if (addr.nServices & NODE_QUANTUM_QUASAR) continue;
+                const auto failed = legacy_failed.find(addr);
+                if (failed != legacy_failed.end() && now - failed->second < qq::LEGACY_FIRST_FAILED_MEMORY) continue;
+            }
+
+            // Give legacy addresses a turn after two QQ attempts, or when
+            // replenishing without a legacy relay after reaching the QQ target.
+            // Keep a fully checked fallback for QQ-only pools.
+            if (legacy_turn && !qq_turn && conn_type == ConnectionType::OUTBOUND_FULL_RELAY) {
+                if (addr.nServices & NODE_QUANTUM_QUASAR) {
+                    if (!qq_recovery_fallback.IsValid()) qq_recovery_fallback = addr;
+                    continue;
+                }
+            } else if ((prefer_qq || qq_turn) && (qq_probe || nTries <= qq::MAX_CANDIDATE_DRAWS / 2) && !(addr.nServices & NODE_QUANTUM_QUASAR)) continue;
             addrConnect = addr;
             break;
         }
 
+        if (!addrConnect.IsValid() && qq_recovery_fallback.IsValid()) addrConnect = qq_recovery_fallback;
+        if (qq_probe) RecordQQSelection(nTries, addrConnect.IsValid());
         if (addrConnect.IsValid()) {
             if (fFeeler) {
                 // Add small amount of random noise before connection to avoid synchronization.
@@ -2756,7 +3565,37 @@ void CConnman::ThreadOpenConnections(const std::vector<std::string> connect)
             const bool count_failures{((int)outbound_ipv46_peer_netgroups.size() + outbound_privacy_network_peers) >= std::min(nMaxConnections - 1, 2)};
             // Use BIP324 transport when both us and them have NODE_V2_P2P set.
             const bool use_v2transport(addrConnect.nServices & GetLocalServices() & NODE_P2P_V2);
-            OpenNetworkConnection(addrConnect, count_failures, std::move(grant), /*strDest=*/nullptr, conn_type, use_v2transport);
+            std::shared_ptr<qq::Probe> probe;
+            if (qq_probe) {
+                probe = std::make_shared<qq::Probe>(qq::Clock::now());
+                outstanding_qq = probe;
+                TrackQQProbe(probe);
+            }
+            bool attempted{false};
+            OpenNetworkConnection(addrConnect, count_failures, std::move(grant), /*strDest=*/nullptr, conn_type, use_v2transport, std::move(probe), &attempted);
+            if (attempted && legacy_first && conn_type == ConnectionType::OUTBOUND_FULL_RELAY &&
+                !(addrConnect.nServices & NODE_QUANTUM_QUASAR) && !AlreadyConnectedToAddress(addrConnect)) {
+                if (legacy_failed.size() >= 64) legacy_failed.erase(legacy_failed.begin());
+                legacy_failed[addrConnect] = now;
+            }
+            if (attempted && qq_turn && (addrConnect.nServices & NODE_QUANTUM_QUASAR)) {
+                if (qq_turn_tried.size() >= 64) qq_turn_tried.erase(qq_turn_tried.begin());
+                qq_turn_tried[addrConnect] = now;
+            }
+            if (attempted && conn_type == ConnectionType::OUTBOUND_FULL_RELAY && !qq_probe) {
+                legacy_first_streak = qq::NextLegacyFirstStreak(legacy_first_streak, legacy_first, qq_turn,
+                                                                addrConnect.nServices & NODE_QUANTUM_QUASAR,
+                                                                AlreadyConnectedToAddress(addrConnect));
+            }
+            if (attempted && full_relay_vacancy && conn_type == ConnectionType::OUTBOUND_FULL_RELAY) {
+                const bool qq_hint = addrConnect.nServices & NODE_QUANTUM_QUASAR;
+                if (prefer_qq_for_vacancy) {
+                    preferred_qq_attempts = qq_hint ? std::min(preferred_qq_attempts + 1, 2U) : 0;
+                }
+                // A stale legacy hint must not monopolize a vacancy when
+                // the only reachable peers advertise QQ.
+                if (seek_legacy_at_target) tried_legacy_at_target = !qq_hint;
+            }
         }
     }
 }
@@ -2834,7 +3673,9 @@ void CConnman::ThreadOpenAddedConnections()
     AssertLockNotHeld(m_reconnections_mutex);
     while (true)
     {
-        CSemaphoreGrant grant(*semAddnode);
+        // A queued fallback can own the last addnode permit, so do not block
+        // this worker before it can reach PerformReconnections().
+        CSemaphoreGrant grant(*semAddnode, /*fTry=*/true);
         std::vector<AddedNodeInfo> vInfo = GetAddedNodeInfo();
         bool tried = false;
         for (const AddedNodeInfo& info : vInfo) {
@@ -2860,15 +3701,16 @@ void CConnman::ThreadOpenAddedConnections()
 }
 
 // if successful, this moves the passed grant to the constructed node
-void CConnman::OpenNetworkConnection(const CAddress& addrConnect, bool fCountFailure, CSemaphoreGrant&& grant_outbound, const char *pszDest, ConnectionType conn_type, bool use_v2transport)
+void CConnman::OpenNetworkConnection(const CAddress& addrConnect, bool fCountFailure, CSemaphoreGrant&& grant_outbound, const char *pszDest, ConnectionType conn_type, bool use_v2transport, std::shared_ptr<qq::Probe> qq_probe, bool* attempted)
 {
+    if (attempted) *attempted = false;
     AssertLockNotHeld(m_unused_i2p_sessions_mutex);
     assert(conn_type != ConnectionType::INBOUND);
 
     //
     // Initiate outbound network connection
     //
-    if (interruptNet) {
+    if (interruptNet || (qq_probe && (qq_probe->Expired(qq::Clock::now()) || !m_use_addrman_outgoing))) {
         return;
     }
     if (!fNetworkActive) {
@@ -2882,11 +3724,26 @@ void CConnman::OpenNetworkConnection(const CAddress& addrConnect, bool fCountFai
     } else if (FindNode(std::string(pszDest)))
         return;
 
-    CNode* pnode = ConnectNode(addrConnect, pszDest, fCountFailure, conn_type, use_v2transport);
+    bool connection_attempted{false};
+    ClearLastConnectError();
+    CNode* pnode = ConnectNode(addrConnect, pszDest, fCountFailure, conn_type, use_v2transport, connection_attempted);
+    if (attempted) *attempted = connection_attempted;
+    if (connection_attempted) {
+        ++m_dial_attempts;
+        if (addrConnect.nServices & NODE_QUANTUM_QUASAR) ++m_qq_dial_attempts;
+        if (!pnode) {
+            ++m_dial_failures;
+            const DialFailClass fail_class{ClassifyConnectError(GetLastConnectError())};
+            ++m_dial_fail_by_class[fail_class];
+            m_last_dial_fail_class = fail_class;
+        }
+    }
+    if (qq_probe) RecordQQConnect(pnode == nullptr);
 
     if (!pnode)
         return;
     pnode->grantOutbound = std::move(grant_outbound);
+    pnode->m_qq_probe = std::move(qq_probe);
 
     m_msgproc->InitializeNode(*pnode, nLocalServices);
     {
@@ -2985,7 +3842,58 @@ void CConnman::ThreadI2PAcceptIncoming()
 
 bool CConnman::BindListenPort(const CService& addrBind, bilingual_str& strError, NetPermissionFlags permissions)
 {
+    std::shared_ptr<Sock> sock;
+    bool in_use{false};
+    if (!BindListenSocket(addrBind, strError, sock, /*quiet=*/false, &in_use)) {
+        if (!in_use) return false;
+
+        // "Address in use" can be transient (see DEFAULT_BIND_RETRY_SECONDS). Retry within
+        // the budget shared by this InitBinds() pass, polling for shutdown while waiting.
+        const auto start{SteadyClock::now()};
+        if (!m_bind_retry_deadline) m_bind_retry_deadline = start + std::chrono::seconds{m_bind_retry_seconds};
+        const auto deadline{*m_bind_retry_deadline};
+        if (start < deadline) {
+            const int budget_s = int(std::chrono::ceil<std::chrono::seconds>(deadline - start).count());
+            LogPrintf("Listen address %s is in use; retrying for up to %d seconds\n", addrBind.ToStringAddrPort(), budget_s);
+            while (SteadyClock::now() < deadline) {
+                const auto next{SteadyClock::now() + BIND_RETRY_INTERVAL};
+                while (SteadyClock::now() < next) {
+                    if (m_shutdown_requested && m_shutdown_requested()) {
+                        LogPrintf("Shutdown requested while waiting to bind to %s\n", addrBind.ToStringAddrPort());
+                        m_bind_aborted = true;
+                        return false;
+                    }
+                    UninterruptibleSleep(BIND_RETRY_POLL);
+                }
+                in_use = false;
+                if (BindListenSocket(addrBind, strError, sock, /*quiet=*/true, &in_use)) {
+                    const auto waited{std::chrono::duration_cast<std::chrono::milliseconds>(SteadyClock::now() - start)};
+                    LogPrintf("Bound to %s after retrying for %d.%03d seconds\n", addrBind.ToStringAddrPort(),
+                              int(waited.count() / 1000), int(waited.count() % 1000));
+                    vhListenSocket.emplace_back(std::move(sock), permissions, addrBind);
+                    return true;
+                }
+                if (!in_use) {
+                    // A different failure now: report it as a normal bind failure.
+                    LogPrintLevel(BCLog::NET, BCLog::Level::Error, "%s\n", strError.original);
+                    return false;
+                }
+            }
+        }
+        // Still in use: fail exactly as before.
+        LogPrintLevel(BCLog::NET, BCLog::Level::Error, "%s\n", strError.original);
+        return false;
+    }
+    vhListenSocket.emplace_back(std::move(sock), permissions, addrBind);
+    return true;
+}
+
+bool CConnman::BindListenSocket(const CService& addrBind, bilingual_str& strError, std::shared_ptr<Sock>& out, bool quiet, bool* addr_in_use)
+{
     int nOne = 1;
+    const auto log_error = [&](const std::string& line) {
+        if (!quiet) LogPrintLevel(BCLog::NET, BCLog::Level::Error, "%s\n", line);
+    };
 
     // Create socket for listening for incoming connections
     struct sockaddr_storage sockaddr;
@@ -2993,14 +3901,14 @@ bool CConnman::BindListenPort(const CService& addrBind, bilingual_str& strError,
     if (!addrBind.GetSockAddr((struct sockaddr*)&sockaddr, &len))
     {
         strError = strprintf(Untranslated("Bind address family for %s not supported"), addrBind.ToStringAddrPort());
-        LogPrintLevel(BCLog::NET, BCLog::Level::Error, "%s\n", strError.original);
+        log_error(strError.original);
         return false;
     }
 
     std::unique_ptr<Sock> sock = CreateSock(addrBind);
     if (!sock) {
         strError = strprintf(Untranslated("Couldn't open socket for incoming connections (socket returned error %s)"), NetworkErrorString(WSAGetLastError()));
-        LogPrintLevel(BCLog::NET, BCLog::Level::Error, "%s\n", strError.original);
+        log_error(strError.original);
         return false;
     }
 
@@ -3008,7 +3916,7 @@ bool CConnman::BindListenPort(const CService& addrBind, bilingual_str& strError,
     // the program was closed and restarted.
     if (sock->SetSockOpt(SOL_SOCKET, SO_REUSEADDR, (sockopt_arg_type)&nOne, sizeof(int)) == SOCKET_ERROR) {
         strError = strprintf(Untranslated("Error setting SO_REUSEADDR on socket: %s, continuing anyway"), NetworkErrorString(WSAGetLastError()));
-        LogPrintf("%s\n", strError.original);
+        if (!quiet) LogPrintf("%s\n", strError.original);
     }
 
     // some systems don't have IPV6_V6ONLY but are always v6only; others do have the option
@@ -3017,38 +3925,44 @@ bool CConnman::BindListenPort(const CService& addrBind, bilingual_str& strError,
 #ifdef IPV6_V6ONLY
         if (sock->SetSockOpt(IPPROTO_IPV6, IPV6_V6ONLY, (sockopt_arg_type)&nOne, sizeof(int)) == SOCKET_ERROR) {
             strError = strprintf(Untranslated("Error setting IPV6_V6ONLY on socket: %s, continuing anyway"), NetworkErrorString(WSAGetLastError()));
-            LogPrintf("%s\n", strError.original);
+            if (!quiet) LogPrintf("%s\n", strError.original);
         }
 #endif
 #ifdef WIN32
         int nProtLevel = PROTECTION_LEVEL_UNRESTRICTED;
         if (sock->SetSockOpt(IPPROTO_IPV6, IPV6_PROTECTION_LEVEL, (const char*)&nProtLevel, sizeof(int)) == SOCKET_ERROR) {
             strError = strprintf(Untranslated("Error setting IPV6_PROTECTION_LEVEL on socket: %s, continuing anyway"), NetworkErrorString(WSAGetLastError()));
-            LogPrintf("%s\n", strError.original);
+            if (!quiet) LogPrintf("%s\n", strError.original);
         }
 #endif
     }
 
     if (sock->Bind(reinterpret_cast<struct sockaddr*>(&sockaddr), len) == SOCKET_ERROR) {
         int nErr = WSAGetLastError();
-        if (nErr == WSAEADDRINUSE)
+        if (nErr == WSAEADDRINUSE) {
             strError = strprintf(_("Unable to bind to %s on this computer. %s is probably already running."), addrBind.ToStringAddrPort(), PACKAGE_NAME);
-        else
+            if (addr_in_use) {
+                // The caller may retry and logs the error itself if it gives up.
+                *addr_in_use = true;
+                return false;
+            }
+        } else {
             strError = strprintf(_("Unable to bind to %s on this computer (bind returned error %s)"), addrBind.ToStringAddrPort(), NetworkErrorString(nErr));
-        LogPrintLevel(BCLog::NET, BCLog::Level::Error, "%s\n", strError.original);
+        }
+        log_error(strError.original);
         return false;
     }
-    LogPrintf("Bound to %s\n", addrBind.ToStringAddrPort());
+    if (!quiet) LogPrintf("Bound to %s\n", addrBind.ToStringAddrPort());
 
     // Listen for incoming connections
     if (sock->Listen(SOMAXCONN) == SOCKET_ERROR)
     {
         strError = strprintf(_("Listening for incoming connections failed (listen returned error %s)"), NetworkErrorString(WSAGetLastError()));
-        LogPrintLevel(BCLog::NET, BCLog::Level::Error, "%s\n", strError.original);
+        log_error(strError.original);
         return false;
     }
 
-    vhListenSocket.emplace_back(std::move(sock), permissions);
+    out = std::move(sock);
     return true;
 }
 
@@ -3103,13 +4017,13 @@ void Discover()
 void CConnman::SetNetworkActive(bool active)
 {
     LogPrintf("%s: %s\n", __func__, active);
-
-    if (fNetworkActive == active) {
-        return;
+    {
+        LOCK(m_https_seed_mutex);
+        if (fNetworkActive == active) return;
+        // A quick false->true toggle must still invalidate the older transfer.
+        ++m_https_seed_generation;
+        fNetworkActive = active;
     }
-
-    fNetworkActive = active;
-
     if (m_client_interface) {
         m_client_interface->NotifyNetworkActiveChanged(fNetworkActive);
     }
@@ -3152,6 +4066,7 @@ bool CConnman::Bind(const CService& addr_, unsigned int flags, NetPermissionFlag
 
     bilingual_str strError;
     if (!BindListenPort(addr, strError, permissions)) {
+        if (m_bind_aborted) return false; // shutdown requested, no error box
         if ((flags & BF_REPORT_ERROR) && m_client_interface) {
             m_client_interface->ThreadSafeMessageBox(strError, "", CClientUIInterface::MSG_ERROR);
         }
@@ -3167,6 +4082,8 @@ bool CConnman::Bind(const CService& addr_, unsigned int flags, NetPermissionFlag
 
 bool CConnman::InitBinds(const Options& options)
 {
+    m_bind_retry_deadline.reset();
+    m_bind_aborted = false;
     bool fBound = false;
     for (const auto& addrBind : options.vBinds) {
         fBound |= Bind(addrBind, BF_REPORT_ERROR, NetPermissionFlags::None);
@@ -3193,7 +4110,7 @@ bool CConnman::Start(CScheduler& scheduler, const Options& connOptions)
     Init(connOptions);
 
     if (fListen && !InitBinds(connOptions)) {
-        if (m_client_interface) {
+        if (m_client_interface && !m_bind_aborted) {
             m_client_interface->ThreadSafeMessageBox(
                 _("Failed to listen on any port. Use -listen=0 if you want this."),
                 "", CClientUIInterface::MSG_ERROR);
@@ -3248,6 +4165,14 @@ bool CConnman::Start(CScheduler& scheduler, const Options& connOptions)
         fMsgProcWake = false;
     }
 
+    // Runtime public endpoint state must be in place before any thread can read it.
+    publicendpoint::Reset();
+    if (!m_public_endpoint_file.empty()) {
+        publicendpoint::SetEnabled(true);
+        m_pe_applied_gen = 0;
+        m_pe_last_logged_failure.clear();
+    }
+
     // Send and receive from sockets, accept connections
     threadSocketHandler = std::thread(&util::TraceThread, "net", [this] { ThreadSocketHandler(); });
 
@@ -3255,6 +4180,18 @@ bool CConnman::Start(CScheduler& scheduler, const Options& connOptions)
         LogPrintf("DNS seeding disabled\n");
     else
         threadDNSAddressSeed = std::thread(&util::TraceThread, "dnsseed", [this] { ThreadDNSAddressSeed(); });
+
+    if (m_https_seed_enabled && m_params.GetChainType() == ChainType::MAIN && m_use_addrman_outgoing && nMaxConnections > 0) {
+        if (httpsseed::InitializeTransport()) {
+            threadHTTPSAddressSeed = std::thread(&util::TraceThread, "httpsseed", [this] { ThreadHTTPSAddressSeed(); });
+        } else {
+            LogPrintf("HTTPS discovery unavailable: TLS transport initialization failed\n");
+        }
+    }
+
+    if (!m_public_endpoint_file.empty()) {
+        threadPublicEndpoint = std::thread(&util::TraceThread, "pubendpoint", [this] { ThreadPublicEndpoint(); });
+    }
 
     // Initiate manual connections
     threadOpenAddedConnections = std::thread(&util::TraceThread, "addcon", [this] { ThreadOpenAddedConnections(); });
@@ -3337,6 +4274,10 @@ void CConnman::StopThreads()
         threadOpenConnections.join();
     if (threadOpenAddedConnections.joinable())
         threadOpenAddedConnections.join();
+    if (threadHTTPSAddressSeed.joinable())
+        threadHTTPSAddressSeed.join();
+    if (threadPublicEndpoint.joinable())
+        threadPublicEndpoint.join();
     if (threadDNSAddressSeed.joinable())
         threadDNSAddressSeed.join();
     if (threadSocketHandler.joinable())
@@ -3363,6 +4304,7 @@ void CConnman::StopNodes()
     std::vector<CNode*> nodes;
     WITH_LOCK(m_nodes_mutex, nodes.swap(m_nodes));
     for (CNode* pnode : nodes) {
+        pnode->SetDisconnectReason(DisconnectReason::LOCAL_SHUTDOWN);
         pnode->CloseSocketDisconnect();
         DeleteNode(pnode);
     }
@@ -3372,6 +4314,14 @@ void CConnman::StopNodes()
     }
     m_nodes_disconnected.clear();
     vhListenSocket.clear();
+    // Runtime public endpoint: all threads are joined, nothing else touches this state.
+    m_pe_listen_socket.reset();
+    m_pe_listen_port = 0;
+    if (const auto active = publicendpoint::Active()) RemoveLocal(*active);
+    publicendpoint::Reset();
+    // Queued fallbacks own grants too. Return them before destroying either
+    // semaphore, including shutdown while networking is paused.
+    WITH_LOCK(m_reconnections_mutex, m_reconnections.clear());
     semOutbound.reset();
     semAddnode.reset();
 }
@@ -3511,43 +4461,43 @@ void CConnman::GetNodeStats(std::vector<CNodeStats>& vstats) const
     }
 }
 
-bool CConnman::DisconnectNode(const std::string& strNode)
+bool CConnman::DisconnectNode(const std::string& strNode, DisconnectReason reason)
 {
     LOCK(m_nodes_mutex);
     if (CNode* pnode = FindNode(strNode)) {
         LogPrint(BCLog::NET, "disconnect by address%s matched peer=%d; disconnecting\n", (fLogIPs ? strprintf("=%s", strNode) : ""), pnode->GetId());
-        pnode->fDisconnect = true;
+        pnode->Disconnect(reason);
         return true;
     }
     return false;
 }
 
-bool CConnman::DisconnectNode(const CSubNet& subnet)
+bool CConnman::DisconnectNode(const CSubNet& subnet, DisconnectReason reason)
 {
     bool disconnected = false;
     LOCK(m_nodes_mutex);
     for (CNode* pnode : m_nodes) {
         if (subnet.Match(pnode->addr)) {
             LogPrint(BCLog::NET, "disconnect by subnet%s matched peer=%d; disconnecting\n", (fLogIPs ? strprintf("=%s", subnet.ToString()) : ""), pnode->GetId());
-            pnode->fDisconnect = true;
+            pnode->Disconnect(reason);
             disconnected = true;
         }
     }
     return disconnected;
 }
 
-bool CConnman::DisconnectNode(const CNetAddr& addr)
+bool CConnman::DisconnectNode(const CNetAddr& addr, DisconnectReason reason)
 {
-    return DisconnectNode(CSubNet(addr));
+    return DisconnectNode(CSubNet(addr), reason);
 }
 
-bool CConnman::DisconnectNode(NodeId id)
+bool CConnman::DisconnectNode(NodeId id, DisconnectReason reason)
 {
     LOCK(m_nodes_mutex);
     for(CNode* pnode : m_nodes) {
         if (id == pnode->GetId()) {
             LogPrint(BCLog::NET, "disconnect by id peer=%d; disconnecting\n", pnode->GetId());
-            pnode->fDisconnect = true;
+            pnode->Disconnect(reason);
             return true;
         }
     }
@@ -3820,7 +4770,8 @@ void CConnman::PerformReconnections()
 {
     AssertLockNotHeld(m_reconnections_mutex);
     AssertLockNotHeld(m_unused_i2p_sessions_mutex);
-    while (true) {
+    for (int batch = 0; batch < 1 && !interruptNet && fNetworkActive; ++batch) {
+        // Bound synchronous reconnect work so selection and timers get a turn.
         // Move first element of m_reconnections to todo (avoiding an allocation inside the lock).
         decltype(m_reconnections) todo;
         {
@@ -3839,7 +4790,8 @@ void CConnman::PerformReconnections()
                               std::move(item.grant),
                               item.destination.empty() ? nullptr : item.destination.c_str(),
                               item.conn_type,
-                              item.use_v2transport);
+                              item.use_v2transport,
+                              std::move(item.qq_probe));
     }
 }
 

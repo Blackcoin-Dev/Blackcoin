@@ -35,6 +35,7 @@
 #include <rpc/protocol.h>
 #include <rpc/request.h>
 #include <rpc/server.h>
+#include <script/descriptor.h>
 #include <script/solver.h>
 #include <shadow.h>
 #include <streams.h>
@@ -50,6 +51,7 @@
 #include <validation.h>
 #include <validationinterface.h>
 #include <wallet/claim_maintenance.h>
+#include <wallet/pow_mining_duty_cycle.h>
 #include <wallet/coincontrol.h>
 #include <wallet/context.h>
 #include <wallet/load.h>
@@ -61,12 +63,18 @@
 #include <wallet/rpc/util.h>
 #include <wallet/scriptpubkeyman.h>
 #include <wallet/spend.h>
+#ifdef USE_SQLITE
+#include <wallet/sqlite.h>
+#endif
 #include <wallet/staking.h>
 #include <wallet/test/util.h>
 #include <wallet/test/wallet_test_fixture.h>
 
 #include <boost/test/unit_test.hpp>
 #include <univalue.h>
+#ifdef USE_SQLITE
+#include <sqlite3.h>
+#endif
 
 using node::MAX_BLOCKFILE_SIZE;
 
@@ -171,6 +179,401 @@ static_assert(DEFAULT_TRANSACTION_MINFEE >= DEFAULT_MIN_RELAY_TX_FEE, "wallet mi
 */
 
 BOOST_FIXTURE_TEST_SUITE(wallet_tests, WalletTestingSetup)
+
+BOOST_AUTO_TEST_CASE(pow_mining_total_work_duty_budget)
+{
+    using namespace std::chrono_literals;
+    // Selection+preparation and hashing are each 60 ms. At 60%, the old
+    // hashing-only throttle gave 40 ms (75% busy); the complete budget is 80.
+    BOOST_CHECK_EQUAL(PowMiningAdditionalDelay(120ms, 0ms, 60).count(), 80);
+    BOOST_CHECK_EQUAL(PowMiningAdditionalDelay(120ms, 0ms, 1).count(), 11880);
+    BOOST_CHECK_EQUAL(PowMiningAdditionalDelay(120ms, 0ms, 100).count(), 0);
+    // A mandatory error backoff or availability wait already pays the budget.
+    BOOST_CHECK_EQUAL(PowMiningAdditionalDelay(1120ms, 1000ms, 60).count(), 0);
+    BOOST_CHECK_EQUAL(PowMiningAdditionalDelay(1120ms, 1000ms, 1).count(), 10880);
+    BOOST_CHECK_EQUAL(PowMiningAdditionalDelay(0ns, 0ns, 1).count(), 0);
+    BOOST_CHECK_EQUAL(PowMiningAdditionalDelay(1us, 0ns, 1).count(), 1);
+    BOOST_CHECK_EQUAL(PowMiningAdditionalDelay(100ms, 100ms, 1).count(), 0);
+    BOOST_CHECK_EQUAL(PowMiningAdditionalDelay(100ms, 200ms, 1).count(), 0);
+}
+
+BOOST_AUTO_TEST_CASE(pow_mining_control_cancelled_after_lock_wait)
+{
+    CWallet wallet{nullptr, "cancel-miner-control", CreateMockableWalletDatabase()};
+    wallet.m_pow_threads = 2;
+    wallet.m_pow_cpu_percent = 60;
+    std::atomic<bool> cancel{false};
+    std::promise<void> entered;
+    std::future<bool> result;
+    {
+        LOCK(wallet.m_pow_recovery_authority_mutex);
+        result = std::async(std::launch::async, [&] {
+            bilingual_str error;
+            bool first_checkpoint{true};
+            return wallet.SetPowMining(true, 2, 60, error, nullptr, false, false,
+                [&] {
+                    if (first_checkpoint) {
+                        first_checkpoint = false;
+                        entered.set_value();
+                        return false; // Cancellation must be seen after the lock.
+                    }
+                    return cancel.load();
+                });
+        });
+        entered.get_future().wait();
+        cancel = true;
+    }
+    BOOST_CHECK(!result.get());
+    BOOST_CHECK(!wallet.m_pow_mining_enabled.load());
+    BOOST_CHECK(wallet.mapWallet.empty());
+    BOOST_CHECK_EQUAL(wallet.m_pow_threads.load(), 2);
+    BOOST_CHECK_EQUAL(wallet.m_pow_cpu_percent.load(), 60);
+    // Disabling preserves the resource choice; enabled state is separate.
+    bilingual_str error;
+    BOOST_CHECK(wallet.SetPowMining(false, 2, 60, error));
+    BOOST_CHECK_EQUAL(wallet.m_pow_threads.load(), 2);
+    BOOST_CHECK_EQUAL(wallet.m_pow_cpu_percent.load(), 60);
+}
+
+BOOST_AUTO_TEST_CASE(pow_mining_duty_period_completion_and_reset)
+{
+    using namespace std::chrono_literals;
+    CWallet wallet{nullptr, "duty-period-records", CreateMockableWalletDatabase()};
+    wallet.m_pow_mining_enabled = true;
+    {
+        LOCK(wallet.cs_wallet);
+        wallet.ResetPowMiningDutyCycleLocked(256, 60);
+    }
+    const auto initial = wallet.GetPowMiningDutyCycle();
+    BOOST_REQUIRE_EQUAL(initial.workers.size(), 256U);
+    const uint64_t generation = wallet.m_pow_wallet_authority_generation.load();
+    wallet.RecordPowMiningDutyPeriod(0, initial.session_id, generation,
+        10ms, 4ms, 4ms, true, 7);
+    wallet.RecordPowMiningDutyPeriod(0, initial.session_id, generation,
+        5ms, 2ms, 1ms, false, 2);
+    // Stop wins the wallet lock before publication, including a zero-wait
+    // period. Its hashes remain observable but cannot become completed duty.
+    wallet.m_pow_mining_enabled = false;
+    wallet.RecordPowMiningDutyPeriod(0, initial.session_id, generation,
+        3ms, 1ms, 0ns, true, 3);
+    const auto stopped = wallet.GetPowMiningDutyCycle();
+    const auto& record = stopped.workers[0];
+    BOOST_CHECK_EQUAL(record.completed_periods, 1U);
+    BOOST_CHECK_EQUAL(record.completed_work_periods, 1U);
+    BOOST_CHECK_EQUAL(record.completed_active_ns, 6'000'000U);
+    BOOST_CHECK_EQUAL(record.completed_explicit_wait_ns, 4'000'000U);
+    BOOST_CHECK_EQUAL(record.completed_duty_wait_ns, 4'000'000U);
+    BOOST_CHECK_EQUAL(record.completed_successful_hashes, 7U);
+    BOOST_CHECK_EQUAL(record.truncated_periods, 2U);
+    BOOST_CHECK_EQUAL(record.truncated_active_ns, 5'000'000U);
+    BOOST_CHECK_EQUAL(record.truncated_explicit_wait_ns, 3'000'000U);
+    BOOST_CHECK_EQUAL(record.truncated_duty_wait_ns, 1'000'000U);
+    BOOST_CHECK_EQUAL(record.successful_hashes, 12U);
+    wallet.StopPowMining();
+    BOOST_CHECK_EQUAL(wallet.GetPowMiningDutyCycle().workers[0].truncated_periods, 2U);
+    {
+        LOCK(wallet.cs_wallet);
+        wallet.ResetPowMiningDutyCycleLocked(1, 1);
+    }
+    wallet.m_pow_mining_enabled = true;
+    const auto reset = wallet.GetPowMiningDutyCycle();
+    BOOST_REQUIRE_EQUAL(reset.workers.size(), 1U);
+    BOOST_CHECK_EQUAL(reset.session_id, initial.session_id + 1);
+    BOOST_CHECK_EQUAL(reset.cpu_percent, 1);
+    // A late old-session record cannot enter the new slot, even with the same
+    // signing authority generation. Removed and negative slots are ignored.
+    for (const int worker : {-1, 0, 255, 256}) {
+        wallet.RecordPowMiningDutyPeriod(worker, initial.session_id, generation,
+            1ms, 0ns, 99ms, true, 1);
+    }
+    wallet.RecordPowMiningDutyPeriod(1, reset.session_id, generation,
+        1ms, 0ns, 99ms, true, 1);
+    BOOST_CHECK_EQUAL(wallet.GetPowMiningDutyCycle().workers[0].completed_periods, 0U);
+    wallet.RecordPowMiningDutyPeriod(0, reset.session_id, generation + 1,
+        1ms, 0ns, 99ms, true, 1);
+    BOOST_CHECK_EQUAL(wallet.GetPowMiningDutyCycle().workers[0].truncated_periods, 1U);
+    wallet.RecordPowMiningDutyPeriod(0, reset.session_id, generation,
+        1ms, 0ns, 99ms, true, 0);
+    const auto idle = wallet.GetPowMiningDutyCycle();
+    BOOST_CHECK_EQUAL(idle.workers[0].completed_periods, 1U);
+    BOOST_CHECK_EQUAL(idle.workers[0].completed_work_periods, 0U);
+    BOOST_CHECK_EQUAL(idle.workers[0].completed_successful_hashes, 0U);
+}
+
+BOOST_AUTO_TEST_CASE(pow_mining_duty_snapshot_is_coherent)
+{
+    using namespace std::chrono_literals;
+    CWallet wallet{nullptr, "duty-snapshot", CreateMockableWalletDatabase()};
+    wallet.m_pow_mining_enabled = true;
+    {
+        LOCK(wallet.cs_wallet);
+        wallet.ResetPowMiningDutyCycleLocked(2, 60);
+    }
+    const auto initial = wallet.GetPowMiningDutyCycle();
+    const uint64_t generation = wallet.m_pow_wallet_authority_generation.load();
+    std::atomic<bool> done{false};
+    std::thread writer([&] {
+        for (int count = 0; count < 1000; ++count) {
+            wallet.RecordPowMiningDutyPeriod(0, initial.session_id, generation,
+                7ns, 4ns, 2ns, true, 5);
+        }
+        done = true;
+    });
+    bool coherent{true};
+    do {
+        const auto snapshot = wallet.GetPowMiningDutyCycle();
+        const auto& record = snapshot.workers[0];
+        coherent &= snapshot.session_id == initial.session_id && snapshot.workers.size() == 2 &&
+            record.completed_active_ns == 3 * record.completed_periods &&
+            record.completed_explicit_wait_ns == 4 * record.completed_periods &&
+            record.completed_duty_wait_ns == 2 * record.completed_periods &&
+            record.completed_successful_hashes == 5 * record.completed_periods &&
+            record.completed_work_periods == record.completed_periods &&
+            snapshot.workers[1].completed_periods == 0;
+        std::this_thread::yield();
+    } while (!done.load());
+    writer.join();
+    BOOST_CHECK(coherent);
+    BOOST_CHECK_EQUAL(wallet.GetPowMiningDutyCycle().workers[0].completed_periods, 1000U);
+}
+
+BOOST_AUTO_TEST_CASE(pow_mining_duty_real_wait_and_stop)
+{
+    using namespace std::chrono_literals;
+    CWallet wallet{nullptr, "duty-real-wait", CreateMockableWalletDatabase()};
+    wallet.m_pow_mining_enabled = true;
+    wallet.m_pow_cpu_percent = 60;
+    wallet.m_pow_state = interfaces::WalletPowMiningState::READY;
+    {
+        LOCK(wallet.cs_wallet);
+        wallet.ResetPowMiningDutyCycleLocked(1, 60);
+        wallet.m_pow_worker_states.assign(1, interfaces::WalletPowMiningState::READY);
+        wallet.m_pow_worker_successful_hashes.assign(1, 0);
+    }
+    {
+        LOCK(wallet.m_pow_miner_mutex);
+        wallet.threadPowMinerGroup = std::make_unique<std::vector<std::thread>>();
+        wallet.threadPowMinerGroup->emplace_back([&] { wallet.ThreadShadowPoWMiner(0); });
+    }
+    // A wallet without a chain performs a real explicit one-second wait. Its
+    // completed telemetry must measure the actual wait rather than a request.
+    const auto deadline = std::chrono::steady_clock::now() + 5s;
+    while (wallet.GetPowMiningDutyCycle().workers[0].completed_periods == 0 &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(10ms);
+    }
+    wallet.StopPowMining();
+    const auto snapshot = wallet.GetPowMiningDutyCycle();
+    BOOST_REQUIRE_EQUAL(snapshot.workers.size(), 1U);
+    BOOST_CHECK_GE(snapshot.workers[0].completed_periods, 1U);
+    BOOST_CHECK_GE(snapshot.workers[0].completed_explicit_wait_ns, 900'000'000U);
+    BOOST_CHECK_EQUAL(snapshot.workers[0].completed_work_periods, 0U);
+    BOOST_CHECK_EQUAL(snapshot.workers[0].successful_hashes, 0U);
+    // At most one final in-progress iteration is interrupted by this stop.
+    BOOST_CHECK_LE(snapshot.workers[0].truncated_periods, 1U);
+}
+
+BOOST_AUTO_TEST_CASE(pow_mining_batch_local_error_retry_and_recovery)
+{
+    struct ResetFailures {
+        ~ResetFailures() { ClearShadowArgon2FailuresForTesting(); }
+    } reset_failures;
+    ShadowPowWork work;
+    work.valid = true;
+    work.target = CScript{} << OP_TRUE;
+    work.quantum_payout_script = GetScriptForDestination(WitnessUnknown{
+        QUANTUM_MIGRATION_WITNESS_VERSION,
+        std::vector<unsigned char>(QUANTUM_MIGRATION_PROGRAM_SIZE, 0x5a)});
+    work.bits = 0; // First successful evaluation finds a proof without a claim.
+
+    for (const int cpu_percent : {1, 60, 100}) {
+        BOOST_TEST_CONTEXT("CPU target " << cpu_percent) {
+            CWallet wallet{nullptr, "synthetic-pow-batch", CreateMockableWalletDatabase()};
+            wallet.m_pow_mining_enabled = true;
+            wallet.m_pow_cpu_percent = cpu_percent;
+            wallet.m_pow_state = interfaces::WalletPowMiningState::READY;
+            wallet.m_pow_total_tries = 17;
+            wallet.m_pow_hashrate = 42.0;
+            wallet.m_pow_hashrate_start_ms = GetTime<std::chrono::milliseconds>().count() - 1000;
+            const uint64_t generation = wallet.m_pow_wallet_authority_generation.load();
+            std::chrono::steady_clock::time_point next_error_log{};
+            std::vector<unsigned char> proof;
+            int error_logs{0};
+            DebugLogHelper log_counter{"local Argon2 proof evaluation failed",
+                [&](const std::string* line) {
+                    if (line) ++error_logs;
+                    return false; // Observe every matching log in this scope.
+                }};
+            ResetShadowArgon2EvaluationCountForTesting();
+            SetShadowArgon2FailuresForTesting(2);
+            const auto started = std::chrono::steady_clock::now();
+            for (uint64_t attempt = 1; attempt <= 2; ++attempt) {
+                const auto result = wallet.RunShadowPowMiningBatch(
+                    work, 0, 1, 128, generation, proof, 0, next_error_log);
+                BOOST_CHECK(result.status == WalletPowMiningGrindStatus::LOCAL_INTERNAL_ERROR);
+                BOOST_CHECK_EQUAL(result.successful_hashes, 0U);
+                BOOST_CHECK_EQUAL(wallet.m_pow_total_tries.load(), 17U);
+                BOOST_CHECK_EQUAL(wallet.m_pow_hashrate.load(), 0.0);
+                BOOST_CHECK(wallet.m_pow_state.load() == interfaces::WalletPowMiningState::RUNTIME_ERROR);
+                BOOST_CHECK(proof.empty());
+                BOOST_CHECK_EQUAL(GetShadowArgon2EvaluationCountForTesting(), attempt);
+                BOOST_CHECK_EQUAL(error_logs, 1);
+                const auto waited = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - started);
+                BOOST_CHECK_GE(waited.count(), static_cast<int64_t>(attempt * 900));
+            }
+
+            ClearShadowArgon2FailuresForTesting();
+            const auto resumed = wallet.RunShadowPowMiningBatch(
+                work, 0, 1, 128, generation, proof, 0, next_error_log);
+            BOOST_CHECK(resumed.status == WalletPowMiningGrindStatus::FOUND);
+            BOOST_CHECK_EQUAL(resumed.successful_hashes, 1U);
+            BOOST_CHECK_EQUAL(wallet.m_pow_total_tries.load(), 18U);
+            BOOST_CHECK_GT(wallet.m_pow_hashrate.load(), 0.0);
+            BOOST_CHECK(wallet.m_pow_state.load() == interfaces::WalletPowMiningState::READY);
+            BOOST_CHECK(!proof.empty());
+            BOOST_CHECK_EQUAL(GetShadowArgon2EvaluationCountForTesting(), 3U);
+            BOOST_CHECK_EQUAL(error_logs, 1);
+            BOOST_CHECK(wallet.mapWallet.empty());
+            BOOST_CHECK_EQUAL(wallet.m_pow_claims_submitted.load(), 0);
+            wallet.m_pow_mining_enabled = false;
+        }
+    }
+}
+
+BOOST_AUTO_TEST_CASE(pow_mining_multiworker_error_does_not_erase_sibling_work)
+{
+    struct ResetFailures { ~ResetFailures() { ClearShadowArgon2FailuresForTesting(); } } reset;
+    CWallet wallet{nullptr, "aggregate-miner", CreateMockableWalletDatabase()};
+    wallet.m_pow_mining_enabled = true;
+    wallet.m_pow_worker_states = {interfaces::WalletPowMiningState::HASHING,
+                                  interfaces::WalletPowMiningState::READY};
+    wallet.m_pow_workers_hashing = 1;
+    wallet.m_pow_worker_successful_hashes = {17, 0};
+    wallet.m_pow_total_tries = 17;
+    wallet.m_pow_hashrate = 42.0;
+    wallet.m_pow_hashrate_start_ms = GetTime<std::chrono::milliseconds>().count() - 1000;
+    ShadowPowWork work;
+    work.valid = true;
+    work.target = CScript{} << OP_TRUE;
+    work.quantum_payout_script = GetScriptForDestination(WitnessUnknown{
+        QUANTUM_MIGRATION_WITNESS_VERSION,
+        std::vector<unsigned char>(QUANTUM_MIGRATION_PROGRAM_SIZE, 0x5a)});
+    work.bits = 0;
+    const uint64_t generation = wallet.m_pow_wallet_authority_generation.load();
+    std::chrono::steady_clock::time_point next_error_log{};
+    std::vector<unsigned char> proof;
+    SetShadowArgon2FailuresForTesting();
+    const auto failed = wallet.RunShadowPowMiningBatch(
+        work, 0, 1, 1, generation, proof, 1, next_error_log);
+    BOOST_CHECK(failed.status == WalletPowMiningGrindStatus::LOCAL_INTERNAL_ERROR);
+    BOOST_CHECK_EQUAL(wallet.m_pow_workers_error.load(), 1);
+    BOOST_CHECK_EQUAL(wallet.m_pow_workers_hashing.load(), 1);
+    BOOST_CHECK_GT(wallet.m_pow_hashrate.load(), 0.0);
+    ClearShadowArgon2FailuresForTesting();
+    const auto healthy = wallet.RunShadowPowMiningBatch(
+        work, 0, 1, 1, generation, proof, 0, next_error_log);
+    BOOST_CHECK(healthy.status == WalletPowMiningGrindStatus::FOUND);
+    BOOST_CHECK(wallet.m_pow_state.load() == interfaces::WalletPowMiningState::RUNTIME_ERROR);
+    BOOST_CHECK_EQUAL(wallet.m_pow_workers_error.load(), 1);
+    // Worker zero has returned READY and may be sleeping for its CPU duty
+    // target. A later sibling error must retain its valid average-rate work.
+    SetShadowArgon2FailuresForTesting();
+    const auto duty_wait_failure = wallet.RunShadowPowMiningBatch(
+        work, 0, 1, 1, generation, proof, 1, next_error_log);
+    BOOST_CHECK(duty_wait_failure.status == WalletPowMiningGrindStatus::LOCAL_INTERNAL_ERROR);
+    BOOST_CHECK_EQUAL(wallet.m_pow_workers_hashing.load(), 0);
+    BOOST_CHECK_GT(wallet.m_pow_hashrate.load(), 0.0);
+    BOOST_CHECK_EQUAL(wallet.m_pow_total_tries.load(), 18);
+    ClearShadowArgon2FailuresForTesting();
+    const auto recovered = wallet.RunShadowPowMiningBatch(
+        work, 0, 1, 1, generation, proof, 1, next_error_log);
+    BOOST_CHECK(recovered.status == WalletPowMiningGrindStatus::FOUND);
+    BOOST_CHECK_EQUAL(wallet.m_pow_workers_error.load(), 0);
+    BOOST_CHECK_EQUAL(wallet.m_pow_workers_hashing.load(), 0);
+    BOOST_CHECK(wallet.m_pow_state.load() == interfaces::WalletPowMiningState::READY);
+    {
+        LOCK(wallet.cs_wallet);
+        wallet.PublishPowMiningWalletAuthorityLocked();
+    }
+    wallet.m_pow_mining_enabled = false;
+}
+
+BOOST_AUTO_TEST_CASE(pow_mining_terminal_disable_retires_worker_telemetry)
+{
+    CWallet wallet{nullptr, "terminal-miner", CreateMockableWalletDatabase()};
+    wallet.m_pow_worker_states = {interfaces::WalletPowMiningState::HASHING,
+                                  interfaces::WalletPowMiningState::RUNTIME_ERROR};
+    wallet.m_pow_workers_hashing = 1;
+    wallet.m_pow_workers_error = 1;
+    wallet.m_pow_hashrate = 42.0;
+    BOOST_CHECK(wallet.PublishPowMiningWorkerState(interfaces::WalletPowMiningState::RUNTIME_ERROR));
+    BOOST_CHECK_EQUAL(wallet.m_pow_workers_hashing.load(), 0);
+    BOOST_CHECK_EQUAL(wallet.m_pow_workers_error.load(), 0);
+    BOOST_CHECK_EQUAL(wallet.m_pow_hashrate.load(), 0.0);
+    // Exit cleanup must retire stale slots without erasing the terminal error.
+    wallet.m_pow_worker_states[0] = interfaces::WalletPowMiningState::HASHING;
+    wallet.m_pow_workers_hashing = 1;
+    wallet.ThreadShadowPoWMiner(0);
+    BOOST_CHECK_EQUAL(wallet.m_pow_workers_hashing.load(), 0);
+    BOOST_CHECK_EQUAL(wallet.m_pow_workers_error.load(), 0);
+    BOOST_CHECK(wallet.m_pow_state.load() == interfaces::WalletPowMiningState::RUNTIME_ERROR);
+}
+
+BOOST_AUTO_TEST_CASE(pow_mining_batch_error_backoff_is_interruptible)
+{
+    struct ResetFailures {
+        ~ResetFailures() { ClearShadowArgon2FailuresForTesting(); }
+    } reset_failures;
+    ShadowPowWork work;
+    work.valid = true;
+    work.target = CScript{} << OP_TRUE;
+    work.quantum_payout_script = GetScriptForDestination(WitnessUnknown{
+        QUANTUM_MIGRATION_WITNESS_VERSION,
+        std::vector<unsigned char>(QUANTUM_MIGRATION_PROGRAM_SIZE, 0x5a)});
+    enum class Cancel { DISABLE, CLOSE, AUTHORITY, STAKING_ONLY };
+    for (const auto cancel : {Cancel::DISABLE, Cancel::CLOSE,
+                              Cancel::AUTHORITY, Cancel::STAKING_ONLY}) {
+        CWallet wallet{nullptr, "cancel-pow-batch", CreateMockableWalletDatabase()};
+        wallet.m_pow_mining_enabled = true;
+        wallet.m_pow_state = interfaces::WalletPowMiningState::READY;
+        const uint64_t generation = wallet.m_pow_wallet_authority_generation.load();
+        std::chrono::steady_clock::time_point next_error_log{};
+        std::vector<unsigned char> proof;
+        ResetShadowArgon2EvaluationCountForTesting();
+        SetShadowArgon2FailuresForTesting();
+        auto batch = std::async(std::launch::async, [&] {
+            return wallet.RunShadowPowMiningBatch(
+                work, 0, 1, 128, generation, proof, 0, next_error_log);
+        });
+        // Observe the actual production error/backoff path before cancelling.
+        for (int wait = 0; wait < 500 &&
+             wallet.m_pow_state.load() != interfaces::WalletPowMiningState::RUNTIME_ERROR; ++wait) {
+            std::this_thread::sleep_for(std::chrono::milliseconds{1});
+        }
+        BOOST_CHECK(wallet.m_pow_state.load() == interfaces::WalletPowMiningState::RUNTIME_ERROR);
+        BOOST_CHECK(batch.wait_for(std::chrono::milliseconds{0}) == std::future_status::timeout);
+        const auto cancelled_at = std::chrono::steady_clock::now();
+        switch (cancel) {
+        case Cancel::DISABLE: wallet.m_pow_mining_enabled = false; break;
+        case Cancel::CLOSE: wallet.m_stop_pow_mining_thread = true; break;
+        case Cancel::AUTHORITY: ++wallet.m_pow_wallet_authority_generation; break;
+        case Cancel::STAKING_ONLY: wallet.SetWalletUnlockStakingOnly(true); break;
+        }
+        BOOST_CHECK(batch.wait_for(std::chrono::milliseconds{700}) == std::future_status::ready);
+        const auto result = batch.get();
+        BOOST_CHECK(result.status == WalletPowMiningGrindStatus::CANCELLED);
+        const auto cancel_wait = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - cancelled_at);
+        BOOST_CHECK_LT(cancel_wait.count(), 700);
+        BOOST_CHECK_EQUAL(GetShadowArgon2EvaluationCountForTesting(), 1U);
+        BOOST_CHECK_EQUAL(wallet.m_pow_total_tries.load(), 0U);
+        BOOST_CHECK_EQUAL(wallet.m_pow_hashrate.load(), 0.0);
+        BOOST_CHECK(wallet.mapWallet.empty());
+        BOOST_CHECK(proof.empty());
+        wallet.m_pow_mining_enabled = false;
+    }
+}
 
 BOOST_AUTO_TEST_CASE(coin_lock_batches_publish_only_after_database_commit)
 {
@@ -4719,6 +5122,53 @@ BOOST_AUTO_TEST_CASE(goldrush_pow_miner_lifecycle_creates_quantum_payout)
     m_wallet.StopPowMining();
 }
 
+BOOST_AUTO_TEST_CASE(goldrush_pow_payout_cancelled_after_lock_wait)
+{
+    ScopedArgsSettings args_guard;
+    args_guard.Force("-qqallowautokeycreation", "0");
+    args_guard.Unset("-qqpowpayoutaddress");
+    const size_t keys_before = WITH_LOCK(
+        m_wallet.cs_wallet, return m_wallet.ListQuantumKeyInfos().size());
+    BOOST_REQUIRE(WITH_LOCK(m_wallet.cs_wallet, return m_wallet.m_pow_payout_quantum.empty()));
+    // The callback proves Core has entered payout resolution before the
+    // request is cancelled. Both lock waits precede the key-creation boundary.
+    for (const bool hold_payout_mutex : {true, false}) {
+        std::atomic<bool> cancelled{false};
+        std::promise<void> reached_checkpoint;
+        bool result{true};
+        bool created{true};
+        bilingual_str error;
+        std::thread caller;
+        const auto start = [&] {
+            caller = std::thread([&] {
+                int checkpoints{0};
+                result = m_wallet.EnsurePowPayoutAddress(error, &created, true, [&] {
+                    if (++checkpoints == (hold_payout_mutex ? 1 : 2)) {
+                        reached_checkpoint.set_value();
+                        return false; // Prove the pre-wait checkpoint passed.
+                    }
+                    return cancelled.load();
+                });
+            });
+            reached_checkpoint.get_future().wait();
+            cancelled = true;
+        };
+        if (hold_payout_mutex) {
+            LOCK(m_wallet.m_pow_payout_mutex);
+            start();
+        } else {
+            LOCK(m_wallet.cs_wallet);
+            start();
+        }
+        caller.join();
+        BOOST_CHECK(!result);
+        BOOST_CHECK(!created);
+        BOOST_CHECK(error.original.find("cancelled") != std::string::npos);
+        BOOST_CHECK_EQUAL(WITH_LOCK(m_wallet.cs_wallet, return m_wallet.ListQuantumKeyInfos().size()), keys_before);
+        BOOST_CHECK(WITH_LOCK(m_wallet.cs_wallet, return m_wallet.m_pow_payout_quantum.empty()));
+    }
+}
+
 BOOST_AUTO_TEST_CASE(goldrush_pow_payout_creation_is_singleflight)
 {
     ScopedArgsSettings args_guard;
@@ -5172,6 +5622,1119 @@ BOOST_FIXTURE_TEST_CASE(lifecycle_balance_requires_matching_wallet_and_chain_tip
     BOOST_CHECK_EQUAL(gui_balance.balance, balance.m_mine_trusted);
     BOOST_CHECK(wallet_interface->tryGetBalances(gui_balance, gui_block_hash));
     BOOST_CHECK_EQUAL(gui_block_hash, tip->GetBlockHash());
+}
+
+namespace {
+struct LifecycleTestBlock {
+    CBlock block;
+    uint256 hash;
+    uint256 prev_hash;
+    int height;
+    unsigned int time_max;
+};
+
+void CompareLifecycleAmounts(const WalletLifecycleAmounts& a, const WalletLifecycleAmounts& b)
+{
+    BOOST_CHECK(a.outputs == b.outputs);
+    BOOST_CHECK(a.nominal == b.nominal);
+    BOOST_CHECK(a.effective == b.effective);
+    BOOST_CHECK(a.burned == b.burned);
+    BOOST_CHECK_EQUAL(a.ordinary_available, b.ordinary_available);
+    BOOST_CHECK_EQUAL(a.spendable_legacy, b.spendable_legacy);
+    BOOST_CHECK_EQUAL(a.spendable_quantum, b.spendable_quantum);
+}
+
+void CompareLifecycleScans(const Balance& a, const WalletLifecycleSummary& sa,
+                           const Balance& b, const WalletLifecycleSummary& sb)
+{
+    BOOST_CHECK_EQUAL(a.m_mine_trusted, b.m_mine_trusted);
+    BOOST_CHECK_EQUAL(a.m_mine_untrusted_pending, b.m_mine_untrusted_pending);
+    BOOST_CHECK_EQUAL(a.m_mine_immature, b.m_mine_immature);
+    BOOST_CHECK_EQUAL(a.m_mine_stake, b.m_mine_stake);
+    BOOST_CHECK_EQUAL(a.m_watchonly_trusted, b.m_watchonly_trusted);
+    BOOST_CHECK_EQUAL(a.m_watchonly_immature, b.m_watchonly_immature);
+    BOOST_CHECK_EQUAL(sa.evaluation_height, sb.evaluation_height);
+    BOOST_CHECK_EQUAL(sa.evaluation_mtp, sb.evaluation_mtp);
+    CompareLifecycleAmounts(sa.mine, sb.mine);
+    CompareLifecycleAmounts(sa.watchonly, sb.watchonly);
+}
+} // namespace
+
+BOOST_FIXTURE_TEST_CASE(lifecycle_memo_matches_database_path, TestChain100Setup)
+{
+    std::unique_ptr<CWallet> wallet{CreateSyncedWallet(
+        *m_node.chain,
+        WITH_LOCK(Assert(m_node.chainman)->GetMutex(),
+                  return m_node.chainman->ActiveChain()),
+        coinbaseKey)};
+
+    std::vector<LifecycleTestBlock> mined;
+    const auto mine_and_connect = [&](int count) {
+        for (int i = 0; i < count; ++i) {
+            LifecycleTestBlock entry;
+            entry.block = CreateAndProcessBlock({}, GetScriptForRawPubKey(coinbaseKey.GetPubKey()));
+            const CBlockIndex* tip = WITH_LOCK(Assert(m_node.chainman)->GetMutex(),
+                                               return m_node.chainman->ActiveChain().Tip());
+            entry.hash = tip->GetBlockHash();
+            entry.prev_hash = tip->pprev->GetBlockHash();
+            entry.height = tip->nHeight;
+            entry.time_max = tip->GetBlockTimeMax();
+            mined.push_back(std::move(entry));
+            const LifecycleTestBlock& e = mined.back();
+            interfaces::BlockInfo info{e.hash};
+            info.prev_hash = &e.prev_hash;
+            info.height = e.height;
+            info.data = &e.block;
+            info.chain_time_max = e.time_max;
+            wallet->blockConnected(ChainstateRole::NORMAL, info);
+        }
+    };
+    const auto disconnect_last = [&] {
+        const LifecycleTestBlock& e = mined.back();
+        interfaces::BlockInfo info{e.hash};
+        info.prev_hash = &e.prev_hash;
+        info.height = e.height;
+        info.data = &e.block;
+        info.chain_time_max = e.time_max;
+        wallet->blockDisconnected(info);
+    };
+    struct Scan {
+        Balance balance;
+        WalletLifecycleSummary summary;
+        WalletLifecycleScanStats stats;
+        bool ok{false};
+    };
+    const auto scan = [&](bool use_memo, uint64_t max_database_reads = 0) {
+        Scan result;
+        WalletLifecycleOptions options;
+        options.use_memo = use_memo;
+        options.max_database_reads = max_database_reads;
+        options.stats = &result.stats;
+        std::string error;
+        LOCK2(Assert(m_node.chainman)->GetMutex(), wallet->cs_wallet);
+        result.ok = GetLifecycleAdjustedBalance(*wallet, /*min_depth=*/0, /*avoid_reuse=*/true,
+                                               result.balance, result.summary, error, options);
+        if (max_database_reads == 0) BOOST_CHECK_MESSAGE(result.ok, error);
+        if (result.stats.budget_exhausted) {
+            BOOST_CHECK(!result.ok);
+            BOOST_CHECK_EQUAL(error, "Wallet lifecycle scan budget exhausted");
+        }
+        return result;
+    };
+    // Deep wallet outputs, and the subset the rolling re-verification re-reads
+    // from the database at the current tip.
+    const auto deep_outputs = [&](bool slice_only) {
+        std::vector<COutPoint> outpoints;
+        LOCK2(Assert(m_node.chainman)->GetMutex(), wallet->cs_wallet);
+        const int tip_height = wallet->GetLastBlockHeight();
+        for (const auto& [txid, wtx] : wallet->mapWallet) {
+            if (wallet->GetTxDepthInMainChain(wtx) < 100) continue;
+            for (uint32_t n = 0; n < wtx.tx->vout.size(); ++n) {
+                const COutPoint outpoint{txid, n};
+                if (wallet->IsSpent(outpoint) ||
+                    (wallet->IsMine(wtx.tx->vout[n]) & ISMINE_SPENDABLE) == ISMINE_NO) continue;
+                const bool in_slice = (outpoint.hash.GetUint64(0) + n + static_cast<uint64_t>(tip_height)) % LIFECYCLE_MEMO_VERIFY_MODULUS == 0;
+                if (!slice_only || in_slice) outpoints.push_back(outpoint);
+            }
+        }
+        return outpoints;
+    };
+    const auto memo_size = [&] { return WITH_LOCK(wallet->cs_wallet, return wallet->m_output_lifecycle_memo.size()); };
+
+    // Blocks 1..N are deep once N+100 blocks exist; below that they are not.
+    mine_and_connect(40);
+    {
+        const Scan plain = scan(false);
+        BOOST_REQUIRE(plain.ok);
+        BOOST_CHECK_EQUAL(plain.stats.database_reads, plain.stats.outputs);
+        BOOST_CHECK_EQUAL(plain.stats.memo_hits, 0U);
+        BOOST_CHECK_EQUAL(memo_size(), 0U); // the default path never touches the memo
+
+        const size_t deep = deep_outputs(false).size();
+        BOOST_REQUIRE_GT(deep, 0U);
+        BOOST_REQUIRE_LT(deep, plain.stats.outputs);
+
+        const Scan first = scan(true);
+        BOOST_REQUIRE(first.ok);
+        CompareLifecycleScans(plain.balance, plain.summary, first.balance, first.summary);
+        BOOST_CHECK_EQUAL(first.stats.memo_hits, 0U);
+        BOOST_CHECK_EQUAL(memo_size(), deep);
+
+        const Scan second = scan(true);
+        BOOST_REQUIRE(second.ok);
+        CompareLifecycleScans(plain.balance, plain.summary, second.balance, second.summary);
+        const size_t slice = deep_outputs(true).size();
+        BOOST_CHECK_EQUAL(second.stats.memo_hits, deep - slice);
+        BOOST_CHECK_EQUAL(second.stats.database_reads, second.stats.outputs - (deep - slice));
+        BOOST_CHECK_LT(second.stats.database_reads, plain.stats.database_reads);
+    }
+
+    // New blocks: deep outputs keep joining the memo and results stay equal.
+    for (int round = 0; round < 3; ++round) {
+        mine_and_connect(1);
+        const Scan plain = scan(false);
+        const Scan memo = scan(true);
+        BOOST_REQUIRE(plain.ok && memo.ok);
+        CompareLifecycleScans(plain.balance, plain.summary, memo.balance, memo.summary);
+        BOOST_CHECK_EQUAL(memo_size(), deep_outputs(false).size());
+    }
+
+    // A memo whose stored block hash or output digest no longer matches is
+    // ignored and replaced by the database result.
+    {
+        const std::vector<COutPoint> deep = deep_outputs(false);
+        const std::vector<COutPoint> slice = deep_outputs(true);
+        const auto in_slice = [&](const COutPoint& o) { return std::find(slice.begin(), slice.end(), o) != slice.end(); };
+        const auto victim = std::find_if(deep.begin(), deep.end(), [&](const COutPoint& o) { return !in_slice(o); });
+        BOOST_REQUIRE(victim != deep.end());
+        WalletOutputLifecycleMemo good;
+        {
+            LOCK(wallet->cs_wallet);
+            good = wallet->m_output_lifecycle_memo.at(*victim);
+            auto& entry = wallet->m_output_lifecycle_memo.at(*victim);
+            entry.confirmed_block_hash_prefix ^= 0xff;
+            entry.coin_time += 12345; // would change the result if it were used
+            entry.synthetic = !entry.synthetic;
+        }
+        const Scan plain = scan(false);
+        const Scan memo = scan(true);
+        CompareLifecycleScans(plain.balance, plain.summary, memo.balance, memo.summary);
+        BOOST_CHECK_EQUAL(memo.stats.memo_hits, deep.size() - slice.size() - 1);
+        {
+            LOCK(wallet->cs_wallet);
+            const auto& entry = wallet->m_output_lifecycle_memo.at(*victim);
+            BOOST_CHECK_EQUAL(entry.confirmed_block_hash_prefix, good.confirmed_block_hash_prefix);
+            BOOST_CHECK_EQUAL(entry.coin_time, good.coin_time);
+            BOOST_CHECK_EQUAL(entry.synthetic, good.synthetic);
+        }
+        {
+            LOCK(wallet->cs_wallet);
+            wallet->m_output_lifecycle_memo.at(*victim).txout_digest ^= 0xff;
+        }
+        const Scan digest = scan(true);
+        CompareLifecycleScans(plain.balance, plain.summary, digest.balance, digest.summary);
+        BOOST_CHECK_EQUAL(digest.stats.memo_hits, deep.size() - slice.size() - 1);
+    }
+
+    // Rolling re-verification: find a tip height at which some deep output is
+    // in the re-read slice, corrupt its memo with otherwise matching keys, and
+    // require the scan to notice, clear the memo and return the database answer.
+    {
+        while (deep_outputs(true).empty()) mine_and_connect(1);
+        const std::vector<COutPoint> slice = deep_outputs(true);
+        scan(true); // make sure every deep output is memoized at this tip
+        {
+            LOCK(wallet->cs_wallet);
+            wallet->m_output_lifecycle_memo.at(slice.front()).coin_time += 777;
+        }
+        const Scan plain = scan(false);
+        Scan memo;
+        {
+            DebugLogHelper log_helper{"Lifecycle memo disagrees with the chainstate"};
+            memo = scan(true);
+        }
+        BOOST_REQUIRE(memo.ok);
+        CompareLifecycleScans(plain.balance, plain.summary, memo.balance, memo.summary);
+        BOOST_CHECK_LT(memo.stats.memo_hits, deep_outputs(false).size() - slice.size() + 1);
+        LOCK(wallet->cs_wallet);
+        BOOST_CHECK(wallet->m_output_lifecycle_memo.count(slice.front()) == 1);
+    }
+
+    // A budget-limited scan stops early, keeps what it memoized, and repeated
+    // attempts eventually complete with the database-path result.
+    {
+        BOOST_CHECK_LE(sizeof(WalletOutputLifecycleMemo), 32U);
+        const Scan plain = scan(false);
+        const size_t deep = deep_outputs(false).size();
+        const uint64_t shallow = plain.stats.outputs - deep;
+        BOOST_REQUIRE_GT(deep, 16U); // otherwise a cap of shallow + 8 would not cut the first pass
+        WITH_LOCK(wallet->cs_wallet, wallet->ClearOutputLifecycleMemo());
+        size_t previous_size = 0;
+        int attempts = 0;
+        bool completed = false;
+        while (attempts++ < 200) {
+            const Scan limited = scan(true, shallow + 8);
+            if (limited.ok) {
+                completed = true;
+                CompareLifecycleScans(plain.balance, plain.summary, limited.balance, limited.summary);
+                break;
+            }
+            BOOST_CHECK(limited.stats.budget_exhausted);
+            BOOST_CHECK_EQUAL(limited.stats.database_reads, shallow + 8);
+            BOOST_CHECK_GE(memo_size(), previous_size);
+            previous_size = std::max(previous_size, memo_size());
+        }
+        BOOST_CHECK(completed);
+        // The memo starts empty, so a full pass needs `shallow + deep` database
+        // reads and the first attempt (cap `shallow + 8`) is always cut short.
+        // How many more attempts follow depends on where the shallow outputs
+        // fall in mapWallet, whose order is salted per process, so only the
+        // bounds are asserted: at least two, and at most one per 8 - slice
+        // new deep outputs (every exhausted attempt memoizes at least that many).
+        BOOST_CHECK_GE(attempts, 2);
+        BOOST_CHECK_LE(static_cast<uint64_t>(attempts), deep / (8 - std::min<uint64_t>(deep_outputs(true).size(), 7)) + 2);
+        BOOST_CHECK_EQUAL(memo_size(), deep);
+        // The unlimited memo scan after completion equals the plain path too.
+        const Scan memo = scan(true);
+        CompareLifecycleScans(plain.balance, plain.summary, memo.balance, memo.summary);
+        // Exactly the verification slice is read from the database.
+        BOOST_CHECK_EQUAL(memo.stats.memo_hits, deep - deep_outputs(true).size());
+    }
+
+    const auto reconnect_last = [&] {
+        const LifecycleTestBlock& last = mined.back();
+        interfaces::BlockInfo info{last.hash};
+        info.prev_hash = &last.prev_hash;
+        info.height = last.height;
+        info.data = &last.block;
+        info.chain_time_max = last.time_max;
+        wallet->blockConnected(ChainstateRole::NORMAL, info);
+    };
+    const auto marker = [&] { return WITH_LOCK(wallet->cs_wallet, return wallet->GetBalanceScanMarker()); };
+
+    // A disconnect of the tip keeps the deep entries (every one of them
+    // confirmed below the disconnected block) and bumps the balance marker;
+    // after the block is connected again the next scan serves them from the
+    // memo without reading them from the database.
+    {
+        const size_t before = memo_size();
+        BOOST_REQUIRE_GT(before, 0U);
+        const uint64_t marker_before = marker();
+        disconnect_last();
+        BOOST_CHECK_EQUAL(memo_size(), before);
+        BOOST_CHECK_GT(marker(), marker_before);
+        reconnect_last();
+        const Scan plain = scan(false);
+        const Scan memo = scan(true);
+        BOOST_REQUIRE(plain.ok && memo.ok);
+        CompareLifecycleScans(plain.balance, plain.summary, memo.balance, memo.summary);
+        const size_t deep = deep_outputs(false).size();
+        BOOST_CHECK_EQUAL(memo_size(), deep);
+        BOOST_CHECK_EQUAL(memo.stats.memo_hits, deep - deep_outputs(true).size());
+        BOOST_CHECK_EQUAL(memo.stats.outputs, memo.stats.memo_hits + memo.stats.database_reads);
+    }
+
+    // A disconnect erases the entries confirmed at or above the disconnected
+    // height and nothing below it.
+    {
+        const int height = mined.back().height;
+        const COutPoint at{uint256{0x51}, 0}, above{uint256{0x52}, 3}, below{uint256{0x53}, 1};
+        const size_t before = memo_size();
+        {
+            LOCK(wallet->cs_wallet);
+            WalletOutputLifecycleMemo entry;
+            entry.confirmed_block_height = height;
+            wallet->StoreOutputLifecycleMemo(at, entry);
+            entry.confirmed_block_height = height + 5;
+            wallet->StoreOutputLifecycleMemo(above, entry);
+            entry.confirmed_block_height = height - 1;
+            wallet->StoreOutputLifecycleMemo(below, entry);
+        }
+        BOOST_CHECK_EQUAL(memo_size(), before + 3);
+        disconnect_last();
+        {
+            LOCK(wallet->cs_wallet);
+            BOOST_CHECK_EQUAL(wallet->m_output_lifecycle_memo.count(at), 0U);
+            BOOST_CHECK_EQUAL(wallet->m_output_lifecycle_memo.count(above), 0U);
+            BOOST_CHECK_EQUAL(wallet->m_output_lifecycle_memo.count(below), 1U);
+            wallet->m_output_lifecycle_memo.erase(below);
+        }
+        BOOST_CHECK_EQUAL(memo_size(), before);
+        reconnect_last();
+        const Scan plain = scan(false);
+        const Scan memo = scan(true);
+        BOOST_REQUIRE(plain.ok && memo.ok);
+        CompareLifecycleScans(plain.balance, plain.summary, memo.balance, memo.summary);
+        BOOST_CHECK_EQUAL(memo_size(), before);
+    }
+
+    // A transaction that becomes conflicted (CWallet::MarkConflicted, private,
+    // calls this helper for the confirmed transaction that changed state)
+    // loses its own entries only.
+    {
+        const std::vector<COutPoint> deep = deep_outputs(false);
+        BOOST_REQUIRE_GT(deep.size(), 2U);
+        const uint256 txid = deep.front().hash;
+        const size_t own = static_cast<size_t>(std::count_if(deep.begin(), deep.end(), [&](const COutPoint& o) { return o.hash == txid; }));
+        BOOST_REQUIRE_GT(own, 0U);
+        const size_t before = memo_size();
+        BOOST_REQUIRE_GE(before, deep.size());
+        const uint64_t marker_before = marker();
+        WITH_LOCK(wallet->cs_wallet, wallet->EraseOutputLifecycleMemoForTx(txid));
+        BOOST_CHECK_EQUAL(memo_size(), before - own);
+        BOOST_CHECK_GT(marker(), marker_before);
+        LOCK(wallet->cs_wallet);
+        for (const COutPoint& o : deep) {
+            BOOST_CHECK_EQUAL(wallet->m_output_lifecycle_memo.count(o), o.hash == txid ? 0U : 1U);
+        }
+    }
+
+    // The helpers alone: by height, by transaction, and a full clear still
+    // clears everything and bumps the marker.
+    {
+        LOCK(wallet->cs_wallet);
+        wallet->ClearOutputLifecycleMemo();
+        WalletOutputLifecycleMemo entry;
+        for (int i = 0; i < 4; ++i) {
+            entry.confirmed_block_height = 10 * (i + 1);
+            wallet->StoreOutputLifecycleMemo(COutPoint{uint256{0x60}, static_cast<uint32_t>(i)}, entry);
+            wallet->StoreOutputLifecycleMemo(COutPoint{uint256{0x61}, static_cast<uint32_t>(i)}, entry);
+        }
+        uint64_t m = wallet->GetBalanceScanMarker();
+        wallet->EraseOutputLifecycleMemoFromHeight(30);
+        BOOST_CHECK_EQUAL(wallet->m_output_lifecycle_memo.size(), 4U); // heights 10 and 20 of both
+        BOOST_CHECK_GT(wallet->GetBalanceScanMarker(), m);
+        m = wallet->GetBalanceScanMarker();
+        wallet->EraseOutputLifecycleMemoForTx(uint256{0x60});
+        BOOST_CHECK_EQUAL(wallet->m_output_lifecycle_memo.size(), 2U);
+        for (const auto& [outpoint, memo_entry] : wallet->m_output_lifecycle_memo) BOOST_CHECK(outpoint.hash == uint256{0x61});
+        BOOST_CHECK_GT(wallet->GetBalanceScanMarker(), m);
+        m = wallet->GetBalanceScanMarker();
+        wallet->EraseOutputLifecycleMemoForTx(uint256{0x99}); // unknown: no entries, marker still moves
+        BOOST_CHECK_EQUAL(wallet->m_output_lifecycle_memo.size(), 2U);
+        BOOST_CHECK_GT(wallet->GetBalanceScanMarker(), m);
+        m = wallet->GetBalanceScanMarker();
+        wallet->ClearOutputLifecycleMemo();
+        BOOST_CHECK_EQUAL(wallet->m_output_lifecycle_memo.size(), 0U);
+        BOOST_CHECK_GT(wallet->GetBalanceScanMarker(), m);
+    }
+}
+
+BOOST_FIXTURE_TEST_CASE(sliced_display_balance_matches_single_lock_and_fails_closed, TestChain100Setup)
+{
+    std::unique_ptr<CWallet> wallet{CreateSyncedWallet(
+        *m_node.chain,
+        WITH_LOCK(Assert(m_node.chainman)->GetMutex(),
+                  return m_node.chainman->ActiveChain()),
+        coinbaseKey)};
+    wallet->SetBroadcastTransactions(/*broadcast=*/true);
+
+    // More keys, so that the wallet has many distinct scripts.
+    std::vector<CKey> extra_keys(12);
+    {
+        LOCK(wallet->cs_wallet);
+        for (CKey& key : extra_keys) {
+            key.MakeNewKey(/*fCompressed=*/true);
+            FlatSigningProvider provider;
+            std::string error;
+            std::unique_ptr<Descriptor> desc = Parse("combo(" + EncodeSecret(key) + ")", provider, error, /*require_checksum=*/false);
+            BOOST_REQUIRE(desc);
+            WalletDescriptor w_desc(std::move(desc), 0, 0, 1, 1);
+            BOOST_REQUIRE(wallet->AddWalletDescriptor(w_desc, provider, "", false));
+        }
+    }
+
+    std::vector<LifecycleTestBlock> mined;
+    const auto mine_block_to = [&](const CScript& script) {
+        LifecycleTestBlock entry;
+        entry.block = CreateAndProcessBlock({}, script);
+        const CBlockIndex* tip = WITH_LOCK(Assert(m_node.chainman)->GetMutex(),
+                                           return m_node.chainman->ActiveChain().Tip());
+        entry.hash = tip->GetBlockHash();
+        entry.prev_hash = tip->pprev->GetBlockHash();
+        entry.height = tip->nHeight;
+        entry.time_max = tip->GetBlockTimeMax();
+        mined.push_back(std::move(entry));
+    };
+    const auto mine_block = [&] { mine_block_to(GetScriptForRawPubKey(coinbaseKey.GetPubKey())); };
+    const auto notify_wallet = [&](const LifecycleTestBlock& e) {
+        interfaces::BlockInfo info{e.hash};
+        info.prev_hash = &e.prev_hash;
+        info.height = e.height;
+        info.data = &e.block;
+        info.chain_time_max = e.time_max;
+        wallet->blockConnected(ChainstateRole::NORMAL, info);
+    };
+    const auto mine_and_connect = [&](int count) {
+        for (int i = 0; i < count; ++i) {
+            mine_block();
+            notify_wallet(mined.back());
+        }
+    };
+
+    // The memo journal and the attestation cache belong to the wallet's
+    // display state and outlive every pass, as in the display worker.
+    LifecycleMemoJournal journal;
+    LifecycleAttestationCache attestations;
+
+    struct Sliced {
+        bool a_ok{false}; //!< the walk of the wallet finished
+        bool b_ok{false}; //!< the pass has a result
+        LifecycleSliceResult result{LifecycleSliceResult::MORE};
+        std::string error;
+        Balance balance;
+        WalletLifecycleSummary summary;
+        WalletLifecycleScanStats stats;
+        uint64_t walk_memo_hits{0};
+        size_t pending{0};
+        uint32_t slices{0};
+        uint64_t marker{0};
+        uint256 tip;
+    };
+    // A pass as the display worker runs it: slice after slice, each under one
+    // lock only. `between` runs once, with no lock held, after the walk of
+    // the wallet and before anything is read from the chainstate.
+    const auto sliced = [&](const std::function<void()>& between = {},
+                            const LifecycleSliceLimits& limits = LifecycleSliceLimits::Unlimited(),
+                            bool force_demurrage = false) {
+        Sliced r;
+        LifecyclePass pass;
+        pass.force_demurrage = force_demurrage;
+        bool between_done{false};
+        for (;;) {
+            if (!between_done && pass.stage != LifecyclePass::Stage::TIP && pass.stage != LifecyclePass::Stage::WALK) {
+                r.a_ok = true;
+                r.walk_memo_hits = pass.stats.memo_hits;
+                r.pending = pass.pending.size();
+                between_done = true;
+                if (between) between();
+            }
+            const LifecycleSliceReport report = RunLifecyclePassSlice(*wallet, pass, journal, attestations, limits);
+            BOOST_REQUIRE(report.result != LifecycleSliceResult::LOCK_BUSY);
+            // Never both locks, and the report says which one.
+            BOOST_CHECK(report.held_main != report.held_wallet);
+            if (report.result == LifecycleSliceResult::MORE) continue;
+            r.result = report.result;
+            r.error = report.error;
+            if (report.result == LifecycleSliceResult::DONE) {
+                r.b_ok = true;
+                r.balance = pass.balance;
+                r.summary = pass.summary;
+                r.stats = pass.stats;
+                r.slices = pass.slices;
+                r.marker = pass.marker;
+                r.tip = pass.tip.hash;
+            }
+            return r;
+        }
+    };
+    const auto plain_scan = [&] {
+        struct Plain {
+            Balance balance;
+            WalletLifecycleSummary summary;
+            WalletLifecycleScanStats stats;
+        } plain;
+        WalletLifecycleOptions options;
+        options.stats = &plain.stats;
+        std::string error;
+        LOCK2(Assert(m_node.chainman)->GetMutex(), wallet->cs_wallet);
+        BOOST_REQUIRE_MESSAGE(GetLifecycleAdjustedBalance(*wallet, /*min_depth=*/0, /*avoid_reuse=*/true,
+                                                          plain.balance, plain.summary, error, options), error);
+        return plain;
+    };
+    const auto memo_size = [&] { return WITH_LOCK(wallet->cs_wallet, return wallet->m_output_lifecycle_memo.size()); };
+    const auto marker = [&] { return WITH_LOCK(wallet->cs_wallet, return wallet->GetBalanceScanMarker()); };
+    // Deep wallet outputs (memo-eligible), and the ones the rolling
+    // re-verification re-reads at the current tip. Independent of the
+    // iteration order of mapWallet.
+    const auto deep_outputs = [&](bool slice_only) {
+        size_t count{0};
+        LOCK2(Assert(m_node.chainman)->GetMutex(), wallet->cs_wallet);
+        const int tip_height = wallet->GetLastBlockHeight();
+        for (const auto& [txid, wtx] : wallet->mapWallet) {
+            if (wallet->GetTxDepthInMainChain(wtx) < 100) continue;
+            for (uint32_t n = 0; n < wtx.tx->vout.size(); ++n) {
+                if (wallet->IsSpent(COutPoint{txid, n}) ||
+                    (wallet->IsMine(wtx.tx->vout[n]) & ISMINE_SPENDABLE) == ISMINE_NO) continue;
+                const bool in_slice = (txid.GetUint64(0) + n + static_cast<uint64_t>(tip_height)) % LIFECYCLE_MEMO_VERIFY_MODULUS == 0;
+                if (!slice_only || in_slice) ++count;
+            }
+        }
+        return count;
+    };
+
+    // Blocks to many scripts first (they become deep below), then the rest.
+    for (const CKey& key : extra_keys) {
+        mine_block_to(GetScriptForDestination(PKHash{key.GetPubKey()}));
+        notify_wallet(mined.back());
+    }
+    mine_and_connect(130);
+    const size_t distinct_scripts = extra_keys.size() + 1;
+
+    // 1. Cold memo: every output goes to the chainstate slices; same numbers
+    // as the plain scan, and the memo is filled from the journal.
+    {
+        const auto plain = plain_scan();
+        const Sliced cold = sliced();
+        BOOST_REQUIRE_MESSAGE(cold.a_ok && cold.b_ok, cold.error);
+        CompareLifecycleScans(plain.balance, plain.summary, cold.balance, cold.summary);
+        BOOST_CHECK_EQUAL(cold.stats.pending, plain.stats.outputs);
+        BOOST_CHECK_EQUAL(cold.stats.outputs, plain.stats.outputs);
+        BOOST_CHECK_EQUAL(cold.stats.memo_hits, 0U);
+        BOOST_CHECK_EQUAL(cold.stats.database_reads, plain.stats.outputs);
+        // Each output is counted once: outputs = memo hits + database reads.
+        BOOST_CHECK_EQUAL(cold.stats.outputs, cold.stats.memo_hits + cold.stats.database_reads);
+        BOOST_CHECK_EQUAL(memo_size(), deep_outputs(false));
+        BOOST_REQUIRE_GT(memo_size(), extra_keys.size());
+        BOOST_CHECK_EQUAL(journal.Waiting(), 0U);
+        // The result names the tip and the wallet change marker it is exact for.
+        BOOST_CHECK_EQUAL(cold.marker, marker());
+        BOOST_CHECK(cold.tip == WITH_LOCK(wallet->cs_wallet, return wallet->GetLastBlockHash()));
+    }
+
+    // 2. Warm memo: the deep memoized outputs are classified during the walk
+    // (no cs_main); only shallow outputs and the verify slice are pending.
+    {
+        const auto plain = plain_scan();
+        const Sliced warm = sliced();
+        BOOST_REQUIRE_MESSAGE(warm.a_ok && warm.b_ok, warm.error);
+        CompareLifecycleScans(plain.balance, plain.summary, warm.balance, warm.summary);
+        const uint64_t deep = deep_outputs(false);
+        const uint64_t slice = deep_outputs(true);
+        BOOST_CHECK_EQUAL(warm.walk_memo_hits, deep - slice);
+        BOOST_CHECK_EQUAL(warm.pending, plain.stats.outputs - (deep - slice));
+        BOOST_CHECK_EQUAL(warm.stats.memo_hits, deep - slice);
+        BOOST_CHECK_EQUAL(warm.stats.database_reads, plain.stats.outputs - (deep - slice));
+        BOOST_CHECK_EQUAL(warm.stats.outputs, plain.stats.outputs);
+        BOOST_CHECK_EQUAL(warm.stats.outputs, warm.stats.memo_hits + warm.stats.database_reads);
+    }
+
+    // 3. A resumed pass equals a one-shot pass, however small the slices are
+    // and whatever the clock says.
+    {
+        const auto plain = plain_scan();
+        const Sliced one_shot = sliced();
+        BOOST_REQUIRE(one_shot.b_ok);
+        for (const uint64_t items : {1U, 2U, 7U, 64U}) {
+            LifecycleSliceLimits limits = LifecycleSliceLimits::Unlimited();
+            limits.max_items = items;
+            const Sliced resumed = sliced({}, limits);
+            BOOST_REQUIRE_MESSAGE(resumed.b_ok, resumed.error);
+            CompareLifecycleScans(one_shot.balance, one_shot.summary, resumed.balance, resumed.summary);
+            CompareLifecycleScans(plain.balance, plain.summary, resumed.balance, resumed.summary);
+            BOOST_CHECK_EQUAL(resumed.stats.outputs, one_shot.stats.outputs);
+            BOOST_CHECK_EQUAL(resumed.stats.memo_hits, one_shot.stats.memo_hits);
+            if (items == 1) BOOST_CHECK_GT(resumed.slices, one_shot.pending);
+            BOOST_CHECK_GT(resumed.slices, one_shot.slices);
+        }
+        // An injected clock that jumps a second at every reading: every slice
+        // ends at its first clock check, and the pass still completes.
+        std::chrono::steady_clock::time_point fake{};
+        uint64_t readings{0};
+        LifecycleSliceLimits limits;
+        limits.now = [&] {
+            ++readings;
+            return fake += 1s;
+        };
+        WITH_LOCK(wallet->cs_wallet, wallet->ClearOutputLifecycleMemo());
+        const Sliced timed = sliced({}, limits);
+        BOOST_REQUIRE_MESSAGE(timed.b_ok, timed.error);
+        CompareLifecycleScans(plain.balance, plain.summary, timed.balance, timed.summary);
+        BOOST_CHECK_GT(readings, 0U);
+        // Cold memo: one chainstate slice per 16 reads at most.
+        BOOST_CHECK_GE(timed.slices, plain.stats.outputs / 16);
+        BOOST_CHECK_EQUAL(memo_size(), deep_outputs(false));
+    }
+
+    // 4. With demurrage forced on, the memoized outputs wait for the
+    // attestation of their scripts: they are pending, each distinct script is
+    // looked up once, and the result does not change (demurrage is not active
+    // on this regtest chain).
+    {
+        const auto plain = plain_scan();
+        attestations = {};
+        const Sliced deferred = sliced({}, LifecycleSliceLimits::Unlimited(), /*force_demurrage=*/true);
+        BOOST_REQUIRE_MESSAGE(deferred.a_ok && deferred.b_ok, deferred.error);
+        CompareLifecycleScans(plain.balance, plain.summary, deferred.balance, deferred.summary);
+        BOOST_CHECK_EQUAL(deferred.walk_memo_hits, 0U);
+        BOOST_CHECK_EQUAL(deferred.pending, plain.stats.outputs);
+        BOOST_CHECK_EQUAL(attestations.map.size(), distinct_scripts);
+        BOOST_CHECK_EQUAL(deferred.stats.outputs, plain.stats.outputs);
+        BOOST_CHECK_EQUAL(deferred.stats.memo_hits + deferred.stats.database_reads, plain.stats.outputs);
+        BOOST_CHECK_GT(deferred.stats.memo_hits, 0U);
+    }
+
+    // 5. A demurrage-active wallet with many distinct scripts converges even
+    // when no pass gets far: the attestations found so far are kept for as
+    // long as the tip holds, across slices and across restarts.
+    {
+        const auto plain = plain_scan();
+        attestations = {};
+        LifecycleSliceLimits limits = LifecycleSliceLimits::Unlimited();
+        limits.max_items = 1; // one output per chainstate slice
+        LifecyclePass pass;
+        pass.force_demurrage = true;
+        size_t known_scripts{0};
+        int restarts{0};
+        int chain_slices{0};
+        bool done{false};
+        for (int i = 0; i < 100000 && !done; ++i) {
+            const bool chain = pass.stage == LifecyclePass::Stage::CHAIN;
+            const LifecycleSliceReport report = RunLifecyclePassSlice(*wallet, pass, journal, attestations, limits);
+            if (chain) ++chain_slices;
+            if (report.result == LifecycleSliceResult::DONE) {
+                done = true;
+                break;
+            }
+            if (report.result == LifecycleSliceResult::WALLET_MOVED) {
+                ++restarts;
+                // Nothing that was learned about the scripts was lost.
+                BOOST_CHECK_GE(attestations.map.size(), known_scripts);
+                continue;
+            }
+            BOOST_REQUIRE(report.result == LifecycleSliceResult::MORE);
+            // Interrupt every pass after a few chainstate slices until all
+            // scripts are known: no pass ever resolves the wallet in one go.
+            if (chain && chain_slices % 3 == 0 && attestations.map.size() < distinct_scripts &&
+                attestations.map.size() > known_scripts) {
+                known_scripts = attestations.map.size();
+                WITH_LOCK(wallet->cs_wallet, wallet->BumpBalanceScanMarker());
+            }
+        }
+        BOOST_REQUIRE(done);
+        BOOST_CHECK_GT(restarts, 0);
+        BOOST_CHECK_EQUAL(attestations.map.size(), distinct_scripts);
+        CompareLifecycleScans(plain.balance, plain.summary, pass.balance, pass.summary);
+        // A tip change drops the cache: attestations are facts of one tip.
+        mine_and_connect(1);
+        const Sliced next = sliced({}, LifecycleSliceLimits::Unlimited(), /*force_demurrage=*/true);
+        BOOST_REQUIRE(next.b_ok);
+        BOOST_CHECK(attestations.tip_hash == next.tip);
+        BOOST_CHECK_EQUAL(attestations.map.size(), distinct_scripts);
+        attestations = {};
+    }
+
+    // 6. The walk needs no cs_main: it completes while another thread holds it.
+    {
+        LifecyclePass pass;
+        BOOST_REQUIRE(RunLifecyclePassSlice(*wallet, pass, journal, attestations).result == LifecycleSliceResult::MORE);
+        BOOST_REQUIRE(pass.stage == LifecyclePass::Stage::WALK);
+        std::promise<void> locked, release;
+        std::thread holder([&] {
+            LOCK(Assert(m_node.chainman)->GetMutex());
+            locked.set_value();
+            release.get_future().wait();
+        });
+        locked.get_future().wait();
+        auto walk = std::async(std::launch::async, [&] {
+            LifecycleSliceLimits limits = LifecycleSliceLimits::Unlimited();
+            limits.max_items = 5;
+            while (pass.stage == LifecyclePass::Stage::WALK) {
+                const LifecycleSliceReport report = RunLifecyclePassSlice(*wallet, pass, journal, attestations, limits);
+                if (report.result != LifecycleSliceResult::MORE || !report.held_wallet || report.held_main) return false;
+            }
+            // The next slice needs cs_main, which is taken: nothing happens.
+            return RunLifecyclePassSlice(*wallet, pass, journal, attestations, limits).result == LifecycleSliceResult::LOCK_BUSY;
+        });
+        const bool finished = walk.wait_for(30s) == std::future_status::ready;
+        release.set_value();
+        holder.join();
+        BOOST_REQUIRE_MESSAGE(finished, "the walk waited for cs_main");
+        BOOST_CHECK(walk.get());
+        // And a chainstate slice needs no cs_wallet.
+        BOOST_REQUIRE(pass.stage == LifecyclePass::Stage::CHAIN);
+        std::promise<void> wallet_locked, wallet_release;
+        std::thread wallet_holder([&] {
+            LOCK(wallet->cs_wallet);
+            wallet_locked.set_value();
+            wallet_release.get_future().wait();
+        });
+        wallet_locked.get_future().wait();
+        auto chain = std::async(std::launch::async, [&] {
+            while (pass.stage == LifecyclePass::Stage::CHAIN) {
+                const LifecycleSliceReport report = RunLifecyclePassSlice(*wallet, pass, journal, attestations, LifecycleSliceLimits::Unlimited());
+                if (report.result != LifecycleSliceResult::MORE || !report.held_main || report.held_wallet) return false;
+            }
+            return RunLifecyclePassSlice(*wallet, pass, journal, attestations).result == LifecycleSliceResult::LOCK_BUSY;
+        });
+        const bool chain_finished = chain.wait_for(30s) == std::future_status::ready;
+        wallet_release.set_value();
+        wallet_holder.join();
+        BOOST_REQUIRE_MESSAGE(chain_finished, "a chainstate slice waited for cs_wallet");
+        BOOST_CHECK(chain.get());
+        const auto plain = plain_scan();
+        const LifecycleSliceReport end = RunLifecyclePassToEnd(*wallet, pass, journal, attestations);
+        BOOST_REQUIRE(end.result == LifecycleSliceResult::DONE);
+        CompareLifecycleScans(plain.balance, plain.summary, pass.balance, pass.summary);
+    }
+
+    // 7. Fail closed: anything that changes between the walk and the end
+    // discards the pass; nothing is reported for it.
+    {
+        // 7a. the wallet change marker moved
+        const uint64_t before = marker();
+        Sliced r = sliced([&] { WITH_LOCK(wallet->cs_wallet, wallet->BumpBalanceScanMarker()); });
+        BOOST_CHECK(r.a_ok);
+        BOOST_CHECK(!r.b_ok);
+        BOOST_CHECK_EQUAL(r.balance.m_mine_trusted, 0);
+        BOOST_CHECK_GT(marker(), before);
+
+        // 7b. a block is connected to the chain and the wallet
+        r = sliced([&] { mine_and_connect(1); });
+        BOOST_CHECK(r.a_ok);
+        BOOST_CHECK(!r.b_ok);
+        BOOST_CHECK(r.result == LifecycleSliceResult::TIP_MOVED || r.result == LifecycleSliceResult::WALLET_MOVED);
+
+        // 7c. the chain moved and the wallet has not caught up: there is no
+        // exact balance for a tip the wallet has not processed, neither for
+        // the pass that was under way nor for one that starts now.
+        r = sliced([&] { mine_block(); });
+        BOOST_CHECK(!r.b_ok);
+        BOOST_CHECK(r.result == LifecycleSliceResult::TIP_MOVED);
+        r = sliced();
+        BOOST_CHECK(!r.a_ok);
+        BOOST_CHECK(!r.b_ok);
+        BOOST_CHECK(r.result == LifecycleSliceResult::NOT_SYNCED);
+        notify_wallet(mined.back());
+
+        // 7d. the wallet tip moved on a reorg (disconnect, then reconnect)
+        r = sliced([&] {
+            const LifecycleTestBlock& e = mined.back();
+            interfaces::BlockInfo info{e.hash};
+            info.prev_hash = &e.prev_hash;
+            info.height = e.height;
+            info.data = &e.block;
+            info.chain_time_max = e.time_max;
+            wallet->blockDisconnected(info);
+            wallet->blockConnected(ChainstateRole::NORMAL, info);
+        });
+        BOOST_CHECK(r.a_ok);
+        BOOST_CHECK(!r.b_ok);
+        BOOST_CHECK(r.result == LifecycleSliceResult::WALLET_MOVED);
+
+        // 7e. the wallet learned a transaction
+        r = sliced([&] {
+            CMutableTransaction mtx;
+            mtx.vin.emplace_back(COutPoint{uint256{0x42}, 0});
+            mtx.vout.emplace_back(COIN, GetScriptForRawPubKey(coinbaseKey.GetPubKey()));
+            LOCK(wallet->cs_wallet);
+            wallet->AddToWallet(MakeTransactionRef(mtx), TxStateInactive{});
+        });
+        BOOST_CHECK(r.a_ok);
+        BOOST_CHECK(!r.b_ok);
+
+        // After all that, an undisturbed pass is correct again.
+        const auto plain = plain_scan();
+        const Sliced again = sliced();
+        BOOST_REQUIRE_MESSAGE(again.b_ok, again.error);
+        CompareLifecycleScans(plain.balance, plain.summary, again.balance, again.summary);
+
+        // A pass that finds the wallet where the caller's result already is
+        // (same tip, same marker) says so without walking it.
+        LifecyclePass pass;
+        pass.known = std::make_pair(again.tip, again.marker);
+        LifecycleSliceReport report = RunLifecyclePassToEnd(*wallet, pass, journal, attestations);
+        BOOST_CHECK(report.result == LifecycleSliceResult::UP_TO_DATE);
+        WITH_LOCK(wallet->cs_wallet, wallet->BumpBalanceScanMarker());
+        report = RunLifecyclePassToEnd(*wallet, pass, journal, attestations);
+        BOOST_CHECK(report.result == LifecycleSliceResult::DONE);
+    }
+
+    // 8. The wallet change marker moves wherever wallet contents or states
+    // move, and can be read without the wallet lock.
+    {
+        const uint64_t m0 = marker();
+        BOOST_CHECK_EQUAL(wallet->GetBalanceScanMarkerUnlocked(), m0);
+        mine_and_connect(1);
+        const uint64_t m1 = marker();
+        BOOST_CHECK_GT(m1, m0);
+        const LifecycleTestBlock& e = mined.back();
+        interfaces::BlockInfo info{e.hash};
+        info.prev_hash = &e.prev_hash;
+        info.height = e.height;
+        info.data = &e.block;
+        info.chain_time_max = e.time_max;
+        wallet->blockDisconnected(info);
+        const uint64_t m2 = marker();
+        BOOST_CHECK_GT(m2, m1);
+        wallet->blockConnected(ChainstateRole::NORMAL, info);
+        const uint64_t m3 = marker();
+        BOOST_CHECK_GT(m3, m2);
+        wallet->MarkDirty();
+        const uint64_t m4 = marker();
+        BOOST_CHECK_GT(m4, m3);
+        WITH_LOCK(wallet->cs_wallet, wallet->ClearOutputLifecycleMemo());
+        BOOST_CHECK_GT(marker(), m4);
+        // A read-only scan moves nothing.
+        const uint64_t m5 = marker();
+        plain_scan();
+        sliced();
+        BOOST_CHECK_EQUAL(marker(), m5);
+        BOOST_CHECK_EQUAL(wallet->GetBalanceScanMarkerUnlocked(), m5);
+    }
+
+    // 9. A verified memo entry that disagrees with the chainstate is replaced,
+    // alone: the pass carries on with what the database says (an entry in
+    // the verify slice is never served), every other entry stays.
+    {
+        while (deep_outputs(true) == 0) mine_and_connect(1);
+        sliced(); // every deep output memoized at this tip
+        BOOST_REQUIRE_EQUAL(memo_size(), deep_outputs(false));
+        COutPoint corrupted;
+        WalletOutputLifecycleMemo good;
+        {
+            LOCK(wallet->cs_wallet);
+            const int tip_height = wallet->GetLastBlockHeight();
+            for (auto& [outpoint, memo] : wallet->m_output_lifecycle_memo) {
+                if ((outpoint.hash.GetUint64(0) + outpoint.n + static_cast<uint64_t>(tip_height)) % LIFECYCLE_MEMO_VERIFY_MODULUS == 0) {
+                    good = memo;
+                    memo.coin_time += 777;
+                    corrupted = outpoint;
+                    break;
+                }
+            }
+            BOOST_REQUIRE(!corrupted.IsNull());
+        }
+        const size_t entries = memo_size();
+        const uint64_t mismatches_before = journal.mismatches;
+        const auto plain = plain_scan();
+        Sliced r;
+        {
+            DebugLogHelper log_helper{"Lifecycle memo disagrees with the chainstate"};
+            r = sliced();
+        }
+        BOOST_REQUIRE_MESSAGE(r.a_ok && r.b_ok, r.error);
+        CompareLifecycleScans(plain.balance, plain.summary, r.balance, r.summary);
+        BOOST_CHECK_EQUAL(r.stats.memo_mismatches, 1U);
+        BOOST_CHECK_EQUAL(journal.mismatches, mismatches_before + 1);
+        BOOST_CHECK_EQUAL(memo_size(), entries);
+        {
+            LOCK(wallet->cs_wallet);
+            BOOST_CHECK_EQUAL(wallet->m_output_lifecycle_memo.at(corrupted).coin_time, good.coin_time);
+        }
+        // The single-lock path treats it the same way.
+        {
+            LOCK(wallet->cs_wallet);
+            wallet->m_output_lifecycle_memo.at(corrupted).coin_time += 777;
+        }
+        {
+            DebugLogHelper log_helper{"Lifecycle memo disagrees with the chainstate"};
+            WalletLifecycleOptions options;
+            WalletLifecycleScanStats stats;
+            options.use_memo = true;
+            options.stats = &stats;
+            Balance balance;
+            WalletLifecycleSummary summary;
+            std::string error;
+            LOCK2(Assert(m_node.chainman)->GetMutex(), wallet->cs_wallet);
+            BOOST_REQUIRE(GetLifecycleAdjustedBalance(*wallet, 0, true, balance, summary, error, options));
+            CompareLifecycleScans(plain.balance, plain.summary, balance, summary);
+            BOOST_CHECK_EQUAL(stats.memo_mismatches, 1U);
+            BOOST_CHECK_EQUAL(wallet->m_output_lifecycle_memo.size(), entries);
+            BOOST_CHECK_EQUAL(wallet->m_output_lifecycle_memo.at(corrupted).coin_time, good.coin_time);
+        }
+        const Sliced again = sliced();
+        BOOST_REQUIRE_MESSAGE(again.b_ok, again.error);
+        BOOST_CHECK_EQUAL(again.stats.memo_mismatches, 0U);
+        CompareLifecycleScans(plain.balance, plain.summary, again.balance, again.summary);
+    }
+
+    // 10. A marker bump in the middle of a pass restarts it without losing
+    // memo progress: what the chainstate slices have read is in the journal
+    // and reaches the memo at the next wallet slice, whatever happens to the
+    // pass that read it.
+    {
+        const auto plain = plain_scan();
+        const uint64_t deep = deep_outputs(false);
+        BOOST_REQUIRE_GT(deep, 32U);
+        WITH_LOCK(wallet->cs_wallet, wallet->ClearOutputLifecycleMemo());
+        LifecycleSliceLimits limits = LifecycleSliceLimits::Unlimited();
+        limits.max_items = 4;
+        LifecyclePass pass;
+        size_t previous_progress{0};
+        size_t previous_memo{0};
+        int restarts{0};
+        bool done{false};
+        for (int i = 0; i < 100000 && !done; ++i) {
+            const bool chain = pass.stage == LifecyclePass::Stage::CHAIN;
+            const LifecycleSliceReport report = RunLifecyclePassSlice(*wallet, pass, journal, attestations, limits);
+            if (report.result == LifecycleSliceResult::DONE) {
+                done = true;
+                break;
+            }
+            // The memo itself only grows; the journal reaches it at the next
+            // wallet slice (the walk of the pass that starts over).
+            BOOST_CHECK_GE(memo_size(), previous_memo);
+            previous_memo = memo_size();
+            if (report.result == LifecycleSliceResult::WALLET_MOVED) {
+                ++restarts;
+                // The pass is gone; what it read is not.
+                BOOST_CHECK(pass.stage == LifecyclePass::Stage::TIP);
+                BOOST_CHECK_EQUAL(pass.pending.size(), 0U);
+                BOOST_CHECK_GT(memo_size() + journal.Waiting(), previous_progress);
+                previous_progress = memo_size() + journal.Waiting();
+                continue;
+            }
+            BOOST_REQUIRE(report.result == LifecycleSliceResult::MORE);
+            // Bump after every few chainstate slices while the memo is incomplete.
+            if (chain && journal.Waiting() >= 8 && memo_size() + journal.Waiting() < deep) {
+                WITH_LOCK(wallet->cs_wallet, wallet->BumpBalanceScanMarker());
+            }
+        }
+        BOOST_REQUIRE(done);
+        BOOST_CHECK_GT(restarts, 2);
+        BOOST_CHECK_EQUAL(memo_size(), deep);
+        CompareLifecycleScans(plain.balance, plain.summary, pass.balance, pass.summary);
+    }
+
+    // 11. The memo warm-up is its own job: a cursor over the wallet that
+    // depends neither on the tip nor on the marker. It survives marker
+    // bumps, new blocks and any number of interruptions, and nothing it has
+    // read is discarded.
+    {
+        WITH_LOCK(wallet->cs_wallet, wallet->ClearOutputLifecycleMemo());
+        // A pass that is told to hand over does so instead of reading every
+        // deep output itself.
+        LifecyclePass handover;
+        handover.warmup_threshold = 8;
+        BOOST_CHECK(RunLifecyclePassToEnd(*wallet, handover, journal, attestations).result == LifecycleSliceResult::NEED_WARMUP);
+        BOOST_CHECK_EQUAL(memo_size(), 0U);
+
+        LifecycleSliceLimits limits = LifecycleSliceLimits::Unlimited();
+        limits.max_items = 3;
+        LifecycleWarmup warmup;
+        size_t previous_memo{0};
+        uint64_t previous_progress{0};
+        int slices{0};
+        int disturbances{0};
+        bool done{false};
+        for (; slices < 100000 && !done; ++slices) {
+            const LifecycleSliceReport report = RunLifecycleWarmupSlice(*wallet, warmup, journal, limits);
+            BOOST_REQUIRE(report.result == LifecycleSliceResult::MORE || report.result == LifecycleSliceResult::DONE);
+            BOOST_CHECK(report.held_main != report.held_wallet);
+            done = report.result == LifecycleSliceResult::DONE;
+            // Progress never goes back: the memo only grows, and so does the
+            // count of what was read.
+            BOOST_CHECK_GE(memo_size(), previous_memo);
+            BOOST_CHECK_GE(warmup.fetched, previous_progress);
+            previous_memo = memo_size();
+            previous_progress = warmup.fetched;
+            if (done) break;
+            if (slices % 7 == 3) {
+                WITH_LOCK(wallet->cs_wallet, wallet->BumpBalanceScanMarker());
+                ++disturbances;
+            }
+            if (slices == 20 || slices == 45) {
+                mine_and_connect(1); // the tip and the wallet move
+                ++disturbances;
+            }
+        }
+        BOOST_REQUIRE(done);
+        BOOST_CHECK_GT(disturbances, 4);
+        BOOST_CHECK_GT(slices, 20);
+        BOOST_CHECK_EQUAL(journal.Waiting(), 0U);
+        // Everything that was deep when the cursor passed it is memoized. An
+        // output that became deep behind the cursor is left to the next pass.
+        const uint64_t deep = deep_outputs(false);
+        BOOST_CHECK_GE(memo_size() + 2, deep);
+        BOOST_CHECK_LE(memo_size(), deep);
+        BOOST_CHECK_EQUAL(warmup.skipped, 0U);
+        // Now the pass no longer hands over, reads only what is not deep or
+        // not memoized yet, and agrees with the plain scan.
+        const auto plain = plain_scan();
+        LifecyclePass pass;
+        pass.warmup_threshold = 8;
+        BOOST_REQUIRE(RunLifecyclePassToEnd(*wallet, pass, journal, attestations).result == LifecycleSliceResult::DONE);
+        CompareLifecycleScans(plain.balance, plain.summary, pass.balance, pass.summary);
+        BOOST_CHECK_LE(pass.stats.database_reads, plain.stats.outputs - deep + 2 + deep_outputs(true));
+        BOOST_CHECK_EQUAL(memo_size(), deep);
+        // A warm-up with nothing to do says so after one walk.
+        LifecycleWarmup idle;
+        LifecycleSliceReport report;
+        do {
+            report = RunLifecycleWarmupSlice(*wallet, idle, journal, LifecycleSliceLimits::Unlimited());
+        } while (report.result == LifecycleSliceResult::MORE);
+        BOOST_CHECK(report.result == LifecycleSliceResult::DONE);
+        BOOST_CHECK_EQUAL(idle.collected, 0U);
+    }
+
+    // 12. The scans do not grow the chainstate coins cache: what they read is
+    // read through to the database and dropped at the end of the slice.
+    {
+        WITH_LOCK(wallet->cs_wallet, wallet->ClearOutputLifecycleMemo());
+        {
+            LOCK(::cs_main);
+            m_node.chainman->ActiveChainstate().ForceFlushStateToDisk();
+        }
+        const size_t before = WITH_LOCK(::cs_main, return m_node.chainman->ActiveChainstate().CoinsTip().GetCacheSize());
+        const Sliced cold = sliced();
+        BOOST_REQUIRE(cold.b_ok);
+        BOOST_CHECK_GT(cold.stats.database_reads, 100U);
+        const size_t after = WITH_LOCK(::cs_main, return m_node.chainman->ActiveChainstate().CoinsTip().GetCacheSize());
+        BOOST_CHECK_EQUAL(after, before);
+    }
+
+    // 13. An unconfirmed output (a transaction in the mempool) takes the same
+    // path in both scans.
+    {
+        CKey recipient_key;
+        recipient_key.MakeNewKey(/*fCompressed=*/true);
+        const CRecipient recipient{PKHash{recipient_key.GetPubKey()}, COIN, /*subtract_fee=*/false};
+        CCoinControl coin_control;
+        const auto created = CreateTransaction(*wallet, {recipient}, /*change_pos=*/-1, coin_control);
+        BOOST_REQUIRE_MESSAGE(created, util::ErrorString(created).original);
+        BOOST_REQUIRE(wallet->CommitTransaction(created->tx, {}, {}));
+        {
+            LOCK(wallet->cs_wallet);
+            BOOST_REQUIRE(wallet->mapWallet.at(created->tx->GetHash()).InMempool());
+        }
+        const auto plain = plain_scan();
+        const Sliced r = sliced();
+        BOOST_REQUIRE_MESSAGE(r.a_ok && r.b_ok, r.error);
+        CompareLifecycleScans(plain.balance, plain.summary, r.balance, r.summary);
+        BOOST_CHECK_GT(plain.balance.m_mine_untrusted_pending + plain.balance.m_mine_trusted, 0);
+        // The unconfirmed change is never served from the memo.
+        BOOST_CHECK_GT(r.pending, 0U);
+    }
+
+    // 14. Mempool traffic that does not touch the wallet does not discard a
+    // pass; a transaction that pays the wallet, or spends one of its outputs,
+    // does.
+    {
+        const CScript foreign = CScript() << OP_TRUE;
+        const auto make_tx = [&](const COutPoint& prevout, const CScript& script) {
+            CMutableTransaction mtx;
+            mtx.vin.emplace_back(prevout);
+            mtx.vout.emplace_back(COIN, script);
+            return MakeTransactionRef(mtx);
+        };
+        const auto add_and_remove = [&](const CTransactionRef& tx) {
+            wallet->transactionAddedToMempool(tx);
+            wallet->transactionRemovedFromMempool(tx, MemPoolRemovalReason::EXPIRY);
+        };
+
+        // (1) Unrelated: marker unchanged, the pass still has its result.
+        const CTransactionRef unrelated = make_tx(COutPoint{uint256{0x91}, 0}, foreign);
+        const uint64_t before = marker();
+        add_and_remove(unrelated);
+        BOOST_CHECK_EQUAL(marker(), before);
+        const auto plain = plain_scan();
+        Sliced r = sliced([&] { add_and_remove(make_tx(COutPoint{uint256{0x92}, 1}, foreign)); });
+        BOOST_REQUIRE_MESSAGE(r.a_ok && r.b_ok, r.error);
+        CompareLifecycleScans(plain.balance, plain.summary, r.balance, r.summary);
+
+        // (2a) Pays the wallet: becomes a wallet transaction, marker moves, pass discarded.
+        const CTransactionRef paying = make_tx(COutPoint{uint256{0x93}, 0}, GetScriptForRawPubKey(coinbaseKey.GetPubKey()));
+        const uint64_t m1 = marker();
+        r = sliced([&] { wallet->transactionAddedToMempool(paying); });
+        BOOST_CHECK(r.a_ok);
+        BOOST_CHECK(!r.b_ok);
+        BOOST_CHECK_GT(marker(), m1);
+
+        // (2b) Spends one of the wallet's outputs (pays elsewhere).
+        COutPoint own;
+        {
+            LOCK(wallet->cs_wallet);
+            for (const auto& [txid, wtx] : wallet->mapWallet) {
+                if (wtx.IsCoinBase() && wallet->IsMine(wtx.tx->vout[0]) != ISMINE_NO) {
+                    own = COutPoint{txid, 0};
+                    break;
+                }
+            }
+        }
+        BOOST_REQUIRE(!own.IsNull());
+        const CTransactionRef spending = make_tx(own, foreign);
+        const uint64_t m2 = marker();
+        r = sliced([&] { wallet->transactionAddedToMempool(spending); });
+        BOOST_CHECK(r.a_ok);
+        BOOST_CHECK(!r.b_ok);
+        BOOST_CHECK_GT(marker(), m2);
+
+        // Removal of a wallet transaction moves the marker too.
+        const uint64_t m3 = marker();
+        wallet->transactionRemovedFromMempool(paying, MemPoolRemovalReason::EXPIRY);
+        BOOST_CHECK_GT(marker(), m3);
+    }
 }
 
 BOOST_FIXTURE_TEST_CASE(scan_for_wallet_transactions, TestChain100Setup)
@@ -5989,6 +7552,118 @@ static std::shared_ptr<CWallet> TestLoadQuantumWalletBackup(const fs::path& path
     BOOST_REQUIRE_EQUAL(wallet->LoadWallet(), DBErrors::LOAD_OK);
     return wallet;
 }
+
+#ifdef USE_SQLITE
+BOOST_FIXTURE_TEST_CASE(NonConfirmedProofIndexFollowsRecordState, BasicTestingSetup)
+{
+    // The block-connected callback visits only proof records that are not
+    // confirmed. A record must enter that index whenever it is, or becomes,
+    // unconfirmed, and leave it once a block confirms it.
+    CWallet wallet(/*chain=*/nullptr, "", CreateMockableWalletDatabase());
+    CKey wallet_key;
+    wallet_key.MakeNewKey(/*fCompressed=*/true);
+    {
+        LOCK(wallet.cs_wallet);
+        wallet.SetLastBlockProcessed(321, uint256{42});
+        wallet.SetupLegacyScriptPubKeyMan();
+        BOOST_REQUIRE(wallet.GetOrCreateLegacyScriptPubKeyMan()->AddKeyPubKey(
+            wallet_key, wallet_key.GetPubKey()));
+    }
+    CMutableTransaction funding;
+    funding.vout.emplace_back(2 * COIN, GetScriptForRawPubKey(wallet_key.GetPubKey()));
+    const CTransactionRef funding_ref = MakeTransactionRef(std::move(funding));
+    BOOST_REQUIRE(wallet.AddToWallet(funding_ref, TxStateInactive{}));
+
+    std::vector<unsigned char> proof = GetShadowPrefix();
+    proof.insert(proof.end(), {'Q', 'Q', 'P', '2', 0, 0, 0, 0, 0, 0, 0, 0,
+                               0});
+    CMutableTransaction claim;
+    claim.vin.emplace_back(COutPoint{funding_ref->GetHash(), 0});
+    claim.vout.emplace_back(COIN, CScript{} << OP_TRUE);
+    claim.vout.emplace_back(0, CScript{} << OP_RETURN << proof);
+    const CTransactionRef claim_ref = MakeTransactionRef(std::move(claim));
+    BOOST_REQUIRE(TransactionHasShadowProof(*claim_ref));
+    const uint256 claim_txid = claim_ref->GetHash();
+    const uint256 funding_txid = funding_ref->GetHash();
+
+    BOOST_REQUIRE(wallet.AddToWallet(claim_ref, TxStateInactive{}));
+    {
+        LOCK(wallet.cs_wallet);
+        BOOST_CHECK(wallet.IsIndexedShadowPowClaimLocked(claim_txid));
+        BOOST_CHECK(wallet.IsNonConfirmedShadowPowProofLocked(claim_txid));
+        // An ordinary record is never indexed.
+        BOOST_CHECK(!wallet.IsNonConfirmedShadowPowProofLocked(funding_txid));
+        BOOST_CHECK(wallet.CheckShadowPowNonConfirmedProofIndexLocked());
+    }
+
+    BOOST_REQUIRE(wallet.AddToWallet(claim_ref, TxStateConfirmed{uint256{43}, 322, 1}));
+    {
+        LOCK(wallet.cs_wallet);
+        BOOST_CHECK(wallet.mapWallet.at(claim_txid).isConfirmed());
+        BOOST_CHECK(wallet.IsIndexedShadowPowClaimLocked(claim_txid));
+        BOOST_CHECK(!wallet.IsNonConfirmedShadowPowProofLocked(claim_txid));
+        BOOST_CHECK(wallet.CheckShadowPowNonConfirmedProofIndexLocked());
+    }
+
+    // A reorg returns the record to the unconfirmed state.
+    BOOST_REQUIRE(wallet.AddToWallet(claim_ref, TxStateInactive{}));
+    {
+        LOCK(wallet.cs_wallet);
+        BOOST_CHECK(wallet.mapWallet.at(claim_txid).isUnconfirmed());
+        BOOST_CHECK(wallet.IsNonConfirmedShadowPowProofLocked(claim_txid));
+        BOOST_CHECK(wallet.CheckShadowPowNonConfirmedProofIndexLocked());
+    }
+}
+
+BOOST_FIXTURE_TEST_CASE(BlockConnectedCommitsOncePerWallet, WalletTestingSetup)
+{
+    // Every database write one connected block causes in a wallet (here the
+    // payments of several block transactions) is one SQLite commit, not one
+    // per record.
+    auto wallet = TestLoadQuantumWallet("block-connected-one-commit", DatabaseFormat::SQLITE, m_node.chain.get());
+    CScript script;
+    {
+        LOCK(wallet->cs_wallet);
+        auto dest = wallet->GetNewQuantumDestination("one-commit");
+        BOOST_REQUIRE(dest);
+        script = GetScriptForDestination(*dest);
+    }
+
+    CBlock block;
+    CMutableTransaction coinbase;
+    coinbase.vin.resize(1);
+    coinbase.vin[0].scriptSig = CScript{} << 1 << OP_0;
+    coinbase.vout.resize(1);
+    block.vtx.push_back(MakeTransactionRef(coinbase));
+    for (int i = 0; i < 3; ++i) {
+        CMutableTransaction mtx;
+        mtx.vin.emplace_back(COutPoint{Txid::FromUint256(uint256{static_cast<uint8_t>(i + 1)}), 0});
+        mtx.vout.emplace_back(COIN * (i + 1), script);
+        block.vtx.push_back(MakeTransactionRef(mtx));
+    }
+
+    const uint256 block_hash{uint256{77}};
+    const uint256 prev_hash{uint256{76}};
+    interfaces::BlockInfo info{block_hash};
+    info.prev_hash = &prev_hash;
+    info.height = 1;
+    info.data = &block;
+    info.chain_time_max = GetTime() + 3600;
+
+    sqlite3* db = static_cast<SQLiteDatabase&>(wallet->GetDatabase()).m_db;
+    int commits{0};
+    sqlite3_commit_hook(db, [](void* arg) -> int { ++*static_cast<int*>(arg); return 0; }, &commits);
+    wallet->blockConnected(ChainstateRole::NORMAL, info);
+    sqlite3_commit_hook(db, nullptr, nullptr);
+
+    BOOST_CHECK_EQUAL(commits, 1);
+    LOCK(wallet->cs_wallet);
+    for (size_t i = 1; i < block.vtx.size(); ++i) {
+        BOOST_CHECK(wallet->GetWalletTx(block.vtx[i]->GetHash()));
+    }
+    BOOST_CHECK_EQUAL(sqlite3_get_autocommit(db), 1);
+}
+#endif
 
 BOOST_FIXTURE_TEST_CASE(QuantumWalletKeysPersistAndSign, QuantumWalletSigningTestingSetup)
 {
@@ -8104,8 +9779,9 @@ BOOST_FIXTURE_TEST_CASE(CreateWallet, TestChain100Setup)
     // Loading will also ask for current mempool transactions
     wallet = TestLoadWallet(context);
     BOOST_CHECK(rescan_completed);
-    // AddToWallet events for block_tx and mempool_tx (x2)
-    BOOST_CHECK_EQUAL(addtx_count, 3);
+    // AddToWallet logs only a new or changed record: block_tx and mempool_tx
+    // once each (the duplicate mempool_tx add changes nothing and is not logged)
+    BOOST_CHECK_EQUAL(addtx_count, 2);
     {
         LOCK(wallet->cs_wallet);
         BOOST_CHECK_EQUAL(wallet->mapWallet.count(block_tx.GetHash()), 1U);
@@ -8113,13 +9789,23 @@ BOOST_FIXTURE_TEST_CASE(CreateWallet, TestChain100Setup)
     }
 
 
+    // A repeated add is not logged any more, but it still announces the
+    // transaction, so the stale events are visible through that signal.
+    std::map<uint256, int> announced;
+    boost::signals2::scoped_connection announce_connection{wallet->NotifyTransactionChanged.connect(
+        [&announced](const uint256& txid, ChangeType) { ++announced[txid]; })};
+
     // Unblock notification queue and make sure stale blockConnected and
     // transactionAddedToMempool events are processed
     promise.set_value();
     SyncWithValidationInterfaceQueue();
-    // AddToWallet events for block_tx and mempool_tx events are counted a
-    // second time as the notification queue is processed
-    BOOST_CHECK_EQUAL(addtx_count, 5);
+    // The stale block_tx and mempool_tx events re-add records the wallet
+    // already holds in the same state, so nothing more is logged
+    BOOST_CHECK_EQUAL(addtx_count, 2);
+    // but each was processed once more and announced
+    BOOST_CHECK_EQUAL(announced[block_tx.GetHash()], 1);
+    BOOST_CHECK_EQUAL(announced[mempool_tx.GetHash()], 1);
+    announce_connection.disconnect();
 
 
     TestUnloadWallet(std::move(wallet));
@@ -8142,9 +9828,9 @@ BOOST_FIXTURE_TEST_CASE(CreateWallet, TestChain100Setup)
             SyncWithValidationInterfaceQueue();
         });
     wallet = TestLoadWallet(context);
-    // Since mempool transactions are requested at the end of loading, there will
-    // be 2 additional AddToWallet calls, one from the previous test, and a duplicate for mempool_tx
-    BOOST_CHECK_EQUAL(addtx_count, 2 + 2);
+    // block_tx and mempool_tx are logged once each; the repeated adds
+    // (mempool request at the end of loading, the earlier queue) are no-ops
+    BOOST_CHECK_EQUAL(addtx_count, 2);
     {
         LOCK(wallet->cs_wallet);
         BOOST_CHECK_EQUAL(wallet->mapWallet.count(block_tx.GetHash()), 1U);
@@ -8242,7 +9928,7 @@ BOOST_FIXTURE_TEST_CASE(runtime_loadwallet_attachchain_lifecycle, TestChain100Se
     auto load_handler = HandleLoadWallet(
         context, [&](std::unique_ptr<interfaces::Wallet>) {
             notified_after_validation.store(validation_caught_up.load());
-            notified_after_duplicate.store(block_add_count.load() >= 2);
+            notified_after_duplicate.store(block_add_count.load() >= 1);
             notified_before_worker.store(!worker_started_signaled.load());
             load_notified.store(true);
         });
@@ -8377,7 +10063,8 @@ BOOST_FIXTURE_TEST_CASE(runtime_loadwallet_attachchain_lifecycle, TestChain100Se
     BOOST_CHECK(notified_after_validation.load());
     BOOST_CHECK(notified_after_duplicate.load());
     BOOST_CHECK(notified_before_worker.load());
-    BOOST_CHECK_GE(block_add_count.load(), 2);
+    // A repeated add of the same record is not logged any more, so only the first shows.
+    BOOST_CHECK_GE(block_add_count.load(), 1);
     BOOST_CHECK(GetWallet(context, wallet_name) == wallet);
     const std::optional<int> height = context.chain->getHeight();
     BOOST_REQUIRE(height);

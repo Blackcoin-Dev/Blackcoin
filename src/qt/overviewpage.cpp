@@ -3,6 +3,7 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <qt/overviewpage.h>
+#include <qt/visibilitycontroller.h>
 #include <qt/forms/ui_overviewpage.h>
 
 #include <qt/bitcoinunits.h>
@@ -198,24 +199,36 @@ OverviewPage::OverviewPage(const PlatformStyle *platformStyle, QWidget *parent) 
     showOutOfSyncWarning(true);
     connect(ui->labelWalletStatus, &QPushButton::clicked, this, &OverviewPage::outOfSyncWarningClicked);
     connect(ui->labelTransactionsStatus, &QPushButton::clicked, this, &OverviewPage::outOfSyncWarningClicked);
+    m_visibility = std::make_unique<VisibilityController>(*this, [this](bool active) {
+        if (filter) {
+            filter->setActive(active);
+            // An inactive projection has no columns. Restore the list column
+            // after reattaching its source, including initial show and reentry.
+            if (active) ui->listTransactions->setModelColumn(TransactionTableModel::ToAddress);
+        }
+    }, [this] { return !m_privacy; });
+    m_visibility->refresh();
 }
 
 void OverviewPage::handleTransactionClicked(const QModelIndex &index)
 {
-    if(filter)
-        Q_EMIT transactionClicked(filter->mapToSource(index));
+    if (filter) {
+        const QModelIndex transaction = filter->mapToSource(index);
+        if (transaction.isValid()) Q_EMIT transactionClicked(transaction);
+    }
 }
 
 void OverviewPage::setPrivacy(bool privacy)
 {
     m_privacy = privacy;
-    clientModel->getOptionsModel()->setOption(OptionsModel::OptionID::MaskValues, privacy);
-    const auto& balances = walletModel->getCachedBalance();
-    if (balances.balance != -1) {
-        setBalance(balances);
+    if (clientModel && clientModel->getOptionsModel()) clientModel->getOptionsModel()->setOption(OptionsModel::OptionID::MaskValues, privacy);
+    if (walletModel && walletModel->getOptionsModel()) {
+        const auto& balances = walletModel->getCachedBalance();
+        if (balances.balance != -1) setBalance(balances);
     }
 
     ui->listTransactions->setVisible(!m_privacy);
+    m_visibility->refresh();
 
     const QString status_tip = m_privacy ? tr("Privacy mode activated for the Overview tab. To unmask the values, uncheck Settings->Mask values.") : "";
     setStatusTip(status_tip);
@@ -225,6 +238,7 @@ void OverviewPage::setPrivacy(bool privacy)
 
 OverviewPage::~OverviewPage()
 {
+    m_visibility.reset();
     delete ui;
 }
 
@@ -317,29 +331,55 @@ void OverviewPage::setClientModel(ClientModel *model)
     }
 }
 
+void OverviewPage::updateHistoryState()
+{
+    if (!m_history_state) {
+        m_history_state = new QLabel(tr("Loading transactions…"), this);
+        m_history_state->setObjectName(QStringLiteral("overviewHistoryState"));
+        m_history_state->setWordWrap(true);
+        ui->verticalLayout->insertWidget(1, m_history_state);
+    }
+    const auto* history = walletModel ? walletModel->getTransactionTableModel() : nullptr;
+    const bool failed = history && history->historyLoadHasFailed();
+    if (failed) m_history_state->setText(tr("Transaction history could not be loaded."));
+    else m_history_state->setText(tr("Loading transactions…"));
+    m_history_state->setVisible(history && (failed || !history->isHistoryLoaded()));
+}
+
 void OverviewPage::setWalletModel(WalletModel *model)
 {
+    if (walletModel) disconnect(walletModel, nullptr, this, nullptr);
     this->walletModel = model;
+    ui->listTransactions->setModel(nullptr);
+    filter.reset();
     if(model && model->getOptionsModel())
     {
         // Set up transaction list
-        filter.reset(new TransactionFilterProxy());
+        filter = std::make_unique<TransactionPresentationProxy>(nullptr, NUM_ITEMS);
+        m_visibility->refresh();
+        filter->setActive(m_visibility->active());
         filter->setSourceModel(model->getTransactionTableModel());
-        filter->setDynamicSortFilter(true);
+        {
+            auto* history = model->getTransactionTableModel();
+            const auto refresh = [this, history] {
+                if (walletModel && walletModel->getTransactionTableModel() == history) updateHistoryState();
+            };
+            connect(history, &TransactionTableModel::historyLoaded, this, refresh);
+            connect(history, &TransactionTableModel::historyLoadFailed, this, refresh);
+        }
         filter->setSortRole(Qt::EditRole);
         filter->setShowInactive(false);
         filter->sort(TransactionTableModel::Date, Qt::DescendingOrder);
 
         ui->listTransactions->setModel(filter.get());
         ui->listTransactions->setModelColumn(TransactionTableModel::ToAddress);
+        updateHistoryState();
 
-        connect(filter.get(), &TransactionFilterProxy::rowsInserted, this, &OverviewPage::LimitTransactionRows);
-        connect(filter.get(), &TransactionFilterProxy::rowsRemoved, this, &OverviewPage::LimitTransactionRows);
-        connect(filter.get(), &TransactionFilterProxy::rowsMoved, this, &OverviewPage::LimitTransactionRows);
-        LimitTransactionRows();
         // Keep up to date with wallet
         setBalance(model->getCachedBalance());
         connect(model, &WalletModel::balanceChanged, this, &OverviewPage::setBalance);
+        setBalanceStale(model->balanceIsBehind(), model->balanceHeight());
+        connect(model, &WalletModel::balanceBehindChanged, this, &OverviewPage::setBalanceStale);
         connect(model, &WalletModel::qqDevelopmentDonationChanged, this, [this, model](unsigned int) {
             setBalance(model->getCachedBalance());
         });
@@ -352,6 +392,8 @@ void OverviewPage::setWalletModel(WalletModel *model)
             updateWatchOnlyLabels(showWatchOnly && !walletModel->wallet().privateKeysDisabled());
         });
     }
+
+    updateHistoryState();
 
     // update the display unit, to not use the default ("BTC")
     updateDisplayUnit();
@@ -366,16 +408,6 @@ void OverviewPage::changeEvent(QEvent* e)
     }
 
     QWidget::changeEvent(e);
-}
-
-// Only show most recent NUM_ITEMS rows
-void OverviewPage::LimitTransactionRows()
-{
-    if (filter && ui->listTransactions && ui->listTransactions->model() && filter.get() == ui->listTransactions->model()) {
-        for (int i = 0; i < filter->rowCount(); ++i) {
-            ui->listTransactions->setRowHidden(i, i >= NUM_ITEMS);
-        }
-    }
 }
 
 void OverviewPage::updateDisplayUnit()
@@ -397,6 +429,14 @@ void OverviewPage::updateAlerts(const QString &warnings)
 {
     this->ui->labelAlerts->setVisible(!warnings.isEmpty());
     this->ui->labelAlerts->setText(warnings);
+}
+
+void OverviewPage::setBalanceStale(bool stale, int height)
+{
+    // Called with "behind" only: a balance of the wallet's last block that a
+    // newer wallet change has not reached yet is not labelled.
+    ui->labelBalanceStale->setVisible(stale);
+    if (stale) ui->labelBalanceStale->setText(tr("as of block %1, updating").arg(height));
 }
 
 void OverviewPage::showOutOfSyncWarning(bool fShow)
@@ -421,4 +461,16 @@ void OverviewPage::setMonospacedFont(bool use_embedded_font)
     ui->labelWatchTotal->setFont(f);
     if (m_label_legacy_balance) m_label_legacy_balance->setFont(f);
     if (m_label_quantum_balance) m_label_quantum_balance->setFont(f);
+}
+
+void OverviewPage::showEvent(QShowEvent* event)
+{
+    QWidget::showEvent(event);
+    m_visibility->refresh();
+}
+
+void OverviewPage::hideEvent(QHideEvent* event)
+{
+    QWidget::hideEvent(event);
+    m_visibility->refresh();
 }

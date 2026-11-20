@@ -889,7 +889,7 @@
           </property>
           <layout class="QVBoxLayout" name="verticalLayout_7">
            <item>
-            <widget class="QTableView" name="peerWidget">
+            <widget class="UiPaintTableView" name="peerWidget">
              <property name="tabKeyNavigation">
               <bool>false</bool>
              </property>
@@ -1749,6 +1749,11 @@
   </layout>
  </widget>
  <customwidgets>
+  <customwidget>
+   <class>UiPaintTableView</class>
+   <extends>QTableView</extends>
+   <header>qt/uiperf.h</header>
+  </customwidget>
   <customwidget>
    <class>TrafficGraphWidget</class>
    <extends>QWidget</extends>

@@ -18,11 +18,16 @@
 
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <vector>
+
+#include <chrono>
 
 #include <QObject>
 #include <QThread>
@@ -59,9 +64,10 @@ QT_END_NAMESPACE
 class WalletModel : public QObject
 {
     Q_OBJECT
+    friend class WalletTests; // Deterministic shutdown publication ordering fixture.
 
 public:
-    explicit WalletModel(std::unique_ptr<interfaces::Wallet> wallet, ClientModel& client_model, const PlatformStyle *platformStyle, QObject *parent = nullptr);
+    explicit WalletModel(std::unique_ptr<interfaces::Wallet> wallet, ClientModel& client_model, const PlatformStyle* platformStyle, QObject* parent = nullptr, bool defer_history = false);
     ~WalletModel();
 
     enum StatusCode // Returned by sendCoins
@@ -110,9 +116,19 @@ public:
         StakingMiningSnapshotRequest request;
         bool cancelled{false};
         bool stale_tip{false};
+        bool transient_unavailable{false};
+        std::string unavailable_stage;
         std::string error;
+        //! The first tip the worker saw is authoritative for this result.
+        //! stale_tip now means only "invalid": no starting tip could be
+        //! determined, or the start block was reorganized out before the end.
         std::string start_tip;
         std::string end_tip;
+        int start_height{-1};
+        //! The chain tip moved (or could not be re-read) after start_tip, so
+        //! wallet reads may span more than one block. The result stays usable
+        //! and the view must say so.
+        bool tip_advanced{false};
 
         interfaces::WalletPowMiningInfo pow;
         interfaces::WalletMigrationStatus migration;
@@ -134,6 +150,52 @@ public:
         std::string operator_query_address;
         std::string selected_coldstake_query_address;
     };
+
+    struct AccountSnapshot {
+        bool cancelled{false};
+        bool stale{false};
+        std::string error;
+        interfaces::WalletBalances balances;
+        interfaces::WalletMigrationStatus migration;
+        interfaces::WalletDemurrageInfo demurrage;
+        size_t rgb_assets{0};
+        size_t eutxo_states{0};
+        interfaces::Wallet::CoinsList coins;
+        std::map<CTxDestination, std::string> labels;
+        std::vector<interfaces::WalletQuantumAddressInfo> quantum_addresses;
+        std::map<std::string, std::vector<interfaces::WalletQuantumStakeOutputInfo>> stake_outputs;
+        std::vector<interfaces::WalletQuantumColdStakeInfo> coldstake_delegations;
+        std::map<std::string, interfaces::WalletQuantumColdStakeBalanceInfo> coldstake_balances;
+    };
+
+    std::shared_ptr<std::atomic<bool>> requestAccountSnapshot(
+        std::function<void(std::shared_ptr<const AccountSnapshot>)> callback);
+
+    /** Serialized miner control; consent belongs to this exact view token. */
+    struct PowMiningControlRequest {
+        uint64_t request_id{0};
+        uint64_t generation{0};
+        std::string wallet_name;
+        bool enabled{false};
+        int threads{1};
+        int cpu_percent{1};
+        bool allow_new_payout_key{false};
+        bool lock_wallet{false};
+        std::shared_ptr<std::atomic<bool>> view_current;
+    };
+    struct PowMiningControlResult {
+        PowMiningControlRequest request;
+        bool success{false};
+        bool cancelled{false};
+        bool core_entered{false};
+        bool created_payout_key{false};
+        bool preferences_saved{false};
+        std::string error;
+        interfaces::WalletPowMiningInfo info;
+    };
+    uint64_t requestPowMiningControl(PowMiningControlRequest request);
+    void cancelPowMiningControl(uint64_t request_id);
+    std::shared_ptr<const PowMiningControlResult> takePowMiningControlResult(uint64_t request_id);
 
     /** One wallet-scoped recovery-policy read or durable update. */
     struct PowClaimRecoveryPolicyRequest
@@ -210,6 +272,14 @@ public:
     OptionsModel* getOptionsModel() const;
     AddressTableModel* getAddressTableModel() const;
     TransactionTableModel* getTransactionTableModel() const;
+    //! True while this wallet is the one shown (balances refresh at full rate, transaction statuses are kept current).
+    bool isPollForeground() const { return m_poll_foreground; }
+    //! The wallet is being shown: load its transaction history if that has not begun, and bring a history that was
+    //! left out of date while hidden up to date. History is never loaded for a wallet nobody has looked at.
+    void requestHistory();
+    //! Tests: the wallet whose history is being read right now, and how many are waiting for their turn.
+    static WalletModel* historyLoadActiveForTest();
+    static size_t historyLoadWaitingForTest();
     RecentRequestsTableModel* getRecentRequestsTableModel() const;
 
     EncryptionStatus getEncryptionStatus() const;
@@ -262,6 +332,8 @@ public:
         ~UnlockContext();
 
         bool isValid() const { return valid; }
+        //! Nonblocking narrowing restoration used only while draining shutdown.
+        bool tryRestore();
 
         // Disable unused copy/move constructors/assignments explicitly.
         UnlockContext(const UnlockContext&) = delete;
@@ -274,6 +346,7 @@ public:
         const bool valid;
         const bool relock;
         const std::optional<bool> restoreStakingOnly;
+        bool restored{false};
     };
 
     UnlockContext requestUnlock();
@@ -300,6 +373,26 @@ public:
 
     // Retrieve the cached wallet balance
     interfaces::WalletBalances getCachedBalance() const;
+    //! Whether the cached balance is that of an earlier block (the wallet or
+    //! the chain has moved on and a new balance is being computed), and the
+    //! height of the block it belongs to (-1 before the first balance).
+    bool balanceIsStale() const { return m_balance_stale; }
+    int balanceHeight() const { return m_balance_height; }
+    //! How the balance on screen stands against the wallet and the chain.
+    //! Only Behind is worth telling the user about: the balance is of an
+    //! older block than the wallet has processed. CurrentUnverified is the
+    //! right block with a newer wallet change on its way into the balance.
+    enum class BalanceState { None, Exact, CurrentUnverified, Behind, Failed };
+    BalanceState balanceState() const { return m_balance_state; }
+    //! The balance shown is of an older block than the node tip.
+    bool balanceIsBehind() const { return m_balance_state == BalanceState::Behind; }
+    static BalanceState ClassifyBalance(bool available, bool exact, bool failed, int snapshot_height, int node_tip_height,
+                                        bool other_block_at_tip_height = false, bool node_tip_regressed = false);
+    bool haveWatchOnly() const { return fHaveWatchOnly; }
+
+    void setSendBalanceFamily(std::optional<interfaces::WalletDisplayCoinFamily> family);
+    std::optional<CAmount> getCachedSendBalance(interfaces::WalletDisplayCoinFamily family) const;
+    void refreshSendBalance();
 
     /** Queue one full-detail snapshot on the existing wallet worker thread. */
     void requestStakingMiningSnapshot(const StakingMiningSnapshotRequest& request);
@@ -333,7 +426,22 @@ public:
     // Otherwise, uses the wallet's cached available balance.
     CAmount getAvailableBalance(const wallet::CCoinControl* control);
 
+    /** Start cooperative shutdown without waiting on the GUI thread. */
+    void beginShutdown();
+    /** GUI-thread lifecycle state; does not acquire a wallet lock. */
+    bool isShuttingDown() const { return m_joined; }
+    /** True only once the worker is fully joined; never waits. */
+    bool shutdownReady();
     void join();
+    /** Coalesce state-only Core transaction notifications before posting. */
+    void queueTransactionChanged();
+
+    /** GUI-only advisory cache; an unavailable read never publishes false. */
+    std::optional<bool> getCachedAddressCapability() const { return m_address_capability; }
+    /** A view must release its demand on hide, detach and destruction. */
+    void setAddressCapabilityConsumer(const QObject* consumer, bool active);
+    /** Thread-safe, coalesced Core invalidation; never reads the wallet. */
+    void queueAddressCapabilityChanged();
 
 private:
     std::unique_ptr<interfaces::Wallet> m_wallet;
@@ -344,14 +452,11 @@ private:
     std::unique_ptr<interfaces::Handler> m_handler_show_progress;
     std::unique_ptr<interfaces::Handler> m_handler_watch_only_changed;
     std::unique_ptr<interfaces::Handler> m_handler_can_get_addrs_changed;
+    std::unique_ptr<interfaces::Handler> m_handler_display_balances_changed;
     ClientModel* m_client_model;
     interfaces::Node& m_node;
 
     bool fHaveWatchOnly;
-    //! Set from GUI-thread notification handlers, read and cleared from the
-    //! worker-thread balance poll.
-    std::atomic<bool> fForceCheckBalanceChanged{false};
-
     // Wallet has an options model for wallet-specific options
     // (transaction fee, for example)
     OptionsModel *optionsModel;
@@ -366,18 +471,77 @@ private:
     bool m_status_update_retry_scheduled{false};
     QTimer* timer;
 
-    // Block hash denoting when the last balance update was done.
+    // Balance request, generation and cache ownership stay on the GUI thread.
     uint256 m_cached_last_update_tip{};
-
-    int pollNum = 0;
+    QMetaObject::Connection m_balance_tip_connection;
+    uint64_t m_balance_context_generation{0};
+    uint64_t m_balance_generation{1};
+    uint64_t m_applied_balance_generation{0};
+    bool m_balance_poll_started{false};
+    bool m_balance_poll_requested{false};
+    bool m_balance_failure_reported{false};
+    void invalidateBalanceSnapshot();
+    //! Read by the display balance worker: only the wallet shown in the main
+    //! window is refreshed at once; the others at most once a minute.
+    bool m_poll_foreground{true};
+    //! Sequence of the display snapshot that was last applied.
+    uint64_t m_applied_balance_sequence{0};
+    //! Height of the node tip as last announced (-1 = not yet).
+    int m_node_tip_height{-1};
+    //! The node's tip block when m_node_tip_height was taken (null: unknown).
+    uint256 m_node_tip_hash;
+    //! The node's tip went down (invalidateblock, or a reorg to a shorter
+    //! chain) and no snapshot of the new tip has been applied since.
+    bool m_node_tip_regressed{false};
+    //! Whether the balance shown is older than the wallet or the node tip,
+    //! and the block it is the balance of.
+    bool m_balance_stale{false};
+    BalanceState m_balance_state{BalanceState::None};
+    int m_balance_height{-1};
+    void applyDisplaySnapshot(const interfaces::WalletDisplayBalances& snapshot);
+    std::optional<interfaces::WalletDisplayCoinFamily> m_requested_send_family;
+    bool m_send_retry_requested{false};
+    std::optional<interfaces::WalletDisplayCoinFamily> m_cached_send_family;
+    std::optional<CAmount> m_cached_send_balance;
+    //! Stake weight refresh (wallet worker thread), driven from the poll.
+    uint64_t m_stake_weight_generation{1};
+    uint64_t m_stake_weight_applied_generation{0};
+    bool m_stake_weight_poll_in_flight{false};
+    void pollStakeWeight();
     std::atomic<uint64_t> nWeight;
     std::atomic<bool> updateStakeWeight;
 
+    //! History loading (GUI thread). A wallet's history is read the first time it is shown, one wallet at a time
+    //! process-wide, in chunks that each hold the wallet lock briefly.
+    struct HistoryLoad;
+    void runHistoryChunk();
+    void historyChunkDone();
+    //! A wallet that is not shown gives its turn to the one that is; true when it did.
+    bool yieldHistorySlotToShownWallet();
+    void releaseHistorySlot();
+    static void startNextHistoryLoad();
+    std::shared_ptr<HistoryLoad> m_history_load;
+    bool m_history_requested{false};
+    bool m_history_chunk_pending{false};
+    bool m_deferred_history{false};
+    std::atomic<bool> m_history_cancel{false};
+    std::atomic<bool> m_history_yield{false};
+
     QThread t;
     WalletWorker *worker;
+    std::shared_ptr<std::atomic<bool>> m_account_snapshot_cancel;
     std::shared_ptr<std::atomic<bool>> m_staking_snapshot_cancel;
     uint64_t m_staking_snapshot_request_id{0};
     std::shared_ptr<const StakingMiningSnapshot> m_completed_staking_snapshot;
+    //! Test only: sees every read of the mining details a staking snapshot
+    //! makes, on the wallet worker, and may turn it into a missed try-lock.
+    std::function<void(interfaces::WalletPowMiningInfo&)> m_staking_snapshot_mining_details_read;
+    void publishPendingPowPayoutWarnings();
+    std::mutex m_pow_payout_warning_mutex;
+    std::map<uint64_t, std::string> m_pending_pow_payout_warnings;
+    uint64_t m_pow_mining_control_sequence{0};
+    std::map<uint64_t, std::shared_ptr<std::atomic<bool>>> m_pow_mining_control_cancels;
+    std::map<uint64_t, std::shared_ptr<const PowMiningControlResult>> m_completed_pow_mining_controls;
     uint64_t m_pow_claim_recovery_policy_request_sequence{0};
     std::map<uint64_t, std::shared_ptr<std::atomic<bool>>> m_pow_claim_recovery_policy_cancels;
     std::map<uint64_t, std::shared_ptr<const PowClaimRecoveryPolicyResult>> m_completed_pow_claim_recovery_policy_results;
@@ -385,7 +549,7 @@ private:
         QUEUED,
         CANCELLED_BEFORE_CORE,
         CORE_ENTERED,
-        FINISHED,
+        FINISHED, // Produced outcome still owes GUI publication.
     };
     struct PowClaimRecoveryOperationControl {
         std::atomic<bool> cancel_requested{false};
@@ -399,6 +563,17 @@ private:
     std::map<uint64_t, bool> m_pow_claim_recovery_restore_staking_only;
     uint64_t m_pow_claim_recovery_mutation_in_flight{0};
     bool m_joined{false};
+    std::atomic<bool> m_transaction_notification_queued{false};
+
+    std::optional<bool> m_address_capability;
+    std::set<const QObject*> m_address_capability_consumers;
+    std::atomic<bool> m_address_capability_observed{false};
+    std::atomic<bool> m_address_capability_dirty{true};
+    std::atomic<bool> m_address_capability_notification_queued{false};
+    std::shared_ptr<std::atomic<bool>> m_address_capability_cancel;
+    bool m_address_capability_in_flight{false};
+    QTimer* m_address_capability_retry;
+    void requestAddressCapability();
 
     void subscribeToCoreSignals();
     void unsubscribeFromCoreSignals();
@@ -407,6 +582,7 @@ private:
         PowClaimRecoveryOperationRequest request,
         const std::shared_ptr<PowClaimRecoveryOperationControl>& control);
     void restorePowClaimRecoveryUnlock(uint64_t request_id);
+    bool tryRestorePowClaimRecoveryUnlock(uint64_t request_id);
     void publishPowClaimRecoveryOperationResult(
         const std::shared_ptr<PowClaimRecoveryOperationResult>& result);
 
@@ -440,13 +616,21 @@ Q_SIGNALS:
     // Signal that wallet is about to be removed
     void unload();
 
-    // Notify that there are now keys in the keypool
+    // A new authoritative capability value was accepted into the GUI cache
     void canGetAddressesChanged();
 
     void timerTimeout();
+    void sendBalanceChanged();
+    // The balance shown became stale (it is that of block `height`) or current again
+    void balanceStaleChanged(bool stale, int height);
+    // The balance shown is older than the wallet's last block (behind) or no longer is
+    void balanceBehindChanged(bool behind, int height);
 
     /** Emitted on the GUI thread after a worker request completes or cancels. */
     void stakingMiningSnapshotReady(quint64 request_id, quint64 generation);
+    void powMiningControlReady(quint64 request_id, quint64 generation);
+    /** Critical backup notice, forwarded by WalletController beyond view lifetime. */
+    void powPayoutKeyCreated(const QString& wallet_name);
     /** Emitted on the GUI thread after a wallet recovery-policy request. */
     void powClaimRecoveryPolicyReady(quint64 request_id, quint64 generation);
     /** Emitted after a recovery review/execution/adoption operation. */
@@ -455,6 +639,9 @@ Q_SIGNALS:
 public Q_SLOTS:
     /* Starts a timer to periodically update the balance */
     void startPollBalance();
+
+    /* Mark this model as the one the user is looking at (L15). */
+    void setBalancePollForeground(bool foreground);
 
     /* Wallet status might have changed */
     void updateStatus();
@@ -466,6 +653,8 @@ public Q_SLOTS:
     void updateWatchOnlyFlag(bool fHaveWatchonly);
     /* Current, immature or unconfirmed balance might have changed - emit 'balanceChanged' if so */
     void pollBalanceChanged();
+    /* The display balance worker published a snapshot or changed its failed state */
+    void displayBalancesChanged();
     /* Update stake weight when changed */
     void checkStakeWeightChanged();
 };

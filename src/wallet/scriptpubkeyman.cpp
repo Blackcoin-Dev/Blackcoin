@@ -491,6 +491,15 @@ bool LegacyScriptPubKeyMan::CanGetAddresses(bool internal) const
     return keypool_has_keys;
 }
 
+bool LegacyScriptPubKeyMan::TryCanGetAddresses(bool& result, bool internal) const
+{
+    TRY_LOCK(cs_KeyStore, lock);
+    if (!lock) return false;
+    // Reuse the predicate under its recursive lock without waiting for it.
+    result = CanGetAddresses(internal);
+    return true;
+}
+
 bool LegacyScriptPubKeyMan::Upgrade(int prev_version, int new_version, bilingual_str& error)
 {
     LOCK(cs_KeyStore);
@@ -2203,9 +2212,7 @@ std::map<CKeyID, CKey> DescriptorScriptPubKeyMan::GetKeys() const
 
 bool DescriptorScriptPubKeyMan::TopUp(unsigned int size)
 {
-    m_storage.NotifyOwnershipChanged();
     LOCK(cs_desc_man);
-    OwnershipChangePostNotifier post_notify{m_storage};
     unsigned int target_size;
     if (size > 0) {
         target_size = size;
@@ -2217,8 +2224,30 @@ bool DescriptorScriptPubKeyMan::TopUp(unsigned int size)
     int32_t new_range_end = std::max(m_wallet_descriptor.next_index + (int32_t)target_size, m_wallet_descriptor.range_end);
 
     // If the descriptor is not ranged, we actually just want to fill the first cache item
-    if (!m_wallet_descriptor.descriptor->IsRange()) {
+    const bool is_range = m_wallet_descriptor.descriptor->IsRange();
+    if (!is_range) {
         new_range_end = 1;
+    }
+
+    // MarkUnusedAddresses runs for every own output of every mempool add,
+    // block connect and rescan. When the range, the cache and the stored
+    // descriptor are already current there is nothing to derive, write or
+    // announce, so return before touching the database or the ownership
+    // generation. m_descriptor_write_pending covers a next_index change that
+    // its caller left for this function to persist.
+    const bool range_changes = m_wallet_descriptor.range_end != new_range_end ||
+                               (!is_range && m_wallet_descriptor.range_start != 0);
+    const bool has_new_items = m_max_cached_index + 1 < new_range_end;
+    if (!range_changes && !has_new_items && !m_descriptor_write_pending) {
+        return true;
+    }
+
+    // The pre-change generation bump now happens under the lock, still before
+    // any ownership state is mutated; the post-change bump below is unchanged.
+    m_storage.NotifyOwnershipChanged();
+    OwnershipChangePostNotifier post_notify{m_storage};
+
+    if (!is_range) {
         m_wallet_descriptor.range_end = 1;
         m_wallet_descriptor.range_start = 0;
     }
@@ -2258,6 +2287,7 @@ bool DescriptorScriptPubKeyMan::TopUp(unsigned int size)
     }
     m_wallet_descriptor.range_end = new_range_end;
     batch.WriteDescriptor(GetID(), m_wallet_descriptor);
+    m_descriptor_write_pending = false;
 
     // By this point, the cache size should be the size of the entire range
     assert(m_wallet_descriptor.range_end - 1 == m_max_cached_index);
@@ -2285,6 +2315,8 @@ std::vector<WalletDestination> DescriptorScriptPubKeyMan::MarkUnusedAddresses(co
                 result.push_back({dest, std::nullopt});
                 m_wallet_descriptor.next_index++;
             }
+            // TopUp persists the advanced next_index even if the range is unchanged.
+            m_descriptor_write_pending = true;
         }
         if (!TopUp()) {
             WalletLogPrintf("%s: Topping up keypool failed (locked wallet)\n", __func__);
@@ -2426,6 +2458,14 @@ bool DescriptorScriptPubKeyMan::CanGetAddresses(bool internal) const
     return m_wallet_descriptor.descriptor->IsSingleType() &&
            m_wallet_descriptor.descriptor->IsRange() &&
            (HavePrivateKeys() || m_wallet_descriptor.next_index < m_wallet_descriptor.range_end);
+}
+
+bool DescriptorScriptPubKeyMan::TryCanGetAddresses(bool& result, bool internal) const
+{
+    TRY_LOCK(cs_desc_man, lock);
+    if (!lock) return false;
+    result = CanGetAddresses(internal);
+    return true;
 }
 
 bool DescriptorScriptPubKeyMan::HavePrivateKeys() const

@@ -19,6 +19,7 @@
 #include <util/result.h>
 #include <util/ui_change_type.h>
 
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -52,6 +53,9 @@ namespace interfaces {
 class Handler;
 struct WalletAddress;
 struct WalletBalances;
+struct WalletDisplayBalances;
+
+enum class WalletDisplayCoinFamily { LEGACY, DIRECT_QUANTUM };
 struct WalletTx;
 struct WalletTxOut;
 struct WalletTxStatus;
@@ -119,6 +123,11 @@ public:
     //! Lock wallet.
     virtual bool lock() = 0;
 
+    //! Restore temporary GUI authority without waiting for wallet/relock locks.
+    //! false retains the caller's restoration obligation. This can only lock
+    //! the wallet and/or restrict it to staking-only, never unlock or expand it.
+    virtual bool tryRestoreGuiUnlockState(bool relock, bool staking_only) = 0;
+
     //! Unlock wallet.
     virtual bool unlock(const SecureString& wallet_passphrase,
                         std::optional<bool> staking_only = std::nullopt) = 0;
@@ -172,8 +181,14 @@ public:
         wallet::isminetype* is_mine,
         wallet::AddressPurpose* purpose) = 0;
 
+    //! Get the address label without waiting. A disengaged result means the wallet is busy.
+    //! A missing or unlabeled address returns an empty string.
+    virtual std::optional<std::string> tryGetAddressLabel(const CTxDestination& dest) = 0;
+
     //! Get wallet address list.
     virtual std::vector<WalletAddress> getAddresses() const = 0;
+    virtual bool tryGetAddresses(std::vector<WalletAddress>& addresses,
+                                 const std::function<bool()>& interrupt) const = 0;
 
     //! Get receive requests.
     virtual std::vector<std::string> getAddressReceiveRequests() = 0;
@@ -217,11 +232,37 @@ public:
     //! Get a transaction.
     virtual CTransactionRef getTx(const uint256& txid) = 0;
 
-    //! Get transaction information.
-    virtual WalletTx getWalletTx(const uint256& txid) = 0;
+    //! Get transaction information without waiting for the wallet lock.
+    //! Returns false on lock contention, or true with an empty tx if the hash is absent.
+    virtual bool tryGetWalletTx(const uint256& txid, WalletTx& tx) = 0;
 
     //! Get list of all wallet transactions.
-    virtual std::set<WalletTx> getWalletTxs() = 0;
+    virtual std::vector<WalletTx> getWalletTxs() = 0;
+    virtual bool tryGetWalletTxs(std::vector<WalletTx>& transactions,
+                                 const std::function<bool()>& interrupt = {}) = 0;
+
+    //! Streamed history, step one: the hash of every wallet transaction, taken under one short wallet lock.
+    //! Returns false on lock contention or while the wallet is scanning (retry later).
+    virtual bool tryGetWalletTxHashes(std::vector<uint256>& hashes) = 0;
+
+    //! Streamed history, step two: describe hashes[pos...] in order, holding the wallet lock for at most
+    //! max_txs transactions or about `budget`, whichever comes first, and advance pos past those handled. A hash
+    //! the wallet no longer holds is skipped. Only the value_map entries named in value_keys are copied, so a
+    //! caller that renders a list does not pay for the free-form notes it never shows. Returns false, with pos
+    //! and out unchanged, on lock contention or while the wallet is scanning.
+    virtual bool tryGetWalletTxChunk(const std::vector<uint256>& hashes,
+                                     size_t& pos,
+                                     size_t max_txs,
+                                     std::chrono::milliseconds budget,
+                                     const std::vector<std::string>& value_keys,
+                                     std::vector<WalletTx>& out) = 0;
+
+    //! Status of many transactions under one acquisition of the node and wallet locks. out[i] is empty when the
+    //! wallet does not hold txids[i]. Returns false, with outputs untouched, on lock contention.
+    virtual bool tryGetTxStatuses(const std::vector<uint256>& txids,
+                                  std::vector<std::optional<WalletTxStatus>>& out,
+                                  int& num_blocks,
+                                  int64_t& block_time) = 0;
 
     //! Try to get updated status for a particular transaction, if possible without blocking.
     virtual bool tryGetTxStatus(const uint256& txid,
@@ -255,6 +296,30 @@ public:
     //! Get balances if possible without blocking.
     virtual bool tryGetBalances(WalletBalances& balances, uint256& block_hash) = 0;
 
+    //! Wait for the display balance worker to confirm or replace the
+    //! published display snapshot with a pass that starts after this call, and
+    //! return that snapshot. Blocks the caller (bounded) but takes no wallet or
+    //! chain lock on its thread; not for the GUI thread. Returns false when the
+    //! tip is `unchanged_tip`, when the wallet has not processed the active tip,
+    //! or when no pass finished in time. Rethrows what the pass threw.
+    virtual bool tryGetDisplayBalances(WalletDisplayBalances& result,
+        const std::optional<uint256>& unchanged_tip, std::optional<WalletDisplayCoinFamily> send_family) = 0;
+
+    //! The published display snapshot. Takes neither cs_main nor cs_wallet and
+    //! never waits for the worker; safe on the GUI thread. `available` is
+    //! false until the first balance has been published.
+    virtual WalletDisplayBalances getDisplaySnapshot() = 0;
+
+    //! Tell the display balance worker whether this wallet is the one shown
+    //! and which send-family balance is wanted. `retry_send` asks again for a
+    //! send-family balance that could not be computed. Cheap; never blocks.
+    virtual void requestDisplayBalances(bool foreground, std::optional<WalletDisplayCoinFamily> send_family, bool retry_send) = 0;
+
+    //! Register handler for display snapshot changes (a new snapshot, or a
+    //! change of the failed state). Called on the display worker thread.
+    using DisplayBalancesChangedFn = std::function<void()>;
+    virtual std::unique_ptr<Handler> handleDisplayBalancesChanged(DisplayBalancesChangedFn fn) = 0;
+
     //! Get balance.
     virtual CAmount getBalance() = 0;
 
@@ -278,6 +343,11 @@ public:
     using CoinsList = std::map<CTxDestination, std::vector<std::tuple<COutPoint, WalletTxOut>>>;
     virtual CoinsList listCoins() = 0;
 
+    //! Interruptible listCoins for background snapshots. interrupt() is polled
+    //! during traversal and grouping. Returns nullopt on cancellation or busy locks;
+    //! no partial listing escapes. The ordinary listCoins contract is unchanged.
+    virtual std::optional<CoinsList> tryListCoins(const std::function<bool()>& interrupt) = 0;
+
     //! Return wallet transaction output information.
     virtual std::vector<WalletTxOut> getCoins(const std::vector<COutPoint>& outputs) = 0;
 
@@ -291,6 +361,9 @@ public:
 
     // Return whether the wallet is blank.
     virtual bool canGetAddresses() = 0;
+
+    /** Nonblocking capability query. False means unavailable; result is unchanged. */
+    virtual bool tryCanGetAddresses(bool& result) = 0;
 
     // Return whether private keys enabled.
     virtual bool privateKeysDisabled() = 0;
@@ -338,6 +411,11 @@ public:
     //! Get wallet enabled for staking
     virtual bool getEnabledStaking() = 0;
 
+    //! True when staking or in-process PoW mining is requested for this wallet.
+    //! Reads two atomic flags only: it takes no lock, so a GUI timer can call it
+    //! on the UI thread for every open wallet.
+    virtual bool isStakingOrPowMiningRequested() = 0;
+
     //! Read one coherent wallet-scoped PoS worker snapshot. This does not
     //! infer liveness from the timing-dependent last search interval.
     virtual WalletStakingInfo getStakingInfo() = 0;
@@ -351,7 +429,8 @@ public:
     //! Returns false (and fills `error`) if PoW mining cannot be configured (e.g. wallet locked).
     virtual bool setPowMining(bool enabled, int threads, int cpu_percent, std::string& error,
                               bool allow_new_payout_key = false,
-                              bool* created_payout_key = nullptr) = 0;
+                              bool* created_payout_key = nullptr,
+                              const std::function<bool()>& cancelled = {}) = 0;
 
     //! Blocking bounded reserve refresh for WalletWorker, never GUI polling.
     virtual void refreshPowMiningStakeReserve() = 0;
@@ -412,10 +491,11 @@ public:
     virtual util::Result<WalletQuantumAddressInfo> createQuantumStakeAddress(const std::string& label, uint16_t unbonding_blocks) = 0;
 
     //! List wallet-backed Blackcoin ML-DSA migration addresses.
-    virtual std::vector<WalletQuantumAddressInfo> listQuantumAddresses() = 0;
+    //! Where supplied, availability distinguishes lock contention from an empty list.
+    virtual std::vector<WalletQuantumAddressInfo> listQuantumAddresses(bool* available = nullptr) = 0;
 
     //! List wallet-known Quantum Cold-Stake delegations.
-    virtual std::vector<WalletQuantumColdStakeInfo> listQuantumColdStakeDelegations() = 0;
+    virtual std::vector<WalletQuantumColdStakeInfo> listQuantumColdStakeDelegations(bool* available = nullptr) = 0;
 
     //! Return verified local Quantum Cold-Stake operator registry state.
     virtual WalletQuantumPoolInfo getQuantumPoolInfo() = 0;
@@ -433,7 +513,7 @@ public:
     virtual WalletQuantumOperatorBondInfo getQuantumStakeAddressBondInfo(const std::string& stake_address) = 0;
 
     //! List wallet-owned staking UTXOs for a tiered self-staking address.
-    virtual std::vector<WalletQuantumStakeOutputInfo> listQuantumStakeOutputs(const std::string& stake_address) = 0;
+    virtual std::vector<WalletQuantumStakeOutputInfo> listQuantumStakeOutputs(const std::string& stake_address, bool* available = nullptr) = 0;
 
     //! Fund this wallet's tiered self-staking address from spendable wallet funds.
     virtual util::Result<WalletQuantumOperatorBondTx> fundQuantumStakeAddress(const std::string& stake_address, CAmount amount, bool allow_new_quantum_key) = 0;
@@ -449,6 +529,8 @@ public:
 
     //! Return wallet-owned Quantum Cold-Stake delegation funding status.
     virtual WalletQuantumColdStakeBalanceInfo getQuantumColdStakeBalanceInfo(const std::string& coldstake_address) = 0;
+    virtual std::map<std::string, WalletQuantumColdStakeBalanceInfo> getQuantumColdStakeBalances(
+        const std::vector<std::string>& addresses) = 0;
 
     //! Fund this wallet's Quantum Cold-Stake delegation address from spendable quantum funds.
     virtual util::Result<WalletQuantumOperatorBondTx> fundQuantumColdStakeAddress(const std::string& coldstake_address, CAmount amount, bool allow_new_quantum_key) = 0;
@@ -479,10 +561,10 @@ public:
     virtual util::Result<WalletQuantumActionTx> migrateGoldRushRewards(bool allow_new_quantum_key) = 0;
 
     //! List wallet-owned RGB assets and assignments.
-    virtual std::vector<WalletRGBAssetInfo> listRGBAssets(bool include_spent = false) = 0;
+    virtual std::vector<WalletRGBAssetInfo> listRGBAssets(bool include_spent = false, bool* available = nullptr) = 0;
 
     //! List wallet-persisted EUTXO states.
-    virtual std::vector<WalletEUTXOStateInfo> listEUTXOStates(bool include_spent = false) = 0;
+    virtual std::vector<WalletEUTXOStateInfo> listEUTXOStates(bool include_spent = false, bool* available = nullptr) = 0;
 
     //! Read wallet demurrage exposure for direct quantum outputs.
     virtual WalletDemurrageInfo getDemurrageInfo() = 0;
@@ -622,6 +704,27 @@ struct WalletBalances
     }
 };
 
+struct WalletDisplayBalances
+{
+    WalletBalances balances;
+    //! The block the balances were computed for.
+    uint256 block_hash;
+    std::optional<CAmount> send_family_balance;
+    int block_height{-1};
+    //! A balance has been published.
+    bool available{false};
+    //! The wallet has not changed since the balances were computed for
+    //! block_hash. When false the balances are those of block_height and a
+    //! new snapshot is on its way.
+    bool exact{false};
+    //! The last attempt to compute a snapshot ended in an error.
+    bool failed{false};
+    //! Grows with every published snapshot of the wallet.
+    uint64_t sequence{0};
+    //! The family send_family_balance belongs to.
+    std::optional<WalletDisplayCoinFamily> send_family;
+};
+
 // Wallet transaction information.
 struct WalletTx
 {
@@ -682,7 +785,9 @@ struct WalletPowMiningInfo
     bool enabled{false};            //!< whether in-process PoW mining is currently requested
     WalletPowMiningState state{WalletPowMiningState::DISABLED}; //!< bounded worker readiness/waiting state
     int threads{0};                 //!< worker threads (CPU cores) configured
-    int cpu_percent{0};             //!< per-core CPU duty-cycle target, 1..100
+    int cpu_percent{0};             //!< per-worker total active-work duty target, 1..100
+    int workers_hashing{0};         //!< workers currently inside a proof batch
+    int workers_error{0};           //!< workers in a local-error retry state
     double hashrate{0.0};           //!< Argon2id tries per second (aggregate)
     int current_height{-1};         //!< active-chain tip used for Gold Rush state, or -1 if unavailable
     bool epoch_active{false};       //!< whether the Gold Rush reward window is currently open

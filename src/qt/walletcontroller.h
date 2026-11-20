@@ -10,6 +10,7 @@
 #include <sync.h>
 #include <util/translation.h>
 
+#include <atomic>
 #include <map>
 #include <memory>
 #include <string>
@@ -17,6 +18,7 @@
 
 #include <QMessageBox>
 #include <QMutex>
+#include <QPointer>
 #include <QProgressDialog>
 #include <QThread>
 #include <QTimer>
@@ -56,11 +58,13 @@ class WalletController : public QObject
 public:
     WalletController(ClientModel& client_model, const PlatformStyle* platform_style, QObject* parent);
     ~WalletController();
+    void beginShutdown();
+    bool shutdownReady();
 
     //! Returns wallet models currently open.
     std::vector<WalletModel*> getOpenWallets() const;
 
-    WalletModel* getOrCreateWallet(std::unique_ptr<interfaces::Wallet> wallet);
+    QPointer<WalletModel> getOrCreateWallet(std::unique_ptr<interfaces::Wallet> wallet);
 
     //! Returns all wallet names in the wallet dir mapped to whether the wallet
     //! is loaded.
@@ -74,6 +78,8 @@ public:
 Q_SIGNALS:
     void walletAdded(WalletModel* wallet_model);
     void walletRemoved(WalletModel* wallet_model);
+    /** Critical wallet notice whose recipient outlives individual views. */
+    void walletBackupWarning(const QString& title, const QString& message, unsigned int style);
 
     void coinsSent(WalletModel* wallet_model, SendCoinsRecipient recipient, QByteArray transaction);
 
@@ -85,7 +91,10 @@ private:
     const PlatformStyle* const m_platform_style;
     OptionsModel* const m_options_model;
     mutable QMutex m_mutex;
+    // Owns all registered models, including models awaiting GUI parenting.
     std::vector<WalletModel*> m_wallets;
+    // GUI-thread state: shutdown drains the list and rejects queued removal.
+    std::atomic<bool> m_closing{false};
     std::unique_ptr<interfaces::Handler> m_handler_load_wallet;
 
     friend class WalletControllerActivity;
@@ -111,7 +120,7 @@ protected:
 
     WalletController* const m_wallet_controller;
     QWidget* const m_parent_widget;
-    WalletModel* m_wallet_model{nullptr};
+    QPointer<WalletModel> m_wallet_model;
     bilingual_str m_error_message;
     std::vector<bilingual_str> m_warning_message;
 };

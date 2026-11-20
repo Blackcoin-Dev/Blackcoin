@@ -13,6 +13,12 @@
 #include <QModelIndex>
 #include <QStringList>
 #include <QVariant>
+#include <QPointer>
+
+#include <atomic>
+#include <functional>
+#include <memory>
+#include <utility>
 
 class PeerTablePriv;
 
@@ -22,6 +28,7 @@ class Node;
 
 QT_BEGIN_NAMESPACE
 class QTimer;
+class QThread;
 QT_END_NAMESPACE
 
 struct CNodeCombinedStats {
@@ -30,6 +37,25 @@ struct CNodeCombinedStats {
     bool fNodeStateStatsAvailable;
 };
 Q_DECLARE_METATYPE(CNodeCombinedStats*)
+using PeerStatsSnapshot = std::shared_ptr<const QList<CNodeCombinedStats>>;
+using PeerSnapshotCollector = std::function<PeerStatsSnapshot()>;
+Q_DECLARE_METATYPE(PeerStatsSnapshot)
+
+/** Runs only on the existing ClientModel worker; never owns a GUI model pointer. */
+class PeerTableWorker final : public QObject
+{
+    Q_OBJECT
+public:
+    PeerTableWorker(PeerSnapshotCollector collect, std::shared_ptr<std::atomic<quint64>> active_generation)
+        : m_collect(std::move(collect)), m_active_generation(std::move(active_generation)) {}
+    void collect(quint64 generation);
+Q_SIGNALS:
+    void snapshotReady(quint64 generation, PeerStatsSnapshot snapshot);
+private:
+    friend class UiWorkerTests;
+    PeerSnapshotCollector m_collect;
+    std::shared_ptr<std::atomic<quint64>> m_active_generation;
+};
 
 /**
    Qt model providing information about connected peers, similar to the
@@ -40,10 +66,11 @@ class PeerTableModel : public QAbstractTableModel
     Q_OBJECT
 
 public:
-    explicit PeerTableModel(interfaces::Node& node, QObject* parent);
+    explicit PeerTableModel(interfaces::Node& node, QThread* worker_thread, QObject* parent);
     ~PeerTableModel();
     void startAutoRefresh();
     void stopAutoRefresh();
+    void beginShutdown();
 
     enum ColumnIndex {
         NetNodeId = 0,
@@ -59,6 +86,7 @@ public:
     };
 
     enum {
+        //! Current row pointer, for immediate GUI-thread use only; never retain it.
         StatsRole = Qt::UserRole,
     };
 
@@ -75,10 +103,24 @@ public:
 public Q_SLOTS:
     void refresh();
 
+Q_SIGNALS:
+    //! A current visible refresh finished; false means the Node snapshot was unavailable.
+    void refreshCompleted(bool available);
+
 private:
+    friend class UiWorkerTests;
+    PeerTableModel(PeerSnapshotCollector collector, QThread* worker_thread, QObject* parent);
+    void snapshotReady(quint64 generation, PeerStatsSnapshot snapshot);
+    void publishSnapshot(const QList<CNodeCombinedStats>& peers);
     //! Internal peer data structure.
     QList<CNodeCombinedStats> m_peers_data{};
-    interfaces::Node& m_node;
+    std::shared_ptr<std::atomic<quint64>> m_active_generation{std::make_shared<std::atomic<quint64>>(0)};
+    QPointer<PeerTableWorker> m_worker;
+    quint64 m_generation{0};
+    bool m_active{false};
+    bool m_stopping{false};
+    bool m_in_flight{false};
+    bool m_refresh_pending{false};
     const QStringList columns{
         /*: Title of Peers Table column which contains a
             unique number used to identify a connection. */

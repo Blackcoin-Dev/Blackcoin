@@ -9,6 +9,15 @@
 
 #include <sync.h>
 #include <wallet/db.h>
+#include <wallet/scheduler_stats.h>
+
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <cstdint>
+#include <functional>
+#include <optional>
+#include <thread>
 
 struct bilingual_str;
 
@@ -18,6 +27,18 @@ struct sqlite3_mutex;
 
 namespace wallet {
 class SQLiteDatabase;
+class IntegrityCheckQueue;
+
+//! Pause between backup steps of the background check, so a slow disk is not saturated.
+static constexpr int DEFAULT_CHECK_STEP_DELAY_MS{4};
+//! Quiet time after start-up before the first background check starts.
+static constexpr std::chrono::seconds BACKGROUND_CHECK_START_DELAY{60};
+//! Pause between two wallets' background checks.
+static constexpr std::chrono::seconds BACKGROUND_CHECK_WALLET_PAUSE{5};
+
+/** Page cache of a wallet database connection in KiB: 16 MiB, or 4 MiB on a
+ *  system with 4 GiB of memory or less. */
+int SQLitePageCacheKiB(const std::optional<uint64_t>& total_ram);
 
 /** RAII class that provides a database cursor */
 class SQLiteCursor : public DatabaseCursor
@@ -55,6 +76,9 @@ private:
     sqlite3_stmt* m_delete_stmt{nullptr};
     sqlite3_stmt* m_delete_prefix_stmt{nullptr};
     bool m_durable_txn{false};
+    // True when TxnBegin joined an open bulk scope with a SAVEPOINT instead of
+    // a transaction of its own.
+    bool m_savepoint_txn{false};
     // Successful TxnBegin retains the recursive FULLMUTEX connection lock.
     // Only this batch can end the transaction, on the thread that began it.
     sqlite3_mutex* m_txn_mutex{nullptr};
@@ -90,7 +114,11 @@ public:
 class SQLiteDatabase : public WalletDatabase
 {
 private:
+    friend class IntegrityCheckQueue;
     const bool m_mock{false};
+
+    /** Run the full integrity check in Verify() (otherwise the quick check). */
+    const bool m_full_check{true};
 
     const std::string m_dir_path;
 
@@ -107,6 +135,16 @@ private:
 
     void Cleanup() noexcept EXCLUSIVE_LOCKS_REQUIRED(!g_sqlite_mutex);
 
+    // Background full integrity check (see StartBackgroundIntegrityCheck).
+    Mutex m_check_mutex;
+    std::condition_variable m_check_cv;
+    bool m_check_stop GUARDED_BY(m_check_mutex){false};
+    sqlite3* m_check_copy GUARDED_BY(m_check_mutex){nullptr};
+    std::atomic<int> m_check_state{0};
+    void RunBackgroundIntegrityCheck();
+    /** Wait up to the given time; returns true when a stop was requested. */
+    bool CheckWaitStopped(std::chrono::milliseconds delay) EXCLUSIVE_LOCKS_REQUIRED(!m_check_mutex);
+
 public:
     SQLiteDatabase() = delete;
 
@@ -116,6 +154,45 @@ public:
     ~SQLiteDatabase();
 
     bool Verify(bilingual_str& error);
+
+    enum class BackgroundCheckState : int {
+        NOT_STARTED = 0,
+        QUEUED,
+        RUNNING,
+        PASSED,
+        FAILED,    //!< damage found, warning raised
+        CANCELLED, //!< stopped by Close() or Rewrite()
+        SKIPPED,   //!< could not run (for example no space for the copy); not a finding
+    };
+
+    /**
+     * Run the full integrity check in a low-priority thread. The wallet keeps
+     * the file in exclusive locking mode, so a second connection cannot read
+     * it. The thread therefore copies the file with SQLite's online backup in
+     * small steps through the wallet's own connection (the connection lock is
+     * held for one step at a time, then released), and runs the full check on
+     * that private copy. The copy is deleted afterwards. On damage it logs an
+     * error and sets the wallet integrity warning; it never stops the node.
+     */
+    void StartBackgroundIntegrityCheck() override EXCLUSIVE_LOCKS_REQUIRED(!m_check_mutex);
+    /**
+     * Background checks of all databases share one worker and run one at a
+     * time, in the order they were queued. The first starts after `delay`,
+     * once `ready` (if set) returns true, and the checks are `pause` apart.
+     * Call before StartBackgroundIntegrityCheck; the defaults start at once.
+     */
+    static void ConfigureBackgroundChecks(std::chrono::milliseconds delay, std::chrono::milliseconds pause, std::function<bool()> ready);
+    /** Most checks that ever ran at the same time since the last reset (tests). */
+    static int BackgroundChecksMaxConcurrent(bool reset = false);
+    /** Cancel a queued or running background check and wait for its thread to end. */
+    void StopBackgroundIntegrityCheck() noexcept EXCLUSIVE_LOCKS_REQUIRED(!m_check_mutex);
+    BackgroundCheckState GetBackgroundCheckState() const { return static_cast<BackgroundCheckState>(m_check_state.load()); }
+    /** Wait until this database's check is neither queued nor running, without cancelling it (tests). */
+    void JoinBackgroundIntegrityCheck();
+    /** Pause between backup steps (tests lengthen it to hold the check open). */
+    std::atomic<int> m_check_step_delay_ms{DEFAULT_CHECK_STEP_DELAY_MS};
+    /** Pages copied per backup step. */
+    std::atomic<int> m_check_step_pages{256};
 
     /** Open the database if it is not already opened */
     void Open() override;
@@ -155,6 +232,9 @@ public:
     /** Make a SQLiteBatch connected to this database */
     std::unique_ptr<DatabaseBatch> MakeBatch(bool flush_on_close = true) override;
 
+    /** Group this thread's writes into one SQLite transaction (see DatabaseBulkScope) */
+    std::unique_ptr<DatabaseBulkScope> MakeBulkScope() override;
+
     sqlite3* m_db{nullptr};
     bool m_use_unsafe_sync;
     // Protected by sqlite3_db_mutex(m_db). An unabortable transaction whose
@@ -162,6 +242,17 @@ public:
     // batch. Poison survives until the database connection is reopened.
     bool m_transaction_poisoned{false};
     const SQLiteBatch* m_transaction_owner{nullptr};
+    // A bulk scope owns an open transaction that every batch of this
+    // connection writes into. Protected by sqlite3_db_mutex(m_db), which the
+    // scope holds for its whole life.
+    bool m_bulk_active{false};
+
+    /** Record a commit in this database's counters and the process-wide ones. */
+    void RecordCommit(SqliteCommitKind kind, std::chrono::microseconds duration);
+    const SqliteCommitCounters& CommitCounters() const { return m_commit_counters; }
+
+private:
+    SqliteCommitCounters m_commit_counters;
 };
 
 std::unique_ptr<SQLiteDatabase> MakeSQLiteDatabase(const fs::path& path, const DatabaseOptions& options, DatabaseStatus& status, bilingual_str& error);

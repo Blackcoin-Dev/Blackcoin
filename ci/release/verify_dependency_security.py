@@ -169,7 +169,7 @@ def verify_sources(root, document):
 
 def verify_constraints(root, document):
     constraints = document.get("build_constraints", {})
-    for package in ("liboqs", "qt"):
+    for package in ("liboqs", "qt", "curl", "openssl"):
         recipe_text = (root / f"depends/packages/{package}.mk").read_text(encoding="utf-8")
         package_constraints = constraints.get(package, {})
         required = package_constraints.get("required")

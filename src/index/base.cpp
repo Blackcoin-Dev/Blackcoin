@@ -170,52 +170,61 @@ void BaseIndex::ThreadSync()
                 return;
             }
 
+            const CBlockIndex* candidate{nullptr};
             {
                 LOCK(cs_main);
-                const CBlockIndex* pindex_next = NextSyncBlock(pindex, m_chainstate->m_chain);
-                if (!pindex_next) {
+                // pindex always names the last successfully appended block.
+                // Reconcile even when a disconnect leaves no next block.
+                if (pindex && !m_chainstate->m_chain.Contains(pindex)) {
+                    const CBlockIndex* fork = m_chainstate->m_chain.FindFork(pindex);
+                    SetBestBlockIndex(pindex);
+                    if (!fork || !Rewind(pindex, fork)) {
+                        FatalErrorf("%s: Failed to rewind index %s to a previous chain tip",
+                                   __func__, GetName());
+                        return;
+                    }
+                    pindex = fork;
+                }
+                candidate = NextSyncBlock(pindex, m_chainstate->m_chain);
+                if (!candidate) {
                     SetBestBlockIndex(pindex);
                     // No need to handle errors in Commit. See rationale above.
                     Commit();
                     m_synced = true;
                     break;
                 }
-                if (pindex_next->pprev != pindex && !Rewind(pindex, pindex_next->pprev)) {
-                    FatalErrorf("%s: Failed to rewind index %s to a previous chain tip",
-                               __func__, GetName());
-                    return;
-                }
-                pindex = pindex_next;
             }
 
             auto current_time{std::chrono::steady_clock::now()};
             if (last_log_time + SYNC_LOG_INTERVAL < current_time) {
                 LogPrintf("Syncing %s with block chain from height %d\n",
-                          GetName(), pindex->nHeight);
+                          GetName(), candidate->nHeight);
                 last_log_time = current_time;
             }
 
             if (last_locator_write_time + SYNC_LOCATOR_WRITE_INTERVAL < current_time) {
-                SetBestBlockIndex(pindex->pprev);
+                SetBestBlockIndex(pindex);
                 last_locator_write_time = current_time;
                 // No need to handle errors in Commit. See rationale above.
                 Commit();
             }
 
             CBlock block;
-            interfaces::BlockInfo block_info = kernel::MakeBlockInfo(pindex);
-            if (!m_chainstate->m_blockman.ReadBlockFromDisk(block, *pindex)) {
+            interfaces::BlockInfo block_info = kernel::MakeBlockInfo(candidate);
+            if (!m_chainstate->m_blockman.ReadBlockFromDisk(block, *candidate)) {
                 FatalErrorf("%s: Failed to read block %s from disk",
-                           __func__, pindex->GetBlockHash().ToString());
+                           __func__, candidate->GetBlockHash().ToString());
                 return;
             } else {
                 block_info.data = &block;
             }
-            if (!CustomAppend(block_info)) {
+            const AppendResult result = CustomAppendWithStatus(block_info);
+            if (result == AppendResult::FAILED) {
                 FatalErrorf("%s: Failed to write block %s to index database",
-                           __func__, pindex->GetBlockHash().ToString());
+                           __func__, candidate->GetBlockHash().ToString());
                 return;
             }
+            if (result == AppendResult::APPLIED) pindex = candidate;
         }
     }
 
@@ -313,13 +322,14 @@ void BaseIndex::BlockConnected(ChainstateRole role, const std::shared_ptr<const 
         }
     }
     interfaces::BlockInfo block_info = kernel::MakeBlockInfo(pindex, block.get());
-    if (CustomAppend(block_info)) {
+    const AppendResult result = CustomAppendWithStatus(block_info);
+    if (result == AppendResult::APPLIED) {
         // Setting the best block index is intentionally the last step of this
         // function, so BlockUntilSyncedToCurrentChain callers waiting for the
         // best block index to be updated can rely on the block being fully
         // processed, and the index object being safe to delete.
         SetBestBlockIndex(pindex);
-    } else {
+    } else if (result == AppendResult::FAILED) {
         FatalErrorf("%s: Failed to write block %s to index",
                    __func__, pindex->GetBlockHash().ToString());
         return;

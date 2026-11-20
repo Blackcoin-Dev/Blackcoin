@@ -202,13 +202,16 @@ public:
     explicit BlockAssembler(Chainstate& chainstate, const CTxMemPool* mempool);
     explicit BlockAssembler(Chainstate& chainstate, const CTxMemPool* mempool, const Options& options);
 
+    enum class StakeSearch { DEFAULT, BACKGROUND };
+
     /** Construct a new block template with coinbase to scriptPubKeyIn */
     std::unique_ptr<CBlockTemplate> CreateNewBlock(const CScript& scriptPubKeyIn,
                                                     CWallet* pwallet = nullptr,
                                                     bool* pfPoSCancel = nullptr,
                                                     int64_t* pFees = nullptr,
                                                     CTxDestination destination = CNoDestination(),
-                                                    std::optional<COutPoint> forced_kernel = std::nullopt);
+                                                    std::optional<COutPoint> forced_kernel = std::nullopt,
+                                                    StakeSearch stake_search = StakeSearch::DEFAULT);
 
     inline static std::optional<int64_t> m_last_block_num_txs{};
     inline static std::optional<int64_t> m_last_block_weight{};
@@ -216,11 +219,13 @@ public:
 private:
     const Options m_options;
 
+    struct TemplateOverlay;
+
     // utility functions
     /** Clear the block's state and prepare for assembling a new block */
     void resetBlock();
     /** Add a tx to the block */
-    void AddToBlock(CTxMemPool::txiter iter);
+    void AddToBlock(CTxMemPool::txiter iter, TemplateOverlay& overlay);
 
     // Methods for how to add transactions to a block.
     /** Add transactions based on feerate including unconfirmed ancestors
@@ -239,7 +244,7 @@ private:
       * locktime, premature-witness, serialized size (if necessary)
       * These checks should always succeed, and they're here
       * only as an extra check in case of suboptimal node configuration */
-    bool TestPackageTransactions(const CTxMemPool::setEntries& package, uint32_t nTime);
+    bool TestPackageTransactions(const CTxMemPool::setEntries& package, uint32_t nTime, TemplateOverlay& overlay);
     /** Sort the package in an order that is valid to appear in a block */
     void SortForBlock(const CTxMemPool::setEntries& package, std::vector<CTxMemPool::txiter>& sortedEntries);
 };

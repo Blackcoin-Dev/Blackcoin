@@ -131,6 +131,14 @@ WalletView::WalletView(WalletModel* wallet_model, const PlatformStyle* _platform
 
     // Balloon pop-up for new transaction
     connect(walletModel->getTransactionTableModel(), &TransactionTableModel::rowsInserted, this, &WalletView::processNewTransaction);
+    // The same pop-up for a wallet whose history has not been loaded: there is no row to read it from.
+    connect(walletModel->getTransactionTableModel(), &TransactionTableModel::incomingWhileNotLoaded, this,
+        [this](const QString& date, qint64 amount, const QString& type, const QString& address, const QString& label) {
+            // Prevent balloon-spam when initial block download is in progress
+            if (!clientModel || clientModel->node().isInitialBlockDownload()) return;
+            Q_EMIT incomingTransaction(date, walletModel->getOptionsModel()->getDisplayUnit(), amount, type, address,
+                GUIUtil::HtmlEscape(label), GUIUtil::HtmlEscape(walletModel->getWalletName()));
+        });
 
     // Ask for passphrase if needed
     connect(walletModel, SIGNAL(requireUnlock()), this, SLOT(unlockWallet()));

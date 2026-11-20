@@ -45,7 +45,7 @@ from test_framework.util import assert_equal, assert_raises_rpc_error
 
 
 V30_1_4_VERSION = 300104
-CANDIDATE_VERSION = 300105
+CANDIDATE_VERSION = 300106
 REQUIRED_HISTORICAL_VERSIONS = ["v30.1.4"]
 CLAIM_WALLET = "v3014_qqp2_upgrade"
 MANAGED_DRAFT_WALLET = "v3014_managed_draft_upgrade"

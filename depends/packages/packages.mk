@@ -4,6 +4,9 @@ boost_packages = boost
 
 libevent_packages = libevent
 
+# Native node HTTPS bootstrap, independent of optional Qt.
+httpsseed_packages = curl openssl
+
 # liboqs (post-quantum ML-DSA) is a hard dependency for Quantum Quasar V4 consensus.
 liboqs_packages = liboqs
 

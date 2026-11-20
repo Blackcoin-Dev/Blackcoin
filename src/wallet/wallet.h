@@ -25,6 +25,7 @@
 #include <support/allocators/secure.h>
 #include <sync.h>
 #include <tinyformat.h>
+#include <arith_uint256.h>
 #include <uint256.h>
 #include <util/fs.h>
 #include <util/hasher.h>
@@ -34,15 +35,18 @@
 #include <util/ui_change_type.h>
 #include <wallet/crypter.h>
 #include <wallet/db.h>
+#include <wallet/pow_miner_tip_signal.h>
 #include <wallet/qq_development_donation.h>
 #include <wallet/scriptpubkeyman.h>
 #include <wallet/shadow_pow_claim_recovery_types.h>
 #include <wallet/transaction.h>
 #include <wallet/types.h>
+#include <wallet/walletdb.h>
 #include <wallet/walletutil.h>
 
 #include <atomic>
 #include <cassert>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -73,10 +77,90 @@ enum class TransactionError;
 namespace interfaces {
 class Wallet;
 }
+struct ShadowSyntheticPayoutTransaction;
+
 namespace wallet {
 class CWallet;
 class WalletClaimMaintenance;
 struct WalletClaimMaintenanceSlot;
+
+enum class WalletPowMiningGrindStatus {
+    FOUND,
+    EXHAUSTED,
+    INVALID_WORK,
+    LOCAL_INTERNAL_ERROR,
+    CANCELLED,
+};
+
+struct WalletPowMiningGrindResult {
+    WalletPowMiningGrindStatus status{WalletPowMiningGrindStatus::CANCELLED};
+    /** Completed proof-hash evaluations, excluding a failed Argon2 call. */
+    uint64_t successful_hashes{0};
+    std::chrono::milliseconds elapsed{0};
+};
+
+/** Actual steady-clock durations, in nanoseconds. In-progress periods are
+ * absent. Completed and truncated totals are separate so interrupted duty
+ * waits cannot be presented as completed budget periods. */
+struct WalletPowMiningDutyWorker {
+    uint64_t completed_periods{0};
+    uint64_t completed_work_periods{0};
+    uint64_t completed_active_ns{0};
+    uint64_t completed_explicit_wait_ns{0};
+    uint64_t completed_duty_wait_ns{0};
+    uint64_t completed_successful_hashes{0};
+    uint64_t truncated_periods{0};
+    uint64_t truncated_active_ns{0};
+    uint64_t truncated_explicit_wait_ns{0};
+    uint64_t truncated_duty_wait_ns{0};
+    uint64_t successful_hashes{0};
+};
+
+/** One coherent, bounded snapshot. Reset on each successful new miner start,
+ * retained after stop, and never persisted across process restart. */
+struct WalletPowMiningDutySnapshot {
+    uint64_t session_id{0};
+    int cpu_percent{0};
+    std::vector<WalletPowMiningDutyWorker> workers;
+};
+
+/** Timing of one claim attempt of the built-in miner: the work done for one
+ * tip from the moment the wallet's block callback saw that tip. Offsets are
+ * milliseconds from that moment; -1 means the step was not reached. */
+struct WalletPowClaimTiming {
+    bool valid{false};
+    uint256 tip;
+    int height{-1};
+    /** The tip block's own timestamp. */
+    int64_t block_time{0};
+    /** False when the block callback for this tip was not observed (the
+     * miner started on a tip the wallet already had); offsets then count
+     * from the miner's first sight of the tip. */
+    bool tip_seen_known{false};
+    int64_t tip_seen_unix_ms{0};
+    int64_t gate_ready_ms{-1};
+    int64_t first_hash_ms{-1};
+    int64_t proof_found_ms{-1};
+    int64_t mempool_accept_ms{-1};
+    /** Offset at which the claim was first announced to a peer; -1 when it
+     * was not announced within the observation window (or has no peer). It is
+     * taken by the message handler, so it can be a few milliseconds smaller
+     * than mempool_accept_ms, which is taken when the submission returns. */
+    int64_t first_inv_ms{-1};
+    /** Peers the claim was announced to within one second of the first. */
+    uint32_t inv_peers_1s{0};
+    /** Of those, the peers that were sent the whole transaction at once. */
+    uint32_t push_peers_1s{0};
+    uint64_t hashes{0};
+    uint64_t batches{0};
+    /** Duty sleep taken between the first hash and the end of the attempt. */
+    int64_t duty_sleep_ms{0};
+    /** Whether the tip changed before the claim was submitted. */
+    bool tip_changed{false};
+    /** submitted, persisted_pending, conflict, input_unavailable, failed,
+     * tip_changed, cancelled or stopped. */
+    std::string result;
+};
 
 enum class WalletCommitStatus {
     ACCEPTED,
@@ -153,6 +237,12 @@ bool ShadowPowClaimRefreshInputMatchesMiningGate(
 
 static constexpr int DEFAULT_POW_CLAIM_RESERVE_STAKE_COINS{1};
 
+/** Largest live legacy claim-source subset the complete wallet snapshot accepts. Above it
+ * the PoW miner's snapshot fails with `legacy_source_outputs` and claim creation stops. */
+static constexpr size_t SHADOW_POW_CLAIM_LEGACY_SOURCE_OUTPUT_CAPACITY{65536};
+/** The wallet warns, and the logged capacity line turns into a warning, from this percentage. */
+static constexpr size_t SHADOW_POW_CLAIM_LEGACY_SOURCE_WARNING_PERCENT{75};
+
 /** Diagnostics from one complete wallet-only claim-input source snapshot.
  * Counts are observations, never input-selection authority. A nonnumeric
  * failure has zero observed/limit values. */
@@ -162,6 +252,7 @@ struct ShadowPowClaimInputEnumerationInfo {
     size_t capacity_limit{0};
     size_t live_outputs{0};
     size_t legacy_source_outputs{0};
+    size_t legacy_source_output_limit{SHADOW_POW_CLAIM_LEGACY_SOURCE_OUTPUT_CAPACITY};
     size_t script_managers{0};
     size_t manager_work{0};
     size_t source_work{0};
@@ -316,12 +407,115 @@ struct ShadowPowClaimInventory {
 ShadowPowClaimInventory BuildShadowPowClaimCompatibilityInventory(
     const ShadowPowClaimRecoveryInventory& recovery_inventory);
 
+/** True when an output with this script could ever be a staking candidate: a quantum
+ * migration or cold-stake program, or one of the four legacy kernel script types.
+ * A pure function of the script. */
+bool IsStakeCandidateScript(const CScript& script);
+
+/** One confirmed synthetic Gold Rush payout record, as hashed into a SyntheticPayoutCheckpoint. */
+struct SyntheticPayoutRef {
+    uint256 txid;
+    uint256 block_hash;
+    int height{-1};
+    bool stale{false};
+};
+
+/**
+ * Order-independent, incrementally maintained digest of the confirmed synthetic payout
+ * records (SyntheticPayoutCheckpoint schema 2). Every record contributes a 256-bit term
+ * derived from its txid, block hash and stale flag; the digest is the finalised sum of
+ * the terms (mod 2^256) of the records at heights [0, max_height], with their count.
+ * Adding, removing or changing one record costs O(log n), so a flush no longer collects,
+ * sorts and hashes the wallet's whole payout history. Records are bucketed by height so
+ * a prefix digest only subtracts the buckets above max_height.
+ */
+class SyntheticPayoutDigest
+{
+public:
+    /** Add or replace the record for ref.txid. A negative height keeps it out of every digest. */
+    void Set(const SyntheticPayoutRef& ref);
+    void Erase(const uint256& txid);
+    void Clear();
+    /** Count and digest of the records at heights [0, max_height]. */
+    std::pair<uint32_t, uint256> At(int max_height) const;
+    /** The same value computed from scratch over a list of records (used at load and by tests). */
+    static std::pair<uint32_t, uint256> Compute(const std::vector<SyntheticPayoutRef>& refs, int max_height);
+
+private:
+    struct Entry {
+        int height;
+        arith_uint256 term;
+    };
+    struct Bucket {
+        uint32_t count{0};
+        arith_uint256 sum;
+    };
+    static arith_uint256 Term(const SyntheticPayoutRef& ref);
+    static uint256 Finalize(uint32_t count, const arith_uint256& sum);
+    std::map<uint256, Entry> m_entries;
+    std::map<int, Bucket> m_buckets;
+    uint32_t m_count{0};
+    arith_uint256 m_sum;
+};
+
+struct SyntheticPayoutCheckpoint;
+/** Whether a stored checkpoint (either schema) describes exactly these records. The records carry
+ *  the heights to hash against (at load, the active-chain heights of their blocks). */
+bool SyntheticPayoutCheckpointMatches(const SyntheticPayoutCheckpoint& checkpoint, const std::vector<SyntheticPayoutRef>& refs);
+/** What the load made of one stored payout checkpoint. */
+enum class SyntheticPayoutCheckpointVerdict {
+    ACCEPTED,
+    UNKNOWN_SCHEMA,
+    OTHER_CLIENT_VERSION,
+    NO_HEIGHT,
+    BLOCK_NOT_IN_INDEX,
+    //! The block is known but is not the active-chain block at the checkpoint height.
+    BLOCK_NOT_ACTIVE,
+    COUNT_MISMATCH,
+    DIGEST_MISMATCH,
+};
+struct SyntheticPayoutCheckpointResult {
+    SyntheticPayoutCheckpointVerdict verdict{SyntheticPayoutCheckpointVerdict::NO_HEIGHT};
+    //! Records the wallet holds at or below the checkpoint height (set once the block was found active).
+    uint32_t records_found{0};
+};
+/** Where the chain has a checkpoint's block: ACCEPTED (active at the checkpoint height),
+ *  BLOCK_NOT_IN_INDEX or BLOCK_NOT_ACTIVE. */
+using SyntheticPayoutCheckpointBlockStatus = std::function<SyntheticPayoutCheckpointVerdict(const SyntheticPayoutCheckpoint&)>;
+/**
+ * Check one stored payout checkpoint at load. It is accepted only when its schema is known,
+ * it was written by this client version, block_status says its block is the active-chain
+ * block at its height, and it matches the records (whose heights are the active-chain heights
+ * of their blocks, negative for a block that is not on the active chain).
+ */
+SyntheticPayoutCheckpointResult CheckSyntheticPayoutCheckpoint(
+    const SyntheticPayoutCheckpoint& checkpoint,
+    const std::vector<SyntheticPayoutRef>& refs,
+    const SyntheticPayoutCheckpointBlockStatus& block_status);
+/** One log line's worth of text for a checked checkpoint: its height and count, and the verdict with its reason. */
+std::string DescribeSyntheticPayoutCheckpointResult(const SyntheticPayoutCheckpoint& checkpoint, const SyntheticPayoutCheckpointResult& result);
+/**
+ * Choose among the stored payout checkpoints at load: the index of the accepted checkpoint
+ * with the greatest height (the first of equals), or nullopt when none is accepted and every
+ * payout block has to be authenticated. results, when given, receives the result of every
+ * checkpoint in the order passed.
+ */
+std::optional<size_t> SelectSyntheticPayoutCheckpoint(
+    const std::vector<SyntheticPayoutCheckpoint>& checkpoints,
+    const std::vector<SyntheticPayoutRef>& refs,
+    const SyntheticPayoutCheckpointBlockStatus& block_status,
+    std::vector<SyntheticPayoutCheckpointResult>* results = nullptr);
+
 /** Block timing captured before taking cs_wallet. */
 struct WalletBlockTime {
     int64_t block_time{0};
     int64_t block_max_time{0};
 };
 class WalletBatch;
+class CWallet;
+/** Annotate the wallet record of a block's synthetic payout (comment, address, marker, clears the stale
+ *  mark) and keep the payout index and digest in step. Exposed for tests. */
+void AnnotateWalletShadowPayout(CWallet& wallet, const ::ShadowSyntheticPayoutTransaction& payout, WalletBatch& batch);
 enum class DBErrors : int;
 } // namespace wallet
 struct CBlockLocator;
@@ -372,6 +566,7 @@ struct CStakeCache;
 
 namespace wallet {
 struct WalletContext;
+struct StakeSlotCacheState;
 
 //! Explicitly unload and delete the wallet.
 //! Blocks the current thread after signaling the unload intent so that all
@@ -381,6 +576,12 @@ struct WalletContext;
 void UnloadWallet(std::shared_ptr<CWallet>&& wallet);
 
 bool AddWallet(WalletContext& context, const std::shared_ptr<CWallet>& wallet);
+/** Put a loaded wallet on, and take it off, the display balance worker, which
+ * keeps the balance snapshot the polling RPCs return. Called by AddWallet and
+ * RemoveWallet; both are idempotent. Defined in wallet/display_balance.cpp so
+ * that the wallet does not depend on the worker. */
+void AttachPolledBalance(CWallet& wallet);
+void DetachPolledBalance(CWallet& wallet);
 bool RemoveWallet(WalletContext& context, const std::shared_ptr<CWallet>& wallet, std::optional<bool> load_on_start, std::vector<bilingual_str>& warnings);
 bool RemoveWallet(WalletContext& context, const std::shared_ptr<CWallet>& wallet, std::optional<bool> load_on_start);
 std::vector<std::shared_ptr<CWallet>> GetWallets(WalletContext& context);
@@ -787,6 +988,53 @@ struct WalletShadowSolveReference
     uint256 solve_txid;
 };
 
+/**
+ * In-memory (never persisted) record of the chainstate-derived facts of one
+ * deep confirmed wallet output, used only by the GUI balance display path to
+ * avoid re-reading the coins database for every output on every poll. It is
+ * valid only while the wallet transaction stays confirmed in the same block at
+ * the same height with the same output, and is cleared on any reorg or rescan.
+ */
+struct WalletOutputLifecycleMemo {
+    //! First 64 bits (GetUint64(0)) of the confirming block hash.
+    uint64_t confirmed_block_hash_prefix{0};
+    //! First 64 bits of the SHA256 of the serialized CTxOut the facts describe.
+    uint64_t txout_digest{0};
+    uint32_t coin_time{0};
+    int32_t confirmed_block_height{0};
+    uint32_t coin_height{0};
+    bool coinbase{false};
+    bool coinstake{false};
+    bool synthetic{false};
+};
+
+/**
+ * What one blockDisconnected() call did while it held cs_wallet: how long each
+ * phase took and how many entries each phase looked at. A disconnect must cost
+ * in proportion to the block, not to the wallet's history; the counters are
+ * what the unit tests assert and the times are what the log line of a slow
+ * disconnect reports.
+ */
+struct BlockDisconnectWork {
+    int height{-1};
+    //! Transactions of the disconnected block.
+    uint64_t block_txs{0};
+    //! Lifecycle memo entries examined.
+    uint64_t memo_entries_visited{0};
+    //! Wallet coinstake records examined (orphan abandon and redelegation history).
+    uint64_t coinstakes_visited{0};
+    //! Synthetic payout records of the block that were deactivated.
+    uint64_t payouts_synced{0};
+    std::chrono::microseconds memo{0};
+    std::chrono::microseconds block_sync{0};
+    std::chrono::microseconds payouts{0};
+    std::chrono::microseconds coinstakes{0};
+    std::chrono::microseconds redelegation{0};
+    std::chrono::microseconds commit{0};
+    std::chrono::microseconds total{0};
+    std::string ToString() const;
+};
+
 class WalletRescanReserver; //forward declarations for ScanForWalletTransactions/RescanFromTime
 /**
  * A CWallet maintains a set of transactions and balances, and provides the ability to create new transactions.
@@ -833,12 +1081,19 @@ private:
     std::atomic<bool> fAbortRescan{false};
     std::atomic<bool> fScanningWallet{false}; // controlled by WalletRescanReserver
     std::atomic<bool> m_attaching_chain{false};
+    /** Blocks whose transactions LoadWallet marked Inactive because the block was not in the
+     *  active chain at its snapshot. AttachChainUnpublished rescans from the lowest of these
+     *  that is in the active chain once subscribed, so blocks connected between the snapshot
+     *  and the subscription (which no notification covers) re-confirm their transactions. */
+    std::set<uint256> m_load_inactivated_blocks GUARDED_BY(cs_wallet);
     std::atomic<bool> m_scanning_with_passphrase{false};
     std::atomic<SteadyClock::time_point> m_scanning_start{SteadyClock::time_point{}};
     std::atomic<double> m_scanning_progress{0};
     friend class WalletRescanReserver;
     friend struct WalletLoadTestAccess;
+    friend struct WalletReorgTestAccess;
     friend class WalletClaimMaintenance;
+    friend void AnnotateWalletShadowPayout(CWallet& wallet, const ::ShadowSyntheticPayoutTransaction& payout, WalletBatch& batch);
     std::shared_ptr<WalletClaimMaintenanceSlot> m_claim_maintenance GUARDED_BY(cs_wallet);
     bool m_claim_maintenance_unregistered GUARDED_BY(cs_wallet){false};
 
@@ -855,6 +1110,26 @@ private:
 
     std::map<COutPoint, CStakeCache> stakeCache;
 
+    // Own transactions to put back into the mempool when the chain allows (see
+    // RetryDroppedTransactions). Ordered by txid; submission order is the wallet order.
+    struct ResubmitRetryEntry {
+        uint256 last_attempt_tip; //! wallet best block at the last attempt
+        int last_attempt_height{-1}; //! its height
+        unsigned int attempts{0};
+        //! Blocks that must pass after the last refusal before the next try;
+        //! doubles with every refusal up to MAX_RESUBMIT_RETRY_BLOCK_GAP.
+        unsigned int block_gap{1};
+        //! The last refusal was bad-txns-inputs-missingorspent, which usually
+        //! means the input was spent elsewhere: a much lower attempt cap.
+        bool missing_inputs{false};
+    };
+    std::map<uint256, ResubmitRetryEntry> m_resubmit_retry GUARDED_BY(cs_wallet);
+
+    // Per-tip selection of stake candidates and their kernel inputs (see
+    // wallet/staking.h, StakeSlotCache). Owned and validated by staking.cpp;
+    // only ever dropped or replaced under cs_wallet.
+    mutable std::shared_ptr<StakeSlotCacheState> m_stake_slot_cache GUARDED_BY(cs_wallet);
+
     // Ordered, broad producer-side prefilter for staking. This contains every
     // wallet-known output that is not currently spent by a non-conflicted,
     // non-abandoned wallet transaction. Ownership, maturity, phase, lock,
@@ -865,6 +1140,14 @@ private:
     // by both legacy staking and claim selection are omitted. Dynamic wallet
     // policy and ownership are deliberately evaluated by the warm scan.
     std::set<COutPoint> m_live_unspent_legacy_claim_outpoints GUARDED_BY(cs_wallet);
+    // Ordered subset of the broad live index whose output script is of a kind
+    // the staker can ever use (a quantum migration or cold-stake program, or a
+    // PUBKEY, PUBKEYHASH, witness v0 keyhash or taproot script). The script is
+    // immutable for an outpoint, so membership only follows the live index.
+    // Ownership, maturity, lock, lineage and every other dynamic policy still
+    // run in AvailableCoinsForStaking; this only keeps outputs that could
+    // never pass the script test out of the per-slot walk.
+    std::set<COutPoint> m_live_unspent_stake_candidate_outpoints GUARDED_BY(cs_wallet);
     std::optional<ShadowPowClaimStakeReserveInfo>
         m_cached_shadow_pow_claim_stake_reserve GUARDED_BY(cs_wallet);
     /** Every observable live-index membership change advances this value.
@@ -903,6 +1186,27 @@ private:
     std::set<CScript> m_owned_legacy_shadow_scripts GUARDED_BY(cs_wallet);
     std::map<uint256, std::set<uint256>> m_confirmed_synthetic_payouts_by_block GUARDED_BY(cs_wallet);
     std::map<uint256, uint256> m_confirmed_synthetic_payout_block_by_txid GUARDED_BY(cs_wallet);
+    /** Every coinstake in the wallet. Whether a transaction is a coinstake never changes,
+     *  so this only follows insertion and removal. */
+    std::set<uint256> m_coinstake_txids GUARDED_BY(cs_wallet);
+    /** The coinstakes the orphan sweep can act on: neither confirmed, nor
+     *  conflicted, nor abandoned (inactive, or in the mempool). Only these can
+     *  be orphans that still hold their inputs, so the sweep after a block
+     *  disconnect walks this set and not every coinstake the wallet ever made.
+     *  A lost stake ends conflicted or abandoned and leaves the set, so it does
+     *  not grow with the stakes a wallet has lost. Follows the record's state
+     *  wherever the coinstake index is kept and wherever a state is written
+     *  (UpdateUnconfirmedCoinstakeIndex). */
+    std::set<uint256> m_unconfirmed_coinstake_txids GUARDED_BY(cs_wallet);
+    void UpdateUnconfirmedCoinstakeIndex(const CWalletTx& wtx) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    /** The last step of attaching to the chain: abandon the coinstakes whose block
+     *  the node no longer has and rebuild the redelegation win history from the
+     *  confirmed coinstakes, in one bulk write scope. */
+    void ReconcileCoinstakesAfterAttach();
+    /** When the legacy claim-source capacity was last logged (steady clock). */
+    std::optional<std::chrono::steady_clock::time_point> m_legacy_source_capacity_reported GUARDED_BY(cs_wallet);
+    /** Incremental payout digest, kept in step with the two indexes above. */
+    SyntheticPayoutDigest m_synthetic_payout_digest GUARDED_BY(cs_wallet);
     void RefreshLatestShadowSolve(const CScript& target) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     void RemoveIndexedShadowSolve(const uint256& txid) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     void IndexConfirmedShadowSolve(const CWalletTx& wtx) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
@@ -911,6 +1215,64 @@ private:
     void IndexOwnedLegacyShadowScripts(const CWalletTx& wtx) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     void UpdateConfirmedSyntheticPayoutIndex(const CWalletTx& wtx) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     void RecomputeConfirmedSyntheticPayoutIndex() EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    /** See SyntheticPayoutCheckpoint. Heights are those currently stored in the wallet transactions. */
+    std::vector<SyntheticPayoutRef> CollectSyntheticPayoutRefs() const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+public:
+    /** Incremental digest of the confirmed synthetic payouts at heights [0, height]. */
+    std::pair<uint32_t, uint256> GetSyntheticPayoutDigestLocked(int height) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet)
+    {
+        return m_synthetic_payout_digest.At(height);
+    }
+    /** The same value recomputed from every record in the wallet (tests). schema 1 is the
+     *  sorted-txid hash earlier releases stored, schema 2 the incremental form. */
+    std::pair<uint32_t, uint256> RecomputeSyntheticPayoutDigestLocked(int height, uint32_t schema) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+private:
+    /** Cached copy of the persisted checkpoint (nullopt when none is stored). */
+    std::optional<SyntheticPayoutCheckpoint> m_synthetic_payout_checkpoint GUARDED_BY(cs_wallet);
+    /** True once LoadWallet authenticated every payout without error; checkpoints are never written before. */
+    bool m_synthetic_payout_checkpoint_trusted GUARDED_BY(cs_wallet){false};
+    /** Cached copy of the persisted flush-anchored checkpoint (nullopt when none is stored). */
+    std::optional<SyntheticPayoutCheckpoint> m_synthetic_payout_flush_checkpoint GUARDED_BY(cs_wallet);
+    /** The checkpoint that describes the payout records at heights [0, height]; nullopt when there are none. */
+    std::optional<SyntheticPayoutCheckpoint> MakeSyntheticPayoutCheckpoint(const uint256& block_hash, int height) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    /** Persist a checkpoint for block_hash/height if the wallet holds synthetic payouts and it changed. */
+    void WriteSyntheticPayoutCheckpoint(WalletBatch& batch, const uint256& block_hash, int height) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    /** The same for the flush-anchored record. The caller knows that block_hash is the block the
+     * chainstate holds on disk and that every payout record at or below it is authenticated.
+     * Never written per block: only on a chainstate flush and at load. */
+    void WriteSyntheticPayoutFlushCheckpoint(WalletBatch& batch, const uint256& block_hash, int height) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    /** Record block_hash as the wallet's best block (and move the payout checkpoint with it)
+     * inside the commit scope of the connected block; no-op unless atomic_with_block.
+     * A block that wrote no other wallet record does not get a commit of its own: its
+     * best block is remembered in m_deferred_best_block and written with the next block
+     * that writes a record, after MAX_DEFERRED_BEST_BLOCKS blocks or MAX_BEST_BLOCK_DEFERRAL
+     * (whichever comes first), on a chainstate flush, and when the wallet is flushed or closed. */
+    void PersistBlockProgress(WalletBatch& batch, const CBlockLocator& locator, bool atomic_with_block,
+                              const uint256& block_hash, int block_height, bool block_wrote_records) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    /** Write the best block and the payout checkpoint for it; clears the deferral on success. */
+    bool WriteBlockProgress(WalletBatch& batch, const CBlockLocator& locator,
+                            const uint256& block_hash, int block_height) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    /** Forget any deferred best block: the stored best block is current as of now. */
+    void BestBlockPersisted() EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    struct DeferredBestBlock {
+        CBlockLocator locator;
+        uint256 hash;
+        int height{-1};
+    };
+    /** The last connected block, when its best-block record is not on disk yet. */
+    std::optional<DeferredBestBlock> m_deferred_best_block GUARDED_BY(cs_wallet);
+    /** Blocks connected since the stored best block was last written. */
+    int m_best_block_deferred_blocks GUARDED_BY(cs_wallet){0};
+    /** When the stored best block was last written (or the wallet was created). */
+    NodeClock::time_point m_best_block_persisted_at GUARDED_BY(cs_wallet){NodeClock::now()};
+public:
+    /** Most blocks a crash can make the wallet scan again because their best block was deferred. */
+    static constexpr int MAX_DEFERRED_BEST_BLOCKS{20};
+    /** Longest time the stored best block may trail a connected block while blocks keep arriving. */
+    static constexpr std::chrono::minutes MAX_BEST_BLOCK_DEFERRAL{10};
+    /** Write the best block that blockConnected deferred, if there is one. */
+    void PersistDeferredBestBlock() EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+private:
     bool ReconcileWalletShadowPayoutsForBlock(const uint256& block_hash, int block_height,
                                               const std::set<COutPoint>& authenticated_outpoints,
                                               WalletBatch& batch) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
@@ -1093,7 +1455,9 @@ private:
     // independent of unrelated ordinary wallet history while cs_main is
     // held. Runtime graph construction still enforces its own strict work
     // budget before any proof evaluation.
-    std::set<uint256> m_shadow_pow_claim_txids GUARDED_BY(cs_wallet);
+    // Kept as CWalletTx::m_shadow_pow_index.claim on the record itself: a
+    // lifetime set of every claim cost one tree node per claim. Read it with
+    // IsShadowPowLocalClaimIndexedLocked().
     // Metadata-presence indexes are independent of claim proof ownership.
     // Keep malformed and terminal managed records visible to usage accounting.
     std::set<uint256> m_shadow_pow_managed_resolution_txids GUARDED_BY(cs_wallet);
@@ -1103,7 +1467,8 @@ private:
     // Ownership-independent proof-presence index. This deliberately includes
     // confirmed incoming and foreign QQSPROOF carriers so warm ordering and
     // historical-anchor reservation remain TransactionHasShadowProof-exact.
-    std::set<uint256> m_shadow_pow_all_proof_txids GUARDED_BY(cs_wallet);
+    // Kept as CWalletTx::m_shadow_pow_index.proof on the record itself; read
+    // it with IsIndexedShadowPowClaimLocked().
     // Runtime callbacks do not parse records above the per-record byte cap.
     // Any such record makes proof presence unknown and warm selection returns
     // a typed capacity result before authorizing a prefix.
@@ -1111,17 +1476,32 @@ private:
         GUARDED_BY(cs_wallet);
     std::set<uint256> m_shadow_pow_known_oversized_proof_txids
         GUARDED_BY(cs_wallet);
+    // The proof and unknown-presence records above that are not confirmed.
+    // A long-lived mining wallet holds tens of thousands of confirmed proof
+    // records and a handful of unconfirmed ones, and the block-connected
+    // callback only ever acts on the latter. Kept as a superset: an entry is
+    // added whenever such a record is seen outside a block and every reader
+    // re-tests the record's state, so a stale entry is harmless.
+    std::set<uint256> m_shadow_pow_nonconfirmed_proof_txids
+        GUARDED_BY(cs_wallet);
     // Complete incremental reverse index for ownership-independent proof
     // anchors. Lifetime history is never walked or capped by hot selection.
+    // A proof record indexed from its own inputs (every ordinary claim) keeps
+    // no vector here: CWalletTx::m_shadow_pow_index.proof_inputs_from_vin
+    // says that its distinct non-null inputs are the ones referenced, and
+    // they are read back from the immutable transaction. Only an input list
+    // supplied by the out-of-lock classifier is stored.
     std::map<uint256, std::vector<COutPoint>>
         m_shadow_pow_proof_inputs_by_txid GUARDED_BY(cs_wallet);
-    std::map<COutPoint, std::set<uint256>> m_shadow_pow_proof_anchor_txids
+    // Number of indexed records that reference each anchor (each record
+    // counts once per outpoint). Only presence is ever read.
+    std::map<COutPoint, uint32_t> m_shadow_pow_proof_anchor_txids
         GUARDED_BY(cs_wallet);
     // Unknown oversized records conservatively reserve their input anchors
     // until the out-of-lock type classifier proves them ordinary or proof.
     std::map<uint256, std::vector<COutPoint>>
         m_shadow_pow_unknown_inputs_by_txid GUARDED_BY(cs_wallet);
-    std::map<COutPoint, std::set<uint256>> m_shadow_pow_unknown_anchor_txids
+    std::map<COutPoint, uint32_t> m_shadow_pow_unknown_anchor_txids
         GUARDED_BY(cs_wallet);
     std::set<uint256> m_shadow_pow_proof_input_index_pending_txids
         GUARDED_BY(cs_wallet);
@@ -1180,8 +1560,9 @@ private:
         m_shadow_pow_schema_relay_frontiers GUARDED_BY(cs_wallet);
     std::set<std::pair<int64_t, uint256>>
         m_shadow_pow_legacy_relay_frontiers GUARDED_BY(cs_wallet);
-    std::map<uint256, std::pair<bool, int64_t>>
-        m_shadow_pow_relay_frontier_by_txid GUARDED_BY(cs_wallet);
+    // The reverse index (which set, which frontier) is kept on the record:
+    // CWalletTx::m_shadow_pow_index.{has_relay_frontier, legacy_relay_frontier}
+    // and CWalletTx::m_shadow_pow_relay_frontier.
     // Durable monotonic maximum of validated relay-expiry frontiers. It
     // advances in one scalar write after cs_main is released, so a later
     // chain-time or released-record receipt-clock rollback cannot revive
@@ -1369,6 +1750,7 @@ public:
     bool IsCrypted() const;
     bool IsLocked() const override;
     bool Lock();
+    bool TryRestoreGuiUnlockState(bool relock, bool staking_only);
 
     /** Interface to assert chain access */
     bool HaveChain() const { return m_chain ? true : false; }
@@ -1376,6 +1758,96 @@ public:
     /** Map from txid to CWalletTx for all transactions this wallet is
      * interested in, including received and sent transactions. */
     std::unordered_map<uint256, CWalletTx, SaltedTxidHasher> mapWallet GUARDED_BY(cs_wallet);
+
+    /** GUI-display-only memo of chainstate facts for deep confirmed outputs
+     * (see WalletOutputLifecycleMemo). Never persisted. */
+    mutable std::map<COutPoint, WalletOutputLifecycleMemo> m_output_lifecycle_memo GUARDED_BY(cs_wallet);
+    /** No entry of the memo is confirmed above this height (-1: the memo is
+     * empty or holds no height). Kept by StoreOutputLifecycleMemo, the one
+     * place entries are added, so that a block disconnect does not have to
+     * walk the whole memo to learn that it has nothing to erase: entries are
+     * made only for outputs at least LIFECYCLE_MEMO_MIN_DEPTH deep, so the
+     * disconnected tip is above every one of them. */
+    mutable int m_output_lifecycle_memo_max_height GUARDED_BY(cs_wallet){-1};
+    /** Store (or replace) the memoized facts of one output. Every entry is
+     * added through here. */
+    void StoreOutputLifecycleMemo(const COutPoint& outpoint, const WalletOutputLifecycleMemo& memo) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet)
+    {
+        m_output_lifecycle_memo[outpoint] = memo;
+        m_output_lifecycle_memo_max_height = std::max<int>(m_output_lifecycle_memo_max_height, memo.confirmed_block_height);
+    }
+    /** Drop every memoized fact. Used when nothing can be said about which
+     * entries are still right: a rescan, or an entry that disagreed with the
+     * chainstate. */
+    void ClearOutputLifecycleMemo() EXCLUSIVE_LOCKS_REQUIRED(cs_wallet)
+    {
+        m_output_lifecycle_memo.clear();
+        m_output_lifecycle_memo_max_height = -1;
+        BumpBalanceScanMarker();
+    }
+    /** Drop the memoized facts of outputs confirmed at or above `height`: the
+     * entries a disconnect of the block at that height can have made wrong.
+     * Entries are only made for outputs of transactions at least
+     * LIFECYCLE_MEMO_MIN_DEPTH deep, and every lookup checks the entry against
+     * the transaction's confirmed block hash prefix and height, so an entry
+     * below the disconnected height describes a block that is still in the
+     * chain and a shallow reorg cannot make it wrong; whatever slips past is
+     * caught by the rolling re-verification against the chainstate. Returns
+     * the number of entries examined: none when no entry is confirmed that
+     * high, which is the case for every disconnect of the tip. */
+    size_t EraseOutputLifecycleMemoFromHeight(int height) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet)
+    {
+        size_t visited{0};
+        if (height <= m_output_lifecycle_memo_max_height) {
+            int max_height{-1};
+            for (auto it = m_output_lifecycle_memo.begin(); it != m_output_lifecycle_memo.end();) {
+                ++visited;
+                if (it->second.confirmed_block_height >= height) {
+                    it = m_output_lifecycle_memo.erase(it);
+                } else {
+                    max_height = std::max<int>(max_height, it->second.confirmed_block_height);
+                    ++it;
+                }
+            }
+            m_output_lifecycle_memo_max_height = max_height;
+        }
+        BumpBalanceScanMarker();
+        return visited;
+    }
+    /** The last disconnect, for tests and diagnostics. */
+    BlockDisconnectWork m_last_block_disconnect_work GUARDED_BY(cs_wallet);
+    //! A disconnect that holds cs_wallet at least this long is logged with its phases.
+    static constexpr std::chrono::milliseconds SLOW_BLOCK_DISCONNECT_LOG{100};
+
+    /** Drop the memoized facts of the outputs of one transaction (it changed
+     * state, for example became conflicted). The map is ordered by outpoint,
+     * so the outputs of a transaction are one contiguous range. */
+    void EraseOutputLifecycleMemoForTx(const uint256& txid) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet)
+    {
+        auto it = m_output_lifecycle_memo.lower_bound(COutPoint{txid, 0});
+        while (it != m_output_lifecycle_memo.end() && it->first.hash == txid) {
+            it = m_output_lifecycle_memo.erase(it);
+        }
+        BumpBalanceScanMarker();
+    }
+
+    /** Monotonic counter of wallet changes that can alter a balance: every
+     * change to mapWallet contents or a transaction's state, the spend map,
+     * the keys and scripts that decide IsMine(), the wallet flags and the
+     * lifecycle memo. The GUI balance scan reads the wallet in one lock
+     * scope and resolves chainstate facts in a later one; it discards its
+     * work when this value has moved in between. A bump that is missing
+     * would let a stale balance reach the screen, so callers bump
+     * liberally: extra bumps only cost a repeated scan. */
+    //! Written only under cs_wallet. Atomic so that the display balance
+    //! worker and the GUI can ask "has anything changed since this snapshot"
+    //! without taking the wallet lock (GetBalanceScanMarkerUnlocked()).
+    std::atomic<uint64_t> m_balance_scan_marker{0};
+    void BumpBalanceScanMarker() EXCLUSIVE_LOCKS_REQUIRED(cs_wallet) { m_balance_scan_marker.fetch_add(1, std::memory_order_release); }
+    uint64_t GetBalanceScanMarker() const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet) { return m_balance_scan_marker.load(std::memory_order_acquire); }
+    /** The marker without the wallet lock. Advisory: it tells a reader that a
+     * snapshot is out of date, never that wallet data may be read. */
+    uint64_t GetBalanceScanMarkerUnlocked() const { return m_balance_scan_marker.load(std::memory_order_acquire); }
 
     typedef std::multimap<int64_t, CWalletTx*> TxItems;
     TxItems wtxOrdered;
@@ -1550,7 +2022,12 @@ public:
         //! USER_ABORT.
         uint256 last_failed_block;
     };
-    ScanResult ScanForWalletTransactions(const uint256& start_block, int start_height, std::optional<int> max_height, const WalletRescanReserver& reserver, bool fUpdate, const bool save_progress);
+    /** `wallet_lock_held` is true only for a caller that holds cs_wallet across the whole scan
+     * (wallet attachment); the scan then groups its database writes into one commit per batch of
+     * blocks, with the progress locator in the same commit. Any other caller releases cs_wallet
+     * between blocks and gets one commit per block, because a commit scope that outlived a lock
+     * release could deadlock against a thread that holds cs_wallet and waits for the database. */
+    ScanResult ScanForWalletTransactions(const uint256& start_block, int start_height, std::optional<int> max_height, const WalletRescanReserver& reserver, bool fUpdate, const bool save_progress, const bool wallet_lock_held = false);
     void transactionRemovedFromMempool(const CTransactionRef& tx, MemPoolRemovalReason reason) override;
     /** Set the next time this wallet should resend transactions to 12-36 hours from now, ~1 day on average. */
     void SetNextResend() { m_next_resend = GetDefaultNextResend(); }
@@ -1559,6 +2036,50 @@ public:
     /** Validate and repair stale Gold Rush proofs independently of relay policy. */
     void RepairStaleShadowTransactions(bool force);
     void ResubmitWalletTransactions(bool relay, bool force, bool include_claims = true);
+
+    //! Own transactions that the node lost or refused for a reason the next
+    //! block can change (not final at the current height, inputs not yet in
+    //! the chain or mempool), kept in memory so that they are put back as soon
+    //! as the chain allows rather than at the 12 to 36 hour periodic resend.
+    //! Never persisted; rebuilt at every start.
+    static constexpr size_t MAX_RESUBMIT_RETRY_TXS{2000};
+    static constexpr size_t MAX_RESUBMIT_RETRY_PER_TICK{100};
+    static constexpr unsigned int MAX_RESUBMIT_RETRY_ATTEMPTS{1000};
+    static constexpr unsigned int MAX_RESUBMIT_RETRY_MISSING_INPUT_ATTEMPTS{20};
+    static constexpr unsigned int MAX_RESUBMIT_RETRY_BLOCK_GAP{64};
+    //! True for a transaction the generic resubmit path may submit: unconfirmed,
+    //! not a coinbase or coinstake, and not owned by the Gold Rush claim,
+    //! recovery or reorg machinery, which decide for themselves whether and
+    //! when to relay.
+    static bool IsGenericResubmitCandidate(const CWalletTx& wtx);
+    //! True when a mempool refusal can disappear as the chain advances.
+    static bool IsTipDependentRefusal(const std::string& err_string);
+    //! Book one refusal of a queued transaction: attempt count, the doubled
+    //! block gap before the next try (capped) and whether the refusal was a
+    //! missing input. No-op for a transaction that is not queued.
+    void NoteResubmitRefusal(const uint256& txid, const uint256& tip, int height,
+                             const std::string& err_string) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    //! Whether a queued transaction may be tried at this tip: the tip moved and
+    //! the backoff gap since the last refusal has passed (a reorg to a lower
+    //! height re-opens it).
+    bool IsResubmitRetryDue(const uint256& txid, const uint256& tip, int height) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    struct ResubmitRetryInfo {
+        unsigned int attempts{0};
+        unsigned int block_gap{1};
+        bool missing_inputs{false};
+    };
+    std::optional<ResubmitRetryInfo> GetResubmitRetryInfo(const uint256& txid) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    //! Add a candidate to the retry set (no-op for a non-candidate or a full set).
+    bool QueueResubmitRetry(const CWalletTx& wtx) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    //! Drop the entries whose transaction is gone or no longer a candidate in
+    //! the inactive state (accepted, confirmed, conflicted, abandoned).
+    void PruneResubmitRetry() EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    //! One tick of the retry set: if the best block moved since an entry was
+    //! last tried, submit it to the mempool without relay, in wallet order and
+    //! at most MAX_RESUBMIT_RETRY_PER_TICK per call. Returns the number accepted.
+    size_t RetryDroppedTransactions();
+    size_t GetResubmitRetryCount() const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet) { return m_resubmit_retry.size(); }
+    bool IsInResubmitRetry(const uint256& txid) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet) { return m_resubmit_retry.count(txid) != 0; }
     /** Relay at most one retained proof using the exact typed authorization. */
     bool RelayRetainedShadowPowClaim(bool relay);
     /** Coalesce off-notification claim work; never executes inline. */
@@ -1628,7 +2149,8 @@ public:
     bool SubmitTxMemoryPoolAndRelay(
         const uint256& txid, std::string& err_string, bool relay,
         const ShadowPowClaimRecoveryBroadcastGuard* recovery_guard = nullptr,
-        std::optional<CAmount> max_tx_fee_override = std::nullopt);
+        std::optional<CAmount> max_tx_fee_override = std::nullopt,
+        bool quiet_log = false);
 
     bool ImportScripts(const std::set<CScript> scripts, int64_t timestamp) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     bool ImportPrivKeys(const std::map<CKeyID, CKey>& privkey_map, const int64_t timestamp) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
@@ -1721,6 +2243,11 @@ public:
     // GUI "Staking & Mining" tab / setpowmining RPC; the in-process Argon2id solver reads these.
     std::atomic<bool> m_pow_mining_enabled{false};
     std::atomic<interfaces::WalletPowMiningState> m_pow_state{interfaces::WalletPowMiningState::DISABLED};
+    std::vector<interfaces::WalletPowMiningState> m_pow_worker_states GUARDED_BY(cs_wallet);
+    std::vector<uint64_t> m_pow_worker_successful_hashes GUARDED_BY(cs_wallet);
+    WalletPowMiningDutySnapshot m_pow_duty_cycle GUARDED_BY(cs_wallet);
+    std::atomic<int> m_pow_workers_hashing{0};
+    std::atomic<int> m_pow_workers_error{0};
     std::atomic<int> m_pow_threads{1};         // CPU cores / worker threads
     std::atomic<int> m_pow_cpu_percent{1};     // per-core CPU duty-cycle target, 1..100
     std::atomic<double> m_pow_hashrate{0.0};   // aggregate Argon2id tries/s reported by the solver
@@ -1751,7 +2278,7 @@ public:
     // Runtime cache used to emit the configured QQSIGNAL binding once per
     // wallet process instead of once per retry attempt.
     std::string m_shadow_signal_payout_quantum GUARDED_BY(cs_wallet);
-    Mutex m_pow_miner_mutex;
+    mutable Mutex m_pow_miner_mutex;
     // Worker 0 refreshes the typed, component-aware mining gate and publishes
     // one coherent snapshot for the remaining hashing workers. This avoids N
     // identical proof classifications per second; final submission still
@@ -1763,6 +2290,36 @@ public:
     // reserves this wallet through the current tip. Family-local waits and
     // ordinary in-flight submissions must never acquire this provenance.
     bool m_pow_wallet_wide_tip_wait GUARDED_BY(m_pow_miner_mutex){false};
+    /** Signalled by the block callbacks under cs_wallet; wakes the miner
+     * workers out of every wait and out of a search for the old tip. */
+    PowMinerTipSignal m_pow_tip_signal;
+    /** Miner loop iterations started since the wallet was created. */
+    std::atomic<uint64_t> m_pow_miner_iterations{0};
+    struct PowClaimAttempt {
+        bool open{false};
+        WalletPowClaimTiming timing;
+        std::chrono::steady_clock::time_point origin{};
+        std::chrono::nanoseconds duty_sleep{0};
+    };
+    PowClaimAttempt m_pow_claim_attempt GUARDED_BY(m_pow_miner_mutex);
+    /** A submitted claim whose timing line waits for its relay figures. */
+    struct PowClaimRelayPending {
+        bool open{false};
+        WalletPowClaimTiming timing;
+        /** The fee input the proof is bound to: the relay tracker's key. */
+        COutPoint claim_input;
+        std::chrono::steady_clock::time_point origin{};
+        std::chrono::steady_clock::time_point accepted{};
+    };
+    PowClaimRelayPending m_pow_claim_relay_pending GUARDED_BY(m_pow_miner_mutex);
+    /** Tip sequence, plus one, for which a worker holds a found proof that it
+     * is submitting; zero when none. A lock-free mirror of the single-flight
+     * marker, read once per hash so sibling workers stop searching at once. */
+    std::atomic<uint64_t> m_pow_proof_found_tip_seq{0};
+    WalletPowClaimTiming m_pow_last_claim_timing GUARDED_BY(m_pow_miner_mutex);
+    // When worker zero first held a settled gate for a tip.
+    uint256 m_pow_gate_ready_tip GUARDED_BY(m_pow_miner_mutex);
+    std::chrono::steady_clock::time_point m_pow_gate_ready_at GUARDED_BY(m_pow_miner_mutex){};
     std::set<uint256> m_inflight_wallet_broadcasts GUARDED_BY(cs_wallet);
 
     uint64_t GetStakeWeight() const EXCLUSIVE_LOCKS_REQUIRED(::cs_main, cs_wallet);
@@ -1774,6 +2331,12 @@ public:
         return m_live_unspent_stake_outpoints;
     }
 
+    /** Live outpoints whose script is of a stakable kind; see the member. */
+    const std::set<COutPoint>& GetLiveUnspentStakeCandidateOutpoints() const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet)
+    {
+        return m_live_unspent_stake_candidate_outpoints;
+    }
+
     const std::set<COutPoint>& GetLiveUnspentLegacyClaimOutpoints() const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet)
     {
         return m_live_unspent_legacy_claim_outpoints;
@@ -1783,6 +2346,18 @@ public:
         EXCLUSIVE_LOCKS_REQUIRED(cs_wallet)
     {
         return m_live_unspent_stake_generation;
+    }
+
+    /** The per-tip staking selection cache and its counters (created on first
+     * use). See StakeSlotCache in wallet/staking.h. */
+    StakeSlotCacheState& GetStakeSlotCacheStateLocked() const
+        EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+
+    /** Advances on every effective in-memory coin lock or unlock. */
+    uint64_t GetCoinLockGenerationLocked() const
+        EXCLUSIVE_LOCKS_REQUIRED(cs_wallet)
+    {
+        return m_coin_lock_generation;
     }
 
     /** Bound the raw wallet-spender domain for one captured source and return
@@ -1801,13 +2376,66 @@ public:
     bool IsIndexedShadowPowClaimLocked(const uint256& txid) const
         EXCLUSIVE_LOCKS_REQUIRED(cs_wallet)
     {
-        return m_shadow_pow_all_proof_txids.count(txid) != 0;
+        const auto it = mapWallet.find(txid);
+        return it != mapWallet.end() && it->second.m_shadow_pow_index.proof;
     }
 
-    const std::set<uint256>& GetAllShadowPowProofTxidsLocked() const
+    //! Whether txid is a proof record indexed as a local claim (the former
+    //! m_shadow_pow_claim_txids membership).
+    bool IsShadowPowLocalClaimIndexedLocked(const uint256& txid) const
         EXCLUSIVE_LOCKS_REQUIRED(cs_wallet)
     {
-        return m_shadow_pow_all_proof_txids;
+        const auto it = mapWallet.find(txid);
+        return it != mapWallet.end() && it->second.m_shadow_pow_index.claim;
+    }
+
+    //! Insert into (true) or erase from (false) the two per-record indexes.
+    //! They are keyed by txid like the sets they replace: the bit lives on
+    //! the wallet's own record of txid, whichever copy the caller holds.
+    void SetShadowPowLocalClaimIndexedLocked(const uint256& txid, bool indexed) const
+        EXCLUSIVE_LOCKS_REQUIRED(cs_wallet)
+    {
+        const auto it = mapWallet.find(txid);
+        if (it != mapWallet.end()) it->second.m_shadow_pow_index.claim = indexed;
+    }
+    void SetShadowPowProofIndexedLocked(const uint256& txid, bool indexed) const
+        EXCLUSIVE_LOCKS_REQUIRED(cs_wallet)
+    {
+        const auto it = mapWallet.find(txid);
+        if (it != mapWallet.end()) it->second.m_shadow_pow_index.proof = indexed;
+    }
+
+    bool IsNonConfirmedShadowPowProofLocked(const uint256& txid) const
+        EXCLUSIVE_LOCKS_REQUIRED(cs_wallet)
+    {
+        return m_shadow_pow_nonconfirmed_proof_txids.count(txid) != 0;
+    }
+
+    //! Whether the claim index state kept on the records (proof and local
+    //! claim bits, relay frontier, anchor references) agrees with the
+    //! containers it is paired with and with what a recomputation from the
+    //! records gives. Walks the whole history: tests only. On failure the
+    //! first disagreement is described in *failure.
+    bool CheckShadowPowClaimIndexConsistencyLocked(std::string* failure = nullptr) const
+        EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+
+    //! Whether every proof or unknown-presence record that is not confirmed
+    //! is in the non-confirmed index, and the per-record claim index state is
+    //! consistent. Walks the whole history: tests only.
+    bool CheckShadowPowNonConfirmedProofIndexLocked() const
+        EXCLUSIVE_LOCKS_REQUIRED(cs_wallet)
+    {
+        if (!CheckShadowPowClaimIndexConsistencyLocked()) return false;
+        for (const auto& [txid, wtx] : mapWallet) {
+            if (!wtx.m_shadow_pow_index.proof || wtx.isConfirmed()) continue;
+            if (m_shadow_pow_nonconfirmed_proof_txids.count(txid) == 0) return false;
+        }
+        for (const uint256& txid : m_shadow_pow_unknown_proof_presence_txids) {
+            const auto it = mapWallet.find(txid);
+            if (it == mapWallet.end() || it->second.isConfirmed()) continue;
+            if (m_shadow_pow_nonconfirmed_proof_txids.count(txid) == 0) return false;
+        }
+        return true;
     }
 
     bool HasUnknownShadowPowProofPresenceLocked() const
@@ -1841,6 +2469,17 @@ public:
     {
         LOCK(cs_wallet);
         return m_live_unspent_stake_outpoints.size();
+    }
+
+    /** Log the live legacy claim-source count against its capacity: always when `force`, else
+     *  at most once an hour. From 75% of the capacity the line is a warning. */
+    void ReportLegacyClaimSourceCapacity(bool force) EXCLUSIVE_LOCKS_REQUIRED(!cs_wallet);
+
+    /** O(1) count of live outputs whose script could stake (the per-slot scan size). */
+    size_t GetLiveUnspentStakeCandidateCount() const
+    {
+        LOCK(cs_wallet);
+        return m_live_unspent_stake_candidate_outpoints.size();
     }
 
     /** Number of pre-generated keys/scripts by each spkm (part of the look-ahead process, used to detect payments) */
@@ -1899,7 +2538,8 @@ public:
     bool LoadQuantumKeyBackupState(const std::vector<unsigned char>& witness_program, bool verified) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     bool LoadQuantumColdStakeDelegation(const std::vector<unsigned char>& witness_program, const QuantumColdStakeDelegationRecord& record) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     void RecordQuantumRedelegationWins(const CTransaction& tx, int height, WalletBatch& batch) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
-    void RecomputeQuantumRedelegationWinHistory(WalletBatch& batch) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    /** Returns the number of coinstake records examined. */
+    size_t RecomputeQuantumRedelegationWinHistory(WalletBatch& batch) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     std::vector<WalletShadowSolveReference> GetRecentShadowSolveReferences(int tip_height, size_t limit) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     std::vector<uint256> GetPendingShadowSignalTxids() const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     std::vector<CScript> GetOwnedLegacyShadowScripts(size_t limit) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
@@ -1962,6 +2602,10 @@ public:
     bool IsFromMe(const CTransaction& tx) const;
     CAmount GetDebit(const CTransaction& tx, const isminefilter& filter) const;
     void chainStateFlushed(ChainstateRole role, const CBlockLocator& loc) override;
+    /** Store loc as the wallet's best block, with the payout checkpoint of the last processed
+     * block. chainstate_flushed says that the chainstate is on disk at the front of loc (a
+     * chainstate flush notification); only then may the flush-anchored payout checkpoint move. */
+    void PersistBestBlockLocator(const CBlockLocator& loc, bool chainstate_flushed);
 
     DBErrors LoadWallet();
     DBErrors ZapSelectTx(std::vector<uint256>& vHashIn, std::vector<uint256>& vHashOut) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
@@ -2092,12 +2736,15 @@ public:
 
     /* Returns true if the wallet can give out new addresses. This means it has keys in the keypool or can generate new keys */
     bool CanGetAddresses(bool internal = false) const;
+    /** Try the wallet and manager locks; leave result untouched if unavailable. */
+    bool TryCanGetAddresses(bool& result, bool internal = false) const;
 
     /* Returns the time of the first created key or, in case of an import, it could be the time of the first received transaction */
     int64_t GetBirthTime() const { return m_birth_time; }
 
     /* Function that will remove potentially abandoned coinstakes, returning the input to the wallet. */
-    void AbandonOrphanedCoinstakes();
+    /** Returns the number of coinstake records examined. */
+    size_t AbandonOrphanedCoinstakes();
 
     /**
      * Blocks until the wallet catches up to the chain tip observed on entry.
@@ -2286,7 +2933,8 @@ public:
     // -powmining=1 consent. Interactive callers must retain the strict default.
     bool SetPowMining(bool enabled, int threads, int cpu_percent, bilingual_str& error,
                       bool* created_payout = nullptr, bool allow_new_payout_key = false,
-                      bool wait_for_normal_unlock = false);
+                      bool wait_for_normal_unlock = false,
+                      const std::function<bool()>& cancelled = {});
     void StopPowMining();
     void StopPowMiningLocked()
         EXCLUSIVE_LOCKS_REQUIRED(m_pow_recovery_authority_mutex);
@@ -2304,7 +2952,48 @@ public:
         std::optional<uint64_t> expected_generation = std::nullopt);
     bool PublishPowMiningHashrate(
         double hashrate,
-        std::optional<uint64_t> expected_generation = std::nullopt);
+        std::optional<uint64_t> expected_generation = std::nullopt,
+        bool local_error = false);
+    WalletPowMiningDutySnapshot GetPowMiningDutyCycle() const;
+    void ResetPowMiningDutyCycleLocked(size_t workers, int cpu_percent)
+        EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    void RecordPowMiningDutyPeriod(
+        int worker_id, uint64_t session_id, uint64_t authority_generation,
+        std::chrono::nanoseconds elapsed, std::chrono::nanoseconds explicit_wait,
+        std::chrono::nanoseconds duty_wait, bool wait_finished,
+        uint64_t successful_hashes);
+    /** Pure work batch plus worker telemetry and interruptible error retry.
+     * No input selection, signing or transaction submission. The log deadline
+     * belongs to the calling worker and is retained across batches. */
+    WalletPowMiningGrindResult RunShadowPowMiningBatch(
+        const ShadowPowWork& work, uint64_t start_nonce, uint64_t nonce_step,
+        uint64_t max_tries, uint64_t authority_generation,
+        std::vector<unsigned char>& proof, int worker_id,
+        std::chrono::steady_clock::time_point& next_error_log,
+        std::optional<uint64_t> tip_sequence = std::nullopt);
+    /** Timing of the most recently finished claim attempt. */
+    WalletPowClaimTiming GetPowClaimTiming() const;
+    /** Start timing an attempt for this tip unless one is already open for
+     * it. Returns the timing line of an attempt it had to close first. */
+    std::string BeginPowClaimAttemptLocked(const uint256& tip, int height, int64_t block_time)
+        EXCLUSIVE_LOCKS_REQUIRED(m_pow_miner_mutex);
+    /** Close the open attempt and return its one-line log record, or an
+     * empty string when no attempt is open. */
+    /** With relay_key, a submitted attempt returns no line yet: the line is
+     * held until its relay figures are known (FlushPowClaimRelayTimingLocked). */
+    std::string FinishPowClaimAttemptLocked(const std::string& result, bool tip_changed,
+                                            const COutPoint* relay_key = nullptr)
+        EXCLUSIVE_LOCKS_REQUIRED(m_pow_miner_mutex);
+    void FinishPowClaimAttempt(const uint256& tip, const std::string& result, bool tip_changed,
+                               const COutPoint* relay_key = nullptr);
+    /** Return the held timing line of a submitted claim once its relay
+     * figures are settled (one second after the first announcement, or three
+     * seconds after acceptance without one), or at once when forced. */
+    std::string FlushPowClaimRelayTimingLocked(bool force)
+        EXCLUSIVE_LOCKS_REQUIRED(m_pow_miner_mutex);
+    void NotePowClaimAttemptFirstHash(const uint256& tip);
+    void NotePowClaimAttemptBatch(const uint256& tip, uint64_t hashes, bool found);
+    void NotePowClaimAttemptDutySleep(const uint256& tip, std::chrono::nanoseconds slept);
     void ThreadShadowPoWMiner(int worker_id);
     QuantumAddressBindingResult ResolveConfiguredQuantumAddress(
         const std::string& option,
@@ -2312,7 +3001,8 @@ public:
         CTxDestination& destination,
         bilingual_str& error) const;
     bool EnsurePowPayoutAddress(bilingual_str& error, bool* created = nullptr,
-                                bool allow_new_key = false);
+                                bool allow_new_key = false,
+                                const std::function<bool()>& cancelled = {});
     bool EnsureShadowSignalPayoutAddress(
         CScript& payout_script,
         std::string& payout_address,
@@ -2402,12 +3092,15 @@ public:
         EXCLUSIVE_LOCKS_REQUIRED(cs_wallet)
     {
         ++m_shadow_pow_claim_candidate_state_generation;
+        BumpBalanceScanMarker();
     }
     void RefreshShadowPowClaimIndexEntryLocked(const CWalletTx& wtx)
         EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     void SetShadowPowProofPresenceIndexLocked(
         const CWalletTx& wtx, bool exact_proof, bool unknown,
         const std::vector<COutPoint>* prevalidated_inputs = nullptr)
+        EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    void UpdateShadowPowNonConfirmedProofIndexLocked(const CWalletTx& wtx)
         EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     void ClearShadowPowProofPresenceIndexLocked(const uint256& txid)
         EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);

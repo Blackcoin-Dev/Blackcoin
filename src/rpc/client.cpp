@@ -33,6 +33,8 @@ static const CRPCConvertParam vRPCConvertParams[] =
 {
     { "setmocktime", 0, "timestamp" },
     { "mockscheduler", 0, "delta_time" },
+    { "getiocounters", 0, "recorder_start" },
+    { "getiocounters", 1, "include_coin_txids" },
     { "utxoupdatepsbt", 1, "descriptors" },
     { "generatetoaddress", 0, "nblocks" },
     { "generatetoaddress", 2, "maxtries" },
@@ -64,6 +66,9 @@ static const CRPCConvertParam vRPCConvertParams[] =
     { "getbalance", 1, "minconf" },
     { "getbalance", 2, "include_watchonly" },
     { "getbalance", 3, "avoid_reuse" },
+    { "getbalance", 4, "exact" },
+    { "getbalances", 0, "exact" },
+    { "getwalletinfo", 0, "exact" },
     { "getblockfrompeer", 1, "peer_id" },
     { "getblockhash", 0, "height" },
     { "waitforblockheight", 0, "height" },

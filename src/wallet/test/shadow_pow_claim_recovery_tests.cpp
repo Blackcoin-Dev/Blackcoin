@@ -2263,7 +2263,7 @@ BOOST_AUTO_TEST_CASE(wallet_tip_hash_and_height_must_both_match)
             wallet->SetLastBlockProcessed(processed_height,
                                            processed_hash);
         }
-        const mapValue_t metadata_before = WITH_LOCK(
+        const WalletTxValueMap metadata_before = WITH_LOCK(
             wallet->cs_wallet,
             return wallet->mapWallet.at(claim->GetHash()).mapValue);
         const uint64_t generation_before =
@@ -9212,7 +9212,7 @@ BOOST_AUTO_TEST_CASE(repair_reuses_lock_free_proof_cache_and_bounds_drift)
     wallet->RepairStaleShadowTransactions(/*force=*/false);
     BOOST_CHECK_EQUAL(GetShadowPowClaimRecoveryProofEvaluationCountForTesting(), 1U);
 
-    const mapValue_t metadata_before = WITH_LOCK(wallet->cs_wallet, return wallet->mapWallet.at(claim->GetHash()).mapValue);
+    const WalletTxValueMap metadata_before = WITH_LOCK(wallet->cs_wallet, return wallet->mapWallet.at(claim->GetHash()).mapValue);
     WITH_LOCK(wallet->cs_wallet, wallet->ClearShadowPowClaimProofEvaluationCacheForTesting());
     SetShadowPowClaimRecoveryProofEvaluationDelayForTesting(200);
     auto drifting = std::async(std::launch::async, [&] { wallet->RepairStaleShadowTransactions(/*force=*/true); });

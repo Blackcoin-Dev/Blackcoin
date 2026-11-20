@@ -58,9 +58,13 @@ class CCoinsViewDB final : public CCoinsView
 protected:
     DBParams m_db_params;
     CoinsViewOptions m_options;
-    std::unique_ptr<CDBWrapper> m_db;
+    std::shared_ptr<CDBWrapper> m_db;
 public:
     explicit CCoinsViewDB(DBParams db_params, CoinsViewOptions options);
+    CCoinsViewDB(const CCoinsViewDB&) = delete;
+    CCoinsViewDB& operator=(const CCoinsViewDB&) = delete;
+    CCoinsViewDB(CCoinsViewDB&&) = default;
+    CCoinsViewDB& operator=(CCoinsViewDB&&) = default;
 
     bool GetCoin(const COutPoint &outpoint, Coin &coin) const override;
     bool HaveCoin(const COutPoint &outpoint) const override;
@@ -73,8 +77,11 @@ public:
     bool NeedsUpgrade();
     size_t EstimateSize() const override;
 
-    //! Dynamically alter the underlying leveldb cache size.
-    void ResizeCache(size_t new_cache_size) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+    /** Dynamically alter the underlying leveldb cache size.
+     * Returns false if live cursors prevent reopening the on-disk database; the
+     * caller may retry after they are released. In-memory databases are unchanged.
+     */
+    bool ResizeCache(size_t new_cache_size) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 
     //! @returns filesystem path to on-disk storage or std::nullopt if in memory.
     std::optional<fs::path> StoragePath() { return m_db->StoragePath(); }

@@ -21,6 +21,7 @@ TEST_UTIL_H = \
   test/util/net.h \
   test/util/poolresourcetester.h \
   test/util/random.h \
+  test/util/rc14_gate.h \
   test/util/script.h \
   test/util/setup_common.h \
   test/util/str.h \

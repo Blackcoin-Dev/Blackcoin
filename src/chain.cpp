@@ -55,6 +55,35 @@ CBlockLocator GetLocator(const CBlockIndex* index)
     return CBlockLocator{LocatorEntries(index)};
 }
 
+CBlockLocator GetDenseLocator(const CBlockIndex* index)
+{
+    std::vector<uint256> have;
+    if (index == nullptr) return CBlockLocator{};
+    have.reserve(DENSE_LOCATOR_ESTIMATE);
+    // Every block for the first 10, every 4th to depth 64, every 16th to
+    // depth 2048, then the usual doubling steps. A reader takes the first
+    // entry it finds on its chain, so the fork it reports is at most one
+    // step below the true fork: 1, 4 or 16 blocks within two thousand blocks.
+    const int tip_height = index->nHeight;
+    int step = 1;
+    while (index) {
+        have.emplace_back(index->GetBlockHash());
+        if (index->nHeight == 0) break;
+        const int depth = tip_height - index->nHeight;
+        if (depth < 10) {
+            step = 1;
+        } else if (depth < 64) {
+            step = 4;
+        } else if (depth < 2048) {
+            step = 16;
+        } else {
+            step = std::max(step, 16) * 2;
+        }
+        index = index->GetAncestor(std::max(index->nHeight - step, 0));
+    }
+    return CBlockLocator{std::move(have)};
+}
+
 CBlockLocator CChain::GetLocator() const
 {
     return ::GetLocator(Tip());

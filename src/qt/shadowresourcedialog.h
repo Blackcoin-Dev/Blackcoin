@@ -55,6 +55,7 @@ public:
 
     /** Prevent new work and request cooperative cancellation without waiting. */
     void requestShutdown();
+    bool shutdownReady();
     /** Stop and join the worker. Safe to call more than once. */
     void join();
 

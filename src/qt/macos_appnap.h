@@ -15,6 +15,8 @@ public:
 
     void disableAppNap();
     void enableAppNap();
+    //! True while an activity is held (App Nap is being prevented).
+    bool isAppNapDisabled() const;
 
 private:
     class CAppNapImpl;

@@ -11,14 +11,28 @@
 #include <script/solver.h>
 #include <wallet/types.h>
 
+#include <sync.h>
+#include <tinyformat.h>
+
 #include <stdint.h>
 
+#include <cstdio>
+#include <cstdlib>
 #include <map>
 #include <string>
+#include <string_view>
+#include <unordered_map>
 
 #include <QDateTime>
 
 namespace {
+const std::string& MapValueOrEmpty(const std::map<std::string, std::string>& map_value, const char* key)
+{
+    static const std::string empty;
+    const auto it = map_value.find(key);
+    return it == map_value.end() ? empty : it->second;
+}
+
 bool IsGoldRushWalletControlTx(const std::map<std::string, std::string>& map_value)
 {
     const auto it = map_value.find("comment");
@@ -138,7 +152,9 @@ QList<TransactionRecord> TransactionRecord::decomposeTransaction(const interface
     CAmount nDebit = wtx.debit;
     CAmount nNet = nCredit - nDebit;
     uint256 hash = wtx.tx->GetHash();
-    std::map<std::string, std::string> mapValue = wtx.value_map;
+    // Read the free-form notes in place: copying a claim's dozen entries per transaction was the largest transient
+    // allocation of a history load.
+    const std::map<std::string, std::string>& mapValue = wtx.value_map;
 
     const TransactionRecord::Type goldrush_claim_type = GoldRushClaimType(mapValue);
     if (goldrush_claim_type == TransactionRecord::GoldRushPosStake || goldrush_claim_type == TransactionRecord::GoldRushPowClaim) {
@@ -220,7 +236,7 @@ QList<TransactionRecord> TransactionRecord::decomposeTransaction(const interface
                 {
                     // Sent to IP, or other non-address transaction like OP_EVAL
                     sub.type = TransactionRecord::SendToOther;
-                    sub.address = mapValue["to"];
+                    sub.address = MapValueOrEmpty(mapValue, "to");
                 }
 
                 CAmount nValue = txout.nValue;
@@ -264,7 +280,7 @@ QList<TransactionRecord> TransactionRecord::decomposeTransaction(const interface
                 {
                     // Received by IP connection (deprecated features), or a multisignature or other non-simple transaction
                     sub.type = TransactionRecord::RecvFromOther;
-                    sub.address = mapValue["from"];
+                    sub.address = MapValueOrEmpty(mapValue, "from");
                 }
                 if (wtx.is_coinbase)
                 {
@@ -308,15 +324,10 @@ void TransactionRecord::updateStatus(const interfaces::WalletTxStatus& wtx, cons
     default:
         typesort = 9;
     }
-    status.sortKey = strprintf("%010d-%01d-%010u-%03d-%d",
-        wtx.block_height,
-        (wtx.is_coinbase || wtx.is_coinstake) ? 1 : 0,
-        wtx.time_received,
-        idx,
-        typesort);
+    status.sortKey = TransactionSortKey(wtx.block_height, wtx.is_coinbase || wtx.is_coinstake, wtx.time_received, idx, typesort);
     status.countsForBalance = wtx.is_trusted && !(wtx.blocks_to_maturity > 0);
     status.depth = wtx.depth_in_main_chain;
-    status.m_cur_block_hash = block_hash;
+    status.m_cur_tip = block_hash.GetUint64(0);
 
     // For generated transactions, determine maturity
     if (type == TransactionRecord::Generated || type == TransactionRecord::Staked) {
@@ -365,7 +376,7 @@ void TransactionRecord::updateStatus(const interfaces::WalletTxStatus& wtx, cons
 bool TransactionRecord::statusUpdateNeeded(const uint256& block_hash) const
 {
     assert(!block_hash.IsNull());
-    return status.m_cur_block_hash != block_hash || status.needsUpdate;
+    return status.m_cur_tip != block_hash.GetUint64(0) || status.needsUpdate;
 }
 
 QString TransactionRecord::getTxHash() const
@@ -376,4 +387,97 @@ QString TransactionRecord::getTxHash() const
 int TransactionRecord::getOutputIndex() const
 {
     return idx;
+}
+
+std::string TransactionSortKey::str() const
+{
+    if (!m_set) return {};
+    return strprintf("%010d-%01d-%010u-%03d-%d", m_height, m_generated ? 1 : 0, m_received, m_idx, static_cast<int>(m_type_order));
+}
+
+TransactionSortKey& TransactionSortKey::operator=(const std::string& text)
+{
+    // "%010d-%01d-%010u-%03d-%d": the height may carry a sign, every later field is read after its separator.
+    *this = TransactionSortKey{};
+    if (text.empty()) return *this;
+    // Each field is an optionally signed run of decimal digits, read without the C locale.
+    const char* p = text.c_str();
+    const auto read_field = [&p](int64_t& out, char terminator) {
+        const bool negative = *p == '-';
+        if (negative) ++p;
+        if (*p < '0' || *p > '9') return false;
+        int64_t value{0};
+        for (; *p >= '0' && *p <= '9'; ++p) {
+            if (value > 100'000'000'000LL) return false;
+            value = value * 10 + (*p - '0');
+        }
+        if (*p != terminator) return false;
+        if (terminator != '\0') ++p;
+        out = negative ? -value : value;
+        return true;
+    };
+    int64_t height{0}, generated{0}, received{0}, idx{0}, type_order{0};
+    if (!read_field(height, '-') || !read_field(generated, '-') || !read_field(received, '-') ||
+        !read_field(idx, '-') || !read_field(type_order, '\0')) {
+        return *this;
+    }
+    *this = TransactionSortKey(static_cast<int>(height), generated != 0, static_cast<unsigned>(received), static_cast<int>(idx), static_cast<int>(type_order));
+    return *this;
+}
+
+namespace {
+//! Shared address texts. An entry is erased by the last row that stops using it, so the pool never outlives its rows.
+struct AddressPool {
+    Mutex mutex;
+    std::unordered_map<std::string_view, std::weak_ptr<const std::string>> entries GUARDED_BY(mutex);
+};
+AddressPool& Pool()
+{
+    // Leaked on purpose: rows can outlive static destruction in a test or on shutdown.
+    static AddressPool* pool = new AddressPool;
+    return *pool;
+}
+} // namespace
+
+void TransactionAddress::assign(const std::string& text)
+{
+    if (text.empty()) {
+        m_text.reset();
+        return;
+    }
+    AddressPool& pool = Pool();
+    LOCK(pool.mutex);
+    const auto found = pool.entries.find(std::string_view{text});
+    if (found != pool.entries.end()) {
+        if (auto shared = found->second.lock()) {
+            m_text = std::move(shared);
+            return;
+        }
+    }
+    auto created = std::shared_ptr<const std::string>(new std::string(text), [](const std::string* value) {
+        {
+            AddressPool& pool = Pool();
+            LOCK(pool.mutex);
+            const auto entry = pool.entries.find(std::string_view{*value});
+            // A newer entry for the same text may have replaced this one while it was expiring.
+            if (entry != pool.entries.end() && entry->second.expired()) pool.entries.erase(entry);
+        }
+        delete value;
+    });
+    pool.entries.erase(std::string_view{text});
+    pool.entries.emplace(std::string_view{*created}, created);
+    m_text = std::move(created);
+}
+
+const std::string& TransactionAddress::str() const
+{
+    static const std::string empty;
+    return m_text ? *m_text : empty;
+}
+
+size_t TransactionAddress::PoolSize()
+{
+    AddressPool& pool = Pool();
+    LOCK(pool.mutex);
+    return pool.entries.size();
 }

@@ -9,6 +9,7 @@
 
 #include <logging.h>
 #include <util/exception.h>
+#include <util/thread_qos.h>
 #include <util/threadnames.h>
 
 #include <exception>
@@ -19,6 +20,7 @@
 void util::TraceThread(std::string_view thread_name, std::function<void()> thread_func)
 {
     util::ThreadRename(std::string{thread_name});
+    util::ApplyDefaultThreadQos();
     try {
         LogPrintf("%s thread start\n", thread_name);
         thread_func();

@@ -17,6 +17,7 @@
 #include <util/bip32.h>
 #include <util/check.h>
 #include <util/fs.h>
+#include <util/thread_qos.h>
 #include <util/time.h>
 #include <util/translation.h>
 #ifdef USE_BDB
@@ -72,6 +73,8 @@ const std::string QUANTUM_REDELEGATION_LAST_WIN{"quantumredelegationlastwin"};
 const std::string SETTINGS{"settings"};
 const std::string QQ_DEVELOPMENT_DONATION_CONSENT{"qqdevelopmentdonationconsent"};
 const std::string SHADOW_POW_CLAIM_RECOVERY_POLICY{"shadowpowclaimrecoverypolicy"};
+const std::string SYNTHETIC_PAYOUT_CHECKPOINT{"syntheticpayoutcheckpoint"};
+const std::string SYNTHETIC_PAYOUT_FLUSH_CHECKPOINT{"syntheticpayoutflushcheckpoint"};
 const std::string SHADOW_POW_CLAIM_RELAY_CLOCK_HIGH_WATER{
     "shadowpowclaimrelayclockhighwater"};
 const std::string SHADOW_POW_CLAIM_LEGACY_RELAY_CLOCK_HIGH_WATER{
@@ -172,21 +175,12 @@ bool WalletBatch::WriteCryptedKey(const CPubKey& vchPubKey,
 
 bool WalletBatch::WriteQuantumKey(const std::vector<unsigned char>& public_key, const CKeyingMaterial& private_key, const CKeyMetadata& keyMeta)
 {
-    std::vector<unsigned char> private_key_bytes(private_key.begin(), private_key.end());
-
-    std::vector<unsigned char> key_material;
-    key_material.reserve(public_key.size() + private_key_bytes.size());
-    key_material.insert(key_material.end(), public_key.begin(), public_key.end());
-    key_material.insert(key_material.end(), private_key_bytes.begin(), private_key_bytes.end());
-
-    const bool written = WriteIC(std::make_pair(DBKeys::QUANTUM_KEY, public_key), std::make_pair(std::make_pair(private_key_bytes, keyMeta), Hash(key_material)), false);
-    if (!private_key_bytes.empty()) {
-        memory_cleanse(private_key_bytes.data(), private_key_bytes.size());
-    }
-    if (!key_material.empty()) {
-        memory_cleanse(key_material.data(), key_material.size());
-    }
-    return written;
+    // Reference the secure key material without creating plaintext copies. Pair
+    // serialization preserves the existing ((private key, metadata), checksum) format.
+    const std::pair<const CKeyingMaterial&, const CKeyMetadata&> payload{private_key, keyMeta};
+    const uint256 checksum = Hash(public_key, private_key);
+    const std::pair<const decltype(payload)&, const uint256&> value{payload, checksum};
+    return WriteIC(std::make_pair(DBKeys::QUANTUM_KEY, public_key), value, false);
 }
 
 bool WalletBatch::WriteCryptedQuantumKey(const std::vector<unsigned char>& public_key, const std::vector<unsigned char>& crypted_private_key, const CKeyMetadata& keyMeta)
@@ -469,6 +463,45 @@ DBErrors WalletBatch::ReadShadowPowClaimRecoveryPolicy(ShadowPowClaimRecoveryPol
 bool WalletBatch::EraseShadowPowClaimRecoveryPolicy()
 {
     return EraseIC(DBKeys::SHADOW_POW_CLAIM_RECOVERY_POLICY);
+}
+
+bool WalletBatch::WriteSyntheticPayoutCheckpoint(const SyntheticPayoutCheckpoint& checkpoint)
+{
+    return WriteIC(DBKeys::SYNTHETIC_PAYOUT_CHECKPOINT, checkpoint);
+}
+
+static bool ReadPayoutCheckpointRecord(DatabaseBatch& batch, const std::string& key, SyntheticPayoutCheckpoint& checkpoint)
+{
+    checkpoint = SyntheticPayoutCheckpoint{};
+    if (batch.Read(key, checkpoint)) return true;
+    // A failed read can leave a partially decoded record behind.
+    checkpoint = SyntheticPayoutCheckpoint{};
+    return false;
+}
+
+bool WalletBatch::ReadSyntheticPayoutCheckpoint(SyntheticPayoutCheckpoint& checkpoint)
+{
+    return ReadPayoutCheckpointRecord(*m_batch, DBKeys::SYNTHETIC_PAYOUT_CHECKPOINT, checkpoint);
+}
+
+bool WalletBatch::EraseSyntheticPayoutCheckpoint()
+{
+    return EraseIC(DBKeys::SYNTHETIC_PAYOUT_CHECKPOINT);
+}
+
+bool WalletBatch::WriteSyntheticPayoutFlushCheckpoint(const SyntheticPayoutCheckpoint& checkpoint)
+{
+    return WriteIC(DBKeys::SYNTHETIC_PAYOUT_FLUSH_CHECKPOINT, checkpoint);
+}
+
+bool WalletBatch::ReadSyntheticPayoutFlushCheckpoint(SyntheticPayoutCheckpoint& checkpoint)
+{
+    return ReadPayoutCheckpointRecord(*m_batch, DBKeys::SYNTHETIC_PAYOUT_FLUSH_CHECKPOINT, checkpoint);
+}
+
+bool WalletBatch::EraseSyntheticPayoutFlushCheckpoint()
+{
+    return EraseIC(DBKeys::SYNTHETIC_PAYOUT_FLUSH_CHECKPOINT);
 }
 
 bool WalletBatch::WriteShadowPowClaimRelayClockHighWater(int64_t high_water)
@@ -754,34 +787,19 @@ bool LoadQuantumKey(CWallet* pwallet, DataStream& ssKey, DataStream& ssValue, st
         std::vector<unsigned char> public_key;
         ssKey >> public_key;
 
-        std::pair<std::vector<unsigned char>, CKeyMetadata> payload;
+        // The allocator cleanses the private key on every exit, including a
+        // deserialization exception in the metadata or checksum that follows it.
+        std::pair<CKeyingMaterial, CKeyMetadata> payload;
         uint256 checksum;
         ssValue >> payload;
         ssValue >> checksum;
 
-        std::vector<unsigned char> key_material;
-        key_material.reserve(public_key.size() + payload.first.size());
-        key_material.insert(key_material.end(), public_key.begin(), public_key.end());
-        key_material.insert(key_material.end(), payload.first.begin(), payload.first.end());
-        if (Hash(key_material) != checksum) {
-            if (!payload.first.empty()) {
-                memory_cleanse(payload.first.data(), payload.first.size());
-            }
-            if (!key_material.empty()) {
-                memory_cleanse(key_material.data(), key_material.size());
-            }
+        if (Hash(public_key, payload.first) != checksum) {
             strErr = "Error reading wallet database: ML-DSA public/private key corrupt";
             return false;
         }
 
-        CKeyingMaterial private_key(payload.first.begin(), payload.first.end());
-        if (!payload.first.empty()) {
-            memory_cleanse(payload.first.data(), payload.first.size());
-        }
-        if (!key_material.empty()) {
-            memory_cleanse(key_material.data(), key_material.size());
-        }
-        if (!pwallet->LoadQuantumKey(public_key, private_key, payload.second.nCreateTime)) {
+        if (!pwallet->LoadQuantumKey(public_key, payload.first, payload.second.nCreateTime)) {
             strErr = "Error reading wallet database: CWallet::LoadQuantumKey failed";
             return false;
         }
@@ -1064,7 +1082,24 @@ struct LoadResult
 };
 
 using LoadFunc = std::function<DBErrors(CWallet* pwallet, DataStream& key, CDataStream& value, std::string& err)>;
-static LoadResult LoadRecords(CWallet* pwallet, DatabaseBatch& batch, const std::string& key, DataStream& prefix, LoadFunc load_func)
+
+/**
+ * Where the time goes while loading one kind of record, for the "Wallet load
+ * phases" log line: stepping the database cursor, deserialising the record,
+ * and everything else the load callback does (for transactions, the index
+ * maintenance in CWallet::LoadToWallet). Four steady-clock reads per record.
+ */
+struct LoadSubPhaseTimes {
+    int64_t cursor_ns{0};
+    int64_t deserialize_ns{0};
+    int64_t index_ns{0};
+};
+static int64_t NowNs()
+{
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(SteadyClock::now().time_since_epoch()).count();
+}
+
+static LoadResult LoadRecords(CWallet* pwallet, DatabaseBatch& batch, const std::string& key, DataStream& prefix, LoadFunc load_func, LoadSubPhaseTimes* timers = nullptr)
 {
     LoadResult result;
     DataStream ssKey;
@@ -1078,8 +1113,11 @@ static LoadResult LoadRecords(CWallet* pwallet, DatabaseBatch& batch, const std:
         return result;
     }
 
+    int64_t previous_end_ns = timers ? NowNs() : 0;
     while (true) {
         DatabaseCursor::Status status = cursor->Next(ssKey, ssValue);
+        const int64_t record_start_ns = timers ? NowNs() : 0;
+        if (timers) timers->cursor_ns += record_start_ns - previous_end_ns;
         if (status == DatabaseCursor::Status::DONE) {
             break;
         } else if (status == DatabaseCursor::Status::FAIL) {
@@ -1092,6 +1130,11 @@ static LoadResult LoadRecords(CWallet* pwallet, DatabaseBatch& batch, const std:
         assert(type == key);
         std::string error;
         DBErrors record_res = load_func(pwallet, ssKey, ssValue, error);
+        if (timers) {
+            previous_end_ns = NowNs();
+            // Deserialisation was already added by the callback; the rest of the callback is index maintenance.
+            timers->index_ns += previous_end_ns - record_start_ns;
+        }
         if (record_res != DBErrors::LOAD_OK) {
             pwallet->WalletLogPrintf("%s\n", error);
         }
@@ -1101,11 +1144,11 @@ static LoadResult LoadRecords(CWallet* pwallet, DatabaseBatch& batch, const std:
     return result;
 }
 
-static LoadResult LoadRecords(CWallet* pwallet, DatabaseBatch& batch, const std::string& key, LoadFunc load_func)
+static LoadResult LoadRecords(CWallet* pwallet, DatabaseBatch& batch, const std::string& key, LoadFunc load_func, LoadSubPhaseTimes* timers = nullptr)
 {
     DataStream prefix;
     prefix << key;
-    return LoadRecords(pwallet, batch, key, prefix, load_func);
+    return LoadRecords(pwallet, batch, key, prefix, load_func, timers);
 }
 
 static DBErrors LoadLegacyWalletRecords(CWallet* pwallet, DatabaseBatch& batch, int last_client) EXCLUSIVE_LOCKS_REQUIRED(pwallet->cs_wallet)
@@ -1763,7 +1806,7 @@ static DBErrors LoadAddressBookRecords(CWallet* pwallet, DatabaseBatch& batch) E
     return result;
 }
 
-static DBErrors LoadTxRecords(CWallet* pwallet, DatabaseBatch& batch, std::vector<uint256>& upgraded_txs, bool& any_unordered) EXCLUSIVE_LOCKS_REQUIRED(pwallet->cs_wallet)
+static DBErrors LoadTxRecords(CWallet* pwallet, DatabaseBatch& batch, std::vector<uint256>& upgraded_txs, bool& any_unordered, LoadSubPhaseTimes& sub_times) EXCLUSIVE_LOCKS_REQUIRED(pwallet->cs_wallet)
 {
     AssertLockHeld(pwallet->cs_wallet);
     DBErrors result = DBErrors::LOAD_OK;
@@ -1771,7 +1814,7 @@ static DBErrors LoadTxRecords(CWallet* pwallet, DatabaseBatch& batch, std::vecto
     // Load tx record
     any_unordered = false;
     LoadResult tx_res = LoadRecords(pwallet, batch, DBKeys::TX,
-        [&any_unordered, &upgraded_txs] (CWallet* pwallet, DataStream& key, CDataStream& value, std::string& err) EXCLUSIVE_LOCKS_REQUIRED(pwallet->cs_wallet) {
+        [&any_unordered, &upgraded_txs, &sub_times] (CWallet* pwallet, DataStream& key, CDataStream& value, std::string& err) EXCLUSIVE_LOCKS_REQUIRED(pwallet->cs_wallet) {
         DBErrors result = DBErrors::LOAD_OK;
         uint256 hash;
         key >> hash;
@@ -1784,7 +1827,11 @@ static DBErrors LoadTxRecords(CWallet* pwallet, DatabaseBatch& batch, std::vecto
                 result = DBErrors::CORRUPT;
                 return false;
             }
+            const int64_t deserialize_start_ns = NowNs();
             value >> wtx;
+            const int64_t deserialize_ns = NowNs() - deserialize_start_ns;
+            sub_times.deserialize_ns += deserialize_ns;
+            sub_times.index_ns -= deserialize_ns; // LoadRecords charges the whole callback to the index bucket
             if (wtx.GetHash() != hash)
                 return false;
 
@@ -1819,7 +1866,7 @@ static DBErrors LoadTxRecords(CWallet* pwallet, DatabaseBatch& batch, std::vecto
             result = std::max(result, DBErrors::NEED_RESCAN);
         }
         return result;
-    });
+    }, &sub_times);
     result = std::max(result, tx_res.m_result);
 
     // Load locked utxo record
@@ -1989,11 +2036,40 @@ DBErrors WalletBatch::LoadWallet(CWallet* pwallet)
         }
 #endif
 
+        // Every phase is timed and reported in one line at the end, so a slow
+        // wallet load can be attributed to a phase from the default log.
+        const auto elapsed_ms = [](SteadyClock::time_point since) {
+            return Ticks<std::chrono::milliseconds>(SteadyClock::now() - since);
+        };
+        auto phase_start = SteadyClock::now();
+        const auto lap = [&]() {
+            const int64_t ms = elapsed_ms(phase_start);
+            phase_start = SteadyClock::now();
+            return ms;
+        };
+        struct PhaseReport {
+            int64_t legacy{0}, descriptors{0}, quantum{0}, address_book{0}, transactions{0}, active_spkms{0}, decryption{0};
+            size_t tx_count{0};
+            LoadSubPhaseTimes tx_sub;
+        } phases;
+        const auto load_start = SteadyClock::now();
+        const std::optional<int64_t> load_cpu_start = util::CurrentThreadCpuMicros();
+        const auto report_phases = [&]() {
+            pwallet->WalletLogPrintf("Wallet load phases (ms): legacy keys %d, descriptors %d, quantum and RGB records %d, address book %d, %u transactions %d (cursor %d, deserialize %d, index %d), active script managers %d, decryption keys %d; total wall %d%s\n",
+                                     phases.legacy, phases.descriptors, phases.quantum, phases.address_book,
+                                     phases.tx_count, phases.transactions,
+                                     phases.tx_sub.cursor_ns / 1000000, phases.tx_sub.deserialize_ns / 1000000, phases.tx_sub.index_ns / 1000000,
+                                     phases.active_spkms, phases.decryption, elapsed_ms(load_start),
+                                     util::FormatThreadLoadContext(load_cpu_start));
+        };
+
         // Load legacy wallet keys
         result = std::max(LoadLegacyWalletRecords(pwallet, *m_batch, last_client), result);
+        phases.legacy = lap();
 
         // Load descriptors
         result = std::max(LoadDescriptorWalletRecords(pwallet, *m_batch, last_client), result);
+        phases.descriptors = lap();
         // Early return if there are unknown descriptors. Later loading of ACTIVEINTERNALSPK and ACTIVEEXTERNALEXPK
         // may reference the unknown descriptor's ID which can result in a misleading corruption error
         // when in reality the wallet is simply too new.
@@ -2002,18 +2078,25 @@ DBErrors WalletBatch::LoadWallet(CWallet* pwallet)
         // Load Quantum Quasar wallet-managed ML-DSA migration keys. These are wallet-wide
         // private keys, not legacy ScriptPubKeyMan records.
         result = std::max(LoadQuantumWalletRecords(pwallet, *m_batch), result);
+        phases.quantum = lap();
 
         // Load address book
         result = std::max(LoadAddressBookRecords(pwallet, *m_batch), result);
+        phases.address_book = lap();
 
         // Load tx records
-        result = std::max(LoadTxRecords(pwallet, *m_batch, upgraded_txs, any_unordered), result);
+        result = std::max(LoadTxRecords(pwallet, *m_batch, upgraded_txs, any_unordered, phases.tx_sub), result);
+        phases.transactions = lap();
+        phases.tx_count = pwallet->mapWallet.size();
 
         // Load SPKMs
         result = std::max(LoadActiveSPKMs(pwallet, *m_batch), result);
+        phases.active_spkms = lap();
 
         // Load decryption keys
         result = std::max(LoadDecryptionKeys(pwallet, *m_batch), result);
+        phases.decryption = lap();
+        report_phases();
         if (result <= DBErrors::NONCRITICAL_ERROR) {
             if (!pwallet->mapMasterKeys.empty() && pwallet->HasPlaintextQuantumKeys()) {
                 pwallet->WalletLogPrintf("Error reading wallet database: encrypted wallet contains plaintext Quantum Quasar private keys\n");

@@ -54,7 +54,7 @@ FUZZ_SUITE_LD_COMMON = \
  $(MINISKETCH_LIBS) \
  $(LIBOQS_LIBS) \
  $(EVENT_LIBS) \
- $(EVENT_PTHREADS_LIBS)
+ $(EVENT_PTHREADS_LIBS) $(CURL_LIBS)
 
 if USE_UPNP
 FUZZ_SUITE_LD_COMMON += $(MINIUPNPC_LIBS)
@@ -87,6 +87,7 @@ BITCOIN_TESTS =\
   test/blockmanager_tests.cpp \
   test/bloom_tests.cpp \
   test/bswap_tests.cpp \
+  test/caches_tests.cpp \
   test/checkqueue_tests.cpp \
   test/clientversion_tests.cpp \
   test/coins_tests.cpp \
@@ -98,6 +99,7 @@ BITCOIN_TESTS =\
   test/crypto_tests.cpp \
   test/cuckoocache_tests.cpp \
   test/dbwrapper_tests.cpp \
+  test/io_counters_tests.cpp \
   test/denialofservice_tests.cpp \
   test/demurrage_tests.cpp \
   test/descriptor_tests.cpp \
@@ -122,12 +124,14 @@ BITCOIN_TESTS =\
   test/multisig_tests.cpp \
   test/net_peer_eviction_tests.cpp \
   test/net_tests.cpp \
+  test/https_seed_tests.cpp \
   test/netbase_tests.cpp \
   test/orphanage_tests.cpp \
   test/pmt_tests.cpp \
   test/policy_fee_tests.cpp \
   test/pool_tests.cpp \
   test/pow_tests.cpp \
+  test/readahead_tests.cpp \
   test/prevector_tests.cpp \
   test/raii_event_tests.cpp \
   test/random_tests.cpp \
@@ -178,6 +182,7 @@ BITCOIN_TESTS =\
   test/validation_chainstate_tests.cpp \
   test/validation_chainstatemanager_tests.cpp \
   test/validation_flush_tests.cpp \
+  test/validation_stall_tests.cpp \
   test/validation_tests.cpp \
   test/validationinterface_tests.cpp \
   test/v2_block_time_tests.cpp \
@@ -189,15 +194,29 @@ BITCOIN_TESTS += \
   test/quantum_redelegation_tests.cpp \
   wallet/test/psbt_wallet_tests.cpp \
   wallet/test/spend_tests.cpp \
+  wallet/test/resubmit_retry_tests.cpp \
+  wallet/test/payout_digest_tests.cpp \
+  wallet/test/staking_candidate_tests.cpp \
+  wallet/test/block_connect_activity_tests.cpp \
+  wallet/test/coin_facts_tests.cpp \
+  wallet/test/display_balance_tests.cpp \
+  wallet/test/io_gate_tests.cpp \
+  wallet/test/available_coins_memo_tests.cpp \
+  wallet/test/polled_balance_tests.cpp \
   wallet/test/wallet_tests.cpp \
+  wallet/test/pow_miner_schedule_tests.cpp \
+  wallet/test/reorg_scale_tests.cpp \
+  wallet/test/wallet_durability_tests.cpp \
   wallet/test/walletdb_tests.cpp \
   wallet/test/wallet_crypto_tests.cpp \
   wallet/test/wallet_transaction_tests.cpp \
+  wallet/test/txvaluemap_tests.cpp \
   wallet/test/coinselector_tests.cpp \
   wallet/test/init_tests.cpp \
   wallet/test/ismine_tests.cpp \
   wallet/test/rpc_util_tests.cpp \
   wallet/test/scriptpubkeyman_tests.cpp \
+  wallet/test/shadow_pow_claim_index_tests.cpp \
   wallet/test/shadow_pow_claim_pagination_tests.cpp \
   wallet/test/shadow_pow_claim_recovery_tests.cpp \
   wallet/test/walletload_tests.cpp \
@@ -225,12 +244,13 @@ endif # USE_SQLITE
 BITCOIN_TEST_SUITE += \
   wallet/test/wallet_test_fixture.cpp \
   wallet/test/wallet_test_fixture.h \
+  wallet/test/large_wallet_fixture.h \
   wallet/test/init_test_fixture.cpp \
   wallet/test/init_test_fixture.h
 endif # ENABLE_WALLET
 
 test_test_blackcoin_SOURCES = $(BITCOIN_TEST_SUITE) $(BITCOIN_TESTS) $(JSON_TEST_FILES) $(RAW_TEST_FILES)
-test_test_blackcoin_CPPFLAGS = $(AM_CPPFLAGS) $(BITCOIN_INCLUDES) $(CRC32C_CPPFLAGS_INT) -I$(srcdir)/crc32c/src $(TESTDEFS) $(BOOST_CPPFLAGS) $(EVENT_CFLAGS) $(LIBOQS_CFLAGS)
+test_test_blackcoin_CPPFLAGS = $(AM_CPPFLAGS) $(BITCOIN_INCLUDES) $(LEVELDB_CPPFLAGS) $(CRC32C_CPPFLAGS_INT) -I$(srcdir)/crc32c/src $(TESTDEFS) $(BOOST_CPPFLAGS) $(EVENT_CFLAGS) $(LIBOQS_CFLAGS) $(CURL_CFLAGS)
 test_test_blackcoin_LDADD = $(LIBTEST_UTIL)
 if ENABLE_WALLET
 test_test_blackcoin_LDADD += $(LIBBITCOIN_WALLET)
@@ -238,7 +258,7 @@ test_test_blackcoin_CPPFLAGS += $(BDB_CPPFLAGS)
 endif
 
 test_test_blackcoin_LDADD += $(LIBBITCOIN_NODE) $(LIBBITCOIN_CLI) $(LIBBITCOIN_COMMON) $(LIBBITCOIN_UTIL) $(LIBBITCOIN_CONSENSUS) $(LIBBITCOIN_CRYPTO) $(LIBUNIVALUE) \
-  $(LIBLEVELDB) $(LIBMEMENV) $(LIBSECP256K1) $(EVENT_LIBS) $(EVENT_PTHREADS_LIBS) $(MINISKETCH_LIBS)
+  $(LIBLEVELDB) $(LIBMEMENV) $(LIBSECP256K1) $(EVENT_LIBS) $(EVENT_PTHREADS_LIBS) $(MINISKETCH_LIBS) $(CURL_LIBS)
 test_test_blackcoin_CXXFLAGS = $(AM_CXXFLAGS) $(PIE_FLAGS)
 
 test_test_blackcoin_LDADD += $(BDB_LIBS) $(MINIUPNPC_LIBS) $(NATPMP_LIBS) $(SQLITE_LIBS) $(LIBOQS_LIBS)

@@ -1,5 +1,96 @@
 # Changelog
 
+## v30.1.6
+
+- Final release of the source line developed as 30.1.5.3rc1 through
+  30.1.5.3rc15, which were never published. The numeric client version is
+  300106.
+- Announce Gold Rush claims without the trickle delay, send a claim this
+  node's miner created to peers as a whole transaction, and do not round the
+  fee filter above the minimum. The claim fee is unchanged.
+- Cut the wallet work per block: no commit for a block that writes no wallet
+  record, one commit per submitted transaction, packed transaction metadata.
+- Shorten start-up and restart: sequential read-ahead of the block index and
+  the wallet file, a quick integrity check with the full check in the
+  background, and payout checkpoints at the wallet tip and at the last
+  chainstate flush so that a crash does not re-authenticate every payout.
+- Honor a payout checkpoint written by an earlier trusted client version, so
+  the upgrade does not force a full payout re-check.
+- Calculate display balances on one sliced background worker; the balance RPCs
+  return the last calculated balance at once and say whether it is exact.
+- Size the database cache from the system memory, with the chainstate
+  database's own cache capped at 8 MiB.
+- No consensus rules or storage formats change. See
+  `doc/release-notes/release-notes-30.1.6.md` for measured results and known
+  limitations.
+
+## v30.1.5.3rc15 (DEVELOPMENT, unreleased candidate)
+
+- Bound GUI-thread work for wallet history, Account, Staking and Peers with
+  workers and work slices. Pause display work on hidden and minimized pages,
+  and restore a minimized main window on a macOS reopen before activating it.
+- Coalesce block-tip notifications to the GUI in every synchronization state.
+  Catching up outside initial block download previously delivered one update
+  per block and stalled the window for seconds.
+- Destroy the wallet worker only after its thread has exited, closing a rare
+  crash during wallet unload and shutdown.
+- Add the opt-in `-uiperflog` and `-uipaintlog` diagnostics, disabled by
+  default.
+
+## v30.1.5.3rc4 (DEVELOPMENT, unreleased candidate)
+
+- Show Overview's recent transactions through a five-row projection, preserving
+  the existing sorting and source transaction mapping without hiding every
+  history row after updates. Poll peer statistics only while Peers is shown.
+- Skip automatic staking package selection for an already-searched time slot
+  and chain tip. Preserve the late eligibility check and explicit caller paths.
+- Reuse authenticated predecessor proof buckets within one forward block
+  transition, batch the ordered payout inventory updates, and reuse checked
+  block/undo serialized sizes. Preserve state bytes and undo checksums.
+- Coalesce balance display requests on the wallet worker, skip hidden Send
+  balance scans, and filter Account details from a completed snapshot. Preserve
+  newer updates while publishing completed results and distinguish contention
+  from empty data.
+- Load wallet history outside the UI thread and publish at most 256 rows per
+  event-loop turn. Replay live updates before enabling complete-history search
+  and export, and retain transaction clicks made while loading.
+- Preserve wallet storage and consensus rules. Exact-source qualification
+  remains pending.
+
+## v30.1.5.3rc3 (DEVELOPMENT, unreleased candidate)
+
+- Queue wallet transaction updates and label refreshes when the wallet lock is
+  busy so the Qt event loop can continue processing input and repainting.
+- Give legacy peer candidates a bounded replenishment turn when the QQ target
+  is met, an ordinary full-relay slot opens, and no legacy full-relay peer
+  remains. Keep the first eligible QQ candidate as a fallback.
+- Return the canonical MuHash inverse of one directly, preserving reductions,
+  inventory roots and serialized state.
+
+## v30.1.5.3rc2 (DEVELOPMENT, unreleased candidate)
+
+- After two QQ-hint attempts during an outage, reserve a bounded search for a
+  legacy candidate; retain QQ-only fallback and existing connection policies.
+
+- Prefer qualified current-chain QQ peers in automatic outbound connections,
+  targeting eight of sixteen full-relay slots by default. Add a clamped
+  `-qqoutboundtarget` setting, bounded replacement probes, DNS recovery, and
+  `getnetworkinfo` discovery diagnostics.
+- Bound header replay tracking to 2,000 heights per identity and 1,024 identities,
+  reserve 64 identity slots for locally initiated peers, and expire disconnected
+  history after one hour. Reject invalid tracking limits at startup.
+- Run mining controls and detail refreshes on the wallet worker thread with
+  cancellation. Persist PoW resource preferences independently of autostart;
+  account for whole-iteration duty and report aggregate worker diagnostics.
+- Reuse selected transaction state during block-template assembly. The recorded
+  synthetic fixture measured 16.9-fold and 287-fold assembly speedups at 1,000
+  and 12,000 transactions, respectively; these are not application-wide results.
+- Preserve UTXO cursor snapshots across database lifetimes, defer database cache
+  resizing while cursors are active, and stop obsolete witness inventory scans
+  early. Check cancellation before further expensive wallet inventory work.
+- Preserve numeric client version, consensus, activation heights, wallet storage,
+  and chainstate formats. Final release qualification is pending.
+
 ## v30.1.5.2
 
 - Limit the wallet's claim-input source budget to legacy outputs that can be

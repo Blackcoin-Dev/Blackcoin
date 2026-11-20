@@ -35,6 +35,10 @@ struct ChainstateLoadOptions {
     bool block_tree_db_in_memory{false};
     bool coins_db_in_memory{false};
     bool reindex{false};
+    //! Read the block index files once, front to back, before LevelDB loads them.
+    bool block_index_readahead{false};
+    //! Skip the read-ahead when the index files add up to more than this (0 reads nothing).
+    uint64_t block_index_readahead_max_bytes{0};
     bool reindex_chainstate{false};
     bool prune{false};
     //! Setting require_full_verification to true will require all checks at

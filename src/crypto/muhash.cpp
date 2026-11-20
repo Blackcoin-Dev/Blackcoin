@@ -11,6 +11,7 @@
 #include <crypto/common.h>
 #include <hash.h>
 
+#include <algorithm>
 #include <cassert>
 #include <cstdio>
 #include <limits>
@@ -146,6 +147,14 @@ void Num3072::FullReduce()
 
 Num3072 Num3072::GetInverse() const
 {
+    // Finalize normalizes MuHash denominators to one. Avoid exponentiation
+    // for that value while keeping Divide's multiplication and reduction.
+    if (limbs[0] == 1 && std::all_of(limbs + 1, limbs + LIMBS, [](limb_t limb) {
+            return limb == 0;
+        })) {
+        return Num3072{};
+    }
+
     // For fast exponentiation a sliding window exponentiation with repunit
     // precomputation is utilized. See "Fast Point Decompression for Standard
     // Elliptic Curves" (Brumley, Järvinen, 2008).

@@ -24,6 +24,7 @@ struct bilingual_str;
 namespace wallet {
 class LegacyScriptPubKeyMan;
 enum class DatabaseStatus;
+struct PolledBalance;
 struct WalletContext;
 
 extern const std::string HELP_REQUIRING_PASSPHRASE;
@@ -32,6 +33,14 @@ static const RPCResult RESULT_LAST_PROCESSED_BLOCK { RPCResult::Type::OBJ, "last
     {RPCResult::Type::STR_HEX, "hash", "hash of the block this information was generated on"},
     {RPCResult::Type::NUM, "height", "height of the block this information was generated on"}}
 };
+
+//! The `exact` argument of the RPCs that report the wallet balance.
+extern const std::string HELP_BALANCE_EXACT_ARG;
+//! What those RPCs say about the balance they report.
+static const RPCResult RESULT_BALANCE_EXACT{RPCResult::Type::BOOL, "balance_exact", "true when the balances are those of the wallet as it is now; false when they are the last calculated balances and the wallet or the chain has moved on since (a new calculation is under way)"};
+static const RPCResult RESULT_BALANCE_HEIGHT{RPCResult::Type::NUM, "balance_height", "height of the block the balances were calculated for, -1 when no balance has been calculated yet"};
+static const RPCResult RESULT_BALANCE_BLOCKHASH{RPCResult::Type::STR_HEX, "balance_blockhash", /*optional=*/true, "hash of the block the balances were calculated for (absent when no balance has been calculated yet)"};
+static const RPCResult RESULT_BALANCE_STATE{RPCResult::Type::STR, "balance_state", "\"exact\", \"current-unverified\" (calculated for the wallet's last processed block, the wallet changed since), \"behind(N)\" (calculated N blocks before the wallet's last processed block), \"none\" (nothing calculated yet: the balances are reported as 0) or \"failed\""};
 
 /**
  * Figures out what wallet, if any, to use for a JSONRPCRequest.
@@ -56,6 +65,11 @@ void PushParentDescriptors(const CWallet& wallet, const CScript& script_pubkey, 
 void HandleWalletError(const std::shared_ptr<CWallet> wallet, DatabaseStatus& status, bilingual_str& error);
 int64_t ParseISO8601DateTime(const std::string& str);
 void AppendLastProcessedBlock(UniValue& entry, const CWallet& wallet) EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet);
+//! Whether a balance RPC waits for an exact balance: the caller's `exact`
+//! argument, or -walletrpcexactbalance when it is not given.
+bool WantExactBalance(const UniValue& param);
+//! balance_exact, balance_height, balance_blockhash and balance_state.
+void AppendPolledBalanceState(UniValue& entry, const CWallet& wallet, const PolledBalance& polled) EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet);
 } //  namespace wallet
 
 #endif // BITCOIN_WALLET_RPC_UTIL_H

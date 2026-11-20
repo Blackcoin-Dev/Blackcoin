@@ -12,16 +12,36 @@ namespace interfaces {
 class Node;
 } // namespace interfaces
 
+class WalletModel;
+
 class WalletTests : public QObject
 {
  public:
     explicit WalletTests(interfaces::Node& node) : m_node(node) {}
     interfaces::Node& m_node;
+    static QMetaObject::Connection traceStakingSnapshots(WalletModel& model);
 
     Q_OBJECT
 
 private Q_SLOTS:
     void walletTests();
+    void shutdownPublicationReadyOrdering();
+    void stakingSnapshotContention();
+    void receiveCapabilityContention_data();
+    void receiveCapabilityContention();
+    void receiveCapabilityLifecycle();
+    void workerOutlivesShutdownRequest();
+    void historyScaleBenchmark_data();
+    void historyScaleBenchmark();
+    void historyInitialLoad();
+    void historyIncrementalUpdates_data();
+    void historyIncrementalUpdates();
+    void historyOrderOracle_data();
+    void historyOrderOracle();
+    void historyBlockAnnouncementBounded_data();
+    void historyBlockAnnouncementBounded();
+    void historyConfirmationNotStarved_data();
+    void historyConfirmationNotStarved();
 };
 
 #endif // BITCOIN_QT_TEST_WALLETTESTS_H

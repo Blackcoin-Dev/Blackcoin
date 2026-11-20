@@ -67,23 +67,33 @@ class WalletGoldRushPayoutCheckpointTest(BitcoinTestFramework):
 
     def _mine_pos_block(self, wallet):
         node = self.nodes[0]
-        inputs = [{"txid": utxo["txid"], "vout": utxo["vout"]} for utxo in wallet.listunspent(1, 9999999)]
         start_height = node.getblockcount()
-        for _ in range(3000):
-            self._set_mocktime(self.mock_time + 16)
-            kernel = wallet.checkkernel(inputs)
-            if kernel["found"]:
-                kernel_time = kernel["kernel"]["time"]
+        # When staking starts, the wallet may first send its automatic Gold Rush
+        # signal, and that transaction can spend the very output the search
+        # found a kernel for. The clock is frozen, so no other output can stake
+        # then. Search again over the outputs still unspent instead of failing.
+        for attempt in range(4):
+            inputs = [{"txid": utxo["txid"], "vout": utxo["vout"]} for utxo in wallet.listunspent(1, 9999999)]
+            for _ in range(3000):
+                self._set_mocktime(self.mock_time + 16)
+                kernel = wallet.checkkernel(inputs)
+                if kernel["found"]:
+                    kernel_time = kernel["kernel"]["time"]
+                    break
+            else:
+                raise AssertionError("timed out searching for a deterministic PoS kernel")
+            self._set_mocktime(kernel_time - 16)
+            wallet.staking(True)
+            try:
+                self._set_mocktime(kernel_time)
+                self.wait_until(lambda: node.getblockcount() > start_height, timeout=20)
                 break
-        else:
-            raise AssertionError("timed out searching for a deterministic PoS kernel")
-        self._set_mocktime(kernel_time - 16)
-        wallet.staking(True)
-        try:
-            self._set_mocktime(kernel_time)
-            self.wait_until(lambda: node.getblockcount() > start_height, timeout=30)
-        finally:
-            wallet.staking(False)
+            except AssertionError:
+                if attempt == 3:
+                    raise
+                self.log.info("the staker did not use the kernel found; searching again")
+            finally:
+                wallet.staking(False)
 
     def _snapshot(self, wallet):
         """Everything a user can see that payout authentication could influence."""

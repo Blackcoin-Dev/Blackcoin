@@ -1006,7 +1006,7 @@ class GoldRushInfoTest(BitcoinTestFramework):
             node.get_deterministic_priv_key().address,
         )
         assert_equal(len(inactive_wallet.listunspent(1, 9999999, [inactive_target])), 1)
-        inactive_payout = inactive_wallet.getnewquantumaddress("PoW - Quantum Claim Address")["address"]
+        inactive_wallet.getnewquantumaddress("PoW - Quantum Claim Address")["address"]
 
         self.log.info("The claim miner refuses to start after the Gold Rush height window")
         remaining = GOLD_RUSH_END_HEIGHT - node.getblockcount()

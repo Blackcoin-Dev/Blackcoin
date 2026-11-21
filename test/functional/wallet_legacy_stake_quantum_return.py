@@ -190,7 +190,6 @@ class LegacyStakeQuantumReturnTest(TransitionTFinalTestBase, BitcoinTestFramewor
         assert "READY" in info["legacy_staking_notice"] and quantum_address in info["legacy_staking_notice"]
         assert_equal(wallet.getmigrationstatus()["legacy_stake_return_address"], quantum_address)
 
-        legacy_before = self.legacy_total(wallet)
         staked = []  # (txid, value, principal)
 
         self.log.info("Window: every legacy coinstake pays one quantum output (pubkeyhash kernel)")

@@ -68,7 +68,7 @@ class GoldRushEndTransitionTest(BitcoinTestFramework):
             self.bump()
 
     def log_lines(self, node, text, since=0):
-        with open(node.debug_log_path, errors="replace") as f:
+        with open(node.debug_log_path, encoding="utf8", errors="replace") as f:
             f.seek(since)
             return sum(1 for line in f if text in line)
 

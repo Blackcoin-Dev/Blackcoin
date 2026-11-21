@@ -4179,10 +4179,9 @@ void StakingMiningPage::updateStatus()
     } else {
         m_staking_status->setText(tr("Staking is off"));
     }
-    // Read the stake weight the WalletModel already keeps cached (recomputed on
-    // its worker thread on block/balance changes), never a fresh
-    // GetStakeWeight() here: that walks the wallet's coins and would lag the
-    // first click on this tab on large wallets.
+    // Read the stake weight from the published staking info, never a fresh
+    // walk of the wallet's coins, which would lag the first click on this tab
+    // on large wallets.
     m_stake_weight->setText(QString::number(static_cast<qulonglong>(staking_info.weight)));
 
     refreshDonationControls();

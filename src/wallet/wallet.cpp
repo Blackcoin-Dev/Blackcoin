@@ -7729,14 +7729,6 @@ bool CWallet::MoveAddressBook(const CTxDestination& old_address, const CTxDestin
     return true;
 }
 
-uint64_t CWallet::GetStakeWeight() const
-{
-    if (HaveChain()) {
-        return chain().getStakeWeight(*this);
-    }
-    return 0;
-}
-
 size_t CWallet::KeypoolCountExternalKeys() const
 {
     AssertLockHeld(cs_wallet);
@@ -12073,7 +12065,7 @@ void CWallet::PublishStakingTelemetry(
     m_staking_telemetry.tip_height = tip_height;
     m_staking_telemetry.weight_cache_height =
         m_cached_stake_weight_height.load(std::memory_order_acquire);
-    // GetStakeWeight publishes this pair while holding the same mutex, so the
+    // The staking worker publishes this pair while holding the same mutex, so the
     // snapshot cannot combine weight and height from different scans.
     m_staking_telemetry.weight =
         m_cached_stake_weight.load(std::memory_order_relaxed);

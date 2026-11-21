@@ -395,9 +395,6 @@ public:
     //! Stop staking.
     virtual void stopStake(wallet::CWallet& wallet) = 0;
 
-    //! Get stake weight.
-    virtual uint64_t getStakeWeight(const wallet::CWallet& wallet) = 0;
-
     //! Get staking RPC commands.
     virtual Span<const CRPCCommand> getStakingRPCCommands() = 0;
 #endif

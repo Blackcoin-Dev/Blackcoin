@@ -67,8 +67,6 @@ WalletModel::WalletModel(std::unique_ptr<interfaces::Wallet> wallet, ClientModel
     m_node(client_model.node()),
     optionsModel(client_model.getOptionsModel()),
     timer(new QTimer(this)),
-    nWeight(0),
-    updateStakeWeight(true),
     m_deferred_history(defer_history),
     worker(nullptr),
     m_address_capability_retry(new QTimer(this))
@@ -384,7 +382,6 @@ void WalletModel::pollBalanceChanged()
     m_wallet->requestDisplayBalances(m_poll_foreground, m_requested_send_family,
                                      std::exchange(m_send_retry_requested, false));
     applyDisplaySnapshot(m_wallet->getDisplaySnapshot());
-    pollStakeWeight();
 }
 
 void WalletModel::displayBalancesChanged()
@@ -469,7 +466,6 @@ void WalletModel::applyDisplaySnapshot(const interfaces::WalletDisplayBalances& 
             transactionTableModel->updateConfirmations();
             if (gone()) return;
         }
-        if (tip_changed || balance_changed) ++m_stake_weight_generation;
     }
 
     // The send-family balance belongs to one snapshot. A snapshot without the
@@ -483,37 +479,6 @@ void WalletModel::applyDisplaySnapshot(const interfaces::WalletDisplayBalances& 
             Q_EMIT sendBalanceChanged();
         }
     }
-}
-
-void WalletModel::pollStakeWeight()
-{
-    if (!worker || m_stake_weight_poll_in_flight) return;
-    const uint64_t generation = m_stake_weight_generation;
-    const bool stale = generation != m_stake_weight_applied_generation;
-    if (!stale && !updateStakeWeight.load(std::memory_order_relaxed)) return;
-    m_stake_weight_poll_in_flight = true;
-    const bool invoked = QMetaObject::invokeMethod(worker, [this, generation, stale] {
-        bool applied{false};
-        try {
-            if (!m_node.shutdownRequested()) {
-                int height{-1};
-                bool syncing{false};
-                // The stake weight follows the tip and the balance, but not
-                // while the node is still synchronizing.
-                if (stale && m_node.tryGetSyncInfo(height, syncing) && !syncing) {
-                    updateStakeWeight = true;
-                    applied = true;
-                }
-                checkStakeWeightChanged();
-            }
-        } catch (...) {
-        }
-        QMetaObject::invokeMethod(this, [this, generation, applied] {
-            m_stake_weight_poll_in_flight = false;
-            if (applied) m_stake_weight_applied_generation = generation;
-        }, Qt::QueuedConnection);
-    }, Qt::QueuedConnection);
-    if (!invoked) m_stake_weight_poll_in_flight = false;
 }
 
 void WalletModel::invalidateBalanceSnapshot()
@@ -2150,11 +2115,6 @@ CAmount WalletModel::getAvailableBalance(const CCoinControl* control)
     return wallet().getAvailableBalance(*control);
 }
 
-uint64_t WalletModel::getStakeWeight()
-{
-    return nWeight.load(std::memory_order_relaxed);
-}
-
 bool WalletModel::getWalletUnlockStakingOnly()
 {
     return m_wallet->getWalletUnlockStakingOnly();
@@ -2163,15 +2123,6 @@ bool WalletModel::getWalletUnlockStakingOnly()
 void WalletModel::setWalletUnlockStakingOnly(bool unlock)
 {
     m_wallet->setWalletUnlockStakingOnly(unlock);
-}
-
-void WalletModel::checkStakeWeightChanged()
-{
-    uint64_t weight{0};
-    if (updateStakeWeight && m_wallet->tryGetStakeWeight(weight)) {
-        nWeight.store(weight, std::memory_order_relaxed);
-        updateStakeWeight = false;
-    }
 }
 
 void WalletModel::beginShutdown()

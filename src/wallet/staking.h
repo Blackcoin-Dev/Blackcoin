@@ -42,7 +42,6 @@ void StartStake(CWallet& wallet);
 /* Stop staking */
 void StopStake(CWallet& wallet);
 
-uint64_t GetStakeWeight(const CWallet& wallet) EXCLUSIVE_LOCKS_REQUIRED(::cs_main, wallet.cs_wallet);
 void AvailableCoinsForStaking(const CWallet& wallet,
                            std::vector<std::pair<const CWalletTx*, unsigned int> >& vCoins,
                            const CCoinControl* coinControl = nullptr,

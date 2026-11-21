@@ -1953,37 +1953,6 @@ void StopStake(CWallet& wallet) {
     }
 }
 
-uint64_t GetStakeWeight(const CWallet& wallet)
-{
-    AssertLockHeld(::cs_main);
-    AssertLockHeld(wallet.cs_wallet);
-    std::set<std::pair<const CWalletTx*, unsigned int> > setCoins;
-    CAmount nValueIn = 0;
-    CAmount nTargetValue = MAX_MONEY;
-    if (!SelectCoinsForStaking(wallet, nTargetValue, setCoins, nValueIn))
-        return 0;
-
-    if (setCoins.empty() || nValueIn <= wallet.m_reserve_balance)
-        return 0;
-
-    uint64_t nWeight = 0;
-    CAmount nRemaining = nValueIn - wallet.m_reserve_balance;
-
-    for (std::pair<const CWalletTx*,unsigned int> pcoin : setCoins)
-    {
-        if (wallet.GetTxDepthInMainChain(*pcoin.first) >= Params().GetConsensus().nCoinbaseMaturity)
-        {
-            const CAmount nCoinValue = pcoin.first->tx->vout[pcoin.second].nValue;
-            const CAmount nWeightValue = std::min(nCoinValue, nRemaining);
-            nWeight += nWeightValue;
-            nRemaining -= nWeightValue;
-            if (nRemaining <= 0) break;
-        }
-    }
-
-    return nWeight;
-}
-
 struct StakeTransactionEligibility
 {
     bool active{false};

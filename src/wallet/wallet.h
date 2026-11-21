@@ -2230,8 +2230,8 @@ public:
     // Resume automatic QQSIGNAL fee-input discovery after the last bounded
     // wallet-history slice instead of rescanning mapWallet from the beginning.
     COutPoint m_shadow_signal_coin_scan_cursor GUARDED_BY(cs_wallet);
-    // GetStakeWeight is an O(wallet history) calculation. The staking worker
-    // publishes its most recent complete result for non-blocking RPC/GUI reads.
+    // The staking worker publishes its most recent complete stake weight for
+    // non-blocking RPC/GUI reads.
     mutable std::atomic<uint64_t> m_cached_stake_weight{0};
     mutable std::atomic<int> m_cached_stake_weight_height{-1};
     int m_redelegation_last_auto_scan_height GUARDED_BY(cs_wallet){-1};
@@ -2321,8 +2321,6 @@ public:
     uint256 m_pow_gate_ready_tip GUARDED_BY(m_pow_miner_mutex);
     std::chrono::steady_clock::time_point m_pow_gate_ready_at GUARDED_BY(m_pow_miner_mutex){};
     std::set<uint256> m_inflight_wallet_broadcasts GUARDED_BY(cs_wallet);
-
-    uint64_t GetStakeWeight() const EXCLUSIVE_LOCKS_REQUIRED(::cs_main, cs_wallet);
 
     /** Broad ordered staking prefilter. Caller must keep cs_wallet held while
      *  using the returned reference. */

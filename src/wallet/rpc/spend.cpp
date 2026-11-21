@@ -2027,6 +2027,11 @@ RPCHelpMan migratetoquantum()
             {RPCResult::Type::NUM, "remaining_inputs", "legacy UTXOs left for later batches"},
             {RPCResult::Type::STR_AMOUNT, "remaining_amount", "legacy value left for later batches"},
             {RPCResult::Type::BOOL, "more_batches", "whether another call is needed to move the rest"},
+            {RPCResult::Type::NUM, "excluded_legacy_outputs", "legacy outputs this call could not consider (not mature, locked, unconfirmed or not spendable); more_batches false does not mean none remain"},
+            {RPCResult::Type::STR_AMOUNT, "excluded_legacy_amount", "value of those legacy outputs"},
+            {RPCResult::Type::NUM, "next_maturity_height", /*optional=*/true, "first height at which one of them matures; absent when none waits for maturity"},
+            {RPCResult::Type::NUM, "auxiliary_inputs", "confirmed quantum outputs of this wallet spent with the batch as anchor or fee source (their value is not legacy value moved)"},
+            {RPCResult::Type::STR_AMOUNT, "auxiliary_amount", "value of those quantum outputs; it reaches the destination too"},
             {RPCResult::Type::NUM, "max_inputs", "input limit that applied to this batch"},
             {RPCResult::Type::STR, "destination", "quantum address funds were sent to"},
             {RPCResult::Type::BOOL, "newly_generated", "whether destination was freshly minted"},
@@ -2143,14 +2148,28 @@ RPCHelpMan migratetoquantum()
         // in the last Migration block could not be moved.
         filter.include_next_block_mature_coinbase = true;
 
+        const bool anchor_required_early = IsQuantumWitnessSpendActive(consensus, mtp, next_height);
         CAmount eligible_amount = 0;
         unsigned int eligible_inputs = 0;
         unsigned int migration_anchor_inputs = 0;
+        unsigned int migration_auxiliary_inputs = 0;
         std::vector<MigrationBatchInput> batch_candidates;
         const CCoinsViewCache& migration_view = pwallet->chain().chainman().ActiveChainstate().CoinsTip();
         for (const COutput& out : AvailableCoins(*pwallet, &coin_control, std::nullopt, filter).All()) {
             const CScript& spk = out.txout.scriptPubKey;
-            if (IsQuantumMigrationScript(spk)) continue;
+            if (IsQuantumMigrationScript(spk)) {
+                // A confirmed quantum output of the wallet can anchor and fund a later batch.
+                const Coin& quantum_coin = migration_view.AccessCoin(out.outpoint);
+                if (out.spendable && anchor_required_early &&
+                    IsMigrationAuxiliaryOutput(*pwallet, out.outpoint, out.txout, quantum_coin, consensus, mtp, next_height)) {
+                    const int quantum_vsize = CalculateMaximumSignedInputSize(out.txout, pwallet.get(), &coin_control);
+                    batch_candidates.push_back({out.outpoint, out.txout.nValue, out.txout.nValue,
+                                                quantum_vsize > 0 ? int64_t{quantum_vsize} * WITNESS_SCALE_FACTOR : int64_t{4000},
+                                                /*anchor=*/true, /*auxiliary=*/true});
+                    ++migration_auxiliary_inputs;
+                }
+                continue;
+            }
             if (IsQuantumColdStakeScript(spk)) continue;
             if (IsEUTXOScript(spk)) continue;
             if (!out.spendable) continue;
@@ -2173,11 +2192,11 @@ RPCHelpMan migratetoquantum()
                 created_destination);
         }
         const bool anchor_required = IsQuantumWitnessSpendActive(consensus, mtp, next_height);
-        if (anchor_required && migration_anchor_inputs == 0) {
+        if (anchor_required && migration_anchor_inputs == 0 && migration_auxiliary_inputs == 0) {
             ThrowQuantumActionError(
                 RPC_WALLET_ERROR,
                 "Quantum migration",
-                "This wallet's spendable legacy coins are witness-only and cannot create a fork-unique migration transaction. Add a small P2PKH or non-witness P2SH wallet UTXO as a migration anchor. During Gold Rush, prepare that anchor before quantum spending activates.",
+                "This wallet's spendable legacy coins are witness-only and cannot create a fork-unique migration transaction, and it has no confirmed quantum output to anchor them. If an earlier migration batch is still unconfirmed, wait for it to confirm. Otherwise add a small P2PKH or non-witness P2SH wallet UTXO as a migration anchor. During Gold Rush, prepare that anchor before quantum spending activates.",
                 created_destination);
         }
 
@@ -2209,6 +2228,16 @@ RPCHelpMan migratetoquantum()
         result.pushKV("remaining_inputs", (int)batch->remaining_inputs);
         result.pushKV("remaining_amount", ValueFromAmount(batch->remaining_value));
         result.pushKV("more_batches", batch->remaining_inputs > 0);
+        {
+            std::set<COutPoint> considered;
+            for (const MigrationBatchInput& c : batch_candidates) considered.insert(c.outpoint);
+            const ExcludedLegacyOutputs excluded = FindExcludedLegacyOutputs(*pwallet, considered, consensus, next_height);
+            result.pushKV("excluded_legacy_outputs", (int)excluded.count);
+            result.pushKV("excluded_legacy_amount", ValueFromAmount(excluded.amount));
+            if (excluded.next_maturity_height > 0) result.pushKV("next_maturity_height", excluded.next_maturity_height);
+        }
+        result.pushKV("auxiliary_inputs", (int)batch->auxiliary.size());
+        result.pushKV("auxiliary_amount", ValueFromAmount(batch->auxiliary_value));
         result.pushKV("max_inputs", (int)batch_limit);
         result.pushKV("destination", EncodeDestination(dest));
         result.pushKV("newly_generated", newly_generated);

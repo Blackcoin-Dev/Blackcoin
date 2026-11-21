@@ -14,7 +14,7 @@
 namespace wallet {
 namespace {
 
-MigrationBatchInput Input(uint32_t n, CAmount value, int64_t weight, bool anchor = false)
+MigrationBatchInput Input(uint32_t n, CAmount value, int64_t weight, bool anchor = false, bool auxiliary = false)
 {
     MigrationBatchInput in;
     in.outpoint = COutPoint{Txid::FromUint256(uint256{static_cast<unsigned char>(n % 251 + 1)}), n};
@@ -22,6 +22,7 @@ MigrationBatchInput Input(uint32_t n, CAmount value, int64_t weight, bool anchor
     in.effective_value = value;
     in.input_weight = weight;
     in.anchor = anchor;
+    in.auxiliary = auxiliary;
     return in;
 }
 
@@ -152,6 +153,73 @@ BOOST_AUTO_TEST_CASE(option_clamp)
     BOOST_CHECK_EQUAL(ClampMigrationBatchInputs(-5, 400), size_t{400});
     BOOST_CHECK_EQUAL(ClampMigrationBatchInputs(7, 400), size_t{7});
     BOOST_CHECK_EQUAL(ClampMigrationBatchInputs(1000000, 400), size_t{MAX_MIGRATION_BATCH_INPUTS_OPTION});
+}
+
+BOOST_AUTO_TEST_CASE(a_sole_anchor_does_not_strand_witness_inputs_when_a_quantum_output_can_anchor)
+{
+    // One legacy anchor and five witness inputs, two inputs per batch. The first batch takes
+    // the sole anchor. Without an auxiliary quantum output the rest has no anchor (the failure
+    // the review found); with the earlier batch's confirmed output it continues.
+    std::vector<MigrationBatchInput> legacy;
+    legacy.push_back(Input(1, 100, 600, /*anchor=*/true));
+    for (uint32_t i = 2; i <= 6; ++i) legacy.push_back(Input(i, 1000 + i, 600));
+    const MigrationBatchPlan first = PlanMigrationBatch(legacy, 2, 0, 100000, /*require_anchor=*/true);
+    BOOST_REQUIRE_EQUAL(first.selected.size(), size_t{2});
+    BOOST_CHECK(first.selected[0].anchor || first.selected[1].anchor);
+    BOOST_CHECK(first.auxiliary.empty());
+
+    std::vector<MigrationBatchInput> rest;
+    for (const MigrationBatchInput& in : legacy) {
+        if (std::none_of(first.selected.begin(), first.selected.end(), [&](const MigrationBatchInput& s) { return s.outpoint == in.outpoint; })) rest.push_back(in);
+    }
+    BOOST_REQUIRE_EQUAL(rest.size(), size_t{4});
+    BOOST_CHECK(PlanMigrationBatch(rest, 2, 0, 100000, true).blocked_no_anchor);
+
+    // The first batch's own output is a confirmed quantum output: it anchors the next batch.
+    rest.push_back(Input(100, 5000, 4000, /*anchor=*/true, /*auxiliary=*/true));
+    const MigrationBatchPlan second = PlanMigrationBatch(rest, 2, 0, 100000, true);
+    BOOST_CHECK(!second.blocked_no_anchor);
+    BOOST_CHECK_EQUAL(second.selected.size(), size_t{2}); // the auxiliary input is not counted in max_inputs
+    BOOST_REQUIRE_EQUAL(second.auxiliary.size(), size_t{1});
+    for (const MigrationBatchInput& in : second.selected) BOOST_CHECK(!in.auxiliary);
+    BOOST_CHECK_EQUAL(second.estimated_weight, 600 * 2 + 4000);
+}
+
+BOOST_AUTO_TEST_CASE(max_inputs_one_still_finishes_with_an_auxiliary_output)
+{
+    std::vector<MigrationBatchInput> rest;
+    for (uint32_t i = 2; i <= 4; ++i) rest.push_back(Input(i, 900 + i, 600));
+    rest.push_back(Input(100, 5000, 4000, true, true));
+    size_t batches{0};
+    while (!rest.empty() && batches < 10) {
+        const MigrationBatchPlan plan = PlanMigrationBatch(rest, 1, 0, 100000, true);
+        BOOST_REQUIRE(!plan.blocked_no_anchor);
+        BOOST_REQUIRE_EQUAL(plan.selected.size(), size_t{1});
+        rest.erase(std::remove_if(rest.begin(), rest.end(), [&](const MigrationBatchInput& in) {
+            return !in.auxiliary && in.outpoint == plan.selected[0].outpoint;
+        }), rest.end());
+        ++batches;
+        if (std::all_of(rest.begin(), rest.end(), [](const MigrationBatchInput& in) { return in.auxiliary; })) break;
+    }
+    BOOST_CHECK_EQUAL(batches, size_t{3});
+}
+
+BOOST_AUTO_TEST_CASE(an_auxiliary_output_can_fund_a_tail_even_when_a_legacy_anchor_serves)
+{
+    std::vector<MigrationBatchInput> tail;
+    tail.push_back(Input(1, 3, 600, /*anchor=*/true)); // a few units: cannot pay its own fee
+    tail.push_back(Input(100, 50000000, 4000, true, true));
+    const MigrationBatchPlan plain = PlanMigrationBatch(tail, 5, 0, 100000, true);
+    BOOST_CHECK(plain.auxiliary.empty());
+    const MigrationBatchPlan funded = PlanMigrationBatch(tail, 5, 0, 100000, true, /*force_auxiliary=*/true);
+    BOOST_REQUIRE_EQUAL(funded.auxiliary.size(), size_t{1});
+    BOOST_CHECK_EQUAL(funded.selected.size(), size_t{1});
+    // An auxiliary input never makes up a plan on its own: it is not legacy value to move.
+    std::vector<MigrationBatchInput> only_aux{Input(100, 50000000, 4000, true, true)};
+    BOOST_CHECK(PlanMigrationBatch(only_aux, 5, 0, 100000, true).selected.empty());
+    // It still counts toward the weight budget.
+    BOOST_CHECK(PlanMigrationBatch(tail, 5, 0, 4500, true, true).auxiliary.empty() ||
+                PlanMigrationBatch(tail, 5, 0, 4500, true, true).estimated_weight <= 4500);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

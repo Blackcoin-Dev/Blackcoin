@@ -3276,7 +3276,19 @@ void StakingMiningPage::onMigrateLegacyToQuantum()
 
     m_quantum_address->setText(QString::fromStdString(result->address));
     const bool more_legacy = result->remaining_inputs > 0;
-    m_legacy_batch_destination = more_legacy ? QString::fromStdString(result->address) : QString();
+    const bool excluded_legacy = result->excluded_legacy_outputs > 0;
+    // Keep the address while anything is still to move, so a later click reuses it.
+    m_legacy_batch_destination = (more_legacy || excluded_legacy) ? QString::fromStdString(result->address) : QString();
+    const QString excluded_note = excluded_legacy
+        ? tr(" This was the last batch of the legacy outputs that can be moved now, but %1 legacy output(s) worth %2 could not be considered yet (not mature, locked or unconfirmed)%3. Move them with another click once they can be spent, and before the Final phase.")
+              .arg(result->excluded_legacy_outputs)
+              .arg(formatBLK(result->excluded_legacy_amount))
+              .arg(result->next_maturity_height > 0 ? tr("; the first matures at height %1").arg(result->next_maturity_height) : QString())
+        : QString();
+    const QString auxiliary_note = result->auxiliary_inputs > 0
+        ? tr(" (This batch also moved %1 quantum output(s) worth %2 that anchored and funded it; that is not legacy value.)")
+              .arg(result->auxiliary_inputs).arg(formatBLK(result->auxiliary_amount))
+        : QString();
     m_migration_action_status->setText(more_legacy
         ? tr("Batch broadcast: %1. Moved %2 from %3 input(s); fee %4. NOT everything has been moved: %5 legacy output(s) worth %6 remain. Click again to move the next batch, until none remain. Back up this wallet now.")
             .arg(QString::fromStdString(result->txid))
@@ -3285,11 +3297,14 @@ void StakingMiningPage::onMigrateLegacyToQuantum()
             .arg(formatBLK(result->fee))
             .arg(result->remaining_inputs)
             .arg(formatBLK(result->remaining_amount))
-        : tr("Migration broadcast: %1. Moved %2 from %3 input(s); fee %4. No legacy outputs remain to move in this wallet. Back up this wallet now.")
+        : (excluded_legacy
+            ? tr("Migration broadcast: %1. Moved %2 from %3 input(s); fee %4.")
+            : tr("Migration broadcast: %1. Moved %2 from %3 input(s); fee %4. No legacy outputs remain in this wallet. Back up this wallet now."))
             .arg(QString::fromStdString(result->txid))
             .arg(formatBLK(result->amount))
             .arg(result->selected_inputs)
             .arg(formatBLK(result->fee)));
+    m_migration_action_status->setText(m_migration_action_status->text() + auxiliary_note + excluded_note);
     m_force_full_refresh = true;
     updateStatus();
 }

@@ -2010,6 +2010,9 @@ util::Result<WalletQuantumActionTx> CreateQuantumMigrationSweep(
     CAmount fee{0};
     unsigned int total_eligible_inputs{0};
     std::optional<MigrationBatch> batch_result;
+    unsigned int excluded_legacy_outputs{0};
+    CAmount excluded_legacy_amount{0};
+    int64_t next_maturity_height{0};
     std::string comment;
     {
         LOCK2(::cs_main, wallet.cs_wallet);
@@ -2053,6 +2056,7 @@ util::Result<WalletQuantumActionTx> CreateQuantumMigrationSweep(
 
         const CCoinsViewCache& view = wallet.chain().chainman().ActiveChainstate().CoinsTip();
         unsigned int migration_anchor_inputs{0};
+        unsigned int migration_auxiliary_inputs{0};
         std::vector<MigrationBatchInput> candidates;
         std::map<COutPoint, CAmount> candidate_burn;
         for (const COutput& out : AvailableCoins(wallet, &coin_control, std::nullopt, filter).All()) {
@@ -2076,7 +2080,20 @@ util::Result<WalletQuantumActionTx> CreateQuantumMigrationSweep(
                 effective_value = eval.effective_value;
                 burned_value = eval.burned_value;
             } else {
-                if (IsQuantumMigrationScript(spk) || IsQuantumColdStakeScript(spk) || IsEUTXOScript(spk)) continue;
+                if (IsQuantumMigrationScript(spk)) {
+                    // A confirmed quantum output of the wallet can anchor and fund a later batch.
+                    const Coin& quantum_coin = view.AccessCoin(out.outpoint);
+                    if (out.spendable && IsQuantumWitnessSpendActive(consensus, mtp, next_height) &&
+                        IsMigrationAuxiliaryOutput(wallet, out.outpoint, out.txout, quantum_coin, consensus, mtp, next_height)) {
+                        const int quantum_vsize = CalculateMaximumSignedInputSize(out.txout, &wallet, &coin_control);
+                        candidates.push_back({out.outpoint, out.txout.nValue, out.txout.nValue,
+                                              quantum_vsize > 0 ? int64_t{quantum_vsize} * WITNESS_SCALE_FACTOR : int64_t{4000},
+                                              /*anchor=*/true, /*auxiliary=*/true});
+                        ++migration_auxiliary_inputs;
+                    }
+                    continue;
+                }
+                if (IsQuantumColdStakeScript(spk) || IsEUTXOScript(spk)) continue;
                 if (!out.spendable) continue;
                 const Coin& coin = view.AccessCoin(out.outpoint);
                 if (!coin.IsSpent() && IsWalletProtectedLineageInput(
@@ -2100,8 +2117,8 @@ util::Result<WalletQuantumActionTx> CreateQuantumMigrationSweep(
             return fail(failure);
         }
         const bool anchor_required = !goldrush_rewards_only && IsQuantumWitnessSpendActive(consensus, mtp, next_height);
-        if (anchor_required && migration_anchor_inputs == 0) {
-            return fail(_("This wallet's spendable legacy coins are witness-only and cannot create a fork-unique migration transaction. Add a small P2PKH or non-witness P2SH wallet UTXO as a migration anchor; during Gold Rush, prepare that anchor before quantum spending activates."));
+        if (anchor_required && migration_anchor_inputs == 0 && migration_auxiliary_inputs == 0) {
+            return fail(_("This wallet's spendable legacy coins are witness-only and cannot create a fork-unique migration transaction, and it has no confirmed quantum output to anchor them. If an earlier migration batch is still unconfirmed, wait for it to confirm. Otherwise add a small P2PKH or non-witness P2SH wallet UTXO as a migration anchor; during Gold Rush, prepare that anchor before quantum spending activates."));
         }
 
         const size_t batch_limit = max_inputs > 0
@@ -2119,6 +2136,15 @@ util::Result<WalletQuantumActionTx> CreateQuantumMigrationSweep(
                 ? _("Gold Rush reward consolidation would strand funds: selected value is below the dust threshold after fees.")
                 : _("Migration would strand funds: swept value is below the dust threshold after fees.");
             return fail(failure);
+        }
+        // Everything the sweep could not consider: not "eligible", but still legacy.
+        if (!goldrush_rewards_only) {
+            std::set<COutPoint> considered;
+            for (const MigrationBatchInput& c : candidates) considered.insert(c.outpoint);
+            const ExcludedLegacyOutputs excluded = FindExcludedLegacyOutputs(wallet, considered, consensus, next_height);
+            excluded_legacy_outputs = excluded.count;
+            excluded_legacy_amount = excluded.amount;
+            next_maturity_height = excluded.next_maturity_height;
         }
         batch_result = std::move(*batch);
         comment = !comment_override.empty()
@@ -2145,6 +2171,11 @@ util::Result<WalletQuantumActionTx> CreateQuantumMigrationSweep(
     result.total_eligible_inputs = total_eligible_inputs;
     result.remaining_inputs = static_cast<unsigned int>(batch_result->remaining_inputs);
     result.remaining_amount = batch_result->remaining_value;
+    result.excluded_legacy_outputs = excluded_legacy_outputs;
+    result.excluded_legacy_amount = excluded_legacy_amount;
+    result.next_maturity_height = next_maturity_height;
+    result.auxiliary_inputs = static_cast<unsigned int>(batch_result->auxiliary.size());
+    result.auxiliary_amount = batch_result->auxiliary_value;
     if (created_key) {
         result.warning = burned_amount > 0
             ? strprintf("A new ML-DSA quantum address was created. This consolidation realizes %s of scheduled demurrage. Back up this wallet.", FormatMoney(burned_amount))

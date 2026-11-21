@@ -1339,6 +1339,15 @@ struct WalletQuantumActionTx
     unsigned int total_eligible_inputs{0};
     unsigned int remaining_inputs{0};
     CAmount remaining_amount{0};
+    //! Legacy outputs this sweep could not consider (immature, locked, unconfirmed or not
+    //! spendable): "no remaining eligible inputs" is not "no legacy outputs remain".
+    unsigned int excluded_legacy_outputs{0};
+    CAmount excluded_legacy_amount{0};
+    //! First height at which an excluded immature output becomes spendable; 0 when none is waiting for maturity.
+    int64_t next_maturity_height{0};
+    //! Confirmed quantum outputs of this wallet used as anchor or fee source (value not counted as legacy moved).
+    unsigned int auxiliary_inputs{0};
+    CAmount auxiliary_amount{0};
     std::string warning;
 };
 

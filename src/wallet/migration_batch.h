@@ -5,7 +5,9 @@
 #ifndef BITCOIN_WALLET_MIGRATION_BATCH_H
 #define BITCOIN_WALLET_MIGRATION_BATCH_H
 
+#include <coins.h>
 #include <consensus/amount.h>
+#include <consensus/params.h>
 #include <policy/policy.h>
 #include <primitives/transaction.h>
 #include <util/result.h>
@@ -14,6 +16,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <set>
 #include <vector>
 
 namespace wallet {
@@ -45,28 +48,40 @@ struct MigrationBatchInput {
     int64_t input_weight{0};
     //! Whether the input can serve as the fork-unique migration anchor.
     bool anchor{false};
+    //! A confirmed protected quantum output of the wallet, not a legacy coin: it
+    //! serves as the anchor and as a fee source for a later batch when no legacy
+    //! anchor is left. Its value is accounted separately and never counts as
+    //! legacy value migrated or remaining.
+    bool auxiliary{false};
 };
 
 struct MigrationBatchPlan {
-    //! Chosen inputs in spend order.
+    //! Chosen legacy inputs in spend order.
     std::vector<MigrationBatchInput> selected;
+    //! The auxiliary quantum input, when one is used.
+    std::vector<MigrationBatchInput> auxiliary;
     int64_t estimated_weight{0};
-    //! True when an anchor is required, candidates exist, and none is an anchor.
+    //! True when an anchor is required, legacy candidates exist, and neither a
+    //! legacy anchor nor an auxiliary quantum input is available.
     bool blocked_no_anchor{false};
 };
 
 /**
  * Choose one bounded batch. Deterministic: candidates are ordered by value,
- * largest first, then by outpoint. At most max_inputs are taken and the fixed
- * weight plus the chosen input weights stay within weight_budget. When an
- * anchor is required, every batch holds one: the first anchor in order. The
- * rest of the batch is filled with non-anchors first so the anchors that are
- * left can serve the later batches; anchors fill remaining room only when
- * no non-anchor candidate is left.
+ * largest first, then by outpoint. At most max_inputs legacy inputs are taken
+ * (an auxiliary quantum input does not count toward it) and the fixed weight
+ * plus the chosen input weights stay within weight_budget. When an anchor is
+ * required, every batch holds one: the first legacy anchor in order, or, when
+ * no legacy anchor is left, the largest auxiliary quantum input. The rest of
+ * the batch is filled with non-anchors first so the anchors that are left can
+ * serve the later batches; anchors fill remaining room only when no non-anchor
+ * candidate is left. force_auxiliary adds the auxiliary input even when a
+ * legacy anchor serves, to fund a tail that cannot pay its own fee.
  */
 MigrationBatchPlan PlanMigrationBatch(std::vector<MigrationBatchInput> candidates,
                                       size_t max_inputs, int64_t fixed_weight,
-                                      int64_t weight_budget, bool require_anchor);
+                                      int64_t weight_budget, bool require_anchor,
+                                      bool force_auxiliary = false);
 
 struct MigrationBatch {
     CTransactionRef tx;
@@ -74,6 +89,9 @@ struct MigrationBatch {
     std::vector<COutPoint> selected;
     CAmount selected_value{0};
     CAmount selected_effective_value{0};
+    //! Auxiliary quantum inputs spent with the batch (their value reaches the destination too).
+    std::vector<COutPoint> auxiliary;
+    CAmount auxiliary_value{0};
     size_t total_inputs{0};
     CAmount total_value{0};
     size_t remaining_inputs{0};
@@ -93,6 +111,26 @@ util::Result<MigrationBatch> BuildMigrationBatch(CWallet& wallet, const CCoinCon
                                                  const CTxDestination& destination,
                                                  const std::vector<MigrationBatchInput>& candidates,
                                                  size_t max_inputs, bool require_anchor, bool sign)
+    EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet);
+
+/** True when out can be an auxiliary migration input: a confirmed, wallet-owned,
+ *  ordinary quantum output created after Gold Rush by a non-coinbase transaction
+ *  (so it carries protected lineage) and not a Gold Rush payout. */
+bool IsMigrationAuxiliaryOutput(const CWallet& wallet, const COutPoint& outpoint, const CTxOut& txout,
+                                const Coin& coin, const Consensus::Params& consensus,
+                                int64_t spend_time, int spend_height);
+
+/** Legacy outputs of the wallet that a sweep did not consider (immature, locked,
+ *  unconfirmed or not spendable). "No eligible inputs remain" is not "no legacy
+ *  outputs remain": these can become movable later, including in the last Migration block. */
+struct ExcludedLegacyOutputs {
+    unsigned int count{0};
+    CAmount amount{0};
+    //! First height at which an immature coinbase or coinstake output becomes spendable; 0 when none waits for maturity.
+    int64_t next_maturity_height{0};
+};
+ExcludedLegacyOutputs FindExcludedLegacyOutputs(const CWallet& wallet, const std::set<COutPoint>& considered,
+                                                const Consensus::Params& consensus, int next_height)
     EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet);
 
 /** Parse the optional max_inputs value: positive, at most the option maximum. */

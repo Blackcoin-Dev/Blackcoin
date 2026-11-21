@@ -744,6 +744,52 @@ BOOST_FIXTURE_TEST_CASE(the_return_address_is_set_automatically_only_when_fully_
     BOOST_CHECK(!MaybeAutoSetQuantumStakeReturn(*wallet)); // already set
 }
 
+// The preparation says what it did: nothing, reuse, creation or failure, and whether a key was made.
+BOOST_FIXTURE_TEST_CASE(the_return_address_preparation_distinguishes_reuse_creation_no_action_and_failure, LegacyStakeWindowSetup)
+{
+    using Outcome = QuantumStakeReturnPreparation::Outcome;
+    auto wallet = CreateSyncedWallet(*m_node.chain,
+        WITH_LOCK(Assert(m_node.chainman)->GetMutex(), return m_node.chainman->ActiveChain()), coinbaseKey);
+    // No quantum address and key creation not allowed: no action, no key, and it says why.
+    QuantumStakeReturnPreparation prep = PrepareQuantumStakeReturn(*wallet);
+    BOOST_CHECK(prep.outcome == Outcome::NO_ACTION);
+    BOOST_CHECK(!prep.key_created);
+    BOOST_CHECK(!prep.Saved());
+    BOOST_CHECK(!prep.detail.empty());
+
+    // Key creation allowed: a key is created, saved, and reported as created.
+    gArgs.ForceSetArg("-qqallowautokeycreation", "1");
+    prep = PrepareQuantumStakeReturn(*wallet);
+    gArgs.ForceSetArg("-qqallowautokeycreation", "0");
+    BOOST_CHECK(prep.outcome == Outcome::CREATED_ADDRESS);
+    BOOST_CHECK(prep.key_created);
+    BOOST_CHECK(prep.Saved());
+    BOOST_CHECK_EQUAL(WITH_LOCK(wallet->cs_wallet, return wallet->m_quantum_stake_return), prep.address);
+
+    // Set already: no action, the saved address is reported, nothing created.
+    const std::string saved = prep.address;
+    prep = PrepareQuantumStakeReturn(*wallet);
+    BOOST_CHECK(prep.outcome == Outcome::NO_ACTION);
+    BOOST_CHECK(!prep.key_created);
+    BOOST_CHECK_EQUAL(prep.address, saved);
+
+    // A second wallet with an existing quantum address reuses it: reused, nothing created.
+    auto other = CreateSyncedWallet(*m_node.chain,
+        WITH_LOCK(Assert(m_node.chainman)->GetMutex(), return m_node.chainman->ActiveChain()), coinbaseKey);
+    const auto quantum = other->GetNewQuantumDestination("receive");
+    BOOST_REQUIRE(quantum);
+    prep = PrepareQuantumStakeReturn(*other);
+    BOOST_CHECK(prep.outcome == Outcome::REUSED_ADDRESS);
+    BOOST_CHECK(!prep.key_created);
+    BOOST_CHECK_EQUAL(prep.address, EncodeDestination(*quantum));
+
+    // A staking-only unlock: no action.
+    auto limited = CreateSyncedWallet(*m_node.chain,
+        WITH_LOCK(Assert(m_node.chainman)->GetMutex(), return m_node.chainman->ActiveChain()), coinbaseKey);
+    limited->m_wallet_unlock_staking_only = true;
+    BOOST_CHECK(PrepareQuantumStakeReturn(*limited).outcome == Outcome::NO_ACTION);
+}
+
 BOOST_FIXTURE_TEST_CASE(a_coinbase_exactly_maturity_deep_is_a_candidate_for_the_next_block, LegacyStakeOpenSetup)
 {
     auto wallet = CreateSyncedWallet(*m_node.chain,

@@ -750,7 +750,10 @@ void AddLegacyStakeReturnStatus(UniValue& obj, const CWallet& wallet, const Cons
         LOCK(wallet.cs_wallet);
         quantum_return = ResolveLegacyStakeQuantumReturn(wallet);
     }
-    const bool in_window = next_height > *last;
+    // The window runs from the first return height through the last Migration block. At the first Final
+    // block legacy kernels are rejected, so legacy staking has stopped whatever the return address says.
+    const bool final_started = next_height > int64_t{consensus.nQuantumMigrationEndHeight};
+    const bool in_window = next_height > *last && !final_started;
     obj.pushKV("legacy_staking_window_start_height", *last + 1);
     obj.pushKV("legacy_staking_in_window", in_window);
     obj.pushKV("legacy_staking_pays_quantum", true);
@@ -762,8 +765,8 @@ void AddLegacyStakeReturnStatus(UniValue& obj, const CWallet& wallet, const Cons
     } else {
         obj.pushKV("legacy_stake_return_action", quantum_return.reason);
     }
-    // Legacy staking is stopped only while it is in the window without a ready return address.
-    obj.pushKV("legacy_staking_stopped", in_window && !quantum_return.available);
+    // Stopped in the window without a ready return address, and always once Final has started.
+    obj.pushKV("legacy_staking_stopped", final_started || (in_window && !quantum_return.available));
     const std::string notice = LegacyStakingNotice(consensus, static_cast<int>(next_height), quantum_return);
     if (!notice.empty()) obj.pushKV("legacy_staking_notice", notice);
 }
@@ -773,7 +776,9 @@ static RPCHelpMan setquantumstakereturn()
     return RPCHelpMan{"setquantumstakereturn",
         "\nChoose the quantum address that receives the principal and reward of a legacy stake made in the last blocks of\n"
         "the Migration phase (see legacy_staking_window_start_height in getstakinginfo). From that height a legacy stake\n"
-        "could not mature before the Final phase, so it is paid to this address instead and leaves as quantum coins.\n"
+        "would reach maturity only in the last Migration block (the first window height, kept as a margin) or after it, so\n"
+        "it is paid to this address instead and leaves as quantum coins. The first such quantum output can stake again in\n"
+        "the last Migration block; one made a block later, from the first Final block on.\n"
         "The address must already be an ordinary quantum address of this wallet, or be created here with\n"
         "allow_new_quantum_key (needs a normal unlock). A wallet unlocked for staking only cannot create a key,\n"
         "so set the address before the window starts. With no address and no key creation, an existing quantum\n"
@@ -809,7 +814,16 @@ static RPCHelpMan setquantumstakereturn()
     if (!existing.empty()) {
         dest = DecodeDestination(existing);
     } else {
-        if (MaybeAutoSetQuantumStakeReturn(*pwallet)) {
+        const QuantumStakeReturnPreparation prep = PrepareQuantumStakeReturn(*pwallet);
+        // A key the automatic path made counts as created, even when it did not finish: it needs a backup.
+        if (prep.key_created) created = true;
+        if (prep.key_created && !prep.Saved()) {
+            throw JSONRPCError(RPC_WALLET_ERROR, strprintf(
+                "A new ML-DSA key was created for the stake return address (%s) but the address could not be saved: %s. "
+                "The key stays in the wallet database: back up the wallet now, then retry with existing_address set to it.",
+                prep.address, prep.detail));
+        }
+        if (prep.Saved()) {
             LOCK(pwallet->cs_wallet);
             dest = DecodeDestination(pwallet->m_quantum_stake_return);
         } else {
@@ -1017,11 +1031,11 @@ static RPCHelpMan getstakinginfo()
                         {RPCResult::Type::BOOL, "legacy_staking_scheduled", "Whether the chain has a height-authoritative Migration end, so that a last height for legacy staking is known"},
                         {RPCResult::Type::NUM, "legacy_staking_last_height", /*optional=*/true, "Last block height at which this wallet still creates a legacy coinstake. Later legacy stakes could not mature before the Final phase and would be lost, so the wallet stops. Quantum staking is not affected."},
                         {RPCResult::Type::NUM, "legacy_staking_blocks_remaining", /*optional=*/true, "Blocks left, counting the next block, at which legacy staking is still allowed; 0 once it has stopped"},
-                        {RPCResult::Type::BOOL, "legacy_staking_stopped", /*optional=*/true, "Whether legacy staking has already stopped at the next block height"},
+                        {RPCResult::Type::BOOL, "legacy_staking_stopped", /*optional=*/true, "Whether legacy staking has already stopped at the next block height: in the window without a ready return address, and always once the first Final block is next (legacy kernels are rejected there, whatever the return address)"},
                         {RPCResult::Type::NUM, "legacy_migration_end_height", /*optional=*/true, "Last Migration block; legacy coins cannot be spent from the next height on"},
                         {RPCResult::Type::STR, "legacy_staking_notice", /*optional=*/true, "Plain-language notice: from legacy_staking_window_start_height legacy stakes are paid to a quantum address of this wallet, whether that return address is ready, what to do if not, and the need to migrate legacy coins that do not stake before Final"},
                         {RPCResult::Type::NUM, "legacy_staking_window_start_height", /*optional=*/true, "First block height at which a legacy stake is paid to a quantum address instead of a legacy one"},
-                        {RPCResult::Type::BOOL, "legacy_staking_in_window", /*optional=*/true, "Whether the next block is already inside that window"},
+                        {RPCResult::Type::BOOL, "legacy_staking_in_window", /*optional=*/true, "Whether the next block is already inside that window; the window ends with the last Migration block"},
                         {RPCResult::Type::BOOL, "legacy_staking_pays_quantum", /*optional=*/true, "Always true when a schedule exists: legacy stakes in the window are paid to a quantum address"},
                         {RPCResult::Type::BOOL, "legacy_stake_return_ready", /*optional=*/true, "Whether a usable quantum stake return address is saved in this wallet"},
                         {RPCResult::Type::STR, "legacy_stake_return_address", /*optional=*/true, "The saved quantum stake return address, when ready"},

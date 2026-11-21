@@ -2085,9 +2085,14 @@ std::string LegacyStakingNotice(const Consensus::Params& consensus, int next_hei
     }
     std::string ready;
     if (quantum_return.available) {
+        // A return made at height h can stake again at h + maturity. The first return (made at first_quantum,
+        // which is the last Migration block minus the maturity) can stake in the last Migration block; one made
+        // a block later only from the first Final block on.
         ready = strprintf("Return address READY: %s. Legacy coins that stake in the window leave as quantum coins, which "
-                          "cannot stake again until they are %d blocks old (so not inside the window).",
-                          quantum_return.address, consensus.nCoinbaseMaturity);
+                          "can stake again when they are %d blocks old: the first one (made at height %d) in the last Migration "
+                          "block (%d), any later one from the first Final block (%d) on.",
+                          quantum_return.address, consensus.nCoinbaseMaturity, first_quantum,
+                          int64_t{consensus.nQuantumMigrationEndHeight}, final_height);
         if (!quantum_return.backup_verified) ready += " " + QuantumStakeReturnBackupAction();
     } else {
         ready = strprintf("Return address NOT READY: %s Until it is, this wallet will not stake legacy coins from height %d.",
@@ -2192,19 +2197,33 @@ bool SetQuantumStakeReturn(CWallet& wallet, const CTxDestination& dest, bilingua
     return true;
 }
 
-bool MaybeAutoSetQuantumStakeReturn(CWallet& wallet)
+QuantumStakeReturnPreparation PrepareQuantumStakeReturn(CWallet& wallet)
 {
+    using Outcome = QuantumStakeReturnPreparation::Outcome;
+    QuantumStakeReturnPreparation prep;
     const Consensus::Params& consensus = Params().GetConsensus();
-    if (!LastLegacyStakeHeight(consensus)) return false;
+    if (!LastLegacyStakeHeight(consensus)) {
+        prep.detail = "no height-authoritative Migration schedule";
+        return prep;
+    }
     if (wallet.IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS) || wallet.IsLocked() ||
         wallet.m_wallet_unlock_staking_only) {
-        return false;
+        prep.detail = "the wallet cannot create or choose a key in its current unlock state";
+        return prep;
     }
-    if (WITH_LOCK(wallet.cs_wallet, return wallet.GetLastBlockHeight()) + 1 > consensus.nQuantumMigrationEndHeight) return false;
+    if (WITH_LOCK(wallet.cs_wallet, return wallet.GetLastBlockHeight()) + 1 > consensus.nQuantumMigrationEndHeight) {
+        prep.detail = "the window has passed";
+        return prep;
+    }
     CTxDestination chosen;
     {
         LOCK(wallet.cs_wallet);
-        if (ResolveLegacyStakeQuantumReturn(wallet).available) return false;
+        const LegacyStakeQuantumReturn current = ResolveLegacyStakeQuantumReturn(wallet);
+        if (current.available) {
+            prep.address = current.address;
+            prep.detail = "a quantum stake return address is already saved";
+            return prep;
+        }
         const std::vector<std::string> configured = gArgs.GetArgs("-qqpospayoutaddress");
         if (configured.size() == 1) {
             const CTxDestination dest = DecodeDestination(configured.front());
@@ -2222,27 +2241,50 @@ bool MaybeAutoSetQuantumStakeReturn(CWallet& wallet)
             if (const auto pick = ChooseLegacyStakeQuantumReturn(candidates)) chosen = *pick;
         }
     }
+    // The wallet lock is not held from here: key generation and the database writes below take
+    // the locks they need themselves.
+    bool created_key{false};
     if (!IsValidDestination(chosen)) {
         // The existing key-creation policy decides whether a new key may exist.
-        if (!gArgs.GetBoolArg("-qqallowautokeycreation", DEFAULT_ALLOW_AUTO_QUANTUM_KEY_CREATION)) return false;
+        if (!gArgs.GetBoolArg("-qqallowautokeycreation", DEFAULT_ALLOW_AUTO_QUANTUM_KEY_CREATION)) {
+            prep.detail = "no quantum address to reuse and automatic key creation is not allowed";
+            return prep;
+        }
         CScript script;
         std::string address;
         bilingual_str error;
-        if (!wallet.EnsureShadowSignalPayoutAddress(script, address, error)) {
+        bool created{false};
+        if (!wallet.EnsureShadowSignalPayoutAddress(script, address, error, &created)) {
             wallet.WalletLogPrintf("Quantum stake return address not created: %s\n", error.original);
-            return false;
+            prep.outcome = Outcome::FAILED;
+            prep.detail = error.original;
+            return prep;
         }
-        wallet.WalletLogPrintf("Created quantum stake address %s for legacy stakes paid as quantum coins. Back up the wallet.\n", address);
+        created_key = created;
+        prep.key_created = created;
+        if (created) {
+            wallet.WalletLogPrintf("Created quantum stake address %s for legacy stakes paid as quantum coins. Back up the wallet.\n", address);
+        }
         chosen = DecodeDestination(address);
     }
     bilingual_str error;
     if (!SetQuantumStakeReturn(wallet, chosen, error)) {
         wallet.WalletLogPrintf("Quantum stake return address not set: %s\n", error.original);
-        return false;
+        prep.outcome = Outcome::FAILED;
+        prep.address = EncodeDestination(chosen);
+        prep.detail = error.original;
+        return prep;
     }
     wallet.WalletLogPrintf("Quantum stake return address set to %s: legacy stakes in the last %d blocks of Migration are paid there.\n",
                            EncodeDestination(chosen), consensus.nCoinbaseMaturity + LEGACY_STAKE_MIGRATION_MARGIN_BLOCKS);
-    return true;
+    prep.outcome = created_key ? Outcome::CREATED_ADDRESS : Outcome::REUSED_ADDRESS;
+    prep.address = EncodeDestination(chosen);
+    return prep;
+}
+
+bool MaybeAutoSetQuantumStakeReturn(CWallet& wallet)
+{
+    return PrepareQuantumStakeReturn(wallet).Saved();
 }
 
 /**

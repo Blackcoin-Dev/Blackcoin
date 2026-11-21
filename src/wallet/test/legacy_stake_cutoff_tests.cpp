@@ -99,7 +99,10 @@ BOOST_AUTO_TEST_CASE(notice_names_the_window_the_return_address_and_the_migratio
     BOOST_CHECK(notice.find("READY: bcrt1exampleaddress") != std::string::npos);
     BOOST_CHECK(notice.find("height 261") != std::string::npos);
     BOOST_CHECK(notice.find("never win a stake stay legacy: migrate") != std::string::npos);
-    BOOST_CHECK(notice.find("cannot stake again until they are 10 blocks old") != std::string::npos);
+    // N1: the first return (made at height 250 = M - maturity) can stake in the last Migration block (260);
+    // a later one only from the first Final block (261). The notice must not say none can stake in the window.
+    BOOST_CHECK(notice.find("can stake again when they are 10 blocks old: the first one (made at height 250) in the last Migration block (260), any later one from the first Final block (261) on") != std::string::npos);
+    BOOST_CHECK(notice.find("so not inside the window") == std::string::npos);
 
     // N1: the margin block is described as a margin, not as impossible. A stake at 250 (M - maturity)
     // matures in the last Migration block; only from 251 on can it not mature before Final.

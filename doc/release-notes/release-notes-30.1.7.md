@@ -31,9 +31,10 @@ and earlier.
   instead (the quantum stake return address), with nothing else of value in the coinstake and no
   stake split or donation output. The legacy key still signs the block, in the usual zero-value
   output, so every released version accepts these blocks; no consensus rule changes. The stake
-  weight shown matches. The quantum output cannot stake again until it is 500 blocks old, so not
-  inside the window, and legacy coins that never win a stake stay legacy and must still be migrated
-  before Final. The return address is saved in the wallet (a new `quantumstakereturn` record that
+  weight shown matches. A quantum return can stake again when it is 500 blocks old: the first one
+  (made at height 6,921,499) in the last Migration block (6,921,999), any later one from the first
+  Final block (6,922,000) on. Legacy coins that never win a stake stay legacy and must still be
+  migrated before Final. The return address is saved in the wallet (a new `quantumstakereturn` record that
   older versions skip). A fully unlocked wallet picks it by itself from an existing quantum address
   (or, only with `-qqallowautokeycreation`, makes one); `setquantumstakereturn` sets it explicitly.
   A wallet unlocked for staking only cannot create a key, so the address must exist before the

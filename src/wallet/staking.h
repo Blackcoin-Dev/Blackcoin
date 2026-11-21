@@ -104,11 +104,34 @@ LegacyStakeQuantumReturn ResolveLegacyStakeQuantumReturn(const CWallet& wallet)
  *  older versions skip it). The address must pass the same checks as above. */
 bool SetQuantumStakeReturn(CWallet& wallet, const CTxDestination& dest, bilingual_str& error);
 
+/** What an automatic preparation of the quantum stake return address did. */
+struct QuantumStakeReturnPreparation
+{
+    enum class Outcome {
+        NO_ACTION,       //!< nothing to do or not allowed now (no schedule, locked, staking-only, past the window, already set)
+        REUSED_ADDRESS,  //!< an address the wallet already had was chosen and saved
+        CREATED_ADDRESS, //!< a new quantum key was created and its address saved
+        FAILED,          //!< an attempt was made and did not complete
+    };
+    Outcome outcome{Outcome::NO_ACTION};
+    //! The address saved (REUSED_ADDRESS, CREATED_ADDRESS) or the one already saved (NO_ACTION because it was set).
+    std::string address;
+    //! A new quantum key was generated and persisted by this call, whatever happened afterwards (a FAILED
+    //! preparation can still leave a key behind that needs a backup).
+    bool key_created{false};
+    //! Why NO_ACTION or FAILED, when known.
+    std::string detail;
+    bool Saved() const { return outcome == Outcome::REUSED_ADDRESS || outcome == Outcome::CREATED_ADDRESS; }
+};
+
 /** When the wallet is fully unlocked (or unencrypted), has no valid return
  *  address and a height schedule exists: set one. An existing wallet-owned
  *  quantum address is reused (-qqpospayoutaddress first); a key is created only
  *  when the existing policy allows it (-qqallowautokeycreation). Never creates
- *  a key otherwise. Call outside cs_main. Returns true when a address was set. */
+ *  a key otherwise. Call outside cs_main and cs_wallet. The result tells reuse,
+ *  creation, no action and failure apart. */
+QuantumStakeReturnPreparation PrepareQuantumStakeReturn(CWallet& wallet);
+/** PrepareQuantumStakeReturn(wallet).Saved(). */
 bool MaybeAutoSetQuantumStakeReturn(CWallet& wallet);
 
 struct BoundedLegacyStakeCandidate

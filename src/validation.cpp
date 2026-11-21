@@ -681,6 +681,60 @@ static bool CheckInputsFromMempoolAndCache(const CTransaction& tx, TxValidationS
     return CheckInputScripts(tx, state, view, flags, /* cacheSigStore= */ true, /* cacheFullScriptStore= */ true, txdata);
 }
 
+bool IsQuantumLifecycleGateRejectReason(const std::string& reject_reason)
+{
+    // Exactly the explicit phase gates. quantum-output-downgrade, the tier and
+    // covenant rules, attestation rules and bad-goldrush-payout-marker are not
+    // phase gates and stay punitive.
+    static const std::set<std::string> gate_reasons{
+        "legacy-spend-disabled",
+        "legacy-output-disabled",
+        "blackcoin-migration-spend-premature",
+        "goldrush-payout-spend-premature",
+        "quantum-lineage-anchor-required",
+        "quantum-tier-output-premature",
+        "unsupported-nested-witness-spend",
+        "unsupported-witness-v1-spend",
+        "unsupported-witness-v1-output",
+        "unknown-quantum-witness-spend",
+        "unknown-quantum-witness-output",
+        "eutxo-spend-disabled",
+        "eutxo-output-disabled",
+    };
+    return gate_reasons.count(reject_reason) != 0;
+}
+
+bool DemurrageRejectionDependsOnNextBlock(const CTransaction& tx, const CCoinsViewCache& inputs,
+                                          const CBlockIndex& tip, const Consensus::Params& consensus_params,
+                                          const std::string& reject_reason)
+{
+    if (reject_reason != "bad-txns-in-belowout" && reject_reason != "bad-txns-spends-locked-coin") return false;
+    if (tx.IsCoinBase() || !inputs.HaveInputs(tx)) return false;
+    // The state one block earlier: spend height of the tip, demurrage time of
+    // the tip's parent (the next block uses the tip's own median time past).
+    if (!tip.pprev) return false;
+    const int prior_height = tip.nHeight;
+    const int64_t prior_time = tip.pprev->GetMedianTimePast();
+    CAmount value_in{0};
+    for (const CTxIn& txin : tx.vin) {
+        const Coin& coin = inputs.AccessCoin(txin.prevout);
+        if (coin.IsSpent() || !MoneyRange(coin.out.nValue)) return false;
+        const std::optional<Consensus::DemurrageAttestationState> latest_attestation =
+            Consensus::LatestDemurrageAttestationStateForScript(inputs, coin.out.scriptPubKey);
+        const Consensus::DemurrageEvaluation eval = Consensus::EvaluateDemurrage(
+            coin, consensus_params, prior_height, prior_time,
+            latest_attestation ? std::optional<int>{latest_attestation->height} : std::nullopt,
+            latest_attestation ? std::optional<int>{static_cast<int>(latest_attestation->coverage_start_height)} : std::nullopt);
+        if (eval.locked) return false;
+        if (!MoneyRange(eval.effective_value)) return false;
+        value_in += eval.effective_value;
+        if (!MoneyRange(value_in)) return false;
+    }
+    if (reject_reason == "bad-txns-spends-locked-coin") return true;
+    if (tx.IsCoinStake()) return false;
+    return value_in >= tx.GetValueOut();
+}
+
 namespace {
 
 class MemPoolAccept
@@ -894,6 +948,13 @@ private:
     // Run the script checks using our policy flags. As this can be slow, we should
     // only invoke this on transactions that have otherwise passed policy checks.
     bool PolicyScriptChecks(const ATMPArgs& args, Workspace& ws) EXCLUSIVE_LOCKS_REQUIRED(cs_main, m_pool.cs);
+
+    /** After CheckInputScripts failed with TX_CONSENSUS, reclassify (mempool
+     * only) the failures that only the phase of the next block caused: an
+     * explicit lifecycle gate reason, or a missing SIGHASH_FORKID that the
+     * same input scripts pass without the FORKID requirement. */
+    void ClassifyLifecycleScriptFailure(const CTransaction& tx, TxValidationState& state,
+                                        unsigned int script_verify_flags) EXCLUSIVE_LOCKS_REQUIRED(cs_main, m_pool.cs);
 
     // Re-run the script checks, using consensus flags, and try to cache the
     // result in the scriptcache. This should be done after
@@ -1163,6 +1224,14 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
     if (!CheckQuantumQuasarTransaction(tx, m_view, script_verify_flags, next_height,
                                        consensus, next_block_mtp,
                                        quantum_reject_reason)) {
+        // A phase gate refusal depends on which block comes next, so a peer
+        // that relayed a transaction valid one block earlier is not
+        // misbehaving. Mempool acceptance only: blocks keep the strict result.
+        if (IsQuantumLifecycleGateRejectReason(quantum_reject_reason)) {
+            return state.Invalid(TxValidationResult::TX_RECENT_CONSENSUS_CHANGE, quantum_reject_reason,
+                                 "the rules for this phase of the Quantum Quasar lifecycle changed at the last block; "
+                                 "this transaction was built for an earlier phase and must be created again");
+        }
         return state.Invalid(TxValidationResult::TX_CONSENSUS, quantum_reject_reason);
     }
     const std::vector<Consensus::DemurrageAttestation> demurrage_attestations =
@@ -1231,7 +1300,17 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
     // The mempool holds txs for the next block, so pass height+1 to CheckTxInputs
     if (!Consensus::CheckTxInputs(tx, state, m_view, m_active_chainstate.m_chain.Height() + 1,
                                   next_block_spend_time, next_block_mtp, ws.m_base_fees)) {
-        return false; // state filled in by CheckTxInputs
+        // state filled in by CheckTxInputs. A value or locked-coin failure that
+        // the demurrage state of the next block alone caused is not evidence
+        // against the relaying peer (mempool acceptance only).
+        const std::string input_reject_reason{state.GetRejectReason()};
+        if (state.GetResult() == TxValidationResult::TX_CONSENSUS && tip &&
+            DemurrageRejectionDependsOnNextBlock(tx, m_view, *tip, consensus, input_reject_reason)) {
+            return state.Invalid(TxValidationResult::TX_RECENT_CONSENSUS_CHANGE, input_reject_reason,
+                                 "demurrage changed the spendable value of an input at the last block; "
+                                 "this transaction must be created again");
+        }
+        return false;
     }
 
     // Blackcoin: Minimum fee check
@@ -1437,6 +1516,52 @@ bool MemPoolAccept::PackageMempoolChecks(const std::vector<CTransactionRef>& txn
    return true;
 }
 
+/** Blocks after the last Gold Rush block in which a transaction signed
+ * without FORKID is still treated as an honest stale relay. */
+static constexpr int FORKID_STALE_RELAY_WINDOW_BLOCKS{720};
+
+void MemPoolAccept::ClassifyLifecycleScriptFailure(const CTransaction& tx, TxValidationState& state,
+                                                   unsigned int script_verify_flags)
+{
+    AssertLockHeld(cs_main);
+    AssertLockHeld(m_pool.cs);
+    if (state.GetResult() != TxValidationResult::TX_CONSENSUS) return;
+
+    const std::string reject_reason{state.GetRejectReason()};
+    if (IsQuantumLifecycleGateRejectReason(reject_reason)) {
+        state.Invalid(TxValidationResult::TX_RECENT_CONSENSUS_CHANGE, reject_reason,
+                      "the rules for this phase of the Quantum Quasar lifecycle changed at the last block; "
+                      "this transaction was built for an earlier phase and must be created again");
+        return;
+    }
+
+    // Missing SIGHASH_FORKID. From the first block after Gold Rush every
+    // legacy signature must carry the FORKID flag. A node that relays a
+    // transaction signed before that point is not misbehaving, so look only
+    // for a failure that the FORKID requirement alone causes: the same input
+    // scripts, with every other flag unchanged, pass without it. A bad
+    // signature, a malformed encoding or any other failure also fails this
+    // check and stays punitive.
+    if (!(script_verify_flags & SCRIPT_ENABLE_SIGHASH_FORKID)) return;
+    if (reject_reason.rfind("mandatory-script-verify-flag-failed", 0) != 0) return;
+    const CBlockIndex* tip = m_active_chainstate.m_chain.Tip();
+    const Consensus::Params& consensus = m_active_chainstate.m_chainman.GetConsensus();
+    if (!tip) return;
+    if (consensus.nGoldRushEndHeight > 0 &&
+        tip->nHeight + 1 > consensus.nGoldRushEndHeight + FORKID_STALE_RELAY_WINDOW_BLOCKS) {
+        return;
+    }
+    TxValidationState diagnostic_state;
+    PrecomputedTransactionData diagnostic_txdata; // fresh: CheckInputScripts sets the FORKID domain from the flags
+    if (!CheckInputScripts(tx, diagnostic_state, m_view, script_verify_flags & ~SCRIPT_ENABLE_SIGHASH_FORKID,
+                           /*cacheSigStore=*/false, /*cacheFullScriptStore=*/false, diagnostic_txdata)) {
+        return; // fails without FORKID too, or a local verifier error: keep the original result
+    }
+    state.Invalid(TxValidationResult::TX_RECENT_CONSENSUS_CHANGE, reject_reason,
+                  "this transaction is signed in the format used before the Quantum Quasar migration; "
+                  "signatures must now include the FORKID flag, so sign it again with a current wallet");
+}
+
 bool MemPoolAccept::PolicyScriptChecks(const ATMPArgs& args, Workspace& ws)
 {
     AssertLockHeld(cs_main);
@@ -1459,6 +1584,7 @@ bool MemPoolAccept::PolicyScriptChecks(const ATMPArgs& args, Workspace& ws)
             state.Invalid(TxValidationResult::TX_WITNESS_STRIPPED,
                     state.GetRejectReason(), state.GetDebugMessage());
         }
+        ClassifyLifecycleScriptFailure(tx, state, scriptVerifyFlags);
         return false; // state filled in by CheckInputScripts
     }
 

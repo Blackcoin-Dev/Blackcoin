@@ -162,6 +162,21 @@ bool CheckQuantumQuasarTransaction(const CTransaction& tx, const CCoinsViewCache
                                    unsigned int flags, int spend_height,
                                    const Consensus::Params& consensus_params,
                                    int64_t spend_time, std::string& reject_reason);
+/** True when a Quantum Quasar rejection reason names a lifecycle gate: the
+ * transaction is refused only because of the phase the next block is in (too
+ * early or too late for this kind of spend or output). Mempool acceptance
+ * reports such a rejection as TX_RECENT_CONSENSUS_CHANGE so a peer that relays
+ * a transaction that was valid one block earlier is not punished. Block
+ * validation never uses this and stays exactly as strict. */
+bool IsQuantumLifecycleGateRejectReason(const std::string& reject_reason);
+/** Mempool only. Called after Consensus::CheckTxInputs rejected a transaction
+ * with bad-txns-in-belowout or bad-txns-spends-locked-coin. Returns true when
+ * the transaction would have passed the same checks one block earlier (spend
+ * height and demurrage time of the current tip), meaning only the demurrage
+ * state of the next block made it fail. */
+bool DemurrageRejectionDependsOnNextBlock(const CTransaction& tx, const CCoinsViewCache& inputs,
+                                          const CBlockIndex& tip, const Consensus::Params& consensus_params,
+                                          const std::string& reject_reason);
 bool CheckInputScripts(const CTransaction& tx, TxValidationState& state,
                        const CCoinsViewCache& inputs, unsigned int flags,
                        bool cacheSigStore, bool cacheFullScriptStore,

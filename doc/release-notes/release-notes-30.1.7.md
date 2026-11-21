@@ -246,7 +246,8 @@ operator can see before the last Gold Rush block (height 6,192,999), in plain la
   `setquantumstakereturn` and the `legacy_*` status fields are available before the end. The
   readiness report is read-only and short: 0.01 to 0.05 seconds on a wallet with 20,000 legacy
   outputs, and 0.07 seconds (0.12 seconds once demurrage is active) on a wallet with 20,000 quantum
-  outputs, holding the same locks as the neighbouring status commands, which take longer.
+  outputs. It holds the chain and wallet locks for that time, which is shorter than
+  `getdemurragewalletinfo` takes on the same wallet (0.2 to 0.27 seconds), so it is not sliced.
 - **A backup prompt appears for the return key** once one is selected (by the explicit command
   before the end, by the wallet itself after it). It never blocks staking.
 - **Automatic Gold Rush signal and attestation rescans** react to competing blocks at the same
@@ -269,7 +270,7 @@ operator can see before the last Gold Rush block (height 6,192,999), in plain la
 
 - **Quantum transaction hex without the witness.** `getrawtransaction` and `gettransaction` return
   the transaction without its witness under the default `-rpcserialversion=0`, so the hex of a
-  quantum transaction (about 137 bytes for a one-input transaction against about 3,900 with the
+  quantum transaction (about 137 bytes for a one-input transaction against about 3,880 with the
   witness) is not broadcastable as returned. This predates 30.1.7. Start the node with
   `-rpcserialversion=1` to get witness-inclusive hex; the `send` family already returns the full
   signed form. The default is not changed in this release.

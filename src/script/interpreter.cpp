@@ -254,7 +254,7 @@ bool CheckSignatureEncoding(const std::vector<unsigned char> &vchSig, unsigned i
     // semantics: 0x40 is not a defined base type under STRICTENC, but blocks
     // validated without STRICTENC may contain a correctly signed raw 0x41.
     if (forkid_enabled && !signature_has_forkid) {
-        return set_error(serror, SCRIPT_ERR_SIG_HASHTYPE);
+        return set_error(serror, SCRIPT_ERR_SIG_FORKID_MISSING);
     }
 
     return true;

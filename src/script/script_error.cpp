@@ -56,6 +56,7 @@ std::string ScriptErrorString(const ScriptError serror)
         case SCRIPT_ERR_UNSATISFIED_LOCKTIME:
             return "Locktime requirement not satisfied";
         case SCRIPT_ERR_SIG_HASHTYPE:
+        case SCRIPT_ERR_SIG_FORKID_MISSING:
             return "Signature hash type missing or not understood";
         case SCRIPT_ERR_SIG_DER:
             return "Non-canonical DER signature";

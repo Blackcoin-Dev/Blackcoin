@@ -687,31 +687,39 @@ bool IsQuantumLifecycleGateRejectReason(const std::string& reject_reason)
     // covenant rules, attestation rules and bad-goldrush-payout-marker are not
     // phase gates and stay punitive.
     static const std::set<std::string> gate_reasons{
-        "legacy-spend-disabled",
-        "legacy-output-disabled",
-        "blackcoin-migration-spend-premature",
-        "goldrush-payout-spend-premature",
-        "quantum-lineage-anchor-required",
-        "quantum-tier-output-premature",
-        "unsupported-nested-witness-spend",
-        "unsupported-witness-v1-spend",
-        "unsupported-witness-v1-output",
-        "unknown-quantum-witness-spend",
-        "unknown-quantum-witness-output",
-        "eutxo-spend-disabled",
-        "eutxo-output-disabled",
+        quantum_reject::LEGACY_SPEND_DISABLED,
+        quantum_reject::LEGACY_OUTPUT_DISABLED,
+        quantum_reject::MIGRATION_SPEND_PREMATURE,
+        quantum_reject::GOLDRUSH_PAYOUT_SPEND_PREMATURE,
+        quantum_reject::LINEAGE_ANCHOR_REQUIRED,
+        quantum_reject::TIER_OUTPUT_PREMATURE,
+        quantum_reject::NESTED_WITNESS_SPEND,
+        quantum_reject::WITNESS_V1_SPEND,
+        quantum_reject::WITNESS_V1_OUTPUT,
+        quantum_reject::UNKNOWN_WITNESS_SPEND,
+        quantum_reject::UNKNOWN_WITNESS_OUTPUT,
+        quantum_reject::EUTXO_SPEND_DISABLED,
+        quantum_reject::EUTXO_OUTPUT_DISABLED,
     };
     return gate_reasons.count(reject_reason) != 0;
 }
 
 bool DemurrageRejectionDependsOnNextBlock(const CTransaction& tx, const CCoinsViewCache& inputs,
                                           const CBlockIndex& tip, const Consensus::Params& consensus_params,
-                                          const std::string& reject_reason)
+                                          const std::string& reject_reason, int64_t fee_time)
 {
-    if (reject_reason != "bad-txns-in-belowout" && reject_reason != "bad-txns-spends-locked-coin") return false;
+    if (reject_reason != Consensus::REJECT_TX_IN_BELOW_OUT &&
+        reject_reason != Consensus::REJECT_TX_SPENDS_LOCKED_COIN &&
+        reject_reason != Consensus::REJECT_TX_FEE_NOT_ENOUGH) {
+        return false;
+    }
     if (tx.IsCoinBase() || !inputs.HaveInputs(tx)) return false;
-    // The state one block earlier: spend height of the tip, demurrage time of
-    // the tip's parent (the next block uses the tip's own median time past).
+    // The preceding evaluation point: the spend height of the tip and the
+    // demurrage time of the tip's parent (the next block uses the tip's own
+    // median time past). The input coins and attestation state are read from
+    // the current view, including anything the tip itself committed, so this
+    // is the effect of the demurrage curve moving by one block on the current
+    // inputs, not a replay of the previous chain state.
     if (!tip.pprev) return false;
     const int prior_height = tip.nHeight;
     const int64_t prior_time = tip.pprev->GetMedianTimePast();
@@ -725,14 +733,24 @@ bool DemurrageRejectionDependsOnNextBlock(const CTransaction& tx, const CCoinsVi
             coin, consensus_params, prior_height, prior_time,
             latest_attestation ? std::optional<int>{latest_attestation->height} : std::nullopt,
             latest_attestation ? std::optional<int>{static_cast<int>(latest_attestation->coverage_start_height)} : std::nullopt);
+        // Already locked at the preceding point: not a next-block effect.
         if (eval.locked) return false;
         if (!MoneyRange(eval.effective_value)) return false;
         value_in += eval.effective_value;
         if (!MoneyRange(value_in)) return false;
     }
-    if (reject_reason == "bad-txns-spends-locked-coin") return true;
-    if (tx.IsCoinStake()) return false;
-    return value_in >= tx.GetValueOut();
+    // A coinstake has no value-in or fee requirement in CheckTxInputs.
+    if (tx.IsCoinStake()) return reject_reason == Consensus::REJECT_TX_SPENDS_LOCKED_COIN;
+    // The input-value and minimum-fee requirements CheckTxInputs applies must
+    // all have been met at the preceding point, for every supported reason.
+    // This is what keeps a transaction that was already short (more output than
+    // the decayed input, or a fee under the minimum) punitive.
+    const CAmount value_out = tx.GetValueOut();
+    if (value_in < value_out) return false;
+    const CAmount fee = value_in - value_out;
+    if (!MoneyRange(fee)) return false;
+    if (consensus_params.IsProtocolV3_1(fee_time) && fee < GetMinFee(tx, fee_time)) return false;
+    return true;
 }
 
 namespace {
@@ -951,10 +969,10 @@ private:
 
     /** After CheckInputScripts failed with TX_CONSENSUS, reclassify (mempool
      * only) the failures that only the phase of the next block caused: an
-     * explicit lifecycle gate reason, or a missing SIGHASH_FORKID that the
-     * same input scripts pass without the FORKID requirement. */
+     * explicit lifecycle gate reason, or the typed missing-SIGHASH_FORKID
+     * script error. */
     void ClassifyLifecycleScriptFailure(const CTransaction& tx, TxValidationState& state,
-                                        unsigned int script_verify_flags) EXCLUSIVE_LOCKS_REQUIRED(cs_main, m_pool.cs);
+                                        ScriptError mandatory_error) EXCLUSIVE_LOCKS_REQUIRED(cs_main, m_pool.cs);
 
     // Re-run the script checks, using consensus flags, and try to cache the
     // result in the scriptcache. This should be done after
@@ -1229,8 +1247,7 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
         // misbehaving. Mempool acceptance only: blocks keep the strict result.
         if (IsQuantumLifecycleGateRejectReason(quantum_reject_reason)) {
             return state.Invalid(TxValidationResult::TX_RECENT_CONSENSUS_CHANGE, quantum_reject_reason,
-                                 "the rules for this phase of the Quantum Quasar lifecycle changed at the last block; "
-                                 "this transaction was built for an earlier phase and must be created again");
+                                 "the transaction conflicts with lifecycle-dependent rules at the current next-block evaluation point");
         }
         return state.Invalid(TxValidationResult::TX_CONSENSUS, quantum_reject_reason);
     }
@@ -1300,22 +1317,27 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
     // The mempool holds txs for the next block, so pass height+1 to CheckTxInputs
     if (!Consensus::CheckTxInputs(tx, state, m_view, m_active_chainstate.m_chain.Height() + 1,
                                   next_block_spend_time, next_block_mtp, ws.m_base_fees)) {
-        // state filled in by CheckTxInputs. A value or locked-coin failure that
-        // the demurrage state of the next block alone caused is not evidence
-        // against the relaying peer (mempool acceptance only).
+        // state filled in by CheckTxInputs. A value, locked-coin or minimum-fee
+        // failure that only the demurrage state of the next block caused is
+        // not evidence against the relaying peer (mempool acceptance only).
         const std::string input_reject_reason{state.GetRejectReason()};
+        const int64_t input_fee_time{tx.nVersion >= 2 ? next_block_spend_time : static_cast<int64_t>(tx.nTime)};
         if (state.GetResult() == TxValidationResult::TX_CONSENSUS && tip &&
-            DemurrageRejectionDependsOnNextBlock(tx, m_view, *tip, consensus, input_reject_reason)) {
+            DemurrageRejectionDependsOnNextBlock(tx, m_view, *tip, consensus, input_reject_reason, input_fee_time)) {
             return state.Invalid(TxValidationResult::TX_RECENT_CONSENSUS_CHANGE, input_reject_reason,
-                                 "demurrage changed the spendable value of an input at the last block; "
-                                 "this transaction must be created again");
+                                 "the transaction conflicts with the demurrage state at the current next-block evaluation point");
         }
         return false;
     }
 
     // Blackcoin: Minimum fee check
-    if (Params().GetConsensus().IsProtocolV3_1(nTimeTx) && ws.m_base_fees < GetMinFee(tx, nTimeTx))
-        return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-txns-fee-not-enough");
+    if (Params().GetConsensus().IsProtocolV3_1(nTimeTx) && ws.m_base_fees < GetMinFee(tx, nTimeTx)) {
+        if (tip && DemurrageRejectionDependsOnNextBlock(tx, m_view, *tip, consensus, Consensus::REJECT_TX_FEE_NOT_ENOUGH, nTimeTx)) {
+            return state.Invalid(TxValidationResult::TX_RECENT_CONSENSUS_CHANGE, Consensus::REJECT_TX_FEE_NOT_ENOUGH,
+                                 "the transaction conflicts with the demurrage state at the current next-block evaluation point");
+        }
+        return state.Invalid(TxValidationResult::TX_CONSENSUS, Consensus::REJECT_TX_FEE_NOT_ENOUGH);
+    }
 
     if (m_pool.m_require_standard && !AreInputsStandard(tx, m_view)) {
         return state.Invalid(TxValidationResult::TX_INPUTS_NOT_STANDARD, "bad-txns-nonstandard-inputs");
@@ -1516,12 +1538,8 @@ bool MemPoolAccept::PackageMempoolChecks(const std::vector<CTransactionRef>& txn
    return true;
 }
 
-/** Blocks after the last Gold Rush block in which a transaction signed
- * without FORKID is still treated as an honest stale relay. */
-static constexpr int FORKID_STALE_RELAY_WINDOW_BLOCKS{720};
-
 void MemPoolAccept::ClassifyLifecycleScriptFailure(const CTransaction& tx, TxValidationState& state,
-                                                   unsigned int script_verify_flags)
+                                                   ScriptError mandatory_error)
 {
     AssertLockHeld(cs_main);
     AssertLockHeld(m_pool.cs);
@@ -1530,36 +1548,21 @@ void MemPoolAccept::ClassifyLifecycleScriptFailure(const CTransaction& tx, TxVal
     const std::string reject_reason{state.GetRejectReason()};
     if (IsQuantumLifecycleGateRejectReason(reject_reason)) {
         state.Invalid(TxValidationResult::TX_RECENT_CONSENSUS_CHANGE, reject_reason,
-                      "the rules for this phase of the Quantum Quasar lifecycle changed at the last block; "
-                      "this transaction was built for an earlier phase and must be created again");
+                      "the transaction conflicts with lifecycle-dependent rules at the current next-block evaluation point");
         return;
     }
 
-    // Missing SIGHASH_FORKID. From the first block after Gold Rush every
-    // legacy signature must carry the FORKID flag. A node that relays a
-    // transaction signed before that point is not misbehaving, so look only
-    // for a failure that the FORKID requirement alone causes: the same input
-    // scripts, with every other flag unchanged, pass without it. A bad
-    // signature, a malformed encoding or any other failure also fails this
-    // check and stays punitive.
-    if (!(script_verify_flags & SCRIPT_ENABLE_SIGHASH_FORKID)) return;
-    if (reject_reason.rfind("mandatory-script-verify-flag-failed", 0) != 0) return;
-    const CBlockIndex* tip = m_active_chainstate.m_chain.Tip();
-    const Consensus::Params& consensus = m_active_chainstate.m_chainman.GetConsensus();
-    if (!tip) return;
-    if (consensus.nGoldRushEndHeight > 0 &&
-        tip->nHeight + 1 > consensus.nGoldRushEndHeight + FORKID_STALE_RELAY_WINDOW_BLOCKS) {
-        return;
+    // Missing SIGHASH_FORKID: the script check itself reports a distinct typed
+    // error (SCRIPT_ERR_SIG_FORKID_MISSING) for the first failing input, with
+    // the same public reason text as before. No second script evaluation runs
+    // and no height or time window decides anything: a bad signature, a
+    // malformed encoding or any other script failure carries another error
+    // value and stays punitive. Only that input is classified; the node
+    // rejects the transaction either way.
+    if (mandatory_error == SCRIPT_ERR_SIG_FORKID_MISSING) {
+        state.Invalid(TxValidationResult::TX_RECENT_CONSENSUS_CHANGE, reject_reason,
+                      "a signature does not carry the SIGHASH_FORKID flag required at the current next-block evaluation point");
     }
-    TxValidationState diagnostic_state;
-    PrecomputedTransactionData diagnostic_txdata; // fresh: CheckInputScripts sets the FORKID domain from the flags
-    if (!CheckInputScripts(tx, diagnostic_state, m_view, script_verify_flags & ~SCRIPT_ENABLE_SIGHASH_FORKID,
-                           /*cacheSigStore=*/false, /*cacheFullScriptStore=*/false, diagnostic_txdata)) {
-        return; // fails without FORKID too, or a local verifier error: keep the original result
-    }
-    state.Invalid(TxValidationResult::TX_RECENT_CONSENSUS_CHANGE, reject_reason,
-                  "this transaction is signed in the format used before the Quantum Quasar migration; "
-                  "signatures must now include the FORKID flag, so sign it again with a current wallet");
 }
 
 bool MemPoolAccept::PolicyScriptChecks(const ATMPArgs& args, Workspace& ws)
@@ -1573,7 +1576,8 @@ bool MemPoolAccept::PolicyScriptChecks(const ATMPArgs& args, Workspace& ws)
 
     // Check input scripts and signatures.
     // This is done last to help prevent CPU exhaustion denial-of-service attacks.
-    if (!CheckInputScripts(tx, state, m_view, scriptVerifyFlags, true, false, ws.m_precomputed_txdata)) {
+    ScriptError mandatory_script_error{SCRIPT_ERR_OK};
+    if (!CheckInputScriptsWithError(tx, state, m_view, scriptVerifyFlags, true, false, ws.m_precomputed_txdata, &mandatory_script_error)) {
         // SCRIPT_VERIFY_CLEANSTACK requires SCRIPT_VERIFY_WITNESS, so we
         // need to turn both off, and compare against just turning off CLEANSTACK
         // to see if the failure is specifically due to witness validation.
@@ -1584,7 +1588,7 @@ bool MemPoolAccept::PolicyScriptChecks(const ATMPArgs& args, Workspace& ws)
             state.Invalid(TxValidationResult::TX_WITNESS_STRIPPED,
                     state.GetRejectReason(), state.GetDebugMessage());
         }
-        ClassifyLifecycleScriptFailure(tx, state, scriptVerifyFlags);
+        ClassifyLifecycleScriptFailure(tx, state, mandatory_script_error);
         return false; // state filled in by CheckInputScripts
     }
 
@@ -2561,12 +2565,42 @@ bool InitScriptExecutionCache(size_t max_size_bytes)
  */
 static std::optional<int> GetP2SHRedeemWitnessVersion(const CScript& script, const CTxIn& input);
 
+static bool CheckInputScriptsImpl(const CTransaction& tx, TxValidationState& state,
+                                  const CCoinsViewCache& inputs, unsigned int flags, bool cacheSigStore,
+                                  bool cacheFullScriptStore, PrecomputedTransactionData& txdata,
+                                  std::vector<CScriptCheck>* pvChecks,
+                                  std::atomic_bool* mldsa_internal_error,
+                                  ScriptError* mandatory_error) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+
 bool CheckInputScripts(const CTransaction& tx, TxValidationState& state,
                        const CCoinsViewCache& inputs, unsigned int flags, bool cacheSigStore,
                        bool cacheFullScriptStore, PrecomputedTransactionData& txdata,
                        std::vector<CScriptCheck>* pvChecks,
                        std::atomic_bool* mldsa_internal_error)
 {
+    // Block validation, the assembler and every other caller: same function,
+    // same result and reject reason as before the typed error existed.
+    return CheckInputScriptsImpl(tx, state, inputs, flags, cacheSigStore, cacheFullScriptStore, txdata,
+                                 pvChecks, mldsa_internal_error, nullptr);
+}
+
+bool CheckInputScriptsWithError(const CTransaction& tx, TxValidationState& state,
+                                const CCoinsViewCache& inputs, unsigned int flags, bool cacheSigStore,
+                                bool cacheFullScriptStore, PrecomputedTransactionData& txdata,
+                                ScriptError* mandatory_error)
+{
+    return CheckInputScriptsImpl(tx, state, inputs, flags, cacheSigStore, cacheFullScriptStore, txdata,
+                                 nullptr, nullptr, mandatory_error);
+}
+
+static bool CheckInputScriptsImpl(const CTransaction& tx, TxValidationState& state,
+                                  const CCoinsViewCache& inputs, unsigned int flags, bool cacheSigStore,
+                                  bool cacheFullScriptStore, PrecomputedTransactionData& txdata,
+                                  std::vector<CScriptCheck>* pvChecks,
+                                  std::atomic_bool* mldsa_internal_error,
+                                  ScriptError* mandatory_error)
+{
+    if (mandatory_error) *mandatory_error = SCRIPT_ERR_OK;
     if (tx.IsCoinBase()) return true;
 
     if (pvChecks) {
@@ -2615,7 +2649,7 @@ bool CheckInputScripts(const CTransaction& tx, TxValidationState& state,
             GetP2SHRedeemWitnessVersion(txdata.m_spent_outputs[i].scriptPubKey, tx.vin[i]);
         if (quantum_rules_active && nested_witness_version && *nested_witness_version > 0) {
             return state.Invalid(TxValidationResult::TX_CONSENSUS,
-                                 "unsupported-nested-witness-spend",
+                                 quantum_reject::NESTED_WITNESS_SPEND,
                                  "Nested witness versions above v0 are disabled after quantum activation");
         }
         CScript generated_payout_script;
@@ -2630,21 +2664,21 @@ bool CheckInputScripts(const CTransaction& tx, TxValidationState& state,
         const bool is_eutxo_spend = (flags & SCRIPT_VERIFY_EUTXO) && is_eutxo_script;
         if (quantum_rules_active && is_eutxo_script) {
             return state.Invalid(TxValidationResult::TX_CONSENSUS,
-                                 "eutxo-spend-disabled",
+                                 quantum_reject::EUTXO_SPEND_DISABLED,
                                  "EUTXO v15 lacks quantum ownership authorization");
         }
         if (quantum_rules_active && is_future_witness_spend &&
             !is_quantum_spend && !is_eutxo_spend) {
             return state.Invalid(TxValidationResult::TX_CONSENSUS,
-                                 "unknown-quantum-witness-spend",
+                                 quantum_reject::UNKNOWN_WITNESS_SPEND,
                                  "Only exact Blackcoin v14 and v16 witness programs are spendable after quantum activation");
         }
         if (is_generated_quantum_spend && !(flags & SCRIPT_VERIFY_QUANTUM_ML_DSA)) {
-            return state.Invalid(TxValidationResult::TX_CONSENSUS, "blackcoin-migration-spend-premature", "Quantum migration spends are not active until the post-Gold-Rush migration window");
+            return state.Invalid(TxValidationResult::TX_CONSENSUS, quantum_reject::MIGRATION_SPEND_PREMATURE, "Quantum migration spends are not active until the post-Gold-Rush migration window");
         }
         spends_quantum_migration_output = spends_quantum_migration_output || is_quantum_spend;
         if (!is_quantum_spend && !is_eutxo_spend && (flags & SCRIPT_VERIFY_LEGACY_ECDSA_LOCKOUT)) {
-            return state.Invalid(TxValidationResult::TX_CONSENSUS, "legacy-spend-disabled", "Legacy spends are disabled after the Quantum Quasar migration deadline");
+            return state.Invalid(TxValidationResult::TX_CONSENSUS, quantum_reject::LEGACY_SPEND_DISABLED, "Legacy spends are disabled after the Quantum Quasar migration deadline");
         }
     }
 
@@ -2693,6 +2727,9 @@ bool CheckInputScripts(const CTransaction& tx, TxValidationState& state,
         if (pvChecks) {
             pvChecks->emplace_back(std::move(check));
         } else if (!check()) {
+            // The error of the first failing input under the mandatory flags
+            // (the one reported below unless a non-mandatory flag came first).
+            ScriptError mandatory_script_error = check.GetScriptError();
             if (check.GetScriptError() == SCRIPT_ERR_ML_DSA_INTERNAL) {
                 return state.Error("local-mldsa-verification-error");
             }
@@ -2709,6 +2746,7 @@ bool CheckInputScripts(const CTransaction& tx, TxValidationState& state,
                         flags & ~STANDARD_NOT_MANDATORY_VERIFY_FLAGS, cacheSigStore, &txdata,
                         mldsa_internal_error);
                 const bool mandatory_valid = check2();
+                if (!mandatory_valid) mandatory_script_error = check2.GetScriptError();
                 if (!mandatory_valid && check2.GetScriptError() == SCRIPT_ERR_ML_DSA_INTERNAL) {
                     return state.Error("local-mldsa-verification-error");
                 }
@@ -2724,6 +2762,7 @@ bool CheckInputScripts(const CTransaction& tx, TxValidationState& state,
             // support, to avoid splitting the network (but this
             // depends on the details of how net_processing handles
             // such errors).
+            if (mandatory_error) *mandatory_error = mandatory_script_error;
             return state.Invalid(TxValidationResult::TX_CONSENSUS, strprintf("mandatory-script-verify-flag-failed (%s)", ScriptErrorString(check.GetScriptError())));
         }
     }
@@ -3071,17 +3110,17 @@ static bool CheckQuantumMigrationSpendIsolation(const CTransaction& tx, const CC
             // P2SH hides the witness version from the top-level classifier.
             // Only nested v0 has established ownership semantics. Nested v1+
             // would otherwise be consensus-true as an unknown witness program.
-            reject_reason = "unsupported-nested-witness-spend";
+            reject_reason = quantum_reject::NESTED_WITNESS_SPEND;
             return false;
         }
         if (quantum_rules_active && witness_version == 1 && is_witness_input &&
             !(flags & SCRIPT_VERIFY_TAPROOT)) {
-            reject_reason = "unsupported-witness-v1-spend";
+            reject_reason = quantum_reject::WITNESS_V1_SPEND;
             return false;
         }
         if (quantum_rules_active && is_witness_input && witness_version > 1 &&
             !is_quantum_input && !is_eutxo_input) {
-            reject_reason = "unknown-quantum-witness-spend";
+            reject_reason = quantum_reject::UNKNOWN_WITNESS_SPEND;
             return false;
         }
         if (is_eutxo_input) {
@@ -3089,11 +3128,11 @@ static bool CheckQuantumMigrationSpendIsolation(const CTransaction& tx, const CC
             // quantum-authenticated covenant model exists, accepting it would
             // permit permissionless theft even if downgrade outputs were
             // forbidden.
-            reject_reason = "eutxo-spend-disabled";
+            reject_reason = quantum_reject::EUTXO_SPEND_DISABLED;
             return false;
         }
         if (final_lockout_active && !is_quantum_input) {
-            reject_reason = "legacy-spend-disabled";
+            reject_reason = quantum_reject::LEGACY_SPEND_DISABLED;
             return false;
         }
         if (is_quantum_input) {
@@ -3110,7 +3149,7 @@ static bool CheckQuantumMigrationSpendIsolation(const CTransaction& tx, const CC
         if (payout_status == GoldRushPayoutStatus::AUTHENTICATED) {
             has_protected_lineage = true;
             if (!(flags & SCRIPT_VERIFY_QUANTUM_ML_DSA)) {
-                reject_reason = "goldrush-payout-spend-premature";
+                reject_reason = quantum_reject::GOLDRUSH_PAYOUT_SPEND_PREMATURE;
                 return false;
             }
             if (!IsQuantumMigrationScript(coin.out.scriptPubKey) || payout_script != coin.out.scriptPubKey) {
@@ -3139,7 +3178,7 @@ static bool CheckQuantumMigrationSpendIsolation(const CTransaction& tx, const CC
     // authenticated Gold Rush payout or post-G migration descendant, both
     // covered above.
     if (quantum_rules_active && !has_protected_lineage) {
-        reject_reason = "quantum-lineage-anchor-required";
+        reject_reason = quantum_reject::LINEAGE_ANCHOR_REQUIRED;
         return false;
     }
 
@@ -3180,28 +3219,28 @@ bool CheckQuantumQuasarOutputs(const CTransaction& tx, unsigned int flags, std::
         const std::optional<QuantumStakeTierProgram> tier = GetQuantumStakeTierProgram(txout.scriptPubKey);
         if ((flags & SCRIPT_VERIFY_QUANTUM_ML_DSA) && tier && tier->tiered &&
             !(flags & SCRIPT_VERIFY_QUANTUM_STAKE_TIERS)) {
-            reject_reason = "quantum-tier-output-premature";
+            reject_reason = quantum_reject::TIER_OUTPUT_PREMATURE;
             return false;
         }
         if ((flags & SCRIPT_VERIFY_QUANTUM_ML_DSA) && IsEUTXOScript(txout.scriptPubKey)) {
-            reject_reason = "eutxo-output-disabled";
+            reject_reason = quantum_reject::EUTXO_OUTPUT_DISABLED;
             return false;
         }
         if ((flags & SCRIPT_VERIFY_QUANTUM_ML_DSA) && witness_version == 1 &&
             !(flags & SCRIPT_VERIFY_TAPROOT)) {
-            reject_reason = "unsupported-witness-v1-output";
+            reject_reason = quantum_reject::WITNESS_V1_OUTPUT;
             return false;
         }
         if ((flags & SCRIPT_VERIFY_QUANTUM_ML_DSA) &&
             is_future_witness_output && !is_recognized_quantum_output) {
-            reject_reason = "unknown-quantum-witness-output";
+            reject_reason = quantum_reject::UNKNOWN_WITNESS_OUTPUT;
             return false;
         }
         if (!(flags & SCRIPT_VERIFY_LEGACY_ECDSA_LOCKOUT)) continue;
         if (txout.IsEmpty()) continue;
         if (IsOpReturnOutput(txout) && txout.nValue == 0) continue;
         if (is_recognized_quantum_output) continue;
-        reject_reason = "legacy-output-disabled";
+        reject_reason = quantum_reject::LEGACY_OUTPUT_DISABLED;
         return false;
     }
     return true;

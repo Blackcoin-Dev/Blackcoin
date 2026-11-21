@@ -13725,7 +13725,8 @@ ShadowPowClaimInputSelectionResult CWallet::SelectShadowPowClaimInput(
 bool CWallet::SetPowMining(bool enabled, int threads, int cpu_percent, bilingual_str& error,
                            bool* created_payout, bool allow_new_payout_key,
                            bool wait_for_normal_unlock,
-                           const std::function<bool()>& cancelled)
+                           const std::function<bool()>& cancelled,
+                           const uint64_t* automatic_restart_consent)
 {
     if (created_payout) *created_payout = false;
     bool created_payout_local{false};
@@ -13760,8 +13761,22 @@ bool CWallet::SetPowMining(bool enabled, int threads, int cpu_percent, bilingual
     }
     LOCK(m_pow_recovery_authority_mutex);
     if (cancellation_requested()) return false;
-    // An explicit request replaces any restart queued for a reorganisation.
-    m_pow_resume_below_end.store(false, std::memory_order_release);
+    if (automatic_restart_consent) {
+        // An automatic restart is honoured only while its consent is intact:
+        // no explicit request has completed since it was recorded, and the
+        // restart is still queued. Both are decided here, under the same
+        // mutex explicit control holds, immediately before enabling.
+        if (m_pow_explicit_generation.load(std::memory_order_acquire) != *automatic_restart_consent ||
+            !m_pow_resume_below_end.exchange(false, std::memory_order_acq_rel)) {
+            m_pow_auto_restart_refusals.fetch_add(1);
+            error = _("The automatic Gold Rush PoW miner restart was superseded by an explicit miner request.");
+            return false;
+        }
+    } else {
+        // An explicit request replaces any restart queued for a reorganisation.
+        m_pow_explicit_generation.fetch_add(1, std::memory_order_acq_rel);
+        m_pow_resume_below_end.store(false, std::memory_order_release);
+    }
     // Reject an interactive start/reconfiguration without changing an
     // already-enabled startup worker. In particular, an encrypted wallet may
     // intentionally retain a zero-work worker while locked or staking-only so
@@ -14148,28 +14163,45 @@ void CWallet::ReconcilePowMinerWithGoldRushWindow()
     if (!HaveChain()) return;
     const std::optional<int> tip_height = chain().getHeight();
     if (!tip_height) return;
-    const bool closed = IsShadowGoldRushWindowClosedAtTip(*tip_height);
+    ReconcilePowMinerWithWindowState(IsShadowGoldRushWindowClosedAtTip(*tip_height), *tip_height);
+}
+
+void CWallet::ReconcilePowMinerWithWindowState(bool closed, int tip_height)
+{
     if (closed && m_pow_mining_enabled.load(std::memory_order_acquire)) {
-        const int threads = m_pow_threads.load();
-        const int cpu_percent = m_pow_cpu_percent.load();
+        if (m_pow_reconcile_test_hook) m_pow_reconcile_test_hook("before_end_stop_lock");
+        bool stopped{false};
         {
             LOCK(m_pow_recovery_authority_mutex);
-            // Remember the settings only for a miner that was running; a
-            // later explicit request clears the memory.
-            m_pow_resume_threads.store(threads);
-            m_pow_resume_cpu_percent.store(cpu_percent);
-            m_pow_resume_below_end.store(true, std::memory_order_release);
-            StopPowMiningLocked();
+            // Decide under the mutex explicit control holds: an explicit
+            // disable that completed since the unlocked check above has
+            // already stopped the miner and must not leave a restart queued.
+            if (m_pow_mining_enabled.load(std::memory_order_acquire)) {
+                // Remember the settings only for a miner that was running; a
+                // later explicit request clears the memory.
+                m_pow_resume_threads.store(m_pow_threads.load());
+                m_pow_resume_cpu_percent.store(m_pow_cpu_percent.load());
+                m_pow_resume_below_end.store(true, std::memory_order_release);
+                StopPowMiningLocked();
+                stopped = true;
+            }
         }
-        WalletLogPrintf("Gold Rush has ended at height %d: the PoW claim miner was stopped and its workers joined\n",
-                        *tip_height);
-    } else if (!closed && m_pow_resume_below_end.exchange(false)) {
+        if (stopped) {
+            WalletLogPrintf("Gold Rush has ended at height %d: the PoW claim miner was stopped and its workers joined\n",
+                            tip_height);
+        }
+    } else if (!closed && m_pow_resume_below_end.load(std::memory_order_acquire)) {
+        // Record the explicit-request count first; SetPowMining re-checks it,
+        // and that the restart is still queued, under the authority mutex.
+        const uint64_t consent = m_pow_explicit_generation.load(std::memory_order_acquire);
+        if (m_pow_reconcile_test_hook) m_pow_reconcile_test_hook("before_restart");
         bilingual_str error;
         if (SetPowMining(/*enabled=*/true, m_pow_resume_threads.load(),
                          m_pow_resume_cpu_percent.load(), error,
                          /*created_payout=*/nullptr,
                          /*allow_new_payout_key=*/false,
-                         /*wait_for_normal_unlock=*/true)) {
+                         /*wait_for_normal_unlock=*/true,
+                         /*cancelled=*/{}, &consent)) {
             WalletLogPrintf("The chain is back below the end of Gold Rush: the PoW claim miner was restarted\n");
         } else {
             WalletLogPrintf("The chain is back below the end of Gold Rush but the PoW claim miner could not restart: %s\n",

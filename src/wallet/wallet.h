@@ -2226,6 +2226,11 @@ public:
     // watermark pairs it with the tip hash. A null hash means "scan again".
     int m_demurrage_last_auto_attest_scan_height GUARDED_BY(cs_wallet){-1};
     uint256 m_demurrage_last_auto_attest_scan_tip GUARDED_BY(cs_wallet);
+    // Rescans of a tip that is not newer than the last one scanned (a
+    // reorganisation) are rate limited; see DecideAutoScan.
+    std::chrono::steady_clock::time_point m_demurrage_last_reorg_scan GUARDED_BY(cs_wallet){};
+    std::chrono::steady_clock::time_point m_shadow_signal_last_reorg_scan GUARDED_BY(cs_wallet){};
+    std::chrono::steady_clock::time_point m_redelegation_last_reorg_scan GUARDED_BY(cs_wallet){};
     std::map<uint256, int> m_demurrage_last_auto_attest_attempt_height GUARDED_BY(cs_wallet);
     int m_shadow_signal_last_auto_scan_height GUARDED_BY(cs_wallet){-1};
     uint256 m_shadow_signal_last_auto_scan_tip GUARDED_BY(cs_wallet);
@@ -2272,6 +2277,16 @@ public:
     // below the end after the miner was stopped for it.
     std::atomic<bool> m_gold_rush_end_observed{false};
     std::atomic<bool> m_pow_resume_below_end{false};
+    // Counts explicit miner-control requests. It is written only under
+    // m_pow_recovery_authority_mutex. An automatic restart records it before
+    // deciding and is honoured only if it is unchanged when checked again
+    // under that mutex, so an explicit request that completes in between wins.
+    std::atomic<uint64_t> m_pow_explicit_generation{0};
+    // Automatic restarts refused because an explicit request superseded them.
+    std::atomic<uint64_t> m_pow_auto_restart_refusals{0};
+    // Test-only: called at the named point of the automatic end-stop or
+    // restart so a test can interleave an explicit request deterministically.
+    std::function<void(const char* stage)> m_pow_reconcile_test_hook;
     std::atomic<int> m_pow_resume_threads{1};
     std::atomic<int> m_pow_resume_cpu_percent{1};
     std::atomic<uint64_t> m_pow_next_nonce{0};
@@ -2953,12 +2968,15 @@ public:
     bool SetPowMining(bool enabled, int threads, int cpu_percent, bilingual_str& error,
                       bool* created_payout = nullptr, bool allow_new_payout_key = false,
                       bool wait_for_normal_unlock = false,
-                      const std::function<bool()>& cancelled = {});
+                      const std::function<bool()>& cancelled = {},
+                      const uint64_t* automatic_restart_consent = nullptr);
     void StopPowMining();
     /** Stop the claim miner once the next block is past the Gold Rush reward
      *  window, and restart it if a reorganisation returns below the end. Runs
      *  on the claim maintenance thread, which may join the workers. */
     void ReconcilePowMinerWithGoldRushWindow();
+    /** The decision part of the above for a given window state. */
+    void ReconcilePowMinerWithWindowState(bool closed, int tip_height);
     /** Funds held by claims that the closed reward window left unconfirmable.
      *  Empty before the window closes. */
     ShadowPowClosedClaimReservation GetClosedClaimReservationLocked() const

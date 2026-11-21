@@ -182,6 +182,7 @@ BITCOIN_TESTS =\
   test/validation_chainstate_tests.cpp \
   test/validation_chainstatemanager_tests.cpp \
   test/validation_flush_tests.cpp \
+  test/validation_lifecycle_classification_tests.cpp \
   test/validation_stall_tests.cpp \
   test/validation_tests.cpp \
   test/validationinterface_tests.cpp \

@@ -34,7 +34,6 @@ from test_framework.util import (
 BLOCKS = 60
 G = 1 + BLOCKS  # last Gold Rush block
 M = G + 30      # last Migration block
-F = M + 1       # first Final block
 FEE = Decimal("0.01")
 
 

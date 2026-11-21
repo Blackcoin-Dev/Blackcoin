@@ -29,10 +29,10 @@ enum class TxValidationResult {
     TX_CONSENSUS,            //!< invalid by consensus rules
     /**
      * Invalid by a change to consensus rules more recent than SegWit.
-     * Currently unused as there are no such consensus rule changes, and any download
-     * sources realistically need to support SegWit in order to provide useful data,
-     * so differentiating between always-invalid and invalid-by-pre-SegWit-soft-fork
-     * is uninteresting.
+     * Mempool acceptance uses it when only the Quantum Quasar lifecycle phase
+     * or the demurrage state of the next block made a transaction invalid, for
+     * example a transaction that was valid one block earlier. The relaying peer
+     * is not punished for it. Block validation never returns it.
      */
     TX_RECENT_CONSENSUS_CHANGE,
     TX_INPUTS_NOT_STANDARD,   //!< inputs (covered by txid) failed policy rules
@@ -69,10 +69,10 @@ enum class BlockValidationResult {
     BLOCK_CONSENSUS,         //!< invalid by consensus rules (excluding any below reasons)
     /**
      * Invalid by a change to consensus rules more recent than SegWit.
-     * Currently unused as there are no such consensus rule changes, and any download
-     * sources realistically need to support SegWit in order to provide useful data,
-     * so differentiating between always-invalid and invalid-by-pre-SegWit-soft-fork
-     * is uninteresting.
+     * Mempool acceptance uses it when only the Quantum Quasar lifecycle phase
+     * or the demurrage state of the next block made a transaction invalid, for
+     * example a transaction that was valid one block earlier. The relaying peer
+     * is not punished for it. Block validation never returns it.
      */
     BLOCK_RECENT_CONSENSUS_CHANGE,
     BLOCK_CACHED_INVALID,    //!< this block was cached as being invalid and we didn't store the reason why

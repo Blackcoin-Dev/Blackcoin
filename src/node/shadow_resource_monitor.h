@@ -104,6 +104,8 @@ enum class ShadowResourceStatusLevel {
     HEALTHY,
     WARNING,
     OUTSIDE_ENVELOPE,
+    /** Live measurements are fine; only the reviewed horizon has passed. */
+    QUALIFICATION_EXPIRED,
 };
 
 struct ShadowResourceMeasurements {
@@ -139,6 +141,7 @@ struct ShadowResourceStatus {
     uint64_t absolute_point_seeks{0};
     int support_through_height{0};
     bool within_supported_height{false};
+    bool qualification_expired{false};
     bool within_chainstate_size{false};
     bool within_immediate_scan_free_space{false};
     bool within_projected_free_space{false};
@@ -146,6 +149,8 @@ struct ShadowResourceStatus {
     bool operational_envelope_satisfied{false};
     bool diagnostic_scan_default_authorized{false};
     std::string warning;
+    /** Informational only: never registered as a node warning. */
+    std::string qualification_notice;
     std::string operator_action;
 };
 

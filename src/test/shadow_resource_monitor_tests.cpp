@@ -73,13 +73,50 @@ BOOST_AUTO_TEST_CASE(height_projection_and_thresholds_are_exact)
     BOOST_CHECK_EQUAL(status.required_free_bytes,
                       node::SHADOW_RESOURCE_MINIMUM_FREE_BYTES);
 
+    // The qualification horizon passing is information, not an alarm.
     measurement.height = 6'193'000;
     status = node::EvaluateShadowResourceStatus(measurement);
     BOOST_CHECK_EQUAL(
         node::ShadowResourceStatusName(status.level),
-        "outside_operational_envelope");
+        "qualification_expired");
     BOOST_CHECK(!status.within_supported_height);
+    BOOST_CHECK(status.qualification_expired);
+    BOOST_CHECK(!status.qualification_notice.empty());
+    BOOST_CHECK(status.warning.empty());
     BOOST_CHECK(!status.diagnostic_scan_default_authorized);
+
+    // Real alarms stay after the horizon: low storage and an oversized chainstate.
+    node::ShadowResourceMeasurements late = measurement;
+    late.filesystem_available_bytes = node::SHADOW_RESOURCE_MINIMUM_FREE_BYTES - 1;
+    status = node::EvaluateShadowResourceStatus(late);
+    BOOST_CHECK_EQUAL(
+        node::ShadowResourceStatusName(status.level),
+        "outside_operational_envelope");
+    BOOST_CHECK(!status.warning.empty());
+    late = measurement;
+    late.estimated_chainstate_bytes =
+        node::SHADOW_RESOURCE_MAX_ESTIMATED_CHAINSTATE_BYTES + 1;
+    status = node::EvaluateShadowResourceStatus(late);
+    BOOST_CHECK(!status.warning.empty());
+    late = measurement;
+    late.available = false;
+    status = node::EvaluateShadowResourceStatus(late);
+    BOOST_CHECK_EQUAL(node::ShadowResourceStatusName(status.level), "unavailable");
+    BOOST_CHECK(!status.warning.empty());
+
+    // The last supported height itself stays healthy with no notice.
+    measurement.height = 6'192'999;
+    status = node::EvaluateShadowResourceStatus(measurement);
+    BOOST_CHECK(!status.qualification_expired);
+    BOOST_CHECK(status.qualification_notice.empty());
+
+    // Not applicable (every chain except mainnet) is unchanged at any height.
+    node::ShadowResourceMeasurements other;
+    other.height = 6'193'000;
+    status = node::EvaluateShadowResourceStatus(other);
+    BOOST_CHECK_EQUAL(node::ShadowResourceStatusName(status.level), "not_applicable");
+    BOOST_CHECK(status.warning.empty());
+    BOOST_CHECK(!status.qualification_expired);
 
     // A corrupt or synthetic extreme height must stay fail-closed without
     // overflowing the next-height projection.
@@ -87,6 +124,7 @@ BOOST_AUTO_TEST_CASE(height_projection_and_thresholds_are_exact)
     status = node::EvaluateShadowResourceStatus(measurement);
     BOOST_CHECK_EQUAL(status.remaining_gold_rush_blocks, 0U);
     BOOST_CHECK(!status.within_supported_height);
+    BOOST_CHECK(status.warning.empty());
 }
 
 BOOST_AUTO_TEST_CASE(warning_and_hard_thresholds_do_not_change_scan_policy)

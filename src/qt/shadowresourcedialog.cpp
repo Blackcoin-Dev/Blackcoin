@@ -161,6 +161,11 @@ QString StatusDetails(const node::ShadowResourceStatus& status)
     add(QObject::tr("Support through height"),
         QString::number(status.support_through_height));
     add(QObject::tr("Within supported height"), YesNo(status.within_supported_height));
+    add(QObject::tr("Qualification horizon passed"), YesNo(status.qualification_expired));
+    if (!status.qualification_notice.empty()) {
+        add(QObject::tr("Qualification notice"),
+            QString::fromStdString(status.qualification_notice));
+    }
     add(QObject::tr("Within chainstate size"), YesNo(status.within_chainstate_size));
     add(QObject::tr("Within immediate scan free space"),
         YesNo(status.within_immediate_scan_free_space));

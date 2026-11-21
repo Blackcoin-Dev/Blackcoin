@@ -1140,6 +1140,8 @@ static UniValue ShadowResourceStatusToJSON(
     result.pushKV("automatic_shutdown", false);
     result.pushKV("automatic_network_disable", false);
     result.pushKV("warning", status.warning);
+    result.pushKV("qualification_expired", status.qualification_expired);
+    result.pushKV("qualification_notice", status.qualification_notice);
     result.pushKV("operator_action", status.operator_action);
 
     UniValue scan_json(UniValue::VOBJ);
@@ -1186,7 +1188,7 @@ static RPCHelpMan getshadowresourceinfo()
             {RPCResult::Type::STR, "production_evidence_authorization", "External exact-SHA verifier requirement"},
             {RPCResult::Type::BOOL, "applicable", "Whether the mainnet envelope applies"},
             {RPCResult::Type::BOOL, "measurements_available", "Whether both chainstate and filesystem measurements succeeded"},
-            {RPCResult::Type::STR, "status", "not_applicable, unavailable, healthy, warning, or outside_operational_envelope"},
+            {RPCResult::Type::STR, "status", "not_applicable, unavailable, healthy, qualification_expired, warning, or outside_operational_envelope"},
             {RPCResult::Type::NUM, "height", /*optional=*/true, "Measured active height"},
             {RPCResult::Type::STR_HEX, "bestblock", /*optional=*/true, "Measured active block hash"},
             {RPCResult::Type::NUM, "chainstate_estimated_bytes", "LevelDB estimate for current chainstate key space"},
@@ -1229,6 +1231,8 @@ static RPCHelpMan getshadowresourceinfo()
             {RPCResult::Type::BOOL, "automatic_shutdown", "Always false"},
             {RPCResult::Type::BOOL, "automatic_network_disable", "Always false"},
             {RPCResult::Type::STR, "warning", "Persistent operator warning, or an empty string"},
+            {RPCResult::Type::BOOL, "qualification_expired", "Whether the reviewed qualification horizon has passed (information only, never a node warning)"},
+            {RPCResult::Type::STR, "qualification_notice", "Explanation shown when the qualification horizon has passed, or an empty string"},
             {RPCResult::Type::STR, "operator_action", "Explicit next action without automatic consent"},
             {RPCResult::Type::OBJ, "supply_scan", "Single-flight scan progress and last outcome", {
                 {RPCResult::Type::BOOL, "active", "Whether a full supply scan is active"},

@@ -80,6 +80,8 @@ const char* ShadowResourceStatusName(ShadowResourceStatusLevel level)
         return "warning";
     case ShadowResourceStatusLevel::OUTSIDE_ENVELOPE:
         return "outside_operational_envelope";
+    case ShadowResourceStatusLevel::QUALIFICATION_EXPIRED:
+        return "qualification_expired";
     }
     return "unavailable";
 }
@@ -173,15 +175,15 @@ ShadowResourceStatus EvaluateShadowResourceStatus(
         status.within_supported_height && status.within_chainstate_size &&
         status.within_immediate_scan_free_space;
 
-    if (!status.within_supported_height) {
-        status.level = ShadowResourceStatusLevel::OUTSIDE_ENVELOPE;
-        status.warning = strprintf(
-            "Quantum Quasar has passed the reviewed operational support horizon at height %d (reviewed through %d). "
+    // The reviewed qualification horizon is information, not an operational
+    // alarm: after it passes, only a real size or storage failure below is a
+    // warning. The qualification notice stays visible in the status fields.
+    status.qualification_expired = !status.within_supported_height;
+    if (status.qualification_expired) {
+        status.qualification_notice = strprintf(
+            "The reviewed operational qualification covers heights through %d and the chain is now at height %d. "
             "Base-chain validation, networking, staking, mining, and consensus rules remain unchanged. Optional full supply scans require explicit operator consent and fresh qualification.",
-            status.height, status.support_through_height);
-        status.operator_action =
-            "Obtain fresh exact-build resource evidence for the new phase before relying on a full supply scan. A one-call override does not qualify the release.";
-        return status;
+            status.support_through_height, status.height);
     }
 
     if (!status.within_chainstate_size ||
@@ -231,6 +233,13 @@ ShadowResourceStatus EvaluateShadowResourceStatus(
             GiB(status.required_free_bytes));
         status.operator_action =
             "Monitor getshadowresourceinfo and plan additional storage before the hard operating-envelope threshold is reached.";
+        return status;
+    }
+
+    if (status.qualification_expired) {
+        status.level = ShadowResourceStatusLevel::QUALIFICATION_EXPIRED;
+        status.operator_action =
+            "No action. Live resource measurements are healthy. The reviewed qualification horizon has passed, so a full supply scan needs explicit one-call consent and a one-call override does not qualify the release.";
         return status;
     }
 

@@ -170,6 +170,7 @@ BASE_SCRIPTS = [
     'feature_quantum_demurrage_height_boundary.py',
     'feature_goldrush_value_path.py',
     'feature_goldrush_pow_miner_e2e.py',
+    'feature_goldrush_end_transition.py',
     'feature_io_counters.py --descriptors',
     'wallet_io_gates.py --descriptors',
     'wallet_io_claim_commit.py --descriptors',

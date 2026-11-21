@@ -664,6 +664,50 @@ BOOST_FIXTURE_TEST_CASE(a_legacy_kernel_in_the_window_pays_one_quantum_output, L
     BOOST_CHECK_EQUAL(paid - in, GetProofOfStakeSubsidy());
 }
 
+BOOST_FIXTURE_TEST_CASE(a_return_address_is_refused_unless_its_key_and_record_are_in_the_database, LegacyStakeWindowSetup)
+{
+    // A wallet with a database whose writes can be made to fail.
+    CWallet wallet(/*chain=*/nullptr, "", CreateMockableWalletDatabase());
+    BOOST_REQUIRE_EQUAL(wallet.LoadWallet(), DBErrors::LOAD_OK);
+    MockableDatabase& database = GetMockableDatabase(wallet);
+    wallet.SetWalletFlag(WALLET_FLAG_DESCRIPTORS);
+
+    // The key write fails: there is no key, so there is nothing to use as the return address.
+    database.m_pass = false;
+    BOOST_CHECK(!wallet.GetNewQuantumDestination("PoS - Quantum Stake Address"));
+    database.m_pass = true;
+    BOOST_CHECK(WITH_LOCK(wallet.cs_wallet, return wallet.ListQuantumKeyInfos().empty()));
+
+    // The key is written; the record naming it is then not: the address is not set, and no
+    // legacy stake is paid to it.
+    const auto quantum = wallet.GetNewQuantumDestination("PoS - Quantum Stake Address");
+    BOOST_REQUIRE(quantum);
+    bilingual_str error;
+    database.m_pass = false;
+    BOOST_CHECK(!SetQuantumStakeReturn(wallet, *quantum, error));
+    BOOST_CHECK(!error.original.empty());
+    database.m_pass = true;
+    {
+        LOCK(wallet.cs_wallet);
+        BOOST_CHECK(wallet.m_quantum_stake_return.empty());
+        const LegacyStakeQuantumReturn status = ResolveLegacyStakeQuantumReturn(wallet);
+        BOOST_CHECK(!status.available);
+        BOOST_CHECK(status.reason.find("setquantumstakereturn") != std::string::npos);
+    }
+
+    // With both written the address is ready; the key is durably stored but in no verified backup,
+    // and the notice says so.
+    BOOST_REQUIRE_MESSAGE(SetQuantumStakeReturn(wallet, *quantum, error), error.original);
+    LOCK(wallet.cs_wallet);
+    const LegacyStakeQuantumReturn ready = ResolveLegacyStakeQuantumReturn(wallet);
+    BOOST_CHECK(ready.available);
+    BOOST_CHECK(!ready.backup_verified);
+    BOOST_CHECK(wallet.GetQuantumKeyInfo(*quantum)->durably_stored);
+    const std::string notice = LegacyStakingNotice(Params().GetConsensus(), 101, ready);
+    BOOST_CHECK(notice.find("fresh wallet backup") != std::string::npos);
+    BOOST_CHECK(notice.find("cannot recover coins paid to it") != std::string::npos);
+}
+
 BOOST_FIXTURE_TEST_CASE(a_saved_return_address_that_is_not_ours_is_not_ready, LegacyStakeWindowSetup)
 {
     auto wallet = CreateSyncedWallet(*m_node.chain,

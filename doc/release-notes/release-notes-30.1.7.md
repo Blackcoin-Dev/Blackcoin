@@ -61,6 +61,25 @@ and earlier.
   now reports the maximum signed size and the exact fee of the real call instead of the much smaller
   unsigned size. The Staking page buttons move one batch per click, reuse the same address for
   the next batch, and say how much remains.
+- **A partial migration batch is authorised only when the rest can finish.** Before the first
+  batch is built the wallet simulates every later batch with the planner it will use: the actual
+  signed size of spending the earlier batch's quantum output (the anchor and fee source of a
+  later batch), the `max_inputs` in force, the fee rate (no lower than this batch's, the relay
+  minimum and the wallet's required fee) and the dust limit, and refuses the batch when a later
+  batch would have no anchor, would not fit, or could not pay its fee and leave an output above
+  dust. A wallet whose remainder needs several batches that each spend the previous batch's
+  output is told how many batches (`continuation_batches`), what they are expected to pay
+  (`continuation_fees`) and the fewest blocks the whole migration needs
+  (`minimum_blocks_to_finish`: a later batch that spends an earlier batch's output waits for it to
+  confirm). When even that cannot finish by the last Migration block the result carries
+  `completion_warning`. A passing funding estimate is not a promise to finish before the Final
+  phase.
+- **The leftover report is an inventory.** `excluded_legacy_outputs` and `excluded_legacy_amount`
+  now cover every unspent legacy output the wallet owns that the batch did not move, not only
+  what the coin-selection view shows, and `excluded_legacy_by_reason` files each one under
+  protected asset (a live RGB seal, never spent automatically), locked, immature, unconfirmed,
+  no signer in this wallet, or other. The Staking page says "no other legacy output" only when
+  that inventory is empty, and lists the reasons otherwise.
 - **The last Migration block is usable.** `migratetoquantum` now includes a coinbase or coinstake
   output that matures exactly in the last Migration block. It used to be one block more cautious
   than the consensus rules.
@@ -145,6 +164,18 @@ outputs the wallet stakes, what it reports, and what it tells the user to do.
 - The missing-FORKID case is identified by a distinct internal script error
   value reported with the same text as before; no second script evaluation is
   run and no block-height window applies.
+- A demurrage attestation whose payload is well formed but names a state that has
+  moved, a target that is now locked, or an attestation that came too soon is
+  turned away by a cheap check that runs before the ML-DSA signature is verified.
+  It is not punished: another attestation for the same key can confirm while a
+  peer's is in flight, and a target can become locked in the same way. The check
+  looks at the target, the controlling key, the referenced state, the lock state
+  and the minimum interval, in the mempool only; a flood of such candidates
+  costs no signature verification. A bad signature on a current state, a target
+  the transaction itself spends, a missing target and a key that does not
+  control the target are still rejected and still penalize the sender. Block
+  validation does not use the check and is unchanged: the same attestation in a
+  block is still invalid.
 - The rejection text of `sendrawtransaction` is unchanged. The debug message only
   states that the transaction conflicts with lifecycle-dependent or demurrage
   rules at the current next-block evaluation point.
@@ -187,3 +218,67 @@ outputs the wallet stakes, what it reports, and what it tells the user to do.
   height, so a competing block at the same height is scanned too. Retry state
   recorded on a disconnected block is dropped. The wallet file stays readable by
   30.1.6 and earlier; an older record without a block hash means scan again.
+
+## Behaviour that changes before the end of Gold Rush
+
+Gold Rush is still running on mainnet and nodes are mining claims. Nothing below changes a
+consensus rule or which blocks are valid, and the claim reward, the proof calculation and the
+acceptance of a valid manual claim are untouched. These are the remaining differences a node
+operator can see before the last Gold Rush block (height 6,192,999), in plain language:
+
+- **Staking a coinbase or coinstake one block earlier.** The staker takes such an output as a
+  kernel from the block it matures in, one block earlier than before, as consensus already
+  accepts it. This changes which kernels the wallet tries now. Balances and ordinary spending keep
+  their old maturity rule.
+- **Claim input selection is unchanged.** The stake reserve that keeps your largest stakeable
+  legacy coins out of claim fee-input selection keeps the wallet's own maturity rule, so which
+  coin is reserved and which coin a claim spends is exactly what 30.1.6 did. The only coin the
+  staker now sees one block earlier is the one exactly at maturity, and the claim selector cannot
+  spend it yet, so the staker and the claim miner cannot contend for it.
+- **The quantum stake return address is not prepared by itself before Gold Rush ends.** The
+  wallet's own maintenance saves a return address (or, with `-qqallowautokeycreation`, creates a
+  key) only once the next block is above the last Gold Rush block and only for a wallet that
+  holds legacy coins the staker could stake. No key, saved record or backup prompt appears on its
+  own before that. The `setquantumstakereturn` command works at any time; calling it can create a
+  key and changes the saved choice, and it reports `created` whenever a key was made, including by
+  its automatic path.
+- **New status fields and commands exist now.** `getquantumstakereadiness`,
+  `setquantumstakereturn` and the `legacy_*` status fields are available before the end. The
+  readiness report is read-only and short: 0.01 to 0.05 seconds on a wallet with 20,000 legacy
+  outputs, and 0.07 seconds (0.12 seconds once demurrage is active) on a wallet with 20,000 quantum
+  outputs, holding the same locks as the neighbouring status commands, which take longer.
+- **A backup prompt appears for the return key** once one is selected (by the explicit command
+  before the end, by the wallet itself after it). It never blocks staking.
+- **Automatic Gold Rush signal and attestation rescans** react to competing blocks at the same
+  height and are rate-limited across a run of reorganisations, so the timing of a fee-paying
+  automatic signal after a reorganisation can differ from before. An automatic demurrage attestation
+  reuses a pending wallet attestation for the same key and state instead of signing another.
+- **Claim maintenance and the miner** check the Gold Rush window; before the last Gold Rush block
+  this does nothing. An explicit `setpowmining` records the consent and cancels a queued automatic
+  restart.
+- **Mempool rejection classes.** Premature lifecycle transactions, and demurrage attestations that
+  are stale, locked or too early, are rejected without the usual penalty for the sender. They are
+  still not accepted, relayed or mined.
+- **Migration planning** builds bounded batches and reports the inventory, the continuation plan and
+  the reasons described above. Actual migration of legacy coins stays refused until Gold Rush ends.
+  Planning counts an output that matures in the next block as movable.
+- **Less database and index work** while loading a wallet and recording spends, and no stake weight
+  refresh in the Qt window; PSBT signing no longer copies the PSBT per input.
+
+## Known limitations
+
+- **Quantum transaction hex without the witness.** `getrawtransaction` and `gettransaction` return
+  the transaction without its witness under the default `-rpcserialversion=0`, so the hex of a
+  quantum transaction (about 137 bytes for a one-input transaction against about 3,900 with the
+  witness) is not broadcastable as returned. This predates 30.1.7. Start the node with
+  `-rpcserialversion=1` to get witness-inclusive hex; the `send` family already returns the full
+  signed form. The default is not changed in this release.
+- **`getstakinginfo.weight` is a cached value.** It is the weight of the last completed staking scan
+  and stays at that value when staking is switched off. It is not the weight the staker would use
+  now; `weight_cached` and `weight_cache_height` say how old it is. Use `getquantumstakereadiness`
+  for the current figures. This predates 30.1.7.
+- **Downgrade.** A wallet written by 30.1.7 opens in 30.1.6 with the same balances, unspent outputs
+  and transactions, and 30.1.7 finds its quantum stake return record again. 30.1.6 does not know the
+  late-Migration policy: do not use 30.1.6 to stake legacy coins in the last Migration window (from
+  height 6,921,499), because it would pay a legacy return that could not be spent before Final.
+  Switch legacy staking off there, or stay on 30.1.7.

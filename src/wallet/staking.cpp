@@ -1977,7 +1977,44 @@ struct StakeCandidateScanContext
     bool script_class_prevalidated{false};
     std::set<uint256> trusted_parents;
     std::map<uint256, StakeTransactionEligibility> transaction_eligibility;
+    // A legacy kernel would return its principal to an output that cannot
+    // mature before Final (see IsLegacyStakeBarredByMigrationEnd).
+    bool legacy_stake_barred{false};
 };
+
+std::optional<int64_t> LastLegacyStakeHeight(const Consensus::Params& consensus)
+{
+    // Only the height-authoritative schedule names the Migration end exactly.
+    // A wall-clock-only test schedule cannot be turned into a height.
+    if (!consensus.UsesHeightLifecycle() || !consensus.IsMigrationEndScheduled()) return std::nullopt;
+    return int64_t{consensus.nQuantumMigrationEndHeight} - int64_t{consensus.nCoinbaseMaturity} -
+           int64_t{LEGACY_STAKE_MIGRATION_MARGIN_BLOCKS};
+}
+
+bool IsLegacyStakeBarredByMigrationEnd(const Consensus::Params& consensus, int stake_height)
+{
+    const std::optional<int64_t> last = LastLegacyStakeHeight(consensus);
+    return last && int64_t{stake_height} > *last;
+}
+
+std::string LegacyStakingNotice(const Consensus::Params& consensus, int next_height)
+{
+    const std::optional<int64_t> last = LastLegacyStakeHeight(consensus);
+    if (!last || int64_t{next_height} > int64_t{consensus.nQuantumMigrationEndHeight}) return "";
+    const int64_t final_height = int64_t{consensus.nQuantumMigrationEndHeight} + 1;
+    if (int64_t{next_height} > *last) {
+        return strprintf("Legacy staking has stopped: this wallet no longer creates legacy stakes after block height %d, "
+                         "because a legacy stake made later could not mature before the Final phase and would be lost. "
+                         "Legacy coins that are not migrated before height %d (the first Final block) can never be spent. "
+                         "Migrate them to a quantum address now.",
+                         *last, final_height);
+    }
+    return strprintf("Legacy staking stops after block height %d (%d blocks from now). A legacy stake made after that could not "
+                     "mature before the Final phase and would be lost, so this wallet stops creating them. "
+                     "Legacy coins that are not migrated before height %d (the first Final block) can never be spent. "
+                     "Migrate legacy coins to a quantum address before then.",
+                     *last, *last - int64_t{next_height} + 1, final_height);
+}
 
 /**
  * The staking eligibility predicate exactly as it stood before the per-slot
@@ -2036,7 +2073,8 @@ static bool EvaluateStakeCandidateReference(const CWallet& wallet, const COutPoi
     const bool quantum_output = IsQuantumMigrationScript(output.scriptPubKey) ||
                                 IsQuantumColdStakeScript(output.scriptPubKey);
     if ((quantum_output && !context.lineage_active) ||
-        (context.final_quantum_lockout && !quantum_output)) {
+        (context.final_quantum_lockout && !quantum_output) ||
+        (context.legacy_stake_barred && !quantum_output)) {
         return false;
     }
 
@@ -2109,7 +2147,8 @@ static bool EvaluateStakeCandidate(const CWallet& wallet, const COutPoint& outpo
     const bool quantum_output = IsQuantumMigrationScript(output.scriptPubKey) ||
                                 IsQuantumColdStakeScript(output.scriptPubKey);
     if ((quantum_output && !context.lineage_active) ||
-        (context.final_quantum_lockout && !quantum_output)) {
+        (context.final_quantum_lockout && !quantum_output) ||
+        (context.legacy_stake_barred && !quantum_output)) {
         return false;
     }
 
@@ -2222,6 +2261,7 @@ BoundedLegacyStakeCandidates GetBoundedLegacyStakeCandidates(
         {},
         {},
     };
+    context.legacy_stake_barred = IsLegacyStakeBarredByMigrationEnd(consensus, spend_height);
     result.candidates.reserve(sources.size());
     for (const BoundedLegacyStakeSource& source : sources) {
         const COutPoint& outpoint = source.outpoint;
@@ -2297,6 +2337,8 @@ static void AvailableCoinsForStakingImpl(const CWallet& wallet,
         {},
         {},
     };
+
+    context.legacy_stake_barred = IsLegacyStakeBarredByMigrationEnd(consensus, spend_height);
 
     // The candidate subset holds exactly the live outpoints whose script can
     // stake, in the same order, so the selected set equals a walk of the full
@@ -2574,6 +2616,9 @@ bool CreateCoinStake(CWallet& wallet, unsigned int nBits, int64_t nSearchInterva
     const Consensus::Params& consensus = Params().GetConsensus();
     const bool quantum_stake_rules_active = IsQuantumWitnessSpendActive(consensus, stake_mtp, stake_height);
     const bool final_quantum_lockout = consensus.IsQuantumFinalLockout(stake_mtp, stake_height);
+    // Checked here as well as in the candidate filter: a legacy coinstake this
+    // late could never be spent before Final.
+    const bool legacy_stake_barred = IsLegacyStakeBarredByMigrationEnd(consensus, stake_height);
     const bool stake_reward_split_active = consensus.IsStakeRewardSplitActive(stake_height);
 
     // Select coins with suitable depth. The selection and the kernel inputs
@@ -2622,6 +2667,11 @@ bool CreateCoinStake(CWallet& wallet, unsigned int nBits, int64_t nSearchInterva
             !IsQuantumColdStakeScript(pcoin.first->tx->vout[pcoin.second].scriptPubKey)) {
             continue;
         }
+        if (legacy_stake_barred &&
+            !IsQuantumMigrationScript(pcoin.first->tx->vout[pcoin.second].scriptPubKey) &&
+            !IsQuantumColdStakeScript(pcoin.first->tx->vout[pcoin.second].scriptPubKey)) {
+            continue;
+        }
 
         CTransactionRef tx = pcoin.first->tx;
         if (!tx) {
@@ -2659,6 +2709,11 @@ bool CreateCoinStake(CWallet& wallet, unsigned int nBits, int64_t nSearchInterva
                     break;
                 }
 
+                if (!quantum_kernel && legacy_stake_barred)
+                {
+                    LogPrint(BCLog::COINSTAKE, "CreateCoinStake : skipping legacy kernel that could not mature before Final\n");
+                    break;
+                }
                 if (!quantum_kernel && whichType != TxoutType::PUBKEY && whichType != TxoutType::PUBKEYHASH && whichType != TxoutType::WITNESS_V0_KEYHASH && whichType != TxoutType::WITNESS_V1_TAPROOT)
                 {
                     LogPrint(BCLog::COINSTAKE, "CreateCoinStake : no support for kernel type=%s\n", GetTxnOutputType(whichType));

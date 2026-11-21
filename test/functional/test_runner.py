@@ -203,6 +203,9 @@ BASE_SCRIPTS = [
     'feature_goldrush_reorg.py',
     'feature_goldrush_schedule_controls.py',
     'feature_quantum_lifecycle.py',
+    'feature_first_final_transition.py',
+    'wallet_legacy_stake_cutoff.py',
+    'wallet_migration_batches.py',
     'feature_quantum_final_lockout_sighash.py',
     'feature_weak_subjectivity_checkpoint.py',
     'wallet_taproot.py --descriptors',
@@ -480,6 +483,7 @@ NON_SCRIPTS = [
     "combine_logs.py",
     "create_cache.py",
     "test_runner.py",
+    "transition_t_final_util.py",
 ]
 
 def main():

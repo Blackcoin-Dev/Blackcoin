@@ -622,6 +622,10 @@ void StakingMiningPage::setupUi()
     m_pos_goldrush_status = new QLabel(tr("PoS Gold Rush jackpot: unknown"), stakingBox);
     m_pos_goldrush_status->setObjectName(QStringLiteral("posGoldrushStatus"));
     m_pos_goldrush_status->setWordWrap(true);
+    m_legacy_staking_notice = new QLabel(stakingBox);
+    m_legacy_staking_notice->setObjectName(QStringLiteral("legacyStakingNotice"));
+    m_legacy_staking_notice->setWordWrap(true);
+    m_legacy_staking_notice->setVisible(false);
     m_staking_summary = new QLabel(tr("Wallet staking summary will appear after the wallet is loaded."), stakingBox);
     m_staking_summary->setObjectName(QStringLiteral("stakingSummary"));
     configureInfoPanel(m_staking_summary);
@@ -691,14 +695,15 @@ void StakingMiningPage::setupUi()
     sgrid->addWidget(m_goldrush_badge, 7, 0, 1, 3);
     sgrid->addWidget(m_pos_goldrush_status, 8, 0, 1, 3);
     sgrid->addWidget(m_staking_summary, 9, 0, 1, 3);
-    sgrid->addWidget(m_donation_enable, 10, 0, 1, 3);
-    sgrid->addWidget(new QLabel(tr("QQ development donation:"), stakingBox), 11, 0);
-    sgrid->addWidget(m_donation_percent, 11, 1);
-    sgrid->addWidget(m_donation_status, 12, 0, 1, 3);
-    sgrid->addWidget(new QLabel(tr("UTXO size:"), stakingBox), 13, 0);
-    sgrid->addWidget(m_optimize_amount, 13, 1);
-    sgrid->addWidget(m_optimize_button, 13, 2);
-    sgrid->addWidget(m_optimize_status, 14, 0, 1, 3);
+    sgrid->addWidget(m_legacy_staking_notice, 10, 0, 1, 3);
+    sgrid->addWidget(m_donation_enable, 11, 0, 1, 3);
+    sgrid->addWidget(new QLabel(tr("QQ development donation:"), stakingBox), 12, 0);
+    sgrid->addWidget(m_donation_percent, 12, 1);
+    sgrid->addWidget(m_donation_status, 13, 0, 1, 3);
+    sgrid->addWidget(new QLabel(tr("UTXO size:"), stakingBox), 14, 0);
+    sgrid->addWidget(m_optimize_amount, 14, 1);
+    sgrid->addWidget(m_optimize_button, 14, 2);
+    sgrid->addWidget(m_optimize_status, 15, 0, 1, 3);
     miningLayout->addWidget(stakingBox);
 
     // ---- Explicit optional automation ----
@@ -3244,14 +3249,17 @@ void StakingMiningPage::onMigrateLegacyToQuantum()
     if (!confirmBroadcast(
             this,
             tr("Move legacy funds to quantum"),
-            tr("This will create a fresh non-HD wallet-backed quantum address and move all spendable legacy wallet funds into it. The new key is written to the wallet before final transaction construction or broadcast, is not recoverable from the wallet seed, and may remain even if migration later fails. If any failure reports that a key was created, back up the wallet immediately. Continue?"))) {
+            tr("This will move spendable legacy wallet funds into a wallet-backed quantum address, one batch at a time: a large wallet needs several clicks, and the result says how much remains. The first batch creates a fresh non-HD address; later batches reuse it. The new key is written to the wallet before final transaction construction or broadcast, is not recoverable from the wallet seed, and may remain even if migration later fails. If any failure reports that a key was created, back up the wallet immediately. Continue?"))) {
         return;
     }
 
     WalletModel::UnlockContext ctx(m_wallet_model->requestUnlock());
     if (!ctx.isValid()) return;
 
-    auto result = m_wallet_model->wallet().migrateLegacyToQuantum(/*allow_new_quantum_key=*/true);
+    // A large wallet needs several batches. Reuse the address of the previous
+    // batch of this session so repeated clicks do not create a new key each time.
+    auto result = m_wallet_model->wallet().migrateLegacyToQuantum(
+        /*allow_new_quantum_key=*/true, m_legacy_batch_destination.toStdString());
     if (!result) {
         const QString msg = QString::fromStdString(util::ErrorString(result).original);
         m_migration_action_status->setText(msg);
@@ -3260,11 +3268,21 @@ void StakingMiningPage::onMigrateLegacyToQuantum()
     }
 
     m_quantum_address->setText(QString::fromStdString(result->address));
-    m_migration_action_status->setText(tr("Migration broadcast: %1. Moved %2 from %3 input(s); fee %4. Back up this wallet now.")
-        .arg(QString::fromStdString(result->txid))
-        .arg(formatBLK(result->amount))
-        .arg(result->selected_inputs)
-        .arg(formatBLK(result->fee)));
+    const bool more_legacy = result->remaining_inputs > 0;
+    m_legacy_batch_destination = more_legacy ? QString::fromStdString(result->address) : QString();
+    m_migration_action_status->setText(more_legacy
+        ? tr("Batch broadcast: %1. Moved %2 from %3 input(s); fee %4. NOT everything has been moved: %5 legacy output(s) worth %6 remain. Click again to move the next batch, until none remain. Back up this wallet now.")
+            .arg(QString::fromStdString(result->txid))
+            .arg(formatBLK(result->amount))
+            .arg(result->selected_inputs)
+            .arg(formatBLK(result->fee))
+            .arg(result->remaining_inputs)
+            .arg(formatBLK(result->remaining_amount))
+        : tr("Migration broadcast: %1. Moved %2 from %3 input(s); fee %4. No legacy outputs remain to move in this wallet. Back up this wallet now.")
+            .arg(QString::fromStdString(result->txid))
+            .arg(formatBLK(result->amount))
+            .arg(result->selected_inputs)
+            .arg(formatBLK(result->fee)));
     m_force_full_refresh = true;
     updateStatus();
 }
@@ -3275,14 +3293,15 @@ void StakingMiningPage::onMigrateGoldRushRewards()
     if (!confirmBroadcast(
             this,
             tr("Consolidate Gold Rush rewards"),
-            tr("This optional action creates a fresh non-HD wallet-backed quantum address and consolidates mature, unlocked Gold Rush reward outputs into it. The key is written to the wallet before final transaction construction or broadcast, is not recoverable from the wallet seed, and may remain even if consolidation later fails. If any failure reports that a key was created, back up the wallet immediately. The original outputs are already ordinary quantum funds after Gold Rush; consolidation is not required for use. Continue?"))) {
+            tr("This optional action creates a fresh non-HD wallet-backed quantum address and consolidates a batch of mature, unlocked Gold Rush reward outputs into it (a large number needs several clicks). The key is written to the wallet before final transaction construction or broadcast, is not recoverable from the wallet seed, and may remain even if consolidation later fails. If any failure reports that a key was created, back up the wallet immediately. The original outputs are already ordinary quantum funds after Gold Rush; consolidation is not required for use. Continue?"))) {
         return;
     }
 
     WalletModel::UnlockContext ctx(m_wallet_model->requestUnlock());
     if (!ctx.isValid()) return;
 
-    auto result = m_wallet_model->wallet().migrateGoldRushRewards(/*allow_new_quantum_key=*/true);
+    auto result = m_wallet_model->wallet().migrateGoldRushRewards(
+        /*allow_new_quantum_key=*/true, m_goldrush_batch_destination.toStdString());
     if (!result) {
         const QString msg = QString::fromStdString(util::ErrorString(result).original);
         m_migration_action_status->setText(msg);
@@ -3291,12 +3310,23 @@ void StakingMiningPage::onMigrateGoldRushRewards()
     }
 
     m_quantum_address->setText(QString::fromStdString(result->address));
-    m_migration_action_status->setText(tr("Gold Rush reward consolidation broadcast: %1. Fresh quantum address: %2. Consolidated %3 from %4 output(s); fee %5. Back up this wallet now.")
-        .arg(QString::fromStdString(result->txid))
-        .arg(QString::fromStdString(result->address))
-        .arg(formatBLK(result->amount))
-        .arg(result->selected_inputs)
-        .arg(formatBLK(result->fee)));
+    const bool more_rewards = result->remaining_inputs > 0;
+    m_goldrush_batch_destination = more_rewards ? QString::fromStdString(result->address) : QString();
+    m_migration_action_status->setText(more_rewards
+        ? tr("Gold Rush reward consolidation batch broadcast: %1. Quantum address: %2. Consolidated %3 from %4 output(s); fee %5. %6 reward output(s) worth %7 remain and can be consolidated by clicking again (optional). Back up this wallet now.")
+            .arg(QString::fromStdString(result->txid))
+            .arg(QString::fromStdString(result->address))
+            .arg(formatBLK(result->amount))
+            .arg(result->selected_inputs)
+            .arg(formatBLK(result->fee))
+            .arg(result->remaining_inputs)
+            .arg(formatBLK(result->remaining_amount))
+        : tr("Gold Rush reward consolidation broadcast: %1. Quantum address: %2. Consolidated %3 from %4 output(s); fee %5. Back up this wallet now.")
+            .arg(QString::fromStdString(result->txid))
+            .arg(QString::fromStdString(result->address))
+            .arg(formatBLK(result->amount))
+            .arg(result->selected_inputs)
+            .arg(formatBLK(result->fee)));
     m_force_full_refresh = true;
     updateStatus();
 }
@@ -4708,7 +4738,16 @@ void StakingMiningPage::applyFullDetailSnapshot(const WalletModel::StakingMining
                 .arg(formatBLK(direct_delegation_balance))
                 .arg(staked_note));
         }
-        m_migration_advice->setText(QString::fromStdString(migration.advice));
+        {
+            QString advice_text = QString::fromStdString(migration.advice);
+            if (!migration.legacy_staking_notice.empty()) {
+                advice_text += QStringLiteral("\n\n") + QString::fromStdString(migration.legacy_staking_notice);
+            }
+            m_migration_advice->setText(advice_text);
+            const QString stake_notice = QString::fromStdString(migration.legacy_staking_notice);
+            m_legacy_staking_notice->setText(stake_notice);
+            m_legacy_staking_notice->setVisible(!stake_notice.isEmpty());
+        }
     } else {
         m_migration_advice->setText(tr("Wallet is busy; migration status will refresh shortly."));
         m_coldstake_quantum_available->setText(tr("Wallet is busy; quantum balance will refresh shortly."));
@@ -5183,6 +5222,7 @@ void StakingMiningPage::resetStatusForNoWallet()
     m_migration_quantum_amount->setText(QStringLiteral("-"));
     m_migration_goldrush_amount->setText(QStringLiteral("-"));
     m_migration_advice->setText((m_wallet_model ? tr("Refresh details to inspect this wallet.") : tr("Load a wallet to view migration status.")));
+    m_legacy_staking_notice->setVisible(false);
     m_migration_action_status->setText(QStringLiteral("-"));
     m_coldstake_quantum_available->setText(QStringLiteral("-"));
     m_demurrage_status->setText((m_wallet_model ? tr("Refresh details to inspect this wallet.") : tr("Load a wallet to view demurrage status.")));

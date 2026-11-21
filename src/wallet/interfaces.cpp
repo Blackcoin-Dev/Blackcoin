@@ -44,6 +44,7 @@
 #include <wallet/receive.h>
 #include <wallet/rpc/wallet.h>
 #include <wallet/spend.h>
+#include <wallet/migration_batch.h>
 #include <wallet/staking.h>
 #include <wallet/shadow_pow_claim_recovery.h>
 #include <wallet/wallet.h>
@@ -1918,6 +1919,7 @@ WalletDemurrageInfo GetWalletDemurrageInfo(CWallet& wallet)
         output.locked = eval.locked;
         output.attestation_due = attestation_due;
         output.blocks_until_decay = std::max(0, consensus.DemurrageGraceBlocks() - eval.inactive_blocks);
+        output.blocks_until_first_reduction = Consensus::DemurrageBlocksUntilFirstReduction(eval.inactive_blocks, consensus);
         output.blocks_until_lock = std::max(0, consensus.DemurrageZeroBlocks() - eval.inactive_blocks);
         if (!info.demurrage_active) {
             output.action = "none: demurrage is inactive";
@@ -1953,9 +1955,11 @@ util::Result<WalletQuantumActionTx> CreateQuantumMigrationSweep(
     bool allow_goldrush_epoch,
     const std::string& destination_label,
     const std::string& comment_override,
-    bool allow_new_quantum_key)
+    bool allow_new_quantum_key,
+    const std::string& existing_address,
+    size_t max_inputs)
 {
-    if (!allow_new_quantum_key) {
+    if (existing_address.empty() && !allow_new_quantum_key) {
         return util::Error{_("This action creates a new non-HD ML-DSA destination key. Retry with allow_new_quantum_key=true only after authorizing key creation, then back up the wallet. No key or transaction was created.")};
     }
     // Check the current lifecycle before reserving a new destination. Repeat
@@ -1968,40 +1972,57 @@ util::Result<WalletQuantumActionTx> CreateQuantumMigrationSweep(
         }
     }
 
-    const std::string label = !destination_label.empty()
-        ? destination_label
-        : (goldrush_rewards_only ? "goldrush-consolidation-gui" : "migration-gui");
-    auto destination_result = wallet.GetNewQuantumDestination(label);
-    if (!destination_result) return util::Error{util::ErrorString(destination_result)};
-    const CTxDestination destination = *destination_result;
-    const CScript destination_script = GetScriptForDestination(destination);
-    const std::string destination_address = EncodeDestination(destination);
     const std::string action_name = goldrush_rewards_only
         ? "Gold Rush reward consolidation"
         : "Quantum migration";
+    CTxDestination destination;
+    // A key created by this call may remain after a later failure and must be
+    // reported; a destination the caller named already existed.
+    const bool created_key = existing_address.empty();
+    if (created_key) {
+        const std::string label = !destination_label.empty()
+            ? destination_label
+            : (goldrush_rewards_only ? "goldrush-consolidation-gui" : "migration-gui");
+        auto destination_result = wallet.GetNewQuantumDestination(label);
+        if (!destination_result) return util::Error{util::ErrorString(destination_result)};
+        destination = *destination_result;
+    } else {
+        std::string decode_error;
+        destination = DecodeDestination(existing_address, decode_error);
+        const auto* witness = std::get_if<WitnessUnknown>(&destination);
+        if (!IsValidDestination(destination) || !witness ||
+            !IsQuantumMigrationWitnessProgram(witness->GetWitnessVersion(), witness->GetWitnessProgram())) {
+            return util::Error{_("The destination is not a Blackcoin migration address. No transaction was created.")};
+        }
+        LOCK(wallet.cs_wallet);
+        if (!wallet.GetQuantumKeyInfo(destination).has_value()) {
+            return util::Error{_("The destination is not wallet-backed (no ML-DSA private key in this wallet). No transaction was created.")};
+        }
+    }
+    const CScript destination_script = GetScriptForDestination(destination);
+    const std::string destination_address = EncodeDestination(destination);
+    auto fail = [&](const bilingual_str& failure) -> util::Error {
+        return util::Error{created_key ? DurableQuantumKeyFailure(destination, action_name, failure) : failure};
+    };
 
     CTransactionRef tx;
-    CAmount eligible_amount{0};
-    CAmount effective_eligible_amount{0};
     CAmount burned_amount{0};
     CAmount fee{0};
-    unsigned int eligible_inputs{0};
+    unsigned int total_eligible_inputs{0};
+    std::optional<MigrationBatch> batch_result;
     std::string comment;
     {
         LOCK2(::cs_main, wallet.cs_wallet);
         bilingual_str spend_error;
         if (!CanCreateSignedSpend(wallet, spend_error)) {
-            return util::Error{DurableQuantumKeyFailure(destination, action_name, spend_error)};
+            return fail(spend_error);
         }
         if (wallet.IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS)) {
-            return util::Error{DurableQuantumKeyFailure(
-                destination,
-                action_name,
-                _("Error: Private keys are disabled for this wallet"))};
+            return fail(_("Error: Private keys are disabled for this wallet"));
         }
 
         if (const auto error = QuantumMigrationSweepPhaseError(wallet, goldrush_rewards_only)) {
-            return util::Error{DurableQuantumKeyFailure(destination, action_name, *error)};
+            return fail(*error);
         }
         const Consensus::Params& consensus = Params().GetConsensus();
         const CBlockIndex* tip = wallet.chain().getTip();
@@ -2010,10 +2031,7 @@ util::Result<WalletQuantumActionTx> CreateQuantumMigrationSweep(
         const int next_height = tip->nHeight + 1;
 
         if (!wallet.GetQuantumKeyInfo(destination).has_value()) {
-            return util::Error{DurableQuantumKeyFailure(
-                destination,
-                action_name,
-                _("Refusing to continue: destination ML-DSA key is not confirmed stored in the wallet."))};
+            return fail(_("Refusing to continue: destination ML-DSA key is not confirmed stored in the wallet."));
         }
 
         CCoinControl coin_control;
@@ -2028,12 +2046,20 @@ util::Result<WalletQuantumActionTx> CreateQuantumMigrationSweep(
         filter.only_spendable = true;
         filter.skip_locked = true;
         filter.include_immature_coinbase = false;
+        // An output that matures in the next block may be spent in it (see the
+        // migratetoquantum RPC).
+        filter.include_next_block_mature_coinbase = !goldrush_rewards_only;
         filter.include_generated_quantum_inputs = goldrush_rewards_only;
 
         const CCoinsViewCache& view = wallet.chain().chainman().ActiveChainstate().CoinsTip();
         unsigned int migration_anchor_inputs{0};
+        std::vector<MigrationBatchInput> candidates;
+        std::map<COutPoint, CAmount> candidate_burn;
         for (const COutput& out : AvailableCoins(wallet, &coin_control, std::nullopt, filter).All()) {
             const CScript& spk = out.txout.scriptPubKey;
+            CAmount effective_value = out.txout.nValue;
+            CAmount burned_value{0};
+            bool is_anchor{false};
             if (goldrush_rewards_only) {
                 if (!IsQuantumMigrationScript(spk) || spk == destination_script) continue;
                 CScript marker_script;
@@ -2047,50 +2073,54 @@ util::Result<WalletQuantumActionTx> CreateQuantumMigrationSweep(
                     latest_attestation ? std::optional<int>{latest_attestation->height} : std::nullopt,
                     latest_attestation ? std::optional<int>{static_cast<int>(latest_attestation->coverage_start_height)} : std::nullopt);
                 if (eval.locked || eval.effective_value <= 0) continue;
-                effective_eligible_amount += eval.effective_value;
-                burned_amount += eval.burned_value;
+                effective_value = eval.effective_value;
+                burned_value = eval.burned_value;
             } else {
                 if (IsQuantumMigrationScript(spk) || IsQuantumColdStakeScript(spk) || IsEUTXOScript(spk)) continue;
                 if (!out.spendable) continue;
                 const Coin& coin = view.AccessCoin(out.outpoint);
                 if (!coin.IsSpent() && IsWalletProtectedLineageInput(
                         wallet, out.outpoint, coin, consensus, mtp, next_height)) {
+                    is_anchor = true;
                     ++migration_anchor_inputs;
                 }
             }
-            coin_control.Select(out.outpoint);
-            eligible_amount += out.txout.nValue;
-            if (!goldrush_rewards_only) effective_eligible_amount += out.txout.nValue;
-            ++eligible_inputs;
+            const int input_vsize = CalculateMaximumSignedInputSize(out.txout, &wallet, &coin_control);
+            candidates.push_back({out.outpoint, out.txout.nValue, effective_value,
+                                  input_vsize > 0 ? int64_t{input_vsize} * WITNESS_SCALE_FACTOR
+                                                  : (goldrush_rewards_only ? int64_t{4000} : int64_t{600}),
+                                  is_anchor});
+            candidate_burn.emplace(out.outpoint, burned_value);
+            ++total_eligible_inputs;
         }
-        if (eligible_inputs == 0) {
+        if (total_eligible_inputs == 0) {
             const bilingual_str failure = goldrush_rewards_only
                 ? _("No spendable wallet-owned Gold Rush reward outputs are available to consolidate.")
                 : _("No spendable legacy coins to migrate.");
-            return util::Error{DurableQuantumKeyFailure(destination, action_name, failure)};
+            return fail(failure);
         }
-        if (!goldrush_rewards_only && IsQuantumWitnessSpendActive(consensus, mtp, next_height) &&
-            migration_anchor_inputs == 0) {
-            return util::Error{DurableQuantumKeyFailure(
-                destination,
-                action_name,
-                _("This wallet's spendable legacy coins are witness-only and cannot create a fork-unique migration transaction. Add a small P2PKH or non-witness P2SH wallet UTXO as a migration anchor; during Gold Rush, prepare that anchor before quantum spending activates."))};
+        const bool anchor_required = !goldrush_rewards_only && IsQuantumWitnessSpendActive(consensus, mtp, next_height);
+        if (anchor_required && migration_anchor_inputs == 0) {
+            return fail(_("This wallet's spendable legacy coins are witness-only and cannot create a fork-unique migration transaction. Add a small P2PKH or non-witness P2SH wallet UTXO as a migration anchor; during Gold Rush, prepare that anchor before quantum spending activates."));
         }
 
-        std::vector<CRecipient> recipients{{destination, effective_eligible_amount, /*fSubtractFeeFromAmount=*/true}};
-        int change_pos = RANDOM_CHANGE_POSITION;
-        auto res = CreateTransaction(wallet, recipients, change_pos, coin_control, /*sign=*/true);
-        if (!res) {
-            return util::Error{DurableQuantumKeyFailure(destination, action_name, util::ErrorString(res))};
+        const size_t batch_limit = max_inputs > 0
+            ? max_inputs
+            : (goldrush_rewards_only ? DEFAULT_GOLDRUSH_CONSOLIDATION_BATCH_INPUTS : DEFAULT_LEGACY_MIGRATION_BATCH_INPUTS);
+        auto batch = BuildMigrationBatch(wallet, coin_control, destination, candidates, batch_limit, anchor_required, /*sign=*/true);
+        if (!batch) {
+            return fail(util::ErrorString(batch));
         }
-        tx = res->tx;
-        fee = res->fee;
+        for (const COutPoint& selected : batch->selected) burned_amount += candidate_burn.at(selected);
+        tx = batch->tx;
+        fee = batch->fee;
         if (tx->vout.size() != 1 || IsDust(tx->vout[0], wallet.chain().relayDustFee())) {
             const bilingual_str failure = goldrush_rewards_only
                 ? _("Gold Rush reward consolidation would strand funds: selected value is below the dust threshold after fees.")
                 : _("Migration would strand funds: swept value is below the dust threshold after fees.");
-            return util::Error{DurableQuantumKeyFailure(destination, action_name, failure)};
+            return fail(failure);
         }
+        batch_result = std::move(*batch);
         comment = !comment_override.empty()
             ? comment_override
             : goldrush_rewards_only
@@ -2101,7 +2131,7 @@ util::Result<WalletQuantumActionTx> CreateQuantumMigrationSweep(
     mapValue_t map_value;
     map_value["comment"] = std::move(comment);
     if (auto committed = CommitWalletTransactionOrError(wallet, tx, std::move(map_value), action_name); !committed) {
-        return util::Error{DurableQuantumKeyFailure(destination, action_name, util::ErrorString(committed))};
+        return fail(util::ErrorString(committed));
     }
 
     WalletQuantumActionTx result;
@@ -2110,11 +2140,18 @@ util::Result<WalletQuantumActionTx> CreateQuantumMigrationSweep(
     result.amount = tx->vout.empty() ? 0 : tx->vout[0].nValue;
     result.fee = fee;
     result.vsize = static_cast<int>(GetVirtualTransactionSize(*tx, 0, 0));
-    result.selected_inputs = eligible_inputs;
-    result.selected_amount = eligible_amount;
-    result.warning = burned_amount > 0
-        ? strprintf("A new ML-DSA quantum address was created. This consolidation realizes %s of scheduled demurrage. Back up this wallet.", FormatMoney(burned_amount))
-        : "A new ML-DSA quantum address was created. Back up this wallet before relying on the moved funds.";
+    result.selected_inputs = static_cast<unsigned int>(batch_result->selected.size());
+    result.selected_amount = batch_result->selected_value;
+    result.total_eligible_inputs = total_eligible_inputs;
+    result.remaining_inputs = static_cast<unsigned int>(batch_result->remaining_inputs);
+    result.remaining_amount = batch_result->remaining_value;
+    if (created_key) {
+        result.warning = burned_amount > 0
+            ? strprintf("A new ML-DSA quantum address was created. This consolidation realizes %s of scheduled demurrage. Back up this wallet.", FormatMoney(burned_amount))
+            : "A new ML-DSA quantum address was created. Back up this wallet before relying on the moved funds.";
+    } else if (burned_amount > 0) {
+        result.warning = strprintf("This consolidation realizes %s of scheduled demurrage.", FormatMoney(burned_amount));
+    }
     return result;
 }
 
@@ -3900,6 +3937,10 @@ public:
         status.deadline_passed = passed;
         status.goldrush_remigration_active = quantum_active;
         status.quantum_spends_active = quantum_active;
+        if (const std::optional<int64_t> legacy_stake_last = LastLegacyStakeHeight(consensus)) {
+            status.legacy_staking_last_height = *legacy_stake_last;
+            status.legacy_staking_notice = LegacyStakingNotice(consensus, next_height);
+        }
 
         const CCoinsViewCache& view = chainman.ActiveChainstate().CoinsTip();
         for (const COutput& out : AvailableCoinsListUnspent(*m_wallet).All()) {
@@ -3963,13 +4004,13 @@ public:
         status.stake_tiers_active = IsQuantumStakeTiersActive(consensus, mtp, next_height);
         return status;
     }
-    util::Result<WalletQuantumActionTx> migrateLegacyToQuantum(bool allow_new_quantum_key) override
+    util::Result<WalletQuantumActionTx> migrateLegacyToQuantum(bool allow_new_quantum_key, const std::string& existing_address) override
     {
-        return CreateQuantumMigrationSweep(*m_wallet, /*goldrush_rewards_only=*/false, /*allow_goldrush_epoch=*/false, /*destination_label=*/"", /*comment_override=*/"", allow_new_quantum_key);
+        return CreateQuantumMigrationSweep(*m_wallet, /*goldrush_rewards_only=*/false, /*allow_goldrush_epoch=*/false, /*destination_label=*/"", /*comment_override=*/"", allow_new_quantum_key, existing_address);
     }
-    util::Result<WalletQuantumActionTx> migrateGoldRushRewards(bool allow_new_quantum_key) override
+    util::Result<WalletQuantumActionTx> migrateGoldRushRewards(bool allow_new_quantum_key, const std::string& existing_address) override
     {
-        return CreateQuantumMigrationSweep(*m_wallet, /*goldrush_rewards_only=*/true, /*allow_goldrush_epoch=*/true, /*destination_label=*/"", /*comment_override=*/"", allow_new_quantum_key);
+        return CreateQuantumMigrationSweep(*m_wallet, /*goldrush_rewards_only=*/true, /*allow_goldrush_epoch=*/true, /*destination_label=*/"", /*comment_override=*/"", allow_new_quantum_key, existing_address);
     }
     std::vector<WalletRGBAssetInfo> listRGBAssets(bool include_spent = false, bool* available = nullptr) override
     {

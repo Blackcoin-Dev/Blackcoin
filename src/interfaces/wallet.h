@@ -548,11 +548,13 @@ public:
     //! lightweight GUI guard fails closed if chain state is unavailable.
     virtual WalletQuantumFundingStatus getQuantumFundingStatus() = 0;
 
-    //! Sweep spendable legacy coins into a wallet-backed quantum address.
-    virtual util::Result<WalletQuantumActionTx> migrateLegacyToQuantum(bool allow_new_quantum_key) = 0;
+    //! Move one bounded batch of spendable legacy coins into a wallet-backed
+    //! quantum address (existing_address, or a new key when empty and allowed).
+    //! The result reports how many outputs remain for a further batch.
+    virtual util::Result<WalletQuantumActionTx> migrateLegacyToQuantum(bool allow_new_quantum_key, const std::string& existing_address = "") = 0;
 
-    //! Optionally consolidate matured wallet-owned Gold Rush reward outputs to a fresh quantum address.
-    virtual util::Result<WalletQuantumActionTx> migrateGoldRushRewards(bool allow_new_quantum_key) = 0;
+    //! Optionally consolidate one bounded batch of matured wallet-owned Gold Rush reward outputs.
+    virtual util::Result<WalletQuantumActionTx> migrateGoldRushRewards(bool allow_new_quantum_key, const std::string& existing_address = "") = 0;
 
     //! List wallet-owned RGB assets and assignments.
     virtual std::vector<WalletRGBAssetInfo> listRGBAssets(bool include_spent = false, bool* available = nullptr) = 0;
@@ -1311,6 +1313,10 @@ struct WalletMigrationStatus
     CAmount goldrush_reward_amount_needing_move{0};
     bool goldrush_remigration_active{false};
     bool quantum_spends_active{false};
+    //! Last height at which the wallet still creates a legacy coinstake; -1 when no height schedule exists.
+    int64_t legacy_staking_last_height{-1};
+    //! Plain-language legacy staking cutoff notice; empty when none applies.
+    std::string legacy_staking_notice;
     std::string advice;
 };
 
@@ -1324,6 +1330,10 @@ struct WalletQuantumActionTx
     int vsize{0};
     unsigned int selected_inputs{0};
     CAmount selected_amount{0};
+    //! Eligible inputs before this batch, and what is left for further batches.
+    unsigned int total_eligible_inputs{0};
+    unsigned int remaining_inputs{0};
+    CAmount remaining_amount{0};
     std::string warning;
 };
 
@@ -1381,7 +1391,10 @@ struct WalletDemurrageOutputInfo
     CAmount burned_if_spent_amount{0};
     bool locked{false};
     bool attestation_due{false};
+    //! End of the grace period; stays 0 afterwards even before any reduction.
     int blocks_until_decay{0};
+    //! Blocks until the value is first reduced (0 once it is).
+    int blocks_until_first_reduction{0};
     int blocks_until_lock{0};
     std::string action;
 };

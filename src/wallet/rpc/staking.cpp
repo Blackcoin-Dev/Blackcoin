@@ -778,6 +778,12 @@ static RPCHelpMan getstakinginfo()
                         {RPCResult::Type::NUM, "expectedtime", "Expected time to earn reward"},
                         {RPCResult::Type::BOOL, "chainstate_cached", "Whether chain statistics were served from the last non-blocking snapshot"},
                         {RPCResult::Type::STR, "chain", "Current chain name"},
+                        {RPCResult::Type::BOOL, "legacy_staking_scheduled", "Whether the chain has a height-authoritative Migration end, so that a last height for legacy staking is known"},
+                        {RPCResult::Type::NUM, "legacy_staking_last_height", /*optional=*/true, "Last block height at which this wallet still creates a legacy coinstake. Later legacy stakes could not mature before the Final phase and would be lost, so the wallet stops. Quantum staking is not affected."},
+                        {RPCResult::Type::NUM, "legacy_staking_blocks_remaining", /*optional=*/true, "Blocks left, counting the next block, at which legacy staking is still allowed; 0 once it has stopped"},
+                        {RPCResult::Type::BOOL, "legacy_staking_stopped", /*optional=*/true, "Whether legacy staking has already stopped at the next block height"},
+                        {RPCResult::Type::NUM, "legacy_migration_end_height", /*optional=*/true, "Last Migration block; legacy coins cannot be spent from the next height on"},
+                        {RPCResult::Type::STR, "legacy_staking_notice", /*optional=*/true, "Plain-language notice about the legacy staking cutoff and the need to migrate legacy coins before Final"},
                         {RPCResult::Type::STR, "warnings", "Current network and wallet warnings"},
                     }
                 },
@@ -905,6 +911,19 @@ static RPCHelpMan getstakinginfo()
     obj.pushKV("chainstate_cached", chainstate_cached);
 
     obj.pushKV("chain", chainman.GetParams().GetChainTypeString());
+    {
+        const std::optional<int64_t> legacy_last = LastLegacyStakeHeight(consensusParams);
+        const int64_t next_height = int64_t{active_blocks} + 1;
+        obj.pushKV("legacy_staking_scheduled", legacy_last.has_value());
+        if (legacy_last) {
+            obj.pushKV("legacy_staking_last_height", *legacy_last);
+            obj.pushKV("legacy_staking_blocks_remaining", std::max<int64_t>(0, *legacy_last - next_height + 1));
+            obj.pushKV("legacy_staking_stopped", next_height > *legacy_last);
+            obj.pushKV("legacy_migration_end_height", consensusParams.nQuantumMigrationEndHeight);
+            const std::string notice = LegacyStakingNotice(consensusParams, active_blocks + 1);
+            if (!notice.empty()) obj.pushKV("legacy_staking_notice", notice);
+        }
+    }
     obj.pushKV("warnings", GetWarnings(false).original);
     return obj;
 },
@@ -5573,7 +5592,8 @@ static RPCHelpMan getdemurragewalletinfo()
                     {RPCResult::Type::STR_AMOUNT, "burned_if_spent_amount", "Amount burned if this output is spent now"},
                     {RPCResult::Type::BOOL, "locked", "Whether this output has reached the 24-month lock"},
                     {RPCResult::Type::STR, "exemption", "Reason the output is currently whole, or empty when decaying"},
-                    {RPCResult::Type::NUM, "blocks_until_decay", "Blocks until decay starts; zero if already decaying"},
+                    {RPCResult::Type::NUM, "blocks_until_decay", "Blocks until the grace period ends; zero once it has ended. The value does not drop yet when the grace period ends: the first real reduction comes later (see blocks_until_first_reduction). Kept for compatibility."},
+                    {RPCResult::Type::NUM, "blocks_until_first_reduction", "Blocks until the output's value is first reduced; zero if it is already reduced"},
                     {RPCResult::Type::NUM, "blocks_until_lock", "Blocks until hard lock; zero if already locked"},
                     {RPCResult::Type::BOOL, "attestation_due", "Whether this output is beyond the 3-month auto-attestation policy threshold"},
                     {RPCResult::Type::STR, "action", "Suggested wallet action"},
@@ -5666,6 +5686,7 @@ static RPCHelpMan getdemurragewalletinfo()
         entry.pushKV("locked", eval.locked);
         entry.pushKV("exemption", eval.exemption);
         entry.pushKV("blocks_until_decay", std::max(0, consensus.DemurrageGraceBlocks() - eval.inactive_blocks));
+        entry.pushKV("blocks_until_first_reduction", Consensus::DemurrageBlocksUntilFirstReduction(eval.inactive_blocks, consensus));
         entry.pushKV("blocks_until_lock", std::max(0, consensus.DemurrageZeroBlocks() - eval.inactive_blocks));
         entry.pushKV("attestation_due", attestation_due);
         std::string action;

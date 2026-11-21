@@ -63,7 +63,11 @@ util::Result<interfaces::WalletQuantumActionTx> CreateQuantumMigrationSweep(
     bool allow_goldrush_epoch = false,
     const std::string& destination_label = "",
     const std::string& comment_override = "",
-    bool allow_new_quantum_key = false);
+    bool allow_new_quantum_key = false,
+    //! Reuse this wallet-owned quantum address instead of creating a key.
+    const std::string& existing_address = "",
+    //! 0 means the default batch size for the action.
+    size_t max_inputs = 0);
 
 } // namespace wallet
 

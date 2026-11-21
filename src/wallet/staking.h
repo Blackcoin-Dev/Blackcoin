@@ -15,9 +15,36 @@
 #include <atomic>
 #include <chrono>
 #include <map>
+#include <optional>
 #include <set>
 
 namespace wallet {
+/**
+ * Wallet policy only; no block or transaction is judged by it. A legacy
+ * coinstake created at height h can be spent from h + maturity, and Final
+ * rejects every legacy input, so a legacy coinstake with
+ * h + maturity > M (M = last Migration block) loses its principal and reward
+ * for good. The wallet therefore stops creating legacy-return coinstakes a
+ * little earlier than that bound. The margin leaves the last legacy coinstake
+ * one full block of migration time before M instead of exactly the last one.
+ */
+static constexpr int LEGACY_STAKE_MIGRATION_MARGIN_BLOCKS = 1;
+
+/** Last height at which this wallet will still create a legacy-return
+ *  coinstake, or nullopt when the Migration end height is not known (no
+ *  complete height-authoritative schedule). 64-bit arithmetic throughout. */
+std::optional<int64_t> LastLegacyStakeHeight(const Consensus::Params& consensus);
+
+/** True when a legacy-return coinstake created at stake_height would not be
+ *  spendable before Final. Same condition for candidate filtering, status
+ *  weight and the check inside CreateCoinStake. */
+bool IsLegacyStakeBarredByMigrationEnd(const Consensus::Params& consensus, int stake_height);
+
+/** Plain-language notice for status output: when legacy staking stops and that
+ *  legacy coins must be migrated before Final. Empty when no height-authoritative
+ *  schedule is configured or when next_height is already in Final. */
+std::string LegacyStakingNotice(const Consensus::Params& consensus, int next_height);
+
 struct BoundedLegacyStakeCandidate
 {
     COutPoint outpoint;

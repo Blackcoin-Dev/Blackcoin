@@ -565,6 +565,12 @@ struct CoinFilterParams {
     bool only_spendable{true};
     // By default, do not include immature coinbase outputs
     bool include_immature_coinbase{false};
+    // Include coinbase and coinstake outputs that become mature in the
+    // candidate next block. Consensus allows spending them there (depth equal
+    // to the maturity), although the wallet's display formula still counts
+    // one block to go. Used by the legacy migration, whose last block is a
+    // hard deadline.
+    bool include_next_block_mature_coinbase{false};
     // By default, skip locked UTXOs
     bool skip_locked{true};
     // Ordinary wallet funding must not consume Gold Rush rewards while v16

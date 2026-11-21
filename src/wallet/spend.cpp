@@ -1773,6 +1773,9 @@ CoinsResult AvailableCoins(const CWallet& wallet,
     const CBlockIndex* tip = wallet.chain().getTip();
     const int spend_height = tip ? tip->nHeight + 1 : 0;
     const int64_t spend_time = tip ? tip->GetMedianTimePast() : 0;
+    // Depth at which a coinbase or coinstake is spendable in the next block
+    // (the same maturity IsNextBlockMatureGoldRushPayout uses).
+    const int consensus_maturity = Params().GetConsensus().nCoinbaseMaturity;
     std::vector<COutPoint> outpoints;
 
     // Never auto-select UTXOs carrying live RGB single-use-seal or EUTXO state.
@@ -1818,6 +1821,7 @@ CoinsResult AvailableCoins(const CWallet& wallet,
             const COutPoint outpoint(wtxid, i);
 
             if (tx_immature && !params.include_immature_coinbase &&
+                !(params.include_next_block_mature_coinbase && nDepth >= consensus_maturity) &&
                 !IsNextBlockMatureGoldRushPayout(wallet, outpoint, spend_height, spend_time)) {
                 continue;
             }

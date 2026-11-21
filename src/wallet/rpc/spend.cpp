@@ -21,9 +21,11 @@
 #include <util/vector.h>
 #include <wallet/coincontrol.h>
 #include <wallet/fees.h>
+#include <wallet/migration_batch.h>
 #include <wallet/rpc/util.h>
 #include <wallet/receive.h>
 #include <wallet/spend.h>
+#include <wallet/staking.h>
 #include <wallet/wallet.h>
 
 #include <univalue.h>
@@ -1984,8 +1986,15 @@ static std::string QQPhaseName(Consensus::QuantumQuasarPhase phase)
 RPCHelpMan migratetoquantum()
 {
     return RPCHelpMan{"migratetoquantum",
-        "\nSweep all spendable legacy (non-quantum) coins in this wallet into a single\n"
-        "wallet-backed Blackcoin ML-DSA migration (witness-v16) address.\n"
+        "\nMove spendable legacy (non-quantum) coins in this wallet into a wallet-backed\n"
+        "Blackcoin ML-DSA migration (witness-v16) address. This is the command that\n"
+        "protects your coins: legacy coins that are not moved before the Migration phase\n"
+        "ends can never be spent. (Gold Rush payouts are already quantum outputs and need\n"
+        "no move; see migrategoldrushrewards, which is optional.)\n"
+        "\nEach call builds ONE transaction of at most max_inputs inputs (and never more\n"
+        "than fits a standard transaction), chosen largest first. The result says how many\n"
+        "legacy outputs remain; call again, with existing_address set to the returned\n"
+        "destination, until more_batches is false.\n"
         "\nOn mainnet, Gold Rush permits address preparation and dry-run planning only.\n"
         "Funding begins at Migration height 6,193,000 and ends after height 6,921,999.\n"
         "\nThe destination ML-DSA key is generated and written to the wallet database BEFORE\n"
@@ -2003,20 +2012,27 @@ RPCHelpMan migratetoquantum()
                     {"label", RPCArg::Type::STR, RPCArg::Default{"migration"}, "Label for a newly generated migration address."},
                     {"fee_rate", RPCArg::Type::AMOUNT, RPCArg::DefaultHint{"wallet default"}, "Fee rate in " + CURRENCY_ATOM + "/vB."},
                     {"include_unsafe", RPCArg::Type::BOOL, RPCArg::Default{false}, "Include unconfirmed/unsafe legacy coins."},
+                    {"max_inputs", RPCArg::Type::NUM, RPCArg::DefaultHint{"400"}, "Most legacy inputs this call may spend. The batch is also cut so that the signed transaction always fits the standard size limit."},
                 },
             },
         },
         RPCResult{RPCResult::Type::OBJ, "", "", {
             {RPCResult::Type::STR, "phase", "current Blackcoin phase"},
             {RPCResult::Type::NUM_TIME, "deadline_mtp", "forecast final migration time (0 if unscheduled; non-authoritative for the mainnet height schedule)"},
-            {RPCResult::Type::NUM, "eligible_inputs", "count of legacy UTXOs swept"},
-            {RPCResult::Type::STR_AMOUNT, "eligible_amount", "total legacy value selected"},
+            {RPCResult::Type::NUM, "eligible_inputs", "count of legacy UTXOs moved by this batch"},
+            {RPCResult::Type::STR_AMOUNT, "eligible_amount", "legacy value moved by this batch"},
+            {RPCResult::Type::NUM, "total_eligible_inputs", "count of legacy UTXOs that could be moved before this batch"},
+            {RPCResult::Type::STR_AMOUNT, "total_eligible_amount", "legacy value that could be moved before this batch"},
+            {RPCResult::Type::NUM, "remaining_inputs", "legacy UTXOs left for later batches"},
+            {RPCResult::Type::STR_AMOUNT, "remaining_amount", "legacy value left for later batches"},
+            {RPCResult::Type::BOOL, "more_batches", "whether another call is needed to move the rest"},
+            {RPCResult::Type::NUM, "max_inputs", "input limit that applied to this batch"},
             {RPCResult::Type::STR, "destination", "quantum address funds were sent to"},
             {RPCResult::Type::BOOL, "newly_generated", "whether destination was freshly minted"},
             {RPCResult::Type::BOOL, "stored_in_wallet", "destination key confirmed persisted"},
             {RPCResult::Type::STR_AMOUNT, "amount", "value of migration output after fee"},
             {RPCResult::Type::STR_AMOUNT, "fee", "fee paid"},
-            {RPCResult::Type::NUM, "vsize", "virtual transaction size"},
+            {RPCResult::Type::NUM, "vsize", "virtual transaction size; for dry_run the maximum signed size the real call will build"},
             {RPCResult::Type::STR_HEX, "txid", /*optional=*/true, "txid (absent for dry_run)"},
             {RPCResult::Type::STR, "warning", /*optional=*/true, "backup reminder"},
         }},
@@ -2038,6 +2054,12 @@ RPCHelpMan migratetoquantum()
         const std::optional<CFeeRate> requested_fee_rate = options.exists("fee_rate")
             ? std::optional<CFeeRate>{FeeRateFromSatVbValue(options["fee_rate"])}
             : std::nullopt;
+        size_t batch_limit = DEFAULT_LEGACY_MIGRATION_BATCH_INPUTS;
+        if (options.exists("max_inputs")) {
+            const int64_t requested = options["max_inputs"].getInt<int64_t>();
+            if (requested < 1) throw JSONRPCError(RPC_INVALID_PARAMETER, "max_inputs must be at least 1");
+            batch_limit = ClampMigrationBatchInputs(requested, DEFAULT_LEGACY_MIGRATION_BATCH_INPUTS);
+        }
         if (dry_run && existing.empty()) {
             throw JSONRPCError(RPC_INVALID_PARAMETER, "dry_run requires existing_address so the estimate does not create wallet metadata");
         }
@@ -2115,10 +2137,15 @@ RPCHelpMan migratetoquantum()
         filter.only_spendable = true;
         filter.skip_locked = true;
         filter.include_immature_coinbase = false;
+        // A coinbase or coinstake output that matures in the very next block is
+        // valid to spend in that block. Without this, an output maturing exactly
+        // in the last Migration block could not be moved.
+        filter.include_next_block_mature_coinbase = true;
 
         CAmount eligible_amount = 0;
         unsigned int eligible_inputs = 0;
         unsigned int migration_anchor_inputs = 0;
+        std::vector<MigrationBatchInput> batch_candidates;
         const CCoinsViewCache& migration_view = pwallet->chain().chainman().ActiveChainstate().CoinsTip();
         for (const COutput& out : AvailableCoins(*pwallet, &coin_control, std::nullopt, filter).All()) {
             const CScript& spk = out.txout.scriptPubKey;
@@ -2127,11 +2154,13 @@ RPCHelpMan migratetoquantum()
             if (IsEUTXOScript(spk)) continue;
             if (!out.spendable) continue;
             const Coin& coin = migration_view.AccessCoin(out.outpoint);
-            if (!coin.IsSpent() && IsWalletProtectedLineageInput(
-                    *pwallet, out.outpoint, coin, consensus, mtp, next_height)) {
-                ++migration_anchor_inputs;
-            }
-            coin_control.Select(out.outpoint);
+            const bool is_anchor = !coin.IsSpent() && IsWalletProtectedLineageInput(
+                    *pwallet, out.outpoint, coin, consensus, mtp, next_height);
+            if (is_anchor) ++migration_anchor_inputs;
+            const int input_vsize = CalculateMaximumSignedInputSize(out.txout, pwallet.get(), &coin_control);
+            batch_candidates.push_back({out.outpoint, out.txout.nValue, out.txout.nValue,
+                                        input_vsize > 0 ? int64_t{input_vsize} * WITNESS_SCALE_FACTOR : int64_t{600},
+                                        is_anchor});
             eligible_amount += out.txout.nValue;
             ++eligible_inputs;
         }
@@ -2142,7 +2171,8 @@ RPCHelpMan migratetoquantum()
                 "No spendable legacy coins to migrate.",
                 created_destination);
         }
-        if (IsQuantumWitnessSpendActive(consensus, mtp, next_height) && migration_anchor_inputs == 0) {
+        const bool anchor_required = IsQuantumWitnessSpendActive(consensus, mtp, next_height);
+        if (anchor_required && migration_anchor_inputs == 0) {
             ThrowQuantumActionError(
                 RPC_WALLET_ERROR,
                 "Quantum migration",
@@ -2150,20 +2180,16 @@ RPCHelpMan migratetoquantum()
                 created_destination);
         }
 
-        std::vector<CRecipient> recipients;
-        recipients.push_back({dest, eligible_amount, /*fSubtractFeeFromAmount=*/true});
-
-        constexpr int RANDOM_CHANGE_POSITION = -1;
-        auto res = CreateTransaction(*pwallet, recipients, RANDOM_CHANGE_POSITION, coin_control, /*sign=*/!dry_run);
-        if (!res) {
+        auto batch = BuildMigrationBatch(*pwallet, coin_control, dest, batch_candidates, batch_limit, anchor_required, /*sign=*/!dry_run);
+        if (!batch) {
             ThrowQuantumActionError(
                 RPC_WALLET_ERROR,
                 "Quantum migration",
-                util::ErrorString(res).original,
+                util::ErrorString(batch).original,
                 created_destination);
         }
 
-        const CTransactionRef& tx = res->tx;
+        const CTransactionRef& tx = batch->tx;
         if (tx->vout.size() != 1 || IsDust(tx->vout[0], pwallet->chain().relayDustFee())) {
             ThrowQuantumActionError(
                 RPC_WALLET_INSUFFICIENT_FUNDS,
@@ -2175,14 +2201,20 @@ RPCHelpMan migratetoquantum()
         UniValue result(UniValue::VOBJ);
         result.pushKV("phase", phase);
         result.pushKV("deadline_mtp", consensus.nQuantumMigrationDeadlineTime);
-        result.pushKV("eligible_inputs", (int)eligible_inputs);
-        result.pushKV("eligible_amount", ValueFromAmount(eligible_amount));
+        result.pushKV("eligible_inputs", (int)batch->selected.size());
+        result.pushKV("eligible_amount", ValueFromAmount(batch->selected_value));
+        result.pushKV("total_eligible_inputs", (int)eligible_inputs);
+        result.pushKV("total_eligible_amount", ValueFromAmount(eligible_amount));
+        result.pushKV("remaining_inputs", (int)batch->remaining_inputs);
+        result.pushKV("remaining_amount", ValueFromAmount(batch->remaining_value));
+        result.pushKV("more_batches", batch->remaining_inputs > 0);
+        result.pushKV("max_inputs", (int)batch_limit);
         result.pushKV("destination", EncodeDestination(dest));
         result.pushKV("newly_generated", newly_generated);
         result.pushKV("stored_in_wallet", true);
         result.pushKV("amount", ValueFromAmount(tx->vout[0].nValue));
-        result.pushKV("fee", ValueFromAmount(res->fee));
-        result.pushKV("vsize", (int)GetVirtualTransactionSize(*tx, 0, 0));
+        result.pushKV("fee", ValueFromAmount(batch->fee));
+        result.pushKV("vsize", dry_run ? (int)batch->estimated_vsize : (int)GetVirtualTransactionSize(*tx, 0, 0));
         if (!dry_run) {
             CommitWalletTransactionOrThrow(*pwallet, tx, {}, "Quantum migration", created_destination);
             result.pushKV("txid", tx->GetHash().GetHex());
@@ -2201,7 +2233,15 @@ RPCHelpMan migrategoldrushrewards()
 {
     return RPCHelpMan{"migrategoldrushrewards",
         "\nOptionally consolidate matured wallet-owned Gold Rush reward outputs into another\n"
-        "wallet-backed Blackcoin ML-DSA address. A fresh move is not required for normal use.\n",
+        "wallet-backed Blackcoin ML-DSA address. A fresh move is not required for normal use:\n"
+        "Gold Rush payouts are already quantum outputs, they stay spendable after the Final\n"
+        "phase begins, and nothing is lost by leaving them as they are. This command only\n"
+        "reduces the number of outputs you hold. (Legacy coins are different: they must be\n"
+        "moved with migratetoquantum before the Migration phase ends.)\n"
+        "\nEach call builds ONE transaction of at most max_inputs payout inputs (and never more\n"
+        "than fits a standard transaction), chosen largest first. The result says how many\n"
+        "payout outputs remain; call again, with existing_address set to the returned\n"
+        "destination, until more_batches is false.\n",
         {
             {"options", RPCArg::Type::OBJ_NAMED_PARAMS, RPCArg::Optional::OMITTED, "",
                 {
@@ -2211,22 +2251,29 @@ RPCHelpMan migrategoldrushrewards()
                     {"label", RPCArg::Type::STR, RPCArg::Default{"goldrush-consolidation"}, "Label for a newly generated optional consolidation address."},
                     {"fee_rate", RPCArg::Type::AMOUNT, RPCArg::DefaultHint{"wallet default"}, "Fee rate in " + CURRENCY_ATOM + "/vB."},
                     {"include_unsafe", RPCArg::Type::BOOL, RPCArg::Default{false}, "Include unconfirmed/unsafe reward coins."},
+                    {"max_inputs", RPCArg::Type::NUM, RPCArg::DefaultHint{"90"}, "Most payout inputs this call may spend. The batch is also cut so that the signed transaction always fits the standard size limit (about 90 payout inputs)."},
                 },
             },
         },
         RPCResult{RPCResult::Type::OBJ, "", "", {
             {RPCResult::Type::STR, "phase", "current Blackcoin phase"},
             {RPCResult::Type::NUM_TIME, "deadline_mtp", "forecast final migration time (non-authoritative for the mainnet height schedule)"},
-            {RPCResult::Type::NUM, "eligible_inputs", "count of Gold Rush reward UTXOs moved"},
-            {RPCResult::Type::STR_AMOUNT, "eligible_amount", "nominal Gold Rush reward value selected (compatibility field)"},
-            {RPCResult::Type::STR_AMOUNT, "effective_eligible_amount", "spendable value after scheduled demurrage"},
-            {RPCResult::Type::STR_AMOUNT, "burned_amount", "scheduled demurrage realized by this consolidation"},
+            {RPCResult::Type::NUM, "eligible_inputs", "count of Gold Rush reward UTXOs moved by this batch"},
+            {RPCResult::Type::STR_AMOUNT, "eligible_amount", "nominal Gold Rush reward value moved by this batch (compatibility field)"},
+            {RPCResult::Type::STR_AMOUNT, "effective_eligible_amount", "spendable value after scheduled demurrage, for this batch"},
+            {RPCResult::Type::STR_AMOUNT, "burned_amount", "scheduled demurrage realized by this batch"},
+            {RPCResult::Type::NUM, "total_eligible_inputs", "count of payout UTXOs that could be consolidated before this batch"},
+            {RPCResult::Type::STR_AMOUNT, "total_eligible_amount", "nominal payout value that could be consolidated before this batch"},
+            {RPCResult::Type::NUM, "remaining_inputs", "payout UTXOs left for later batches"},
+            {RPCResult::Type::STR_AMOUNT, "remaining_amount", "nominal payout value left for later batches"},
+            {RPCResult::Type::BOOL, "more_batches", "whether another call would consolidate more"},
+            {RPCResult::Type::NUM, "max_inputs", "input limit that applied to this batch"},
             {RPCResult::Type::STR, "destination", "new quantum address funds were sent to"},
             {RPCResult::Type::BOOL, "newly_generated", "whether destination was freshly generated"},
             {RPCResult::Type::BOOL, "stored_in_wallet", "destination key confirmed persisted"},
             {RPCResult::Type::STR_AMOUNT, "amount", "value of the new quantum output after fee"},
             {RPCResult::Type::STR_AMOUNT, "fee", "fee paid"},
-            {RPCResult::Type::NUM, "vsize", "virtual transaction size"},
+            {RPCResult::Type::NUM, "vsize", "virtual transaction size; for dry_run the maximum signed size the real call will build"},
             {RPCResult::Type::STR_HEX, "txid", /*optional=*/true, "txid (absent for dry_run)"},
             {RPCResult::Type::STR, "warning", /*optional=*/true, "backup reminder"},
         }},
@@ -2248,6 +2295,12 @@ RPCHelpMan migrategoldrushrewards()
         const std::optional<CFeeRate> requested_fee_rate = options.exists("fee_rate")
             ? std::optional<CFeeRate>{FeeRateFromSatVbValue(options["fee_rate"])}
             : std::nullopt;
+        size_t batch_limit = DEFAULT_GOLDRUSH_CONSOLIDATION_BATCH_INPUTS;
+        if (options.exists("max_inputs")) {
+            const int64_t requested = options["max_inputs"].getInt<int64_t>();
+            if (requested < 1) throw JSONRPCError(RPC_INVALID_PARAMETER, "max_inputs must be at least 1");
+            batch_limit = ClampMigrationBatchInputs(requested, DEFAULT_GOLDRUSH_CONSOLIDATION_BATCH_INPUTS);
+        }
         if (dry_run && existing.empty()) {
             throw JSONRPCError(RPC_INVALID_PARAMETER, "dry_run requires existing_address so the estimate does not create wallet metadata");
         }
@@ -2329,9 +2382,9 @@ RPCHelpMan migrategoldrushrewards()
         ChainstateManager& chainman = pwallet->chain().chainman();
         const CCoinsViewCache& view = chainman.ActiveChainstate().CoinsTip();
         CAmount eligible_amount = 0;
-        CAmount effective_eligible_amount = 0;
-        CAmount burned_amount = 0;
         unsigned int eligible_inputs = 0;
+        std::vector<MigrationBatchInput> batch_candidates;
+        std::map<COutPoint, CAmount> candidate_burn;
         for (const COutput& out : AvailableCoins(*pwallet, &coin_control, std::nullopt, filter).All()) {
             const CScript& spk = out.txout.scriptPubKey;
             if (!IsQuantumMigrationScript(spk) || spk == destination_script) continue;
@@ -2346,10 +2399,12 @@ RPCHelpMan migrategoldrushrewards()
                 latest_attestation ? std::optional<int>{latest_attestation->height} : std::nullopt,
                 latest_attestation ? std::optional<int>{static_cast<int>(latest_attestation->coverage_start_height)} : std::nullopt);
             if (eval.locked || eval.effective_value <= 0) continue;
-            coin_control.Select(out.outpoint);
+            const int input_vsize = CalculateMaximumSignedInputSize(out.txout, pwallet.get(), &coin_control);
+            batch_candidates.push_back({out.outpoint, out.txout.nValue, eval.effective_value,
+                                        input_vsize > 0 ? int64_t{input_vsize} * WITNESS_SCALE_FACTOR : int64_t{4000},
+                                        /*anchor=*/false});
+            candidate_burn.emplace(out.outpoint, eval.burned_value);
             eligible_amount += out.txout.nValue;
-            effective_eligible_amount += eval.effective_value;
-            burned_amount += eval.burned_value;
             ++eligible_inputs;
         }
         if (eligible_inputs == 0) {
@@ -2360,20 +2415,19 @@ RPCHelpMan migrategoldrushrewards()
                 created_destination);
         }
 
-        std::vector<CRecipient> recipients;
-        recipients.push_back({dest, effective_eligible_amount, /*fSubtractFeeFromAmount=*/true});
-
-        constexpr int RANDOM_CHANGE_POSITION = -1;
-        auto res = CreateTransaction(*pwallet, recipients, RANDOM_CHANGE_POSITION, coin_control, /*sign=*/!dry_run);
-        if (!res) {
+        auto batch = BuildMigrationBatch(*pwallet, coin_control, dest, batch_candidates, batch_limit, /*require_anchor=*/false, /*sign=*/!dry_run);
+        if (!batch) {
             ThrowQuantumActionError(
                 RPC_WALLET_ERROR,
                 "Gold Rush reward consolidation",
-                util::ErrorString(res).original,
+                util::ErrorString(batch).original,
                 created_destination);
         }
+        CAmount burned_amount = 0;
+        for (const COutPoint& selected : batch->selected) burned_amount += candidate_burn.at(selected);
+        const CAmount effective_eligible_amount = batch->selected_effective_value;
 
-        const CTransactionRef& tx = res->tx;
+        const CTransactionRef& tx = batch->tx;
         if (tx->vout.size() != 1 || IsDust(tx->vout[0], pwallet->chain().relayDustFee())) {
             ThrowQuantumActionError(
                 RPC_WALLET_INSUFFICIENT_FUNDS,
@@ -2385,16 +2439,22 @@ RPCHelpMan migrategoldrushrewards()
         UniValue result(UniValue::VOBJ);
         result.pushKV("phase", phase);
         result.pushKV("deadline_mtp", consensus.nQuantumMigrationDeadlineTime);
-        result.pushKV("eligible_inputs", (int)eligible_inputs);
-        result.pushKV("eligible_amount", ValueFromAmount(eligible_amount));
+        result.pushKV("eligible_inputs", (int)batch->selected.size());
+        result.pushKV("eligible_amount", ValueFromAmount(batch->selected_value));
         result.pushKV("effective_eligible_amount", ValueFromAmount(effective_eligible_amount));
         result.pushKV("burned_amount", ValueFromAmount(burned_amount));
+        result.pushKV("total_eligible_inputs", (int)eligible_inputs);
+        result.pushKV("total_eligible_amount", ValueFromAmount(eligible_amount));
+        result.pushKV("remaining_inputs", (int)batch->remaining_inputs);
+        result.pushKV("remaining_amount", ValueFromAmount(batch->remaining_value));
+        result.pushKV("more_batches", batch->remaining_inputs > 0);
+        result.pushKV("max_inputs", (int)batch_limit);
         result.pushKV("destination", EncodeDestination(dest));
         result.pushKV("newly_generated", newly_generated);
         result.pushKV("stored_in_wallet", true);
         result.pushKV("amount", ValueFromAmount(tx->vout[0].nValue));
-        result.pushKV("fee", ValueFromAmount(res->fee));
-        result.pushKV("vsize", (int)GetVirtualTransactionSize(*tx, 0, 0));
+        result.pushKV("fee", ValueFromAmount(batch->fee));
+        result.pushKV("vsize", dry_run ? (int)batch->estimated_vsize : (int)GetVirtualTransactionSize(*tx, 0, 0));
         if (!dry_run) {
             CommitWalletTransactionOrThrow(*pwallet, tx, {}, "Gold Rush reward consolidation", created_destination);
             result.pushKV("txid", tx->GetHash().GetHex());
@@ -3937,6 +3997,8 @@ RPCHelpMan getmigrationstatus()
                     {RPCResult::Type::STR_AMOUNT, "burned_amount", "value removed by demurrage"},
                 }},
             }},
+            {RPCResult::Type::NUM, "legacy_staking_last_height", /*optional=*/true, "last block height at which this wallet still creates a legacy coinstake (absent without a height-authoritative schedule); later legacy stakes could not mature before the Final phase"},
+            {RPCResult::Type::STR, "legacy_staking_notice", /*optional=*/true, "plain-language notice about the legacy staking cutoff and migrating before Final"},
             {RPCResult::Type::STR, "advice", "human-readable next step"},
         }},
         RPCExamples{HelpExampleCli("getmigrationstatus", "") + HelpExampleRpc("getmigrationstatus", "")},
@@ -4075,6 +4137,11 @@ RPCHelpMan getmigrationstatus()
                               std::move(category));
         }
         r.pushKV("categories", std::move(categories));
+        if (const std::optional<int64_t> legacy_stake_last = LastLegacyStakeHeight(c)) {
+            r.pushKV("legacy_staking_last_height", *legacy_stake_last);
+            const std::string stake_notice = LegacyStakingNotice(c, next_height);
+            if (!stake_notice.empty()) r.pushKV("legacy_staking_notice", stake_notice);
+        }
         std::string advice;
         if (passed)              advice = "Deadline passed. Remaining legacy coins are permanently unspendable.";
         else if (goldrush_reward_n > 0) advice = "Gold Rush reward outputs remain locked until the Gold Rush ends; they then become ordinary quantum funds after normal maturity.";

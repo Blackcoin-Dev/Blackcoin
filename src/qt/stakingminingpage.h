@@ -158,6 +158,10 @@ private:
     QCheckBox* m_unlock_quantum_legacy_staking{nullptr};
     QLabel* m_quantum_legacy_unlock_note{nullptr};
     QLabel* m_staking_status{nullptr};
+    QLabel* m_legacy_staking_notice{nullptr};
+    //! Destination of the previous migration batch, reused while more batches remain.
+    QString m_legacy_batch_destination;
+    QString m_goldrush_batch_destination;
     QLabel* m_stake_weight{nullptr};
     QLabel* m_goldrush_badge{nullptr};
     QLabel* m_pos_goldrush_status{nullptr};

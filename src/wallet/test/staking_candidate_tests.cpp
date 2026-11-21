@@ -516,6 +516,68 @@ BOOST_AUTO_TEST_CASE(stake_slot_cost_on_a_large_wallet)
                        << " ms; cached warm: " << warm_ms << " ms");
 }
 
+/** Regtest chain of 100 blocks whose Migration end sits at a chosen height; the
+ *  next block (101) is still in Gold Rush, so legacy staking is otherwise open. */
+class LegacyStakeScheduleSetup : public TestChain100Setup
+{
+public:
+    explicit LegacyStakeScheduleSetup(const char* migration_end_arg)
+        : TestChain100Setup{ChainType::REGTEST, {
+              "-shadowwhitelistheight=99",
+              "-shadowgoldrushstartheight=100",
+              "-shadowgoldrushendheight=102",
+              "-qqgoldrushendheight=102",
+              migration_end_arg,
+          }}
+    {
+    }
+};
+
+class LegacyStakeOpenSetup : public LegacyStakeScheduleSetup
+{
+public:
+    LegacyStakeOpenSetup() : LegacyStakeScheduleSetup{"-qqmigrationendheight=300"} {}
+};
+
+class LegacyStakeBarredSetup : public LegacyStakeScheduleSetup
+{
+public:
+    // Last allowed legacy stake height is 105 - 10 - 1 = 94, below the next height 101.
+    LegacyStakeBarredSetup() : LegacyStakeScheduleSetup{"-qqmigrationendheight=105"} {}
+};
+
+StakeCoins LegacyCandidatesAtTip(TestChain100Setup& setup, CWallet& wallet)
+{
+    LOCK2(::cs_main, wallet.cs_wallet);
+    BOOST_REQUIRE(setup.m_node.chainman);
+    StakeCoins fast, reference;
+    AvailableCoinsForStaking(wallet, fast);
+    AvailableCoinsForStakingReference(wallet, reference);
+    // The status weight and the kernel search read the same set as the reference scan.
+    BOOST_CHECK(fast == reference);
+    return fast;
+}
+
+BOOST_FIXTURE_TEST_CASE(legacy_kernels_are_candidates_before_the_cutoff, LegacyStakeOpenSetup)
+{
+    auto wallet = CreateSyncedWallet(*m_node.chain,
+        WITH_LOCK(Assert(m_node.chainman)->GetMutex(), return m_node.chainman->ActiveChain()), coinbaseKey);
+    BOOST_CHECK_EQUAL(m_node.chainman->ActiveChain().Height(), 100);
+    BOOST_CHECK(!LegacyCandidatesAtTip(*this, *wallet).empty());
+}
+
+BOOST_FIXTURE_TEST_CASE(legacy_kernels_are_not_candidates_past_the_cutoff, LegacyStakeBarredSetup)
+{
+    auto wallet = CreateSyncedWallet(*m_node.chain,
+        WITH_LOCK(Assert(m_node.chainman)->GetMutex(), return m_node.chainman->ActiveChain()), coinbaseKey);
+    BOOST_CHECK_EQUAL(m_node.chainman->ActiveChain().Height(), 100);
+    const Consensus::Params& consensus = Params().GetConsensus();
+    BOOST_CHECK(IsLegacyStakeBarredByMigrationEnd(consensus, 101));
+    // The same wallet and coins as the open schedule, but none may stake: a
+    // legacy coinstake made now could not mature before Final.
+    BOOST_CHECK(LegacyCandidatesAtTip(*this, *wallet).empty());
+}
+
 BOOST_AUTO_TEST_SUITE_END()
 } // namespace
 } // namespace wallet

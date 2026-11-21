@@ -146,16 +146,6 @@ class GoldRushHeightScheduleMultiNodeTest(BitcoinTestFramework):
             self._bump_mocktime(16)
         raise last_error or AssertionError("failed to mine deterministic PoS block")
 
-    def _mine_plain_pow_block(self, node, address):
-        start_height = node.getblockcount()
-        for _ in range(400):
-            if node.generatetoaddress(nblocks=1, address=address, maxtries=25000, invalid_call=False):
-                break
-            self._bump_mocktime(16)
-        assert_equal(node.getblockcount(), start_height + 1)
-        self._bump_mocktime()
-        self._sync_started()
-
     def _mine_pos_to_height(self, node, wallet, target_height):
         while node.getblockcount() < target_height:
             self._mine_pos_block(node, wallet)
@@ -373,15 +363,35 @@ class GoldRushHeightScheduleMultiNodeTest(BitcoinTestFramework):
         self._assert_network_agrees()
 
         self.log.info("Crossing the migration end height %d into Final Lockout", MIGRATION_END_HEIGHT)
-        # The wallet stops legacy staking after the last height whose coinstake
-        # can mature before Final, so this legacy staker takes the blocks up to
-        # that height and plain PoW blocks (still valid) take the rest.
-        legacy_last = staker_a.getstakinginfo()["legacy_staking_last_height"]
-        self._mine_pos_to_height(node, staker_a, min(MIGRATION_END_HEIGHT - 1, legacy_last))
-        while node.getblockcount() < MIGRATION_END_HEIGHT - 1:
-            self._mine_plain_pow_block(node, claim_fee_address)
+        # In the last blocks of Migration a legacy stake is paid to one quantum
+        # output of the staking wallet, so the legacy staker keeps producing
+        # every block through the window (proof of work is not available on
+        # mainnet at these heights). staker_a has no quantum address yet: until
+        # one is set it does not stake legacy coins in the window.
+        info = staker_a.getstakinginfo()
+        window_start = info["legacy_staking_window_start_height"]
+        assert window_start < MIGRATION_END_HEIGHT
+        self._mine_pos_to_height(node, staker_a, window_start - 2)
+        info = staker_a.getstakinginfo()
+        assert_equal(info["legacy_staking_in_window"], False)
+        assert_equal(info["legacy_staking_stopped"], False)
+        self._mine_pos_block(node, staker_a)
+        # The next block is the first in the window and no return address is
+        # ready: the wallet refuses to stake its legacy coins and says so.
+        info = staker_a.getstakinginfo()
+        assert_equal(info["legacy_staking_in_window"], True)
+        assert_equal(info["legacy_stake_return_ready"], False)
+        assert_equal(info["legacy_staking_stopped"], True)
+        staker_a.setquantumstakereturn({"allow_new_quantum_key": True})
+        info = staker_a.getstakinginfo()
+        assert_equal(info["legacy_stake_return_ready"], True)
+        self._mine_pos_to_height(node, staker_a, MIGRATION_END_HEIGHT - 1)
         self._assert_phase_everywhere("migration")
-        self._mine_plain_pow_block(node, claim_fee_address)  # the final Migration block
+        coinstake = node.getblock(node.getblockhash(window_start), 2)["tx"][1]
+        valued = [o for o in coinstake["vout"] if o["value"] > 0]
+        assert_equal(len(valued), 1)
+        assert_equal(valued[0]["scriptPubKey"]["type"], "witness_unknown")
+        self._mine_pos_block(node, staker_a)  # the final Migration block
         self._sync_started()
         assert_equal(node.getblockcount(), MIGRATION_END_HEIGHT)
         self._assert_phase_everywhere("final_lockout")

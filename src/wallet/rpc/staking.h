@@ -7,10 +7,18 @@
 
 #include <span.h>
 
+#include <consensus/params.h>
+
 class CRPCCommand;
+class UniValue;
 
 namespace wallet {
+class CWallet;
 Span<const CRPCCommand> GetStakingRPCCommands();
+/** Adds the quantum return fields of legacy staking (all optional additions) to
+ *  a getstakinginfo or getmigrationstatus object; nothing when no height
+ *  schedule exists. */
+void AddLegacyStakeReturnStatus(UniValue& obj, const CWallet& wallet, const Consensus::Params& consensus, int64_t next_height);
 } // namespace wallet
 
 #endif // BITCOIN_WALLET_RPC_STAKING_H

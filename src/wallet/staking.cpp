@@ -1567,6 +1567,10 @@ int MaybeAutoDemurrageAttest(CWallet& wallet)
 
 int MaybeAutoShadowSignal(CWallet& wallet)
 {
+    // Cheap when the return address is already set: the legacy-stake quantum return
+    // must exist before the window opens, so it is kept ready whenever the wallet
+    // is fully unlocked (never creating a key the policy forbids).
+    MaybeAutoSetQuantumStakeReturn(wallet);
     ScopedDisallowShadowSolverActivityFullScan no_full_solver_scan;
     if (!gArgs.GetBoolArg("-qqautoshadowsignal", DEFAULT_AUTO_SHADOW_SIGNAL)) return 0;
     if (!wallet.m_enabled_staking.load() || wallet.IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS)) {
@@ -1989,8 +1993,9 @@ struct StakeCandidateScanContext
     bool script_class_prevalidated{false};
     std::set<uint256> trusted_parents;
     std::map<uint256, StakeTransactionEligibility> transaction_eligibility;
-    // A legacy kernel would return its principal to an output that cannot
-    // mature before Final (see IsLegacyStakeBarredByMigrationEnd).
+    // Set when a legacy kernel could only return its principal to an output
+    // that cannot mature before Final and the wallet has no quantum stake
+    // return address ready (see IsLegacyStakeBarredByMigrationEnd).
     bool legacy_stake_barred{false};
 };
 
@@ -2009,23 +2014,179 @@ bool IsLegacyStakeBarredByMigrationEnd(const Consensus::Params& consensus, int s
     return last && int64_t{stake_height} > *last;
 }
 
-std::string LegacyStakingNotice(const Consensus::Params& consensus, int next_height)
+std::string LegacyStakingNotice(const Consensus::Params& consensus, int next_height,
+                                const LegacyStakeQuantumReturn& quantum_return)
 {
     const std::optional<int64_t> last = LastLegacyStakeHeight(consensus);
     if (!last || int64_t{next_height} > int64_t{consensus.nQuantumMigrationEndHeight}) return "";
     const int64_t final_height = int64_t{consensus.nQuantumMigrationEndHeight} + 1;
+    const int64_t first_quantum = *last + 1;
+    const std::string unstaked = strprintf(
+        "Legacy coins that never win a stake stay legacy: migrate them to a quantum address before height %d "
+        "(the first Final block) or they can never be spent.", final_height);
+    std::string head;
     if (int64_t{next_height} > *last) {
-        return strprintf("Legacy staking has stopped: this wallet no longer creates legacy stakes after block height %d, "
-                         "because a legacy stake made later could not mature before the Final phase and would be lost. "
-                         "Legacy coins that are not migrated before height %d (the first Final block) can never be spent. "
-                         "Migrate them to a quantum address now.",
-                         *last, final_height);
+        head = strprintf("Legacy stakes are now paid to a quantum address of this wallet (from height %d), because a legacy "
+                         "stake made now could not mature before the Final phase.", first_quantum);
+    } else {
+        head = strprintf("From height %d (%d blocks from now), legacy stakes are paid to a quantum address of this wallet, "
+                         "because a legacy stake made later could not mature before the Final phase.",
+                         first_quantum, first_quantum - int64_t{next_height});
     }
-    return strprintf("Legacy staking stops after block height %d (%d blocks from now). A legacy stake made after that could not "
-                     "mature before the Final phase and would be lost, so this wallet stops creating them. "
-                     "Legacy coins that are not migrated before height %d (the first Final block) can never be spent. "
-                     "Migrate legacy coins to a quantum address before then.",
-                     *last, *last - int64_t{next_height} + 1, final_height);
+    std::string ready;
+    if (quantum_return.available) {
+        ready = strprintf("Return address READY: %s. Legacy coins that stake in the window leave as quantum coins, which "
+                          "cannot stake again until they are %d blocks old (so not inside the window).",
+                          quantum_return.address, consensus.nCoinbaseMaturity);
+    } else {
+        ready = strprintf("Return address NOT READY: %s Until it is, this wallet will not stake legacy coins from height %d.",
+                          quantum_return.reason, first_quantum);
+    }
+    return head + " " + ready + " " + unstaked;
+}
+
+std::optional<CTxDestination> ChooseLegacyStakeQuantumReturn(const std::vector<QuantumReturnCandidate>& candidates)
+{
+    static const std::array<const char*, 3> staker_labels{
+        "PoS - Quantum Stake Address", "Quantum PoS Reward Address", "goldrush-pos"};
+    std::optional<CTxDestination> best;
+    int best_rank{-1};
+    int64_t best_time{0};
+    std::string best_encoded;
+    for (const QuantumReturnCandidate& candidate : candidates) {
+        if (candidate.is_change || !IsValidDestination(candidate.destination)) continue;
+        if (!IsDirectQuantumMigrationScript(GetScriptForDestination(candidate.destination))) continue;
+        int rank{1};
+        for (size_t i = 0; i < staker_labels.size(); ++i) {
+            if (candidate.label == staker_labels[i]) rank = static_cast<int>(10 - i);
+        }
+        const std::string encoded = EncodeDestination(candidate.destination);
+        const bool better = !best || rank > best_rank ||
+                            (rank == best_rank && (candidate.creation_time < best_time ||
+                                                   (candidate.creation_time == best_time && encoded < best_encoded)));
+        if (better) {
+            best = candidate.destination;
+            best_rank = rank;
+            best_time = candidate.creation_time;
+            best_encoded = encoded;
+        }
+    }
+    return best;
+}
+
+namespace {
+//! Why dest cannot be the quantum stake return address; empty when it can.
+std::string QuantumStakeReturnProblem(const CWallet& wallet, const CTxDestination& dest)
+{
+    AssertLockHeld(wallet.cs_wallet);
+    if (!IsValidDestination(dest) || !IsQuantumMigrationDestination(dest) ||
+        !IsDirectQuantumMigrationScript(GetScriptForDestination(dest))) {
+        return "it is not an ordinary quantum address.";
+    }
+    const auto info = wallet.GetQuantumKeyInfo(dest);
+    if (!info) return "it is not backed by a quantum key of this wallet.";
+    if (!info->durably_stored) return "its quantum key is not durably stored yet.";
+    return "";
+}
+} // namespace
+
+LegacyStakeQuantumReturn ResolveLegacyStakeQuantumReturn(const CWallet& wallet)
+{
+    AssertLockHeld(wallet.cs_wallet);
+    LegacyStakeQuantumReturn result;
+    if (wallet.IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS)) {
+        result.reason = "this wallet has no private keys.";
+        return result;
+    }
+    if (wallet.m_quantum_stake_return.empty()) {
+        result.reason = "no quantum stake return address is set. Unlock the wallet normally (not for staking only) "
+                        "so it can choose one, or run setquantumstakereturn.";
+        return result;
+    }
+    const CTxDestination dest = DecodeDestination(wallet.m_quantum_stake_return);
+    const std::string problem = QuantumStakeReturnProblem(wallet, dest);
+    if (!problem.empty()) {
+        result.reason = strprintf("the saved quantum stake return address %s cannot be used: %s Run setquantumstakereturn "
+                                  "with another address.", wallet.m_quantum_stake_return, problem);
+        return result;
+    }
+    result.available = true;
+    result.script = GetScriptForDestination(dest);
+    result.address = wallet.m_quantum_stake_return;
+    return result;
+}
+
+bool SetQuantumStakeReturn(CWallet& wallet, const CTxDestination& dest, bilingual_str& error)
+{
+    LOCK(wallet.cs_wallet);
+    const std::string problem = QuantumStakeReturnProblem(wallet, dest);
+    if (!problem.empty()) {
+        error = Untranslated("The address cannot be the quantum stake return address: " + problem);
+        return false;
+    }
+    const std::string encoded = EncodeDestination(dest);
+    WalletBatch batch(wallet.GetDatabase());
+    if (!batch.WriteQuantumStakeReturn(encoded)) {
+        error = _("Failed to write the quantum stake return address to the wallet database.");
+        return false;
+    }
+    wallet.m_quantum_stake_return = encoded;
+    // The candidate set depends on it inside the window; never serve a stale selection.
+    DropStakeSlotCache(wallet);
+    return true;
+}
+
+bool MaybeAutoSetQuantumStakeReturn(CWallet& wallet)
+{
+    const Consensus::Params& consensus = Params().GetConsensus();
+    if (!LastLegacyStakeHeight(consensus)) return false;
+    if (wallet.IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS) || wallet.IsLocked() ||
+        wallet.m_wallet_unlock_staking_only) {
+        return false;
+    }
+    if (wallet.GetLastBlockHeight() + 1 > consensus.nQuantumMigrationEndHeight) return false;
+    CTxDestination chosen;
+    {
+        LOCK(wallet.cs_wallet);
+        if (ResolveLegacyStakeQuantumReturn(wallet).available) return false;
+        const std::vector<std::string> configured = gArgs.GetArgs("-qqpospayoutaddress");
+        if (configured.size() == 1) {
+            const CTxDestination dest = DecodeDestination(configured.front());
+            if (QuantumStakeReturnProblem(wallet, dest).empty()) chosen = dest;
+        }
+        if (!IsValidDestination(chosen)) {
+            std::vector<QuantumReturnCandidate> candidates;
+            wallet.ForEachAddrBookEntry([&](const CTxDestination& dest, const std::string& label, bool is_change,
+                                            const std::optional<AddressPurpose> purpose) {
+                if (is_change || !purpose || *purpose != AddressPurpose::RECEIVE) return;
+                if (!QuantumStakeReturnProblem(wallet, dest).empty()) return;
+                const auto info = wallet.GetQuantumKeyInfo(dest);
+                candidates.push_back({dest, label, is_change, info ? info->creation_time : 0});
+            });
+            if (const auto pick = ChooseLegacyStakeQuantumReturn(candidates)) chosen = *pick;
+        }
+    }
+    if (!IsValidDestination(chosen)) {
+        // The existing key-creation policy decides whether a new key may exist.
+        if (!gArgs.GetBoolArg("-qqallowautokeycreation", DEFAULT_ALLOW_AUTO_QUANTUM_KEY_CREATION)) return false;
+        CScript script;
+        std::string address;
+        bilingual_str error;
+        if (!wallet.EnsureShadowSignalPayoutAddress(script, address, error)) {
+            wallet.WalletLogPrintf("Quantum stake return address not created: %s\n", error.original);
+            return false;
+        }
+        wallet.WalletLogPrintf("Created quantum stake address %s for legacy stakes paid as quantum coins. Back up the wallet.\n", address);
+        chosen = DecodeDestination(address);
+    }
+    bilingual_str error;
+    if (!SetQuantumStakeReturn(wallet, chosen, error)) {
+        wallet.WalletLogPrintf("Quantum stake return address not set: %s\n", error.original);
+        return false;
+    }
+    wallet.WalletLogPrintf("Quantum stake return address set to %s: legacy stakes in the last %d blocks of Migration are paid there.\n",
+                           EncodeDestination(chosen), consensus.nCoinbaseMaturity + LEGACY_STAKE_MIGRATION_MARGIN_BLOCKS);
+    return true;
 }
 
 /**
@@ -2273,7 +2434,8 @@ BoundedLegacyStakeCandidates GetBoundedLegacyStakeCandidates(
         {},
         {},
     };
-    context.legacy_stake_barred = IsLegacyStakeBarredByMigrationEnd(consensus, spend_height);
+    context.legacy_stake_barred = IsLegacyStakeBarredByMigrationEnd(consensus, spend_height) &&
+                                  !ResolveLegacyStakeQuantumReturn(wallet).available;
     result.candidates.reserve(sources.size());
     for (const BoundedLegacyStakeSource& source : sources) {
         const COutPoint& outpoint = source.outpoint;
@@ -2350,7 +2512,8 @@ static void AvailableCoinsForStakingImpl(const CWallet& wallet,
         {},
     };
 
-    context.legacy_stake_barred = IsLegacyStakeBarredByMigrationEnd(consensus, spend_height);
+    context.legacy_stake_barred = IsLegacyStakeBarredByMigrationEnd(consensus, spend_height) &&
+                                  !ResolveLegacyStakeQuantumReturn(wallet).available;
 
     // The candidate subset holds exactly the live outpoints whose script can
     // stake, in the same order, so the selected set equals a walk of the full
@@ -2628,10 +2791,17 @@ bool CreateCoinStake(CWallet& wallet, unsigned int nBits, int64_t nSearchInterva
     const Consensus::Params& consensus = Params().GetConsensus();
     const bool quantum_stake_rules_active = IsQuantumWitnessSpendActive(consensus, stake_mtp, stake_height);
     const bool final_quantum_lockout = consensus.IsQuantumFinalLockout(stake_mtp, stake_height);
-    // Checked here as well as in the candidate filter: a legacy coinstake this
-    // late could never be spent before Final.
-    const bool legacy_stake_barred = IsLegacyStakeBarredByMigrationEnd(consensus, stake_height);
     const bool stake_reward_split_active = consensus.IsStakeRewardSplitActive(stake_height);
+    // In the quantum return window a legacy kernel pays one quantum output of
+    // this wallet (principal plus reward, nothing else). Checked here as well
+    // as in the candidate filter. Without a ready return address, or if an exact
+    // reward split (which fixes the return script) were already active, no
+    // legacy kernel may stake: a legacy-return coinstake this late could never
+    // be spent before Final.
+    const bool legacy_in_window = IsLegacyStakeBarredByMigrationEnd(consensus, stake_height);
+    const LegacyStakeQuantumReturn legacy_return = legacy_in_window ? ResolveLegacyStakeQuantumReturn(wallet) : LegacyStakeQuantumReturn{};
+    const bool legacy_stake_barred = legacy_in_window && (!legacy_return.available || stake_reward_split_active);
+    bool fReturnToQuantum = false;
 
     // Select coins with suitable depth. The selection and the kernel inputs
     // are shared by every slot of this tip (see StakeSlotCache).
@@ -2817,6 +2987,13 @@ bool CreateCoinStake(CWallet& wallet, unsigned int nBits, int64_t nSearchInterva
                     bMinterKey = true;
                 }
 
+                if (!quantum_kernel && legacy_in_window) {
+                    // The legacy key stays the block-signing key (the value-0
+                    // minter output); the value goes to the quantum output.
+                    bMinterKey = true;
+                    fReturnToQuantum = true;
+                }
+
                 txNew.nTime = kernel_time;
                 txNew.vin.push_back(CTxIn(pcoin.first->GetHash(), pcoin.second));
                 nCredit += kernel_principal;
@@ -2828,7 +3005,8 @@ bool CreateCoinStake(CWallet& wallet, unsigned int nBits, int64_t nSearchInterva
                     // extra output for minter key
                     txNew.vout.push_back(CTxOut(0, scriptPubKeyOut));
                     // redefine scriptPubKeyOut to send output to input address
-                    scriptPubKeyOut = scriptPubKeyKernel;
+                    // (or, for a legacy kernel in the window, to the quantum return)
+                    scriptPubKeyOut = fReturnToQuantum ? legacy_return.script : scriptPubKeyKernel;
                 }
     
                 txNew.vout.push_back(CTxOut(0, scriptPubKeyOut));
@@ -2919,7 +3097,7 @@ bool CreateCoinStake(CWallet& wallet, unsigned int nBits, int64_t nSearchInterva
         wallet.GetQQDevelopmentDonationPercentage();
     bool qq_development_donation_enabled =
         qq_development_percentage > 0 &&
-        quantum_stake_rules_active &&
+        quantum_stake_rules_active && !fReturnToQuantum &&
         IsDirectQuantumMigrationScript(qq_development_script);
 
     // This is wallet policy, never a consensus treasury or required payment.
@@ -2943,7 +3121,7 @@ bool CreateCoinStake(CWallet& wallet, unsigned int nBits, int64_t nSearchInterva
     }
 
     // Split stake
-    if (nCredit >= GetStakeSplitThreshold())
+    if (nCredit >= GetStakeSplitThreshold() && !fReturnToQuantum)
         txNew.vout.push_back(CTxOut(0, scriptPubKeyOut));
 
     if (qq_development_donation_enabled)
@@ -2970,6 +3148,26 @@ bool CreateCoinStake(CWallet& wallet, unsigned int nBits, int64_t nSearchInterva
     if (IsShadowGoldRushRewardActive(consensus, stake_mtp, stake_height) &&
         !final_quantum_lockout) {
         txNew.vout.push_back(CTxOut(0, BuildQuantumQuasarBlockNoticeScript()));
+    }
+
+    // The independent guard: this wallet never emits a legacy-return coinstake in
+    // the window. A legacy kernel there has exactly one output of value, a
+    // quantum output of the wallet, and nothing else of value.
+    if (legacy_in_window && !fQuantumKernel) {
+        if (!fReturnToQuantum || !legacy_return.available) {
+            return error("CreateCoinStake : refusing a legacy-return coinstake in the quantum return window");
+        }
+        size_t valued_outputs{0};
+        for (size_t i = 1; i < txNew.vout.size(); ++i) {
+            if (txNew.vout[i].nValue == 0) continue;
+            ++valued_outputs;
+            if (txNew.vout[i].scriptPubKey != legacy_return.script) {
+                return error("CreateCoinStake : a legacy kernel in the quantum return window may pay only its quantum return output");
+            }
+        }
+        if (valued_outputs != 1) {
+            return error("CreateCoinStake : a legacy kernel in the quantum return window must pay exactly one output");
+        }
     }
 
     // Sign

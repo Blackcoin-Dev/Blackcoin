@@ -741,6 +741,104 @@ static UniValue ThrowOrReturnQuantumStakeTx(util::Result<interfaces::WalletQuant
     return QuantumStakeTxToJSON(*result);
 }
 
+void AddLegacyStakeReturnStatus(UniValue& obj, const CWallet& wallet, const Consensus::Params& consensus, int64_t next_height)
+{
+    const std::optional<int64_t> last = LastLegacyStakeHeight(consensus);
+    if (!last) return;
+    LegacyStakeQuantumReturn quantum_return;
+    {
+        LOCK(wallet.cs_wallet);
+        quantum_return = ResolveLegacyStakeQuantumReturn(wallet);
+    }
+    const bool in_window = next_height > *last;
+    obj.pushKV("legacy_staking_window_start_height", *last + 1);
+    obj.pushKV("legacy_staking_in_window", in_window);
+    obj.pushKV("legacy_staking_pays_quantum", true);
+    obj.pushKV("legacy_stake_return_ready", quantum_return.available);
+    if (quantum_return.available) {
+        obj.pushKV("legacy_stake_return_address", quantum_return.address);
+    } else {
+        obj.pushKV("legacy_stake_return_action", quantum_return.reason);
+    }
+    // Legacy staking is stopped only while it is in the window without a ready return address.
+    obj.pushKV("legacy_staking_stopped", in_window && !quantum_return.available);
+    const std::string notice = LegacyStakingNotice(consensus, static_cast<int>(next_height), quantum_return);
+    if (!notice.empty()) obj.pushKV("legacy_staking_notice", notice);
+}
+
+static RPCHelpMan setquantumstakereturn()
+{
+    return RPCHelpMan{"setquantumstakereturn",
+        "\nChoose the quantum address that receives the principal and reward of a legacy stake made in the last blocks of\n"
+        "the Migration phase (see legacy_staking_window_start_height in getstakinginfo). From that height a legacy stake\n"
+        "could not mature before the Final phase, so it is paid to this address instead and leaves as quantum coins.\n"
+        "The address must already be an ordinary quantum address of this wallet, or be created here with\n"
+        "allow_new_quantum_key (needs a normal unlock). A wallet unlocked for staking only cannot create a key,\n"
+        "so set the address before the window starts. With no address and no key creation, an existing quantum\n"
+        "address of this wallet is chosen.\n",
+        {
+            {"options", RPCArg::Type::OBJ_NAMED_PARAMS, RPCArg::Optional::OMITTED, "",
+                {
+                    {"existing_address", RPCArg::Type::STR, RPCArg::Default{""}, "Use this already-owned quantum address."},
+                    {"allow_new_quantum_key", RPCArg::Type::BOOL, RPCArg::Default{false}, "When no address exists, create one new non-HD ML-DSA key. Back up the wallet afterwards."},
+                },
+                RPCArgOptions{.oneline_description = "options"}},
+        },
+        RPCResult{RPCResult::Type::OBJ, "", "", {
+            {RPCResult::Type::STR, "address", "the saved quantum stake return address"},
+            {RPCResult::Type::BOOL, "created", "whether a new quantum key was created"},
+            {RPCResult::Type::BOOL, "ready", "whether legacy stakes in the window will be paid to it"},
+        }},
+        RPCExamples{
+            HelpExampleCli("setquantumstakereturn", "'{\"existing_address\":\"<addr>\"}'")
+          + HelpExampleRpc("setquantumstakereturn", "{\"allow_new_quantum_key\":true}")
+        },
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
+{
+    std::shared_ptr<CWallet> const pwallet = GetWalletForJSONRPCRequest(request);
+    if (!pwallet) return UniValue::VNULL;
+    const UniValue options = request.params[0].isNull() ? UniValue(UniValue::VOBJ) : request.params[0].get_obj();
+    const std::string existing = options.exists("existing_address") ? options["existing_address"].get_str() : "";
+    const bool allow_new = options.exists("allow_new_quantum_key") && options["allow_new_quantum_key"].get_bool();
+    bool created{false};
+    CTxDestination dest;
+    if (!existing.empty()) {
+        dest = DecodeDestination(existing);
+    } else {
+        if (MaybeAutoSetQuantumStakeReturn(*pwallet)) {
+            LOCK(pwallet->cs_wallet);
+            dest = DecodeDestination(pwallet->m_quantum_stake_return);
+        } else {
+            {
+                LOCK(pwallet->cs_wallet);
+                const LegacyStakeQuantumReturn current = ResolveLegacyStakeQuantumReturn(*pwallet);
+                if (current.available) dest = DecodeDestination(current.address);
+            }
+            if (!IsValidDestination(dest)) {
+                if (!allow_new) {
+                    throw JSONRPCError(RPC_WALLET_ERROR, "This wallet has no quantum address to use. Retry with {\"allow_new_quantum_key\":true} after authorizing key creation (needs a normal unlock; back up the wallet afterwards), or pass existing_address.");
+                }
+                auto result = pwallet->GetNewQuantumDestination("PoS - Quantum Stake Address");
+                if (!result) throw JSONRPCError(RPC_WALLET_ERROR, util::ErrorString(result).original);
+                dest = *result;
+                created = true;
+            }
+        }
+    }
+    bilingual_str error;
+    if (!SetQuantumStakeReturn(*pwallet, dest, error)) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, error.original);
+    }
+    UniValue result(UniValue::VOBJ);
+    result.pushKV("address", EncodeDestination(dest));
+    result.pushKV("created", created);
+    LOCK(pwallet->cs_wallet);
+    result.pushKV("ready", ResolveLegacyStakeQuantumReturn(*pwallet).available);
+    return result;
+},
+    };
+}
+
 static RPCHelpMan getstakinginfo()
 {
     return RPCHelpMan{"getstakinginfo",
@@ -783,7 +881,13 @@ static RPCHelpMan getstakinginfo()
                         {RPCResult::Type::NUM, "legacy_staking_blocks_remaining", /*optional=*/true, "Blocks left, counting the next block, at which legacy staking is still allowed; 0 once it has stopped"},
                         {RPCResult::Type::BOOL, "legacy_staking_stopped", /*optional=*/true, "Whether legacy staking has already stopped at the next block height"},
                         {RPCResult::Type::NUM, "legacy_migration_end_height", /*optional=*/true, "Last Migration block; legacy coins cannot be spent from the next height on"},
-                        {RPCResult::Type::STR, "legacy_staking_notice", /*optional=*/true, "Plain-language notice about the legacy staking cutoff and the need to migrate legacy coins before Final"},
+                        {RPCResult::Type::STR, "legacy_staking_notice", /*optional=*/true, "Plain-language notice: from legacy_staking_window_start_height legacy stakes are paid to a quantum address of this wallet, whether that return address is ready, what to do if not, and the need to migrate legacy coins that do not stake before Final"},
+                        {RPCResult::Type::NUM, "legacy_staking_window_start_height", /*optional=*/true, "First block height at which a legacy stake is paid to a quantum address instead of a legacy one"},
+                        {RPCResult::Type::BOOL, "legacy_staking_in_window", /*optional=*/true, "Whether the next block is already inside that window"},
+                        {RPCResult::Type::BOOL, "legacy_staking_pays_quantum", /*optional=*/true, "Always true when a schedule exists: legacy stakes in the window are paid to a quantum address"},
+                        {RPCResult::Type::BOOL, "legacy_stake_return_ready", /*optional=*/true, "Whether a usable quantum stake return address is saved in this wallet"},
+                        {RPCResult::Type::STR, "legacy_stake_return_address", /*optional=*/true, "The saved quantum stake return address, when ready"},
+                        {RPCResult::Type::STR, "legacy_stake_return_action", /*optional=*/true, "What to do before the window starts, when the return address is not ready"},
                         {RPCResult::Type::STR, "warnings", "Current network and wallet warnings"},
                     }
                 },
@@ -918,10 +1022,8 @@ static RPCHelpMan getstakinginfo()
         if (legacy_last) {
             obj.pushKV("legacy_staking_last_height", *legacy_last);
             obj.pushKV("legacy_staking_blocks_remaining", std::max<int64_t>(0, *legacy_last - next_height + 1));
-            obj.pushKV("legacy_staking_stopped", next_height > *legacy_last);
             obj.pushKV("legacy_migration_end_height", consensusParams.nQuantumMigrationEndHeight);
-            const std::string notice = LegacyStakingNotice(consensusParams, active_blocks + 1);
-            if (!notice.empty()) obj.pushKV("legacy_staking_notice", notice);
+            AddLegacyStakeReturnStatus(obj, *pwallet, consensusParams, next_height);
         }
     }
     obj.pushKV("warnings", GetWarnings(false).original);
@@ -6062,6 +6164,7 @@ static const CRPCCommand commands[] =
 { //  category              actor (function)
   //  ------------------    ------------------------
     { "staking",            &getstakinginfo,                 },
+    { "staking",            &setquantumstakereturn,          },
     { "staking",            &getstakingdonationinfo,         },
     { "staking",            &setstakingdonation,             },
     { "staking",            &getqqdevelopmentdonationinfo,   },

@@ -2245,6 +2245,9 @@ public:
     mutable std::atomic<int> m_cached_stake_weight_height{-1};
     int m_redelegation_last_auto_scan_height GUARDED_BY(cs_wallet){-1};
     uint256 m_redelegation_last_auto_scan_tip GUARDED_BY(cs_wallet);
+    //! Quantum address that receives the principal and reward of a legacy stake made in the last
+    //! blocks of Migration (record "quantumstakereturn", skipped by older versions); empty when unset.
+    std::string m_quantum_stake_return GUARDED_BY(cs_wallet);
     std::map<std::vector<unsigned char>, int> m_redelegation_last_auto_attempt_height GUARDED_BY(cs_wallet);
     std::map<std::vector<unsigned char>, int> m_redelegation_last_auto_success_height GUARDED_BY(cs_wallet);
     std::map<std::vector<unsigned char>, int> m_redelegation_last_win_height GUARDED_BY(cs_wallet);

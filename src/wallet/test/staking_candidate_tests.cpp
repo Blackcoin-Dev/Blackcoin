@@ -7,6 +7,7 @@
 #include <coins.h>
 #include <consensus/validation.h>
 #include <key.h>
+#include <key_io.h>
 #include <pos.h>
 #include <script/solver.h>
 #include <shadow.h>
@@ -546,6 +547,23 @@ public:
     LegacyStakeBarredSetup() : LegacyStakeScheduleSetup{"-qqmigrationendheight=105"} {}
 };
 
+/** The same chain but the next block (101) is in Migration, so quantum outputs are
+ *  allowed, and inside the quantum return window (last legacy-return height 94). */
+class LegacyStakeWindowSetup : public TestChain100Setup
+{
+public:
+    LegacyStakeWindowSetup()
+        : TestChain100Setup{ChainType::REGTEST, {
+              "-shadowwhitelistheight=20",
+              "-shadowgoldrushstartheight=30",
+              "-shadowgoldrushendheight=60",
+              "-qqgoldrushendheight=60",
+              "-qqmigrationendheight=105",
+          }}
+    {
+    }
+};
+
 StakeCoins LegacyCandidatesAtTip(TestChain100Setup& setup, CWallet& wallet)
 {
     LOCK2(::cs_main, wallet.cs_wallet);
@@ -576,6 +594,110 @@ BOOST_FIXTURE_TEST_CASE(legacy_kernels_are_not_candidates_past_the_cutoff, Legac
     // The same wallet and coins as the open schedule, but none may stake: a
     // legacy coinstake made now could not mature before Final.
     BOOST_CHECK(LegacyCandidatesAtTip(*this, *wallet).empty());
+}
+
+BOOST_FIXTURE_TEST_CASE(a_legacy_kernel_in_the_window_without_a_return_address_is_refused, LegacyStakeWindowSetup)
+{
+    auto wallet = CreateSyncedWallet(*m_node.chain,
+        WITH_LOCK(Assert(m_node.chainman)->GetMutex(), return m_node.chainman->ActiveChain()), coinbaseKey);
+    {
+        LOCK(wallet->cs_wallet);
+        const LegacyStakeQuantumReturn status = ResolveLegacyStakeQuantumReturn(*wallet);
+        BOOST_CHECK(!status.available);
+        BOOST_CHECK(status.reason.find("setquantumstakereturn") != std::string::npos);
+    }
+    BOOST_CHECK(LegacyCandidatesAtTip(*this, *wallet).empty());
+    CBlockIndex* tip = WITH_LOCK(::cs_main, return m_node.chainman->ActiveChain().Tip());
+    CMutableTransaction coinstake;
+    coinstake.nTime = tip->nTime + 16;
+    CAmount fees{0};
+    BOOST_CHECK(!CreateCoinStake(*wallet, EASY_BITS, 1, coinstake, fees, PKHash(coinbaseKey.GetPubKey())));
+}
+
+BOOST_FIXTURE_TEST_CASE(a_legacy_kernel_in_the_window_pays_one_quantum_output, LegacyStakeWindowSetup)
+{
+    auto wallet = CreateSyncedWallet(*m_node.chain,
+        WITH_LOCK(Assert(m_node.chainman)->GetMutex(), return m_node.chainman->ActiveChain()), coinbaseKey);
+    const auto quantum = wallet->GetNewQuantumDestination("PoS - Quantum Stake Address");
+    BOOST_REQUIRE(quantum);
+    bilingual_str error;
+    BOOST_REQUIRE_MESSAGE(SetQuantumStakeReturn(*wallet, *quantum, error), error.original);
+    CScript quantum_script;
+    {
+        LOCK(wallet->cs_wallet);
+        const LegacyStakeQuantumReturn status = ResolveLegacyStakeQuantumReturn(*wallet);
+        BOOST_REQUIRE(status.available);
+        BOOST_CHECK_EQUAL(status.address, EncodeDestination(*quantum));
+        quantum_script = status.script;
+    }
+    BOOST_CHECK(!LegacyCandidatesAtTip(*this, *wallet).empty());
+
+    CBlockIndex* tip = WITH_LOCK(::cs_main, return m_node.chainman->ActiveChain().Tip());
+    CMutableTransaction coinstake;
+    coinstake.nTime = tip->nTime + 16;
+    CAmount fees{0};
+    BOOST_REQUIRE(CreateCoinStake(*wallet, EASY_BITS, 1, coinstake, fees, PKHash(coinbaseKey.GetPubKey())));
+    // vout[0] marks the coinstake, vout[1] is the value-0 legacy block-signing key,
+    // and exactly one output carries value: the wallet's quantum address.
+    BOOST_REQUIRE(coinstake.vout.size() >= 3);
+    BOOST_CHECK(coinstake.vout[0].IsEmpty());
+    BOOST_CHECK_EQUAL(coinstake.vout[1].nValue, 0);
+    std::vector<std::vector<unsigned char>> solutions;
+    BOOST_CHECK(Solver(coinstake.vout[1].scriptPubKey, solutions) == TxoutType::PUBKEY);
+    size_t valued{0};
+    CAmount paid{0};
+    for (const CTxOut& out : coinstake.vout) {
+        if (out.nValue == 0) continue;
+        ++valued;
+        paid += out.nValue;
+        BOOST_CHECK(out.scriptPubKey == quantum_script);
+    }
+    BOOST_CHECK_EQUAL(valued, 1U);
+    // Principal plus the scheduled reward, never more: coinstake input value is the
+    // spent coinbase outputs of the kernel(s).
+    CAmount in{0};
+    for (const CTxIn& txin : coinstake.vin) {
+        const CWalletTx* wtx = WITH_LOCK(wallet->cs_wallet, return wallet->GetWalletTx(txin.prevout.hash));
+        BOOST_REQUIRE(wtx);
+        in += wtx->tx->vout[txin.prevout.n].nValue;
+    }
+    BOOST_CHECK_EQUAL(paid - in, GetProofOfStakeSubsidy());
+}
+
+BOOST_FIXTURE_TEST_CASE(a_saved_return_address_that_is_not_ours_is_not_ready, LegacyStakeWindowSetup)
+{
+    auto wallet = CreateSyncedWallet(*m_node.chain,
+        WITH_LOCK(Assert(m_node.chainman)->GetMutex(), return m_node.chainman->ActiveChain()), coinbaseKey);
+    // A legacy address and an unknown quantum address are both refused.
+    bilingual_str error;
+    BOOST_CHECK(!SetQuantumStakeReturn(*wallet, PKHash(coinbaseKey.GetPubKey()), error));
+    BOOST_CHECK(!error.original.empty());
+    CKey other;
+    other.MakeNewKey(true);
+    BOOST_CHECK(!SetQuantumStakeReturn(*wallet, PKHash(other.GetPubKey()), error));
+    LOCK(wallet->cs_wallet);
+    wallet->m_quantum_stake_return = "not an address";
+    const LegacyStakeQuantumReturn status = ResolveLegacyStakeQuantumReturn(*wallet);
+    BOOST_CHECK(!status.available);
+    BOOST_CHECK(status.reason.find("cannot be used") != std::string::npos);
+}
+
+BOOST_FIXTURE_TEST_CASE(the_return_address_is_set_automatically_only_when_fully_unlocked, LegacyStakeWindowSetup)
+{
+    auto wallet = CreateSyncedWallet(*m_node.chain,
+        WITH_LOCK(Assert(m_node.chainman)->GetMutex(), return m_node.chainman->ActiveChain()), coinbaseKey);
+    // No quantum address yet and key creation not allowed: nothing is created or set.
+    BOOST_CHECK(!MaybeAutoSetQuantumStakeReturn(*wallet));
+    BOOST_CHECK(WITH_LOCK(wallet->cs_wallet, return wallet->m_quantum_stake_return.empty()));
+    // An existing quantum address is reused.
+    const auto quantum = wallet->GetNewQuantumDestination("receive");
+    BOOST_REQUIRE(quantum);
+    wallet->m_wallet_unlock_staking_only = true;
+    BOOST_CHECK(!MaybeAutoSetQuantumStakeReturn(*wallet)); // staking-only unlock never sets
+    wallet->m_wallet_unlock_staking_only = false;
+    BOOST_CHECK(MaybeAutoSetQuantumStakeReturn(*wallet));
+    BOOST_CHECK_EQUAL(WITH_LOCK(wallet->cs_wallet, return wallet->m_quantum_stake_return), EncodeDestination(*quantum));
+    BOOST_CHECK(!MaybeAutoSetQuantumStakeReturn(*wallet)); // already set
 }
 
 BOOST_AUTO_TEST_SUITE_END()

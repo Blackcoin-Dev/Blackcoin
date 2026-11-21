@@ -22,28 +22,75 @@ namespace wallet {
 /**
  * Wallet policy only; no block or transaction is judged by it. A legacy
  * coinstake created at height h can be spent from h + maturity, and Final
- * rejects every legacy input, so a legacy coinstake with
- * h + maturity > M (M = last Migration block) loses its principal and reward
- * for good. The wallet therefore stops creating legacy-return coinstakes a
- * little earlier than that bound. The margin leaves the last legacy coinstake
- * one full block of migration time before M instead of exactly the last one.
+ * rejects every legacy input, so a legacy-return coinstake with
+ * h + maturity > M (M = last Migration block) would lose its principal and
+ * reward for good. From the first such height (the "quantum return window")
+ * a legacy kernel therefore pays its principal and reward to a quantum output
+ * this wallet owns instead; the same rules every released node already runs
+ * accept that (the reward split that would fix the return script starts at
+ * Final). The margin keeps the last legacy-return coinstake one full block of
+ * migration time before M.
  */
 static constexpr int LEGACY_STAKE_MIGRATION_MARGIN_BLOCKS = 1;
 
-/** Last height at which this wallet will still create a legacy-return
+/** Last height at which this wallet still creates a legacy-return
  *  coinstake, or nullopt when the Migration end height is not known (no
  *  complete height-authoritative schedule). 64-bit arithmetic throughout. */
 std::optional<int64_t> LastLegacyStakeHeight(const Consensus::Params& consensus);
 
-/** True when a legacy-return coinstake created at stake_height would not be
- *  spendable before Final. Same condition for candidate filtering, status
- *  weight and the check inside CreateCoinStake. */
+/** True when stake_height lies in the quantum return window: a legacy-return
+ *  coinstake created there would not be spendable before Final, so a legacy
+ *  kernel must pay a quantum output (or not stake). Same condition for
+ *  candidate filtering, status weight and the check inside CreateCoinStake. */
 bool IsLegacyStakeBarredByMigrationEnd(const Consensus::Params& consensus, int stake_height);
 
-/** Plain-language notice for status output: when legacy staking stops and that
- *  legacy coins must be migrated before Final. Empty when no height-authoritative
- *  schedule is configured or when next_height is already in Final. */
-std::string LegacyStakingNotice(const Consensus::Params& consensus, int next_height);
+/** Where this wallet stands on the quantum return of legacy stakes. */
+struct LegacyStakeQuantumReturn
+{
+    bool available{false};
+    CScript script;
+    std::string address; // the persisted address, when it is set and usable
+    std::string reason;  // what the user must do, when !available
+};
+
+/** Plain-language notice for status output: the height from which legacy
+ *  stakes are paid to a quantum address, which address, whether the wallet is
+ *  ready, what to do if not, and that legacy coins that do not stake must be
+ *  migrated before Final. Empty when no height-authoritative schedule is
+ *  configured or when next_height is already in Final. */
+std::string LegacyStakingNotice(const Consensus::Params& consensus, int next_height,
+                                const LegacyStakeQuantumReturn& quantum_return);
+
+/** Pure choice among wallet-owned quantum addresses, for the automatic
+ *  setting of the return address: the explicitly configured address first (the
+ *  caller passes it as configured), then the address labelled as the PoS
+ *  quantum stake address, then the oldest ordinary direct quantum receive
+ *  address. Candidates must be wallet-backed with a durably stored key. */
+struct QuantumReturnCandidate
+{
+    CTxDestination destination;
+    std::string label;
+    bool is_change{false};
+    int64_t creation_time{0};
+};
+std::optional<CTxDestination> ChooseLegacyStakeQuantumReturn(const std::vector<QuantumReturnCandidate>& candidates);
+
+/** The persisted quantum stake return address, checked: wallet-owned ordinary
+ *  direct quantum address with a durably stored key. Read-only, never creates a
+ *  key, so it is safe on the staking path and under a staking-only unlock. */
+LegacyStakeQuantumReturn ResolveLegacyStakeQuantumReturn(const CWallet& wallet)
+    EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet);
+
+/** Persist dest as the quantum stake return address (record "quantumstakereturn";
+ *  older versions skip it). The address must pass the same checks as above. */
+bool SetQuantumStakeReturn(CWallet& wallet, const CTxDestination& dest, bilingual_str& error);
+
+/** When the wallet is fully unlocked (or unencrypted), has no valid return
+ *  address and a height schedule exists: set one. An existing wallet-owned
+ *  quantum address is reused (-qqpospayoutaddress first); a key is created only
+ *  when the existing policy allows it (-qqallowautokeycreation). Never creates
+ *  a key otherwise. Call outside cs_main. Returns true when a address was set. */
+bool MaybeAutoSetQuantumStakeReturn(CWallet& wallet);
 
 struct BoundedLegacyStakeCandidate
 {

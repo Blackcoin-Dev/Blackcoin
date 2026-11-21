@@ -3953,7 +3953,12 @@ public:
         status.quantum_spends_active = quantum_active;
         if (const std::optional<int64_t> legacy_stake_last = LastLegacyStakeHeight(consensus)) {
             status.legacy_staking_last_height = *legacy_stake_last;
-            status.legacy_staking_notice = LegacyStakingNotice(consensus, next_height);
+            LegacyStakeQuantumReturn quantum_return;
+            {
+                LOCK(m_wallet->cs_wallet);
+                quantum_return = ResolveLegacyStakeQuantumReturn(*m_wallet);
+            }
+            status.legacy_staking_notice = LegacyStakingNotice(consensus, next_height, quantum_return);
         }
 
         const CCoinsViewCache& view = chainman.ActiveChainstate().CoinsTip();

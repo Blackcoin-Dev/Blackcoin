@@ -156,6 +156,8 @@ static const CRPCConvertParam vRPCConvertParams[] =
     { "combinerawtransaction", 0, "txs" },
     { "fundrawtransaction", 1, "options" },
     { "migratetoquantum", 0, "options" },
+    { "setquantumstakereturn", 0, "options" },
+    { "setquantumstakereturn", 0, "allow_new_quantum_key" },
     { "migratetoquantum", 0, "dry_run" },
     { "migratetoquantum", 0, "fee_rate" },
     { "migratetoquantum", 0, "include_unsafe" },

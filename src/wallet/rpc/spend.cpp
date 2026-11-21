@@ -22,6 +22,7 @@
 #include <wallet/coincontrol.h>
 #include <wallet/fees.h>
 #include <wallet/migration_batch.h>
+#include <wallet/rpc/staking.h>
 #include <wallet/rpc/util.h>
 #include <wallet/receive.h>
 #include <wallet/spend.h>
@@ -3998,7 +3999,14 @@ RPCHelpMan getmigrationstatus()
                 }},
             }},
             {RPCResult::Type::NUM, "legacy_staking_last_height", /*optional=*/true, "last block height at which this wallet still creates a legacy coinstake (absent without a height-authoritative schedule); later legacy stakes could not mature before the Final phase"},
-            {RPCResult::Type::STR, "legacy_staking_notice", /*optional=*/true, "plain-language notice about the legacy staking cutoff and migrating before Final"},
+            {RPCResult::Type::STR, "legacy_staking_notice", /*optional=*/true, "plain-language notice: when legacy stakes start to be paid to a quantum address, whether the return address is ready, and migrating legacy coins that do not stake before Final"},
+            {RPCResult::Type::NUM, "legacy_staking_window_start_height", /*optional=*/true, "first block height at which a legacy stake is paid to a quantum address"},
+            {RPCResult::Type::BOOL, "legacy_staking_in_window", /*optional=*/true, "whether the next block is inside that window"},
+            {RPCResult::Type::BOOL, "legacy_staking_pays_quantum", /*optional=*/true, "true when a height schedule exists"},
+            {RPCResult::Type::BOOL, "legacy_stake_return_ready", /*optional=*/true, "whether a usable quantum stake return address is saved"},
+            {RPCResult::Type::STR, "legacy_stake_return_address", /*optional=*/true, "the saved quantum stake return address, when ready"},
+            {RPCResult::Type::STR, "legacy_stake_return_action", /*optional=*/true, "what to do before the window starts, when not ready"},
+            {RPCResult::Type::BOOL, "legacy_staking_stopped", /*optional=*/true, "true while in the window with no ready return address"},
             {RPCResult::Type::STR, "advice", "human-readable next step"},
         }},
         RPCExamples{HelpExampleCli("getmigrationstatus", "") + HelpExampleRpc("getmigrationstatus", "")},
@@ -4139,8 +4147,7 @@ RPCHelpMan getmigrationstatus()
         r.pushKV("categories", std::move(categories));
         if (const std::optional<int64_t> legacy_stake_last = LastLegacyStakeHeight(c)) {
             r.pushKV("legacy_staking_last_height", *legacy_stake_last);
-            const std::string stake_notice = LegacyStakingNotice(c, next_height);
-            if (!stake_notice.empty()) r.pushKV("legacy_staking_notice", stake_notice);
+            AddLegacyStakeReturnStatus(r, *pwallet, c, next_height);
         }
         std::string advice;
         if (passed)              advice = "Deadline passed. Remaining legacy coins are permanently unspendable.";

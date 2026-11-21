@@ -68,6 +68,7 @@ const std::string QUANTUM_KEY_BACKUP_STATE{"quantumkeybackup"};
 const std::string QUANTUM_KEY{"quantumkey"};
 const std::string QUANTUM_REDELEGATION_AUTO_SCAN{"quantumredelegationautoscan"};
 const std::string QUANTUM_REDELEGATION_AUTO_SCAN_TIP{"quantumredelegationautoscantip"};
+const std::string QUANTUM_STAKE_RETURN{"quantumstakereturn"};
 const std::string QUANTUM_REDELEGATION_LAST_ATTEMPT{"quantumredelegationlastattempt"};
 const std::string QUANTUM_REDELEGATION_LAST_SUCCESS{"quantumredelegationlastsuccess"};
 const std::string QUANTUM_REDELEGATION_LAST_WIN{"quantumredelegationlastwin"};
@@ -200,6 +201,11 @@ bool WalletBatch::WriteQuantumKeyBackupState(const std::vector<unsigned char>& w
 bool WalletBatch::WriteQuantumColdStakeDelegation(const std::vector<unsigned char>& witness_program, const QuantumColdStakeDelegationRecord& record)
 {
     return WriteIC(std::make_pair(DBKeys::QUANTUM_COLDSTAKE, witness_program), record);
+}
+
+bool WalletBatch::WriteQuantumStakeReturn(const std::string& address)
+{
+    return WriteIC(DBKeys::QUANTUM_STAKE_RETURN, address);
 }
 
 bool WalletBatch::WriteQuantumRedelegationAutoScanHeight(int height)
@@ -1641,6 +1647,14 @@ static DBErrors LoadQuantumWalletRecords(CWallet* pwallet, DatabaseBatch& batch)
         return LoadQuantumColdStakeDelegation(pwallet, key, value, err) ? DBErrors::LOAD_OK : DBErrors::CORRUPT;
     });
     result = std::max(result, coldstake_res.m_result);
+
+    {
+        std::string stake_return;
+        if (batch.Read(DBKeys::QUANTUM_STAKE_RETURN, stake_return)) {
+            LOCK(pwallet->cs_wallet);
+            pwallet->m_quantum_stake_return = stake_return;
+        }
+    }
 
     int redelegation_scan_height{-1};
     if (batch.Read(DBKeys::QUANTUM_REDELEGATION_AUTO_SCAN, redelegation_scan_height)) {

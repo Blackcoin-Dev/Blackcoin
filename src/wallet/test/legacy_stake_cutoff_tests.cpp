@@ -57,7 +57,7 @@ BOOST_AUTO_TEST_CASE(unscheduled_or_time_only_schedules_have_no_cutoff)
     Consensus::Params none;
     BOOST_CHECK(!LastLegacyStakeHeight(none).has_value());
     BOOST_CHECK(!IsLegacyStakeBarredByMigrationEnd(none, 1000000));
-    BOOST_CHECK(LegacyStakingNotice(none, 5).empty());
+    BOOST_CHECK(LegacyStakingNotice(none, 5, {}).empty());
 
     Consensus::Params time_only;
     time_only.nGoldRushEndTime = 1000;
@@ -83,20 +83,36 @@ BOOST_AUTO_TEST_CASE(cutoff_arithmetic_does_not_overflow)
     BOOST_CHECK(IsLegacyStakeBarredByMigrationEnd(huge_maturity, 1));
 }
 
-BOOST_AUTO_TEST_CASE(notice_names_the_height_and_the_migration_requirement)
+BOOST_AUTO_TEST_CASE(notice_names_the_window_the_return_address_and_the_migration_requirement)
 {
     const Consensus::Params regtest = HeightSchedule(200, 260, 10);
-    // Well before the cutoff.
-    std::string notice = LegacyStakingNotice(regtest, 201);
-    BOOST_CHECK(notice.find("stops after block height 249") != std::string::npos);
+    LegacyStakeQuantumReturn ready;
+    ready.available = true;
+    ready.address = "bcrt1exampleaddress";
+    LegacyStakeQuantumReturn not_ready;
+    not_ready.reason = "no quantum stake return address is set.";
+
+    // Well before the window: the first quantum height is 250.
+    std::string notice = LegacyStakingNotice(regtest, 201, ready);
+    BOOST_CHECK(notice.find("From height 250") != std::string::npos);
+    BOOST_CHECK(notice.find("paid to a quantum address") != std::string::npos);
+    BOOST_CHECK(notice.find("READY: bcrt1exampleaddress") != std::string::npos);
     BOOST_CHECK(notice.find("height 261") != std::string::npos);
-    BOOST_CHECK(notice.find("Migrate") != std::string::npos);
-    // After the cutoff, still in Migration.
-    notice = LegacyStakingNotice(regtest, 250);
-    BOOST_CHECK(notice.find("has stopped") != std::string::npos);
+    BOOST_CHECK(notice.find("never win a stake stay legacy: migrate") != std::string::npos);
+    BOOST_CHECK(notice.find("cannot stake again until they are 10 blocks old") != std::string::npos);
+
+    // Not ready: says exactly what to do and that no legacy stake happens.
+    notice = LegacyStakingNotice(regtest, 201, not_ready);
+    BOOST_CHECK(notice.find("NOT READY: no quantum stake return address is set.") != std::string::npos);
+    BOOST_CHECK(notice.find("will not stake legacy coins from height 250") != std::string::npos);
+
+    // Inside the window, still in Migration.
+    notice = LegacyStakingNotice(regtest, 250, ready);
+    BOOST_CHECK(notice.find("are now paid to a quantum address") != std::string::npos);
     BOOST_CHECK(notice.find("height 261") != std::string::npos);
+
     // In Final nothing is left to say.
-    BOOST_CHECK(LegacyStakingNotice(regtest, 261).empty());
+    BOOST_CHECK(LegacyStakingNotice(regtest, 261, ready).empty());
 }
 
 BOOST_AUTO_TEST_SUITE_END()

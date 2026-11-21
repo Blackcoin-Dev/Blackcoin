@@ -21,19 +21,29 @@ and earlier.
 
 ## Migration and the Final transition
 
-- **Legacy staking stops before it can lose coins.** A legacy coinstake created at height h can
-  only be spent from h plus the maturity (500 blocks on mainnet), and the Final phase rejects every
-  legacy input. A legacy stake made in the last 500 blocks of Migration therefore could never be spent.
-  The wallet now stops creating legacy stakes after block height 6,921,498 (the last block whose
-  output matures before Migration ends, with one block of margin), and the stake weight shown
-  matches. Quantum staking is not affected, and legacy coins that stopped staking can still be
-  migrated. Blocks made by other wallets are validated exactly as before.
+- **Legacy stakes in the last blocks of Migration are paid out as quantum coins.** A legacy
+  coinstake created at height h can only be spent from h plus the maturity (500 blocks on
+  mainnet), and the Final phase rejects every legacy input, so a legacy-return stake made in the
+  last 500 blocks of Migration could never be spent. From block height 6,921,499 (the first height
+  whose legacy output would not mature before Migration ends, with one block of margin) a wallet
+  that stakes a legacy kernel pays its principal and reward to ONE quantum output of its own
+  instead (the quantum stake return address), with nothing else of value in the coinstake and no
+  stake split or donation output. The legacy key still signs the block, in the usual zero-value
+  output, so every released version accepts these blocks; no consensus rule changes. The stake
+  weight shown matches. The quantum output cannot stake again until it is 500 blocks old, so not
+  inside the window, and legacy coins that never win a stake stay legacy and must still be migrated
+  before Final. The return address is saved in the wallet (a new `quantumstakereturn` record that
+  older versions skip). A fully unlocked wallet picks it by itself from an existing quantum address
+  (or, only with `-qqallowautokeycreation`, makes one); `setquantumstakereturn` sets it explicitly.
+  A wallet unlocked for staking only cannot create a key, so the address must exist before the
+  window opens; if none is ready the wallet does not stake legacy coins in the window and says so.
 - **The wallet says so, early.** `getstakinginfo` now reports `legacy_staking_scheduled`,
   `legacy_staking_last_height`, `legacy_staking_blocks_remaining`, `legacy_staking_stopped`,
-  `legacy_migration_end_height` and a plain-language `legacy_staking_notice`. `getmigrationstatus`
-  reports `legacy_staking_last_height` and the same notice. The Staking page shows the notice.
-  Legacy coins that are not migrated before the Final phase starts (height 6,922,000) can never
-  be spent.
+  `legacy_migration_end_height`, `legacy_staking_window_start_height`, `legacy_staking_in_window`,
+  `legacy_staking_pays_quantum`, `legacy_stake_return_ready`, `legacy_stake_return_address`,
+  `legacy_stake_return_action` and a plain-language `legacy_staking_notice`; `getmigrationstatus`
+  reports the same fields. The Staking page shows the notice. Legacy coins that are not migrated
+  before the Final phase starts (height 6,922,000) can never be spent.
 - **Large wallets can migrate.** `migratetoquantum` and `migrategoldrushrewards` now build one
   bounded batch per call (new `max_inputs` option; defaults of 400 legacy inputs and 90 payout
   inputs; a batch is always cut to fit a standard transaction). The result lists how many outputs

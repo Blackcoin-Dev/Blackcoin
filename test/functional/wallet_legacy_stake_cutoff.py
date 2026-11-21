@@ -2,13 +2,15 @@
 # Copyright (c) 2026 The Blackcoin developers
 # Distributed under the MIT software license, see the accompanying
 # file COPYING or http://www.opensource.org/licenses/mit-license.php.
-"""The wallet never creates a legacy coinstake that cannot be spent before Final.
+"""The wallet never creates a legacy-return coinstake that cannot be spent before Final.
 
 Regtest: Gold Rush ends at G=61, Migration ends at M=91 (first Final block F=92),
 maturity 10. A legacy coinstake created at height h can be spent from h + 10 and
 Final rejects every legacy input, so one created after M - 10 loses principal and
-reward for good. The wallet stops one block earlier (height M - 11 = 80), leaving
-the last legacy coinstake a full block of migration time.
+reward for good. The last legacy-return height is M - 11 = 80, leaving that coinstake a
+full block of migration time. From 81 a legacy kernel is paid to a quantum output (see
+wallet_legacy_stake_quantum_return.py); THIS test keeps the refusal fallback: with no
+quantum stake return address the wallet builds no legacy coinstake in that window.
 
 Also checks that migratetoquantum includes an output that matures exactly in the
 last Migration block (it used to be one block more conservative than consensus),
@@ -31,7 +33,9 @@ class LegacyStakeCutoffTest(TransitionTFinalTestBase, BitcoinTestFramework):
     def set_test_params(self):
         self.num_nodes = 1
         self.setup_clean_chain = True
-        self.extra_args = [LIFECYCLE_ARGS]
+        # Automatic key creation is off, so the wallet cannot ready a quantum stake return
+        # address by itself and the refusal fallback is what is tested.
+        self.extra_args = [[a for a in LIFECYCLE_ARGS if not a.startswith("-qqallowautokeycreation")]]
 
     def check_notice_fields(self, wallet, next_height):
         info = wallet.getstakinginfo()
@@ -40,9 +44,13 @@ class LegacyStakeCutoffTest(TransitionTFinalTestBase, BitcoinTestFramework):
         assert_equal(info["legacy_migration_end_height"], M)
         remaining = max(0, LAST_LEGACY_STAKE_HEIGHT - next_height + 1)
         assert_equal(info["legacy_staking_blocks_remaining"], remaining)
+        assert_equal(info["legacy_staking_window_start_height"], LAST_LEGACY_STAKE_HEIGHT + 1)
+        assert_equal(info["legacy_stake_return_ready"], False)
+        # Legacy staking is stopped only while it is in the window with no ready return address.
         assert_equal(info["legacy_staking_stopped"], next_height > LAST_LEGACY_STAKE_HEIGHT)
         notice = info["legacy_staking_notice"]
-        assert f"height {LAST_LEGACY_STAKE_HEIGHT}" in notice, notice
+        assert f"height {LAST_LEGACY_STAKE_HEIGHT + 1}" in notice, notice
+        assert "NOT READY" in notice, notice
         assert f"height {F}" in notice, notice
         assert "igrate" in notice, notice
         status = wallet.getmigrationstatus()
@@ -83,7 +91,8 @@ class LegacyStakeCutoffTest(TransitionTFinalTestBase, BitcoinTestFramework):
         assert_equal(node.getblockcount(), LAST_LEGACY_STAKE_HEIGHT)
         info = self.check_notice_fields(wallet, next_height=LAST_LEGACY_STAKE_HEIGHT + 1)
         assert_equal(info["legacy_staking_stopped"], True)
-        assert "has stopped" in info["legacy_staking_notice"]
+        assert "NOT READY" in info["legacy_staking_notice"]
+        assert "will not stake legacy coins" in info["legacy_staking_notice"]
 
         self.log.info("From the next height the wallet offers no legacy stake weight and creates no legacy coinstake")
         # Mature legacy kernels exist (the wallet simply refuses to use them).

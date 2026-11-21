@@ -2132,11 +2132,16 @@ bool IsLegacyStakeBarredByMigrationEnd(const Consensus::Params& consensus, int s
 }
 
 std::optional<int64_t> DemurrageFirstReductionCountdown(const Consensus::Params& consensus,
+                                                        const CScript& script_pub_key,
                                                         const Consensus::DemurrageEvaluation& eval,
                                                         int evaluation_height, int64_t evaluation_time)
 {
-    if (eval.exempt) return std::nullopt;
+    // Permanent exemption comes from the script and holds before activation too.
+    if (!Consensus::DemurragePermanentExemption(script_pub_key, consensus).empty()) return std::nullopt;
+    if (eval.locked) return std::nullopt;
     if (consensus.IsDemurrageActive(evaluation_height, evaluation_time)) {
+        // Active. An output in grace (young) or protected by an attestation is exempt only for now: its
+        // inactive blocks (counted from its age, the activation or its attestation) say how long is left.
         return Consensus::DemurrageBlocksUntilFirstReduction(eval.inactive_blocks, consensus);
     }
     // Not active yet. Only a height-given activation makes a countdown.

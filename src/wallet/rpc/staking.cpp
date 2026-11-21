@@ -5961,7 +5961,7 @@ static RPCHelpMan getdemurragewalletinfo()
         entry.pushKV("locked", eval.locked);
         entry.pushKV("exemption", eval.exemption);
         entry.pushKV("blocks_until_decay", std::max(0, consensus.DemurrageGraceBlocks() - eval.inactive_blocks));
-        if (const auto countdown = DemurrageFirstReductionCountdown(consensus, eval, evaluation_height, evaluation_time)) {
+        if (const auto countdown = DemurrageFirstReductionCountdown(consensus, coin.out.scriptPubKey, eval, evaluation_height, evaluation_time)) {
             entry.pushKV("blocks_until_first_reduction", *countdown);
         }
         entry.pushKV("blocks_until_lock", std::max(0, consensus.DemurrageZeroBlocks() - eval.inactive_blocks));

@@ -118,6 +118,14 @@ int64_t DemurrageRemainingPpm(int inactive_blocks, const Params& params);
 int DemurrageBlocksUntilFirstReduction(int inactive_blocks, const Params& params);
 CAmount DemurrageEffectiveValue(CAmount nominal_value, int64_t remaining_ppm);
 bool IsDemurrageTreasuryExemptScript(const CScript& script_pub_key, const Params& params);
+/**
+ * The exemption an output's script has for good, whenever demurrage is evaluated: "treasury" (a configured
+ * treasury script) or "non_quantum" (a script demurrage never applies to), or "" when the script can decay.
+ * It does not look at activation, age or attestations, so it answers the question EvaluateDemurrage cannot
+ * before activation (it returns before classifying) and it is not the temporary grace ("young", "attested")
+ * that also sets DemurrageEvaluation::exempt. Reporting only: EvaluateDemurrage does not call it.
+ */
+std::string DemurragePermanentExemption(const CScript& script_pub_key, const Params& params);
 uint256 DemurragePubKeyHash(const std::vector<unsigned char>& pubkey);
 uint256 DemurrageAttestationMessageHash(const COutPoint& replay_anchor,
                                         const COutPoint& target_outpoint,

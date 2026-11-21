@@ -71,8 +71,11 @@ and earlier.
   grace period) and adds `blocks_until_first_reduction`, the number of blocks until the value is
   first actually reduced. The two differ by 729 blocks on mainnet, so `blocks_until_decay` reaching
   zero does not mean decay has started. Before demurrage activates, `blocks_until_first_reduction`
-  includes the blocks left until activation, and it is absent for an exempt output or when
-  activation is not given by a block height.
+  includes the blocks left until activation. It is absent for an output exempt for good (a
+  treasury script or a script demurrage never applies to, before activation as well), for a locked
+  output, and when activation is not given by a block height. A young output (in its grace
+  period) and an output protected by an attestation are exempt only for now, so they show the
+  blocks left until their first reduction.
 - **Faster PSBT signing.** Signing a PSBT with many inputs no longer copies the whole PSBT for
   every input.
 

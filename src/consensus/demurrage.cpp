@@ -1395,6 +1395,17 @@ CAmount GetDemurrageAdjustedValueIn(const CTransaction& tx, const CCoinsViewCach
     return n_result;
 }
 
+std::string DemurragePermanentExemption(const CScript& script_pub_key, const Params& params)
+{
+    // The same two tests, in the same order, as EvaluateDemurrage applies once demurrage is active.
+    if (IsDemurrageTreasuryExemptScript(script_pub_key, params)) return "treasury";
+    if (!IsQuantumMigrationScript(script_pub_key) && !IsQuantumColdStakeScript(script_pub_key) &&
+        !IsEUTXOScript(script_pub_key)) {
+        return "non_quantum";
+    }
+    return "";
+}
+
 DemurrageEvaluation EvaluateDemurrage(
     const Coin& coin,
     const Params& params,

@@ -48,11 +48,18 @@ bool IsLegacyStakeBarredByMigrationEnd(const Consensus::Params& consensus, int s
 
 /** Blocks from evaluation_height until an output's value is first reduced by
  *  demurrage, for status display. Before activation the distance to the activation
- *  height is added to the curve's own count. nullopt when no meaningful height
- *  countdown exists: an exempt output (permanently whole), or an activation that
- *  is not given by a height. The curve helper itself
- *  (Consensus::DemurrageBlocksUntilFirstReduction) is unchanged. */
+ *  height is added to the curve's own count.
+ *
+ *  Two different things set DemurrageEvaluation::exempt and must not be confused. A PERMANENT
+ *  exemption belongs to the script (a treasury script, or one demurrage never applies to): there is
+ *  no first reduction, so nullopt. It is read from the script, not from the evaluation, because
+ *  EvaluateDemurrage reports only "inactive" before activation. A TEMPORARY exemption (grace for a
+ *  young output, protection by an attestation) ends: the countdown runs from the evaluation's own
+ *  inactive blocks. Also nullopt: a locked output (already past it) and an activation that is not
+ *  given by a height. The curve helper itself (Consensus::DemurrageBlocksUntilFirstReduction) is
+ *  unchanged. */
 std::optional<int64_t> DemurrageFirstReductionCountdown(const Consensus::Params& consensus,
+                                                        const CScript& script_pub_key,
                                                         const Consensus::DemurrageEvaluation& eval,
                                                         int evaluation_height, int64_t evaluation_time);
 

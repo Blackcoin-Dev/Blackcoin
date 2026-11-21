@@ -1919,7 +1919,7 @@ WalletDemurrageInfo GetWalletDemurrageInfo(CWallet& wallet)
         output.locked = eval.locked;
         output.attestation_due = attestation_due;
         output.blocks_until_decay = std::max(0, consensus.DemurrageGraceBlocks() - eval.inactive_blocks);
-        if (const auto countdown = DemurrageFirstReductionCountdown(consensus, eval, info.evaluation_height, info.evaluation_time)) {
+        if (const auto countdown = DemurrageFirstReductionCountdown(consensus, coin.out.scriptPubKey, eval, info.evaluation_height, info.evaluation_time)) {
             output.first_reduction_known = true;
             output.blocks_until_first_reduction = static_cast<int>(std::min<int64_t>(*countdown, std::numeric_limits<int>::max()));
         }

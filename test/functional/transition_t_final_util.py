@@ -104,3 +104,31 @@ class TransitionTFinalTestBase:
                 wallet.staking(False)
             self.bump()
         raise last
+
+    def kernel_slot_for(self, wallet, outpoint):
+        """The mock time of the first slot at which the consensus kernel check passes for this
+        output (checkkernel). The difficulty falls after a long gap, so this can be the next slot."""
+        for _ in range(30000):
+            result = wallet.checkkernel([outpoint])
+            if result["found"]:
+                return result["kernel"]["time"]
+            self.bump()
+        raise AssertionError("no kernel slot found for %s" % outpoint)
+
+    def stake_outpoint(self, wallet, node, outpoint):
+        """Let the wallet's own staker produce the next block, from exactly this kernel."""
+        before = node.getblockcount()
+        kernel_time = self.kernel_slot_for(wallet, outpoint)
+        self.set_mt(kernel_time - 16)
+        wallet.staking(True)
+        try:
+            self.set_mt(kernel_time)
+            self.wait_until(lambda: node.getblockcount() > before, timeout=60)
+        finally:
+            wallet.staking(False)
+        block_hash = node.getbestblockhash()
+        block = node.getblock(block_hash, 2)
+        assert "proof-of-stake" in block["flags"]
+        assert block["tx"][1]["vin"][0]["txid"] == outpoint["txid"]
+        assert block["tx"][1]["vin"][0]["vout"] == outpoint["vout"]
+        return block_hash

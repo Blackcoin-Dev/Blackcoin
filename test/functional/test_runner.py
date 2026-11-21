@@ -168,6 +168,7 @@ BASE_SCRIPTS = [
     'feature_quantum_redelegation_auto.py',
     'feature_quantum_demurrage.py',
     'feature_demurrage_attestation_relay.py',
+    'wallet_demurrage_auto_attest_pending.py',
     'feature_quantum_demurrage_height_boundary.py',
     'feature_goldrush_value_path.py',
     'feature_goldrush_pow_miner_e2e.py',

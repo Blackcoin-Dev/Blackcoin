@@ -2461,7 +2461,7 @@ void CWallet::AddToSpends(const COutPoint& outpoint, const uint256& wtxid, Walle
     mapTxSpends.insert(std::make_pair(outpoint, wtxid));
     MarkShadowPowClaimCandidateStateChangedLocked();
 
-    RefreshLiveUnspentStakeOutpoint(outpoint);
+    if (!m_defer_live_unspent_index) RefreshLiveUnspentStakeOutpoint(outpoint);
 
     if (!preserve_existing_spent_anchor_hold) {
         if (batch) {
@@ -3004,7 +3004,15 @@ bool CWallet::LoadToWallet(const uint256& hash, const UpdateWalletTxFn& fill_wtx
     if (/* insertion took place */ ins.second) {
         wtx.m_it_wtxOrdered = wtxOrdered.insert(std::make_pair(wtx.nOrderPos, &wtx));
     }
-    AddToSpends(wtx);
+    // The database load rebuilds the live-unspent indexes once the whole
+    // wallet is in memory, so they are not maintained per transaction here.
+    const bool defer_live_unspent_index = !reconcile_chainstate;
+    {
+        const bool previous_defer = m_defer_live_unspent_index;
+        m_defer_live_unspent_index = defer_live_unspent_index;
+        AddToSpends(wtx);
+        m_defer_live_unspent_index = previous_defer;
+    }
     for (const CTxIn& txin : wtx.tx->vin) {
         auto it = mapWallet.find(txin.prevout.hash);
         if (it != mapWallet.end()) {
@@ -3020,7 +3028,7 @@ bool CWallet::LoadToWallet(const uint256& hash, const UpdateWalletTxFn& fill_wtx
     UpdatePendingShadowSignalIndex(wtx);
     IndexOwnedLegacyShadowScripts(wtx);
     UpdateConfirmedSyntheticPayoutIndex(wtx);
-    RefreshLiveUnspentStakeOutpoints(wtx);
+    if (!defer_live_unspent_index) RefreshLiveUnspentStakeOutpoints(wtx);
     MarkShadowPowClaimCandidateStateChangedLocked();
 
     return true;

@@ -1153,6 +1153,10 @@ private:
     /** Every observable live-index membership change advances this value.
      * Warm scans carry it through the exact one-coin reservation boundary. */
     uint64_t m_live_unspent_stake_generation GUARDED_BY(cs_wallet){1};
+    //! True while the database load adds transactions: the live-unspent
+    //! indexes are not maintained per transaction then, because LoadWallet
+    //! rebuilds them from the finished wallet (RecomputeLiveUnspentStakeOutpoints).
+    bool m_defer_live_unspent_index GUARDED_BY(cs_wallet){false};
     bool IsSpentForStakeIndex(const COutPoint& outpoint) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     void RefreshLiveUnspentStakeOutpoint(const COutPoint& outpoint) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     /** Restriction-only repair for an exact chain/wallet mismatch discovered

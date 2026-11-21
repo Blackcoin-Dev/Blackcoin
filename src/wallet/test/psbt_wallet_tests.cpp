@@ -6,11 +6,13 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <key_io.h>
+#include <psbt.h>
 #include <util/bip32.h>
 #include <util/strencodings.h>
 #include <wallet/wallet.h>
 
 #include <boost/test/unit_test.hpp>
+#include <type_traits>
 #include <test/util/setup_common.h>
 #include <wallet/test/wallet_test_fixture.h>
 
@@ -27,6 +29,26 @@ static void import_descriptor(CWallet& wallet, const std::string& descriptor)
     assert(desc);
     WalletDescriptor w_desc(std::move(desc), 0, 0, 10, 0);
     wallet.AddWalletDescriptor(w_desc, provider, "", false);
+}
+
+BOOST_AUTO_TEST_CASE(psbt_input_verification_takes_the_psbt_by_reference)
+{
+    // Signing a PSBT verifies every input it signs. Taking the whole PSBT by
+    // value copied it once per input, which made signing quadratic in the
+    // number of inputs. This fails to compile if the parameter is a copy again.
+    static_assert(std::is_same_v<decltype(&PSBTInputSignedAndVerified),
+                                 bool (*)(const PartiallySignedTransaction&, unsigned int,
+                                          const PrecomputedTransactionData*, unsigned int)>);
+
+    PartiallySignedTransaction psbt;
+    psbt.tx = CMutableTransaction();
+    psbt.tx->vin.emplace_back(COutPoint{Txid::FromUint256(uint256{1}), 0});
+    psbt.tx->vout.emplace_back(1, CScript{});
+    psbt.inputs.resize(1);
+    // No UTXO data: the check fails closed, without touching the PSBT.
+    const PartiallySignedTransaction before{psbt};
+    BOOST_CHECK(!PSBTInputSignedAndVerified(psbt, 0, nullptr));
+    BOOST_CHECK(psbt.tx->GetHash() == before.tx->GetHash());
 }
 
 BOOST_AUTO_TEST_CASE(psbt_updater_test)

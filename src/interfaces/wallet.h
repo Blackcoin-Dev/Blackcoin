@@ -1407,8 +1407,10 @@ struct WalletDemurrageOutputInfo
     bool attestation_due{false};
     //! End of the grace period; stays 0 afterwards even before any reduction.
     int blocks_until_decay{0};
-    //! Blocks until the value is first reduced (0 once it is).
+    //! Blocks until the value is first reduced (0 once it is); meaningful only when
+    //! first_reduction_known (not for an exempt output or an activation not given by height).
     int blocks_until_first_reduction{0};
+    bool first_reduction_known{false};
     int blocks_until_lock{0};
     std::string action;
 };

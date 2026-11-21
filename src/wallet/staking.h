@@ -8,6 +8,7 @@
 #ifndef BITCOIN_WALLET_STAKING_H
 #define BITCOIN_WALLET_STAKING_H
 
+#include <consensus/demurrage.h>
 #include <pos.h>
 #include <wallet/spend.h>
 #include <wallet/wallet.h>
@@ -43,6 +44,16 @@ std::optional<int64_t> LastLegacyStakeHeight(const Consensus::Params& consensus)
  *  kernel must pay a quantum output (or not stake). Same condition for
  *  candidate filtering, status weight and the check inside CreateCoinStake. */
 bool IsLegacyStakeBarredByMigrationEnd(const Consensus::Params& consensus, int stake_height);
+
+/** Blocks from evaluation_height until an output's value is first reduced by
+ *  demurrage, for status display. Before activation the distance to the activation
+ *  height is added to the curve's own count. nullopt when no meaningful height
+ *  countdown exists: an exempt output (permanently whole), or an activation that
+ *  is not given by a height. The curve helper itself
+ *  (Consensus::DemurrageBlocksUntilFirstReduction) is unchanged. */
+std::optional<int64_t> DemurrageFirstReductionCountdown(const Consensus::Params& consensus,
+                                                        const Consensus::DemurrageEvaluation& eval,
+                                                        int evaluation_height, int64_t evaluation_time);
 
 /** Where this wallet stands on the quantum return of legacy stakes. */
 struct LegacyStakeQuantumReturn

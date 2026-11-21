@@ -101,6 +101,13 @@ BOOST_AUTO_TEST_CASE(notice_names_the_window_the_return_address_and_the_migratio
     BOOST_CHECK(notice.find("never win a stake stay legacy: migrate") != std::string::npos);
     BOOST_CHECK(notice.find("cannot stake again until they are 10 blocks old") != std::string::npos);
 
+    // N1: the margin block is described as a margin, not as impossible. A stake at 250 (M - maturity)
+    // matures in the last Migration block; only from 251 on can it not mature before Final.
+    BOOST_CHECK(notice.find("starts one block early to keep a migration margin") != std::string::npos);
+    BOOST_CHECK(notice.find("a legacy stake at height 250 would mature only in the last Migration block") != std::string::npos);
+    BOOST_CHECK(notice.find("from height 251 on it could not mature before the Final phase at all") != std::string::npos);
+    BOOST_CHECK(notice.find("would be lost") == std::string::npos);
+
     // Not ready: says exactly what to do and that no legacy stake happens.
     notice = LegacyStakingNotice(regtest, 201, not_ready);
     BOOST_CHECK(notice.find("NOT READY: no quantum stake return address is set.") != std::string::npos);

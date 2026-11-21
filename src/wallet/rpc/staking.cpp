@@ -5714,7 +5714,7 @@ static RPCHelpMan getdemurragewalletinfo()
                     {RPCResult::Type::BOOL, "locked", "Whether this output has reached the 24-month lock"},
                     {RPCResult::Type::STR, "exemption", "Reason the output is currently whole, or empty when decaying"},
                     {RPCResult::Type::NUM, "blocks_until_decay", "Blocks until the grace period ends; zero once it has ended. The value does not drop yet when the grace period ends: the first real reduction comes later (see blocks_until_first_reduction). Kept for compatibility."},
-                    {RPCResult::Type::NUM, "blocks_until_first_reduction", "Blocks until the output's value is first reduced; zero if it is already reduced"},
+                    {RPCResult::Type::NUM, "blocks_until_first_reduction", /*optional=*/true, "Blocks from evaluation_height until the output's value is first reduced; zero if it is already reduced. Before demurrage activates it includes the blocks left until activation. Absent when no countdown exists: the output is exempt (permanently whole), or activation is not given by a block height."},
                     {RPCResult::Type::NUM, "blocks_until_lock", "Blocks until hard lock; zero if already locked"},
                     {RPCResult::Type::BOOL, "attestation_due", "Whether this output is beyond the 3-month auto-attestation policy threshold"},
                     {RPCResult::Type::STR, "action", "Suggested wallet action"},
@@ -5807,7 +5807,9 @@ static RPCHelpMan getdemurragewalletinfo()
         entry.pushKV("locked", eval.locked);
         entry.pushKV("exemption", eval.exemption);
         entry.pushKV("blocks_until_decay", std::max(0, consensus.DemurrageGraceBlocks() - eval.inactive_blocks));
-        entry.pushKV("blocks_until_first_reduction", Consensus::DemurrageBlocksUntilFirstReduction(eval.inactive_blocks, consensus));
+        if (const auto countdown = DemurrageFirstReductionCountdown(consensus, eval, evaluation_height, evaluation_time)) {
+            entry.pushKV("blocks_until_first_reduction", *countdown);
+        }
         entry.pushKV("blocks_until_lock", std::max(0, consensus.DemurrageZeroBlocks() - eval.inactive_blocks));
         entry.pushKV("attestation_due", attestation_due);
         std::string action;

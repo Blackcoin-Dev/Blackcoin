@@ -2014,6 +2014,21 @@ bool IsLegacyStakeBarredByMigrationEnd(const Consensus::Params& consensus, int s
     return last && int64_t{stake_height} > *last;
 }
 
+std::optional<int64_t> DemurrageFirstReductionCountdown(const Consensus::Params& consensus,
+                                                        const Consensus::DemurrageEvaluation& eval,
+                                                        int evaluation_height, int64_t evaluation_time)
+{
+    if (eval.exempt) return std::nullopt;
+    if (consensus.IsDemurrageActive(evaluation_height, evaluation_time)) {
+        return Consensus::DemurrageBlocksUntilFirstReduction(eval.inactive_blocks, consensus);
+    }
+    // Not active yet. Only a height-given activation makes a countdown.
+    if (!consensus.UsesHeightLifecycle()) return std::nullopt;
+    const int activation = consensus.EffectiveDemurrageActivationHeight();
+    if (activation == std::numeric_limits<int>::max() || evaluation_height >= activation) return std::nullopt;
+    return int64_t{activation} - int64_t{evaluation_height} + Consensus::DemurrageBlocksUntilFirstReduction(0, consensus);
+}
+
 std::string LegacyStakingNotice(const Consensus::Params& consensus, int next_height,
                                 const LegacyStakeQuantumReturn& quantum_return)
 {
@@ -2024,14 +2039,18 @@ std::string LegacyStakingNotice(const Consensus::Params& consensus, int next_hei
     const std::string unstaked = strprintf(
         "Legacy coins that never win a stake stay legacy: migrate them to a quantum address before height %d "
         "(the first Final block) or they can never be spent.", final_height);
+    // A stake at first_quantum matures in the very last Migration block, which the wallet does not
+    // rely on (a margin of one block); from first_quantum + 1 on it could not mature before Final.
+    const std::string why = strprintf(
+        "The wallet starts one block early to keep a migration margin: a legacy stake at height %d would mature only in the "
+        "last Migration block, and from height %d on it could not mature before the Final phase at all.",
+        first_quantum, first_quantum + 1);
     std::string head;
     if (int64_t{next_height} > *last) {
-        head = strprintf("Legacy stakes are now paid to a quantum address of this wallet (from height %d), because a legacy "
-                         "stake made now could not mature before the Final phase.", first_quantum);
+        head = strprintf("Legacy stakes are now paid to a quantum address of this wallet (from height %d). %s", first_quantum, why);
     } else {
-        head = strprintf("From height %d (%d blocks from now), legacy stakes are paid to a quantum address of this wallet, "
-                         "because a legacy stake made later could not mature before the Final phase.",
-                         first_quantum, first_quantum - int64_t{next_height});
+        head = strprintf("From height %d (%d blocks from now), legacy stakes are paid to a quantum address of this wallet. %s",
+                         first_quantum, first_quantum - int64_t{next_height}, why);
     }
     std::string ready;
     if (quantum_return.available) {

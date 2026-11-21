@@ -2466,7 +2466,9 @@ void CWallet::AddToSpends(const COutPoint& outpoint, const uint256& wtxid, Walle
     if (!preserve_existing_spent_anchor_hold) {
         if (batch) {
             UnlockCoin(outpoint, batch);
-        } else {
+        } else if (setLockedCoins.count(outpoint) != 0) {
+            // UnlockCoin only uses the batch to erase a locked coin, so the
+            // database batch is created only when the coin is locked.
             WalletBatch temp_batch(GetDatabase());
             UnlockCoin(outpoint, &temp_batch);
         }

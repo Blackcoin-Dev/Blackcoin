@@ -50,7 +50,12 @@ struct WalletLoadTestAccess {
         std::map<uint256, std::set<uint256>> payouts_by_block;
         std::set<uint256> coinstakes;
         std::set<uint256> unconfirmed_coinstakes;
-        bool operator==(const IndexContents& other) const = default;
+        bool operator==(const IndexContents& other) const
+        {
+            return live == other.live && live_legacy_claim == other.live_legacy_claim &&
+                   live_candidates == other.live_candidates && payouts_by_block == other.payouts_by_block &&
+                   coinstakes == other.coinstakes && unconfirmed_coinstakes == other.unconfirmed_coinstakes;
+        }
     };
     static IndexContents Indexes(CWallet& wallet) EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet)
     {

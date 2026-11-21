@@ -2114,7 +2114,19 @@ struct StakeCandidateScanContext
     int blocks_ahead{0};
     // Why the last evaluated output was rejected (the first failing test).
     StakeExclusion exclusion{StakeExclusion::NONE};
+    // Judge a coinbase or coinstake output mature by the wallet's own rule (CWallet::IsTxImmature: one block
+    // after consensus would accept it as a kernel) instead of the next-block kernel rule. Only the claim
+    // miner's stake reserve sets it: its selection of fee inputs must stay exactly what v30.1.6 did, and
+    // the wallet's claim candidate list uses that same wallet rule (see GetBoundedLegacyStakeCandidates).
+    bool wallet_maturity_rule{false};
 };
+
+static bool StakeSourceImmature(const CWallet& wallet, const CWalletTx& wtx, const StakeCandidateScanContext& context)
+    EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet)
+{
+    return context.wallet_maturity_rule ? wallet.IsTxImmature(wtx)
+                                        : IsStakeSourceImmatureForNextBlock(wallet, wtx, context.spend_height);
+}
 
 std::optional<int64_t> LastLegacyStakeHeight(const Consensus::Params& consensus)
 {
@@ -2406,7 +2418,7 @@ static bool EvaluateStakeCandidateReference(const CWallet& wallet, const COutPoi
             (context.blocks_ahead == 0 || depth > 0) &&
             depth + context.blocks_ahead >= context.min_depth && depth <= context.max_depth &&
             CachedTxIsTrusted(wallet, wtx, context.trusted_parents);
-        eligibility->second = {active, IsStakeSourceImmatureForNextBlock(wallet, wtx, context.spend_height)};
+        eligibility->second = {active, StakeSourceImmature(wallet, wtx, context)};
     }
     if (!eligibility->second.active) return false;
 
@@ -2557,7 +2569,7 @@ static bool EvaluateStakeCandidate(const CWallet& wallet, const COutPoint& outpo
             (context.blocks_ahead == 0 || depth > 0) &&
             depth + context.blocks_ahead >= context.min_depth && depth <= context.max_depth &&
             CachedTxIsTrusted(wallet, wtx, context.trusted_parents);
-        eligibility->second = {active, IsStakeSourceImmatureForNextBlock(wallet, wtx, context.spend_height)};
+        eligibility->second = {active, StakeSourceImmature(wallet, wtx, context)};
     }
     if (!eligibility->second.active) {
         const int depth = wallet.GetTxDepthInMainChain(wtx);
@@ -2650,6 +2662,7 @@ BoundedLegacyStakeCandidates GetBoundedLegacyStakeCandidates(
     };
     context.legacy_stake_barred = IsLegacyStakeBarredByMigrationEnd(consensus, spend_height) &&
                                   !ResolveLegacyStakeQuantumReturn(wallet).available;
+    context.wallet_maturity_rule = true;
     result.candidates.reserve(sources.size());
     for (const BoundedLegacyStakeSource& source : sources) {
         const COutPoint& outpoint = source.outpoint;
@@ -2665,10 +2678,10 @@ BoundedLegacyStakeCandidates GetBoundedLegacyStakeCandidates(
             IsQuantumColdStakeScript(script) || IsEUTXOScript(script)) {
             continue;
         }
-        // Same next-block maturity as the shared evaluation (a coinbase or
-        // coinstake is a kernel from the block `maturity` above it). This keeps
-        // the shared legacy call chain-free while preserving the authoritative result.
-        if (IsStakeSourceImmatureForNextBlock(wallet, *wallet_tx, spend_height)) continue;
+        // The wallet's own maturity rule, exactly as in v30.1.6: this list only feeds the claim miner's stake
+        // reserve (which coins stay out of claim fee-input selection), and the claim candidates it is set
+        // against are judged by the same wallet rule. See the note at wallet_maturity_rule.
+        if (wallet.IsTxImmature(*wallet_tx)) continue;
         bool spendable{false};
         if (!EvaluateStakeCandidate(
                 wallet, outpoint, *wallet_tx, context,

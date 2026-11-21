@@ -870,6 +870,60 @@ BOOST_FIXTURE_TEST_CASE(a_coinbase_exactly_maturity_deep_is_a_candidate_for_the_
     }
 }
 
+// The claim miner's stake reserve is built from GetBoundedLegacyStakeCandidates and decides which legacy coins stay out
+// of claim fee-input selection. That selection must stay exactly what v30.1.6 did before Gold Rush ends, so the
+// reserve list keeps the wallet's own maturity rule (a coinbase is mature one block after consensus would accept it
+// as a kernel) while the staker itself uses the kernel rule. The one coin that differs is the coinbase exactly
+// `maturity` deep: the staker may stake it, the claim selector cannot spend it (the wallet calls it immature), so
+// it cannot be contended for, and the reserve must not give it a protected slot that frees another coin for claims.
+BOOST_FIXTURE_TEST_CASE(the_claim_reserve_keeps_the_wallet_maturity_rule_while_the_staker_uses_the_kernel_rule, LegacyStakeOpenSetup)
+{
+    auto wallet = CreateSyncedWallet(*m_node.chain,
+        WITH_LOCK(Assert(m_node.chainman)->GetMutex(), return m_node.chainman->ActiveChain()), coinbaseKey);
+    BOOST_CHECK_EQUAL(m_node.chainman->ActiveChain().Height(), 100);
+    const int maturity = Params().GetConsensus().nCoinbaseMaturity;
+    const int boundary_height = 101 - maturity; // exactly `maturity` deep at tip 100: a kernel for block 101
+    const int64_t mtp = WITH_LOCK(::cs_main, return m_node.chainman->ActiveChain().Tip()->GetMedianTimePast());
+
+    const auto height_of = [&](const COutPoint& outpoint) EXCLUSIVE_LOCKS_REQUIRED(wallet->cs_wallet) {
+        const auto it = wallet->mapWallet.find(outpoint.hash);
+        BOOST_REQUIRE(it != wallet->mapWallet.end());
+        const TxStateConfirmed* confirmed = it->second.state<TxStateConfirmed>();
+        BOOST_REQUIRE(confirmed);
+        return confirmed->confirmed_block_height;
+    };
+
+    std::set<int> staker_heights;
+    {
+        const StakeCoins coins = LegacyCandidatesAtTip(*this, *wallet);
+        LOCK(wallet->cs_wallet);
+        for (const auto& [wtx, n] : coins) staker_heights.insert(height_of(COutPoint{wtx->GetHash(), n}));
+    }
+    BOOST_CHECK(staker_heights.count(boundary_height) == 1); // the staker stakes it
+
+    std::set<int> reserve_heights;
+    {
+        LOCK(wallet->cs_wallet);
+        std::vector<BoundedLegacyStakeSource> sources;
+        for (const auto& [txid, wtx] : wallet->mapWallet) {
+            for (unsigned int n = 0; n < wtx.tx->vout.size(); ++n) {
+                if (!wallet->IsSpent(COutPoint{txid, n})) sources.push_back({COutPoint{txid, n}, &wtx});
+            }
+        }
+        const BoundedLegacyStakeCandidates reserve = GetBoundedLegacyStakeCandidates(*wallet, sources, {}, 100, mtp);
+        BOOST_CHECK(!reserve.capacity_exceeded);
+        for (const BoundedLegacyStakeCandidate& candidate : reserve.candidates) {
+            reserve_heights.insert(height_of(candidate.outpoint));
+        }
+    }
+    // The reserve sees the staker's set less the exact-maturity coinbase: the coinbase one block older is in both.
+    std::set<int> expected = staker_heights;
+    expected.erase(boundary_height);
+    BOOST_CHECK(reserve_heights == expected);
+    BOOST_CHECK(reserve_heights.count(boundary_height - 1) == 1);
+    BOOST_CHECK(reserve_heights.count(boundary_height) == 0);
+}
+
 BOOST_AUTO_TEST_SUITE_END()
 } // namespace
 } // namespace wallet

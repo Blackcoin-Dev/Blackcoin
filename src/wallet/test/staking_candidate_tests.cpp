@@ -847,6 +847,27 @@ BOOST_FIXTURE_TEST_CASE(a_coinbase_exactly_maturity_deep_is_a_candidate_for_the_
     BOOST_CHECK(reasons.at(next_height + 2 - maturity) == StakeExclusion::IMMATURE);
     // And with no look-ahead the staker itself selects exactly the first set.
     BOOST_CHECK(heights_of(LegacyCandidatesAtTip(*this, *wallet)) == heights);
+
+    // The staker's complete selection (SelectCoinsForStaking, which the slot cache and the weight status
+    // are built from) holds the boundary coinbase too, and the weight it publishes is exactly its value
+    // (no reserve here), tagged with the tip it was scanned at.
+    {
+        LOCK2(::cs_main, wallet->cs_wallet);
+        CAmount target{MAX_MONEY};
+        CAmount value_in{0};
+        std::set<std::pair<const CWalletTx*, unsigned int>> selection;
+        BOOST_REQUIRE(SelectCoinsForStaking(*wallet, target, selection, value_in));
+        StakeCoins coins;
+        AvailableCoinsForStaking(*wallet, coins);
+        CAmount expected{0};
+        for (const auto& [wtx, n] : coins) expected += wtx->tx->vout[n].nValue;
+        BOOST_CHECK_GT(expected, 0);
+        BOOST_CHECK_EQUAL(selection.size(), coins.size());
+        BOOST_CHECK_EQUAL(value_in, expected);
+        BOOST_CHECK(heights_of(coins) == heights);
+        BOOST_CHECK_EQUAL(wallet->m_cached_stake_weight.load(), static_cast<uint64_t>(value_in));
+        BOOST_CHECK_EQUAL(wallet->m_cached_stake_weight_height.load(), 100);
+    }
 }
 
 BOOST_AUTO_TEST_SUITE_END()

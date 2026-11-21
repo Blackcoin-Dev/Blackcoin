@@ -248,6 +248,40 @@ BOOST_FIXTURE_TEST_CASE(database_load_defers_the_live_index_until_the_rebuild, T
                 WalletLoadTestAccess::Indexes(per_record).live_candidates);
 }
 
+// A whole LoadWallet() (not the record-level helper): N live transactions in the database cost the one
+// final rebuild of the live index and no per-record maintenance, so the generation moves by the same
+// amount as for an empty wallet's load plus that single publication, not by N.
+BOOST_FIXTURE_TEST_CASE(a_database_load_publishes_the_live_index_once_not_per_record, TestingSetup)
+{
+    const CScript p2pkh = CScript() << OP_DUP << OP_HASH160 << std::vector<unsigned char>(20, 0x43)
+                                    << OP_EQUALVERIFY << OP_CHECKSIG;
+    const auto generation_after_load = [&](size_t transactions) {
+        auto database = CreateMockableWalletDatabase();
+        {
+            WalletBatch batch(*database);
+            for (size_t i = 0; i < transactions; ++i) {
+                CMutableTransaction tx;
+                tx.vin.emplace_back(COutPoint{Txid::FromUint256(uint256{static_cast<uint8_t>(50 + i)}), 0});
+                tx.vout.emplace_back((i + 1) * COIN, p2pkh);
+                CWalletTx wtx(MakeTransactionRef(tx), TxStateInMempool{});
+                BOOST_REQUIRE(batch.WriteTx(wtx));
+            }
+        }
+        CWallet wallet(nullptr, "", std::move(database));
+        BOOST_REQUIRE_EQUAL(wallet.LoadWallet(), DBErrors::LOAD_OK);
+        LOCK(wallet.cs_wallet);
+        BOOST_CHECK_EQUAL(wallet.mapWallet.size(), transactions);
+        BOOST_CHECK_EQUAL(WalletLoadTestAccess::Indexes(wallet).live.size() + 0, transactions);
+        return WalletLoadTestAccess::LiveGeneration(wallet);
+    };
+    const uint64_t none = generation_after_load(0);
+    const uint64_t three = generation_after_load(3);
+    const uint64_t ten = generation_after_load(10);
+    // The same rebuild, whatever the number of records: a per-record path would add one per record.
+    BOOST_CHECK_EQUAL(three, ten);
+    BOOST_CHECK_LE(three, none + 1);
+}
+
 BOOST_FIXTURE_TEST_CASE(database_load_index_equals_a_rebuild_on_a_mixed_wallet, TestingSetup)
 {
     const CScript p2pkh = CScript() << OP_DUP << OP_HASH160 << std::vector<unsigned char>(20, 0x42)

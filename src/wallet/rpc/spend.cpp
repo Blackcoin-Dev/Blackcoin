@@ -2027,9 +2027,21 @@ RPCHelpMan migratetoquantum()
             {RPCResult::Type::NUM, "remaining_inputs", "legacy UTXOs left for later batches"},
             {RPCResult::Type::STR_AMOUNT, "remaining_amount", "legacy value left for later batches"},
             {RPCResult::Type::BOOL, "more_batches", "whether another call is needed to move the rest"},
-            {RPCResult::Type::NUM, "excluded_legacy_outputs", "legacy outputs this call could not consider (not mature, locked, unconfirmed or not spendable); more_batches false does not mean none remain"},
+            {RPCResult::Type::NUM, "excluded_legacy_outputs", "every other unspent legacy output this wallet owns (protected, locked, immature, unconfirmed, no signer here, other); more_batches false does not mean none remain"},
             {RPCResult::Type::STR_AMOUNT, "excluded_legacy_amount", "value of those legacy outputs"},
             {RPCResult::Type::NUM, "next_maturity_height", /*optional=*/true, "first height at which one of them matures; absent when none waits for maturity"},
+            {RPCResult::Type::OBJ, "excluded_legacy_by_reason", "the excluded legacy outputs by reason; protected assets are never spent automatically", {
+                {RPCResult::Type::OBJ, "protected_asset", "live RGB seal or EUTXO state", {{RPCResult::Type::NUM, "count", ""}, {RPCResult::Type::STR_AMOUNT, "amount", ""}}},
+                {RPCResult::Type::OBJ, "locked", "locked with lockunspent", {{RPCResult::Type::NUM, "count", ""}, {RPCResult::Type::STR_AMOUNT, "amount", ""}}},
+                {RPCResult::Type::OBJ, "immature", "coinbase or coinstake output not yet spendable", {{RPCResult::Type::NUM, "count", ""}, {RPCResult::Type::STR_AMOUNT, "amount", ""}}},
+                {RPCResult::Type::OBJ, "unconfirmed", "not yet in a block", {{RPCResult::Type::NUM, "count", ""}, {RPCResult::Type::STR_AMOUNT, "amount", ""}}},
+                {RPCResult::Type::OBJ, "signer_unavailable", "watch-only or without signing support in this wallet", {{RPCResult::Type::NUM, "count", ""}, {RPCResult::Type::STR_AMOUNT, "amount", ""}}},
+                {RPCResult::Type::OBJ, "other", "owned and unspent, not considered, none of the above", {{RPCResult::Type::NUM, "count", ""}, {RPCResult::Type::STR_AMOUNT, "amount", ""}}},
+            }},
+            {RPCResult::Type::NUM, "continuation_batches", "later batches the wallet's plan needs after this one (0 when none)"},
+            {RPCResult::Type::STR_AMOUNT, "continuation_fees", "fees the plan expects those later batches to pay"},
+            {RPCResult::Type::NUM, "minimum_blocks_to_finish", "fewest blocks, counting this batch's, in which every batch can confirm: a later batch that spends an earlier batch's output needs it confirmed first"},
+            {RPCResult::Type::STR, "completion_warning", /*optional=*/true, "present when the migration cannot finish by the last Migration block even if every batch confirms in the next block"},
             {RPCResult::Type::NUM, "auxiliary_inputs", "confirmed quantum outputs of this wallet spent with the batch as anchor or fee source (their value is not legacy value moved)"},
             {RPCResult::Type::STR_AMOUNT, "auxiliary_amount", "value of those quantum outputs; it reaches the destination too"},
             {RPCResult::Type::NUM, "max_inputs", "input limit that applied to this batch"},
@@ -2235,6 +2247,29 @@ RPCHelpMan migratetoquantum()
             result.pushKV("excluded_legacy_outputs", (int)excluded.count);
             result.pushKV("excluded_legacy_amount", ValueFromAmount(excluded.amount));
             if (excluded.next_maturity_height > 0) result.pushKV("next_maturity_height", excluded.next_maturity_height);
+            UniValue reasons(UniValue::VOBJ);
+            auto add_reason = [&reasons](const char* name, const ResidualCategory& c) {
+                UniValue entry(UniValue::VOBJ);
+                entry.pushKV("count", (int)c.count);
+                entry.pushKV("amount", ValueFromAmount(c.amount));
+                reasons.pushKV(name, std::move(entry));
+            };
+            add_reason("protected_asset", excluded.protected_asset);
+            add_reason("locked", excluded.locked);
+            add_reason("immature", excluded.immature);
+            add_reason("unconfirmed", excluded.unconfirmed);
+            add_reason("signer_unavailable", excluded.signer_unavailable);
+            add_reason("other", excluded.other);
+            result.pushKV("excluded_legacy_by_reason", std::move(reasons));
+        }
+        result.pushKV("continuation_batches", (int)batch->continuation_batches);
+        result.pushKV("continuation_fees", ValueFromAmount(batch->continuation_fees));
+        result.pushKV("minimum_blocks_to_finish", (int)batch->continuation_min_blocks);
+        if (batch->remaining_inputs > 0 && consensus.IsMigrationEndScheduled() &&
+            next_height + static_cast<int64_t>(batch->continuation_min_blocks) - 1 > consensus.nQuantumMigrationEndHeight) {
+            result.pushKV("completion_warning",
+                "Even with every later batch confirmed in the next block, the migration cannot finish by the last Migration block; "
+                "move what you can now, with a larger max_inputs if the wallet allows it.");
         }
         result.pushKV("auxiliary_inputs", (int)batch->auxiliary.size());
         result.pushKV("auxiliary_amount", ValueFromAmount(batch->auxiliary_value));

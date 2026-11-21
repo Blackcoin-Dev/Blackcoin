@@ -18,7 +18,7 @@ the next one:
    the auxiliary quantum value is reported separately from the legacy value moved;
 
 The refusal of a partial batch whose destination could not anchor the rest, or whose output is too
-small to fund the remainder, is in BuildMigrationBatch and is not covered by a functional test.
+small to pay for every later batch, is covered by wallet_migration_funding_boundary.py.
 
 Regtest: Gold Rush ends at G=61, Migration ends at M=91.
 """

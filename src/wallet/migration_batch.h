@@ -17,6 +17,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <set>
+#include <string>
 #include <vector>
 
 namespace wallet {
@@ -36,6 +37,9 @@ static constexpr int64_t MIGRATION_BATCH_WEIGHT_BUDGET{360000};
 /** Fixed transaction weight reserved for the version, counts, the marker and
  *  flag, the single destination output and a possible change output. */
 static constexpr int64_t MIGRATION_BATCH_FIXED_WEIGHT{1500};
+/** Weight assumed for spending a quantum output when the wallet cannot compute it (about 3,900
+ *  for a direct ML-DSA spend, rounded up). */
+static constexpr int64_t MIGRATION_QUANTUM_INPUT_FALLBACK_WEIGHT{4000};
 static_assert(MIGRATION_BATCH_WEIGHT_BUDGET < MAX_STANDARD_TX_WEIGHT);
 
 struct MigrationBatchInput {
@@ -53,6 +57,9 @@ struct MigrationBatchInput {
     //! anchor is left. Its value is accounted separately and never counts as
     //! legacy value migrated or remaining.
     bool auxiliary{false};
+    //! Continuation planning only: transactions in the chain that must confirm before this
+    //! quantum output exists (0 for an output that already exists).
+    int depth{0};
 };
 
 struct MigrationBatchPlan {
@@ -98,7 +105,57 @@ struct MigrationBatch {
     CAmount remaining_value{0};
     //! Maximum signed size the wallet expects; for a signed transaction the actual size is at most this.
     int64_t estimated_vsize{0};
+    //! Later batches the continuation plan needs after this one (0 when nothing is left).
+    unsigned int continuation_batches{0};
+    //! Sum of the fees the continuation plan expects those later batches to pay.
+    CAmount continuation_fees{0};
+    //! Fewest blocks, counting this batch's, in which the whole migration can finish: later batches
+    //! that spend an earlier batch's quantum output each need that output confirmed first.
+    unsigned int continuation_min_blocks{1};
 };
+
+//! Inputs to the continuation plan that follows a partial batch.
+struct MigrationContinuationParams {
+    size_t max_inputs{0};
+    int64_t fixed_weight{MIGRATION_BATCH_FIXED_WEIGHT};
+    int64_t weight_budget{MIGRATION_BATCH_WEIGHT_BUDGET};
+    bool require_anchor{false};
+    //! Fee rate the later batches are assumed to pay: at least the first batch's and the minimum relay and wallet fee.
+    int64_t fee_rate_per_kvb{0};
+    //! Dust threshold of the batch output; a later batch whose output is below it is infeasible.
+    CAmount dust{0};
+    //! Maximum signed weight of spending the first batch's own quantum output.
+    int64_t auxiliary_input_weight{0};
+    //! Value of the first batch's output after its fee.
+    CAmount first_output{0};
+    //! Whether the first batch's output is an ordinary quantum output that can anchor and fund a later batch.
+    bool output_can_anchor{false};
+};
+
+struct MigrationContinuation {
+    bool feasible{true};
+    //! Later batches needed, counting a conservative estimate beyond the simulated ones.
+    unsigned int batches{0};
+    CAmount fees{0};
+    //! Fewest blocks, counting the first batch's, in which the migration can finish.
+    unsigned int min_blocks{1};
+    //! Why it is infeasible (empty when feasible).
+    std::string reason;
+};
+
+/**
+ * Simulate every batch the remainder still needs after a first partial batch, with the same
+ * planner the wallet uses: the same max_inputs, weight budget and anchor rule, the actual
+ * auxiliary input weight, and the fee each batch pays at the given rate (plus its rounding
+ * unit). Each batch is funded by the legacy inputs it takes and, when it uses one, by the
+ * quantum output of the batch before it. Infeasible when a batch has no anchor, when no input
+ * fits, or when a batch's output would fall below dust. Beyond a bounded number of simulated
+ * batches the rest is checked with a conservative whole-budget fee per batch.
+ * remaining holds the legacy inputs the first batch did not take plus any unused auxiliary
+ * quantum outputs.
+ */
+MigrationContinuation PlanMigrationContinuation(std::vector<MigrationBatchInput> remaining,
+                                                const MigrationContinuationParams& params);
 
 /**
  * Plan one bounded batch and build its transaction (signed unless sign is
@@ -123,12 +180,26 @@ bool IsMigrationAuxiliaryOutput(const CWallet& wallet, const COutPoint& outpoint
 /** Legacy outputs of the wallet that a sweep did not consider (immature, locked,
  *  unconfirmed or not spendable). "No eligible inputs remain" is not "no legacy
  *  outputs remain": these can become movable later, including in the last Migration block. */
-struct ExcludedLegacyOutputs {
+struct ResidualCategory {
     unsigned int count{0};
     CAmount amount{0};
+};
+struct ExcludedLegacyOutputs {
+    //! Every owned unspent legacy output outside the sweep's own candidates; the categories below
+    //! add up to it (each output is counted once, under the first reason that applies).
+    unsigned int count{0};
+    CAmount amount{0};
+    ResidualCategory protected_asset; //!< live RGB seal or EUTXO state: never spent automatically
+    ResidualCategory locked;          //!< locked by the user (lockunspent)
+    ResidualCategory immature;        //!< coinbase or coinstake output that is not yet spendable
+    ResidualCategory unconfirmed;     //!< not in a block and not in the mempool, or in neither chain
+    ResidualCategory signer_unavailable; //!< owned for watching only, or without signing support here
+    ResidualCategory other;           //!< owned and unspent, not a sweep candidate, none of the above
     //! First height at which an immature coinbase or coinstake output becomes spendable; 0 when none waits for maturity.
     int64_t next_maturity_height{0};
 };
+//! Human-readable list of the non-empty reason categories, e.g. "2 locked (1.5 BLK), 1 immature (3 BLK)"; empty when none.
+std::string DescribeExcludedLegacyOutputs(const ExcludedLegacyOutputs& excluded);
 ExcludedLegacyOutputs FindExcludedLegacyOutputs(const CWallet& wallet, const std::set<COutPoint>& considered,
                                                 const Consensus::Params& consensus, int next_height)
     EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet);

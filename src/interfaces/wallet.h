@@ -1343,6 +1343,11 @@ struct WalletQuantumActionTx
     //! spendable): "no remaining eligible inputs" is not "no legacy outputs remain".
     unsigned int excluded_legacy_outputs{0};
     CAmount excluded_legacy_amount{0};
+    //! The excluded outputs by reason (protected asset, locked, immature, unconfirmed, no signer here, other); empty when none.
+    std::string excluded_legacy_breakdown;
+    //! Later batches the continuation plan needs, and the fewest blocks, counting this batch's, in which the migration can finish.
+    unsigned int continuation_batches{0};
+    unsigned int continuation_min_blocks{1};
     //! First height at which an excluded immature output becomes spendable; 0 when none is waiting for maturity.
     int64_t next_maturity_height{0};
     //! Confirmed quantum outputs of this wallet used as anchor or fee source (value not counted as legacy moved).

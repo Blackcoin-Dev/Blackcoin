@@ -222,6 +222,98 @@ BOOST_AUTO_TEST_CASE(an_auxiliary_output_can_fund_a_tail_even_when_a_legacy_anch
                 PlanMigrationBatch(tail, 5, 0, 4500, true, true).estimated_weight <= 4500);
 }
 
+namespace {
+MigrationContinuationParams ContParams(size_t max_inputs, CAmount first_output)
+{
+    MigrationContinuationParams p;
+    p.max_inputs = max_inputs;
+    p.require_anchor = true;
+    p.fee_rate_per_kvb = 1000000; // 0.01 per kvB, so a 4,000 weight auxiliary input costs 10,001
+    p.dust = 546;
+    p.auxiliary_input_weight = 4000;
+    p.first_output = first_output;
+    p.output_can_anchor = true;
+    return p;
+}
+} // namespace
+
+BOOST_AUTO_TEST_CASE(continuation_counts_the_auxiliary_input_of_every_later_batch)
+{
+    // Sole anchor used by the first batch; five witness-only inputs of 3,000 each are left, one per
+    // later batch (max_inputs=1). Every later batch spends the previous output (4,000 weight) and pays
+    // fixed overhead, which the old single-fee estimate left out.
+    std::vector<MigrationBatchInput> rest;
+    for (uint32_t i = 2; i <= 6; ++i) rest.push_back(Input(i, 3000, 600));
+    // Fee per batch: (1500 + 600 + 4000 weight) = 6100 wu = 1525 vB -> 1525 * 1000000 / 1000 + 1 = 1,525,001.
+    const CAmount per_batch = 1525001;
+    // Barely enough: the first output plus the legacy value covers five fees and the final dust.
+    CAmount enough = 5 * per_batch + 546 - 5 * 3000;
+    const MigrationContinuation ok = PlanMigrationContinuation(rest, ContParams(1, enough));
+    BOOST_CHECK(ok.feasible);
+    BOOST_CHECK_EQUAL(ok.batches, 5U);
+    BOOST_CHECK_EQUAL(ok.fees, 5 * per_batch);
+    // Each later batch spends the one before it, so six blocks in all counting the first batch.
+    BOOST_CHECK_EQUAL(ok.min_blocks, 6U);
+    // One unit short: refused before the first batch is authorised.
+    const MigrationContinuation short_by_one = PlanMigrationContinuation(rest, ContParams(1, enough - 1));
+    BOOST_CHECK(!short_by_one.feasible);
+    BOOST_CHECK(!short_by_one.reason.empty());
+}
+
+BOOST_AUTO_TEST_CASE(continuation_old_estimate_would_have_passed_an_infeasible_plan)
+{
+    // The first output covers one batch fee plus dust (what the old check compared), but not five.
+    std::vector<MigrationBatchInput> rest;
+    for (uint32_t i = 2; i <= 6; ++i) rest.push_back(Input(i, 3000, 600));
+    const MigrationContinuation c = PlanMigrationContinuation(rest, ContParams(1, 1525001 + 546));
+    BOOST_CHECK(!c.feasible);
+}
+
+BOOST_AUTO_TEST_CASE(continuation_with_larger_batches_needs_fewer_fees)
+{
+    std::vector<MigrationBatchInput> rest;
+    for (uint32_t i = 2; i <= 7; ++i) rest.push_back(Input(i, 3000, 600));
+    // max_inputs=3: two later batches.
+    const MigrationContinuation c = PlanMigrationContinuation(rest, ContParams(3, 4000000));
+    BOOST_CHECK(c.feasible);
+    BOOST_CHECK_EQUAL(c.batches, 2U);
+    BOOST_CHECK_EQUAL(c.min_blocks, 3U);
+}
+
+BOOST_AUTO_TEST_CASE(continuation_needs_an_anchor_when_the_output_cannot_anchor)
+{
+    std::vector<MigrationBatchInput> rest;
+    for (uint32_t i = 2; i <= 4; ++i) rest.push_back(Input(i, 5000000, 600));
+    MigrationContinuationParams p = ContParams(2, 50000000);
+    p.output_can_anchor = false;
+    const MigrationContinuation c = PlanMigrationContinuation(rest, p);
+    BOOST_CHECK(!c.feasible);
+    // A legacy anchor that stays behind serves the one later batch without the output; two later batches
+    // would need a second anchor.
+    rest.push_back(Input(9, 5000000, 600, /*anchor=*/true));
+    p.max_inputs = 4;
+    BOOST_CHECK(PlanMigrationContinuation(rest, p).feasible);
+    p.max_inputs = 2;
+    BOOST_CHECK(!PlanMigrationContinuation(rest, p).feasible);
+    // Nothing left: trivially feasible, no further batch.
+    const MigrationContinuation none = PlanMigrationContinuation({}, p);
+    BOOST_CHECK(none.feasible);
+    BOOST_CHECK_EQUAL(none.batches, 0U);
+}
+
+BOOST_AUTO_TEST_CASE(continuation_far_beyond_the_simulation_bound_is_checked_conservatively)
+{
+    std::vector<MigrationBatchInput> rest;
+    for (uint32_t i = 0; i < 1500; ++i) rest.push_back(Input(i + 10, 100000000, 600));
+    // max_inputs=1: 1,500 later batches, beyond the simulated bound; funded generously.
+    BOOST_CHECK(PlanMigrationContinuation(rest, ContParams(1, 50000000)).feasible);
+    // Legacy value too small for the worst-case fees of every batch that is left.
+    std::vector<MigrationBatchInput> poor;
+    for (uint32_t i = 0; i < 1500; ++i) poor.push_back(Input(i + 10, 3000, 600));
+    // The output survives the simulated batches but not the worst-case fee of the ones beyond them.
+    BOOST_CHECK(!PlanMigrationContinuation(poor, ContParams(1, 900000000)).feasible);
+}
+
 BOOST_AUTO_TEST_SUITE_END()
 
 } // namespace wallet

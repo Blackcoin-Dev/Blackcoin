@@ -199,6 +199,7 @@ BITCOIN_TESTS += \
   wallet/test/payout_digest_tests.cpp \
   wallet/test/staking_candidate_tests.cpp \
   wallet/test/migration_batch_tests.cpp \
+  wallet/test/migration_residual_tests.cpp \
   wallet/test/legacy_stake_cutoff_tests.cpp \
   wallet/test/status_countdown_tests.cpp \
   wallet/test/block_connect_activity_tests.cpp \

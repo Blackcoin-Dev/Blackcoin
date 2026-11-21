@@ -2015,6 +2015,7 @@ util::Result<WalletQuantumActionTx> CreateQuantumMigrationSweep(
     std::optional<MigrationBatch> batch_result;
     unsigned int excluded_legacy_outputs{0};
     CAmount excluded_legacy_amount{0};
+    std::string excluded_legacy_breakdown;
     int64_t next_maturity_height{0};
     std::string comment;
     {
@@ -2147,6 +2148,7 @@ util::Result<WalletQuantumActionTx> CreateQuantumMigrationSweep(
             const ExcludedLegacyOutputs excluded = FindExcludedLegacyOutputs(wallet, considered, consensus, next_height);
             excluded_legacy_outputs = excluded.count;
             excluded_legacy_amount = excluded.amount;
+            excluded_legacy_breakdown = DescribeExcludedLegacyOutputs(excluded);
             next_maturity_height = excluded.next_maturity_height;
         }
         batch_result = std::move(*batch);
@@ -2176,6 +2178,9 @@ util::Result<WalletQuantumActionTx> CreateQuantumMigrationSweep(
     result.remaining_amount = batch_result->remaining_value;
     result.excluded_legacy_outputs = excluded_legacy_outputs;
     result.excluded_legacy_amount = excluded_legacy_amount;
+    result.excluded_legacy_breakdown = excluded_legacy_breakdown;
+    result.continuation_batches = static_cast<unsigned int>(batch_result->continuation_batches);
+    result.continuation_min_blocks = static_cast<unsigned int>(batch_result->continuation_min_blocks);
     result.next_maturity_height = next_maturity_height;
     result.auxiliary_inputs = static_cast<unsigned int>(batch_result->auxiliary.size());
     result.auxiliary_amount = batch_result->auxiliary_value;

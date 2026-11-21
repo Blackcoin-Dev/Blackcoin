@@ -4667,6 +4667,30 @@ bool ComponentSelected(const ShadowPowClaimRecoveryComponent& component,
                        });
 }
 
+/** A family whose every claim is terminal only because the Gold Rush reward
+ * window closed before the pinned tip's next block. Nothing else (a transient
+ * or indeterminate claim, a branch-relative ineligibility, a missing local
+ * state) qualifies, and neither does any height inside the window. */
+bool IsEpochClosedClaimComponent(
+    const ShadowPowClaimRecoveryComponent& component, int active_height)
+{
+    if (!IsShadowGoldRushWindowClosedAtTip(active_height)) return false;
+    if (component.claim_txids.empty() ||
+        !component.all_claims_terminal_on_pinned_tip) {
+        return false;
+    }
+    bool any_claim{false};
+    for (const ShadowPowClaimRecoveryNode& node : component.nodes) {
+        if (node.kind != ShadowPowClaimRecoveryNodeKind::CLAIM) continue;
+        if (node.disposition !=
+            ShadowPowClaimMempoolDisposition::HEIGHT_AFTER_WINDOW) {
+            return false;
+        }
+        any_claim = true;
+    }
+    return any_claim;
+}
+
 bool SafeClaimGraphForRecovery(
     const ShadowPowClaimRecoveryComponent& component,
     ShadowPowClaimRecoveryOrigin origin, std::string& reason_code,
@@ -4972,6 +4996,9 @@ ShadowPowClaimRecoveryPlan BuildRecoveryPlanLocked(
     }
 
     ShadowPowClaimRecoveryUsage automatic_usage;
+    // With the miner off, automatic recovery acts only on families the closed
+    // reward window left unconfirmable; every other authority check is kept.
+    bool epoch_closed_recovery_only{false};
     if (request.origin == ShadowPowClaimRecoveryOrigin::AUTOMATIC) {
         if (!automatic_policy || !automatic_policy->HasAutomaticAuthority() ||
             !ValidateShadowPowClaimRecoveryPolicy(*automatic_policy)) {
@@ -4984,7 +5011,9 @@ ShadowPowClaimRecoveryPlan BuildRecoveryPlanLocked(
                 plan, request.selectors);
             return plan;
         }
-        if (!wallet.m_pow_mining_enabled.load()) {
+        epoch_closed_recovery_only = !wallet.m_pow_mining_enabled.load() &&
+            IsShadowGoldRushWindowClosedAtTip(inventory.active_height);
+        if (!wallet.m_pow_mining_enabled.load() && !epoch_closed_recovery_only) {
             ShadowPowClaimRecoveryAction refused;
             refused.reason_code = "miner-not-enabled";
             refused.detail = "automatic recovery requires an already-enabled Gold Rush miner";
@@ -5047,6 +5076,10 @@ ShadowPowClaimRecoveryPlan BuildRecoveryPlanLocked(
         if (!ComponentSelected(component, selector_set)) continue;
         for (const ShadowPowClaimRecoveryNode& node : component.nodes) {
             if (selector_set.count(node.txid)) matched_selectors.insert(node.txid);
+        }
+        if (epoch_closed_recovery_only &&
+            !IsEpochClosedClaimComponent(component, inventory.active_height)) {
+            continue;
         }
 
         ShadowPowClaimRecoveryAction action;
@@ -6420,7 +6453,9 @@ ShadowPowClaimRecoveryResult CWallet::ResolveShadowPowClaims(
                     !m_shadow_pow_claim_recovery_policy.HasAutomaticAuthority() ||
                     !ValidateShadowPowClaimRecoveryPolicy(
                         m_shadow_pow_claim_recovery_policy) ||
-                    !m_pow_mining_enabled.load()) {
+                    (!m_pow_mining_enabled.load() &&
+                     !IsShadowGoldRushWindowClosedAtTip(
+                         result.plan.active_height))) {
                     audit_outcome = RecoveryAuditOutcome::AUTHORITY_REVOKED;
                     result.error = "automatic recovery authority was revoked before relay";
                     return result;
@@ -6458,7 +6493,8 @@ ShadowPowClaimRecoveryResult CWallet::ResolveShadowPowClaims(
         if (effective.origin ==
             ShadowPowClaimRecoveryOrigin::AUTOMATIC) {
             broadcast_guard.expected_automatic_policy = automatic_policy;
-            broadcast_guard.require_pow_mining_enabled = true;
+            broadcast_guard.require_pow_mining_enabled =
+                !IsShadowGoldRushWindowClosedAtTip(result.plan.active_height);
         }
         AssertLockNotHeld(::cs_main);
         AssertLockNotHeld(cs_wallet);
@@ -6784,9 +6820,17 @@ void CWallet::MaybeAutoResolveShadowPowClaims()
     const ShadowPowClaimRecoveryPolicy policy =
         GetShadowPowClaimRecoveryPolicy();
     if (!policy.HasAutomaticAuthority() ||
-        !ValidateShadowPowClaimRecoveryPolicy(policy) ||
-        !m_pow_mining_enabled.load()) {
+        !ValidateShadowPowClaimRecoveryPolicy(policy)) {
         return;
+    }
+    if (!m_pow_mining_enabled.load()) {
+        // Without a miner only the closed reward window opens this path; the
+        // plan builder then restricts it to unconfirmable families.
+        const std::optional<int> tip_height =
+            HaveChain() ? chain().getHeight() : std::nullopt;
+        if (!tip_height || !IsShadowGoldRushWindowClosedAtTip(*tip_height)) {
+            return;
+        }
     }
     ShadowPowClaimRecoveryRequest request;
     request.mode = ShadowPowClaimRecoveryMode::COMMIT_AND_BROADCAST;

@@ -1933,6 +1933,13 @@ void StakingMiningPage::renderPowClaimRecoveryReview()
                          ? tr("pause and ask")
                          : tr("unset"))
             .arg(review.policy.minimum_stale_blocks));
+    if (review.closed_claim_reserved_amount > 0) {
+        m_pow_recovery_summary->setText(
+            m_pow_recovery_summary->text() + QStringLiteral("\n") +
+            tr("Gold Rush has ended: %1 is reserved by %2 closed claim(s) that can no longer confirm. Resolving the plan below spends only each funding input back to this wallet, minus the shown fee; nothing is released until you acknowledge it.")
+                .arg(formatBLK(review.closed_claim_reserved_amount))
+                .arg(QString::number(static_cast<qlonglong>(review.closed_claim_reserved_claims))));
+    }
     if (has_unbound_legacy_proof) {
         m_pow_recovery_summary->setText(
             m_pow_recovery_summary->text() + QStringLiteral("\n") +
@@ -4441,6 +4448,11 @@ void StakingMiningPage::applyFullDetailSnapshot(const WalletModel::StakingMining
               .arg(info.current_height)
               .arg(info.current_height + 1)
               .arg(info.blocks_remaining)
+        : info.gold_rush_ended
+            ? tr("Gold Rush shadow ledger: Gold Rush has ended (reward window %2-%3 closed; chain height %1)")
+                  .arg(info.current_height)
+                  .arg(info.shadow_reward_start_height)
+                  .arg(info.shadow_reward_end_height)
         : info.current_height >= 0
             ? tr("Gold Rush shadow ledger: not active at height %1 (reward window %2-%3)")
                   .arg(info.current_height)
@@ -4491,7 +4503,10 @@ void StakingMiningPage::applyFullDetailSnapshot(const WalletModel::StakingMining
     QString pow_runtime_summary;
     switch (info.state) {
     case interfaces::WalletPowMiningState::DISABLED:
-        pow_runtime_summary = tr("off");
+        pow_runtime_summary = info.gold_rush_ended ? tr("Gold Rush has ended") : tr("off");
+        break;
+    case interfaces::WalletPowMiningState::GOLD_RUSH_ENDED:
+        pow_runtime_summary = tr("Gold Rush has ended");
         break;
     case interfaces::WalletPowMiningState::STARTING:
         pow_runtime_summary = tr("starting");
@@ -4600,7 +4615,11 @@ void StakingMiningPage::applyFullDetailSnapshot(const WalletModel::StakingMining
         .arg(autostart_pow ? tr("ON") : tr("OFF")));
 
     QString recommended_action;
-    if (info.enabled && info.state == interfaces::WalletPowMiningState::NO_SPENDABLE_LEGACY_FEE_UTXO) {
+    if (info.gold_rush_ended && info.closed_claim_reserved_amount > 0) {
+        recommended_action = tr("Gold Rush has ended and %1 is still reserved by %2 closed claim(s) that can no longer confirm, so it is missing from your spendable balance. Select <b>Review claim recovery...</b> to preview Core's exact recovery transaction and its fee, then acknowledge the plan to release the funds. The command line equivalent is resolveallshadowpowclaims.")
+            .arg(formatBLK(info.closed_claim_reserved_amount))
+            .arg(QString::number(static_cast<qlonglong>(info.closed_claim_reserved_claims)));
+    } else if (info.enabled && info.state == interfaces::WalletPowMiningState::NO_SPENDABLE_LEGACY_FEE_UTXO) {
         recommended_action = tr("Send this wallet a confirmed, spendable legacy BLK UTXO so it can authenticate and pay the fee for a Gold Rush PoW claim.");
     } else if (info.enabled && info.state == interfaces::WalletPowMiningState::STAKE_RESERVE_PROTECTED) {
         recommended_action = tr("PoW is paused because the remaining mature legacy coin is protected for PoS. Add another confirmed mature legacy coin, disable staking, or explicitly set -powclaimreservestakecoins=0 on restart if you accept losing current legacy stake capacity. Core will not split or spend funds automatically.");
@@ -4640,6 +4659,12 @@ void StakingMiningPage::applyFullDetailSnapshot(const WalletModel::StakingMining
         m_pow_status->setText(m_pow_pending_enabled ? tr("Starting Gold Rush PoW mining...") : tr("Stopping Gold Rush PoW mining..."));
     } else if (m_pow_settings_dirty && info.enabled) {
         m_pow_status->setText(tr("PoW miner settings changed. Click Apply to update the miner."));
+    } else if (info.gold_rush_ended && info.closed_claim_reserved_amount > 0) {
+        m_pow_status->setText(tr("Gold Rush has ended and the PoW miner is stopped. %1 is still reserved by %2 closed claim(s); use Review claim recovery... to release it.")
+            .arg(formatBLK(info.closed_claim_reserved_amount))
+            .arg(QString::number(static_cast<qlonglong>(info.closed_claim_reserved_claims))));
+    } else if (info.gold_rush_ended) {
+        m_pow_status->setText(tr("Gold Rush has ended. The PoW miner is stopped and cannot be started again on this chain."));
     } else if (info.enabled && info.state == interfaces::WalletPowMiningState::NO_SPENDABLE_LEGACY_FEE_UTXO) {
         m_pow_status->setText(tr("PoW mining is enabled but waiting for a confirmed, spendable legacy BLK UTXO to authenticate and pay the next claim fee."));
     } else if (info.enabled && info.state == interfaces::WalletPowMiningState::STAKE_RESERVE_PROTECTED) {

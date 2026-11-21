@@ -29,6 +29,8 @@ enum class WalletPowMiningState : uint8_t {
     READY,
     HASHING,
     RUNTIME_ERROR,
+    /** The reward window closed: the miner is stopped for good on this chain. */
+    GOLD_RUSH_ENDED,
 };
 
 constexpr std::string_view WalletPowMiningStateName(WalletPowMiningState state) noexcept
@@ -50,6 +52,7 @@ constexpr std::string_view WalletPowMiningStateName(WalletPowMiningState state) 
     case WalletPowMiningState::READY: return "ready";
     case WalletPowMiningState::HASHING: return "hashing";
     case WalletPowMiningState::RUNTIME_ERROR: return "error";
+    case WalletPowMiningState::GOLD_RUSH_ENDED: return "gold_rush_ended";
     }
     return "error";
 }

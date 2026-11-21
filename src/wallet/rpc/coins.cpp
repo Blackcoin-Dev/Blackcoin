@@ -576,6 +576,7 @@ RPCHelpMan getbalances()
                 }},
                 {RPCResult::Type::NUM, "lifecycle_evaluation_height", "candidate next-block height used for lifecycle classification"},
                 {RPCResult::Type::NUM_TIME, "lifecycle_evaluation_mtp", "tip median-time-past used for lifecycle classification"},
+                {RPCResult::Type::OBJ, "closed_claim_reserved", /*optional=*/true, "only present while Gold Rush claims that can no longer confirm keep a funding input reserved: the amount missing from the spendable balance and the command that releases it", ClosedClaimReservationResults()},
                 RESULT_BALANCE_EXACT,
                 RESULT_BALANCE_HEIGHT,
                 RESULT_BALANCE_BLOCKHASH,
@@ -632,6 +633,7 @@ RPCHelpMan getbalances()
 
     balances.pushKV("lifecycle_evaluation_height", lifecycle.evaluation_height);
     balances.pushKV("lifecycle_evaluation_mtp", lifecycle.evaluation_mtp);
+    AppendClosedClaimReservation(balances, wallet);
     AppendPolledBalanceState(balances, wallet, polled);
     AppendLastProcessedBlock(balances, wallet);
     return balances;

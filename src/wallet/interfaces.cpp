@@ -3326,6 +3326,10 @@ public:
                     info.last_stake_coin_guard = reserve->last_stake_coin_guard;
                 }
                 info.payout_address = m_wallet->m_pow_payout_quantum;
+                const ShadowPowClosedClaimReservation closed_claims =
+                    m_wallet->GetClosedClaimReservationLocked();
+                info.closed_claim_reserved_amount = closed_claims.amount;
+                info.closed_claim_reserved_claims = static_cast<int64_t>(closed_claims.claims);
                 const std::vector<CScript> known_scripts =
                     m_wallet->GetOwnedLegacyShadowScripts(MAX_WALLET_SHADOW_SOLVE_REFERENCES);
                 wallet_scripts.insert(known_scripts.begin(), known_scripts.end());
@@ -3344,6 +3348,10 @@ public:
             if (tip) {
                 const Consensus::Params& consensus = Params().GetConsensus();
                 info.current_height = tip->nHeight;
+                info.gold_rush_ended = IsShadowGoldRushWindowClosedAtTip(tip->nHeight);
+                if (info.gold_rush_ended && !info.enabled) {
+                    info.state = interfaces::WalletPowMiningState::GOLD_RUSH_ENDED;
+                }
                 const int next_height = tip->nHeight + 1;
                 info.epoch_active = IsShadowGoldRushRewardActive(consensus, tip->GetMedianTimePast(), next_height);
                 info.blocks_remaining = info.epoch_active ? std::max(0, SHADOW_REWARD_END_HEIGHT - next_height + 1) : 0;
@@ -3459,6 +3467,12 @@ public:
         review.quarantined_claim_objects = inventory.quarantined_claim_objects;
         review.blocking_components = inventory.blocking_components;
         review.resolved_components = inventory.resolved_components;
+        {
+            const ShadowPowClosedClaimReservation closed_claims = WITH_LOCK(
+                m_wallet->cs_wallet, return m_wallet->GetClosedClaimReservationLocked());
+            review.closed_claim_reserved_amount = closed_claims.amount;
+            review.closed_claim_reserved_claims = closed_claims.claims;
+        }
         review.components.reserve(inventory.components.size());
         for (const auto& component : inventory.components) {
             review.components.push_back(MakeRecoveryComponent(component));

@@ -786,6 +786,9 @@ struct WalletPowMiningInfo
     int workers_error{0};           //!< workers in a local-error retry state
     double hashrate{0.0};           //!< Argon2id tries per second (aggregate)
     int current_height{-1};         //!< active-chain tip used for Gold Rush state, or -1 if unavailable
+    bool gold_rush_ended{false};    //!< the next block is past the reward window on the current chain
+    CAmount closed_claim_reserved_amount{0}; //!< funding inputs held by claims the closed window left unconfirmable
+    int64_t closed_claim_reserved_claims{0}; //!< claim transactions holding them
     bool epoch_active{false};       //!< whether the Gold Rush reward window is currently open
     int blocks_remaining{0};        //!< blocks left in the Gold Rush window (0 if inactive)
     std::string payout_address;     //!< auto-created quantum (ML-DSA) payout address (empty until created)
@@ -1064,6 +1067,8 @@ struct WalletPowClaimRecoveryReview
     size_t quarantined_claim_objects{0};
     size_t blocking_components{0};
     size_t resolved_components{0};
+    CAmount closed_claim_reserved_amount{0}; //!< funding inputs held by claims the closed window left unconfirmable
+    size_t closed_claim_reserved_claims{0};
     std::vector<WalletPowClaimRecoveryComponent> components;
     std::vector<std::string> unanchored_claim_txids;
     WalletPowClaimRecoveryPlan plan;

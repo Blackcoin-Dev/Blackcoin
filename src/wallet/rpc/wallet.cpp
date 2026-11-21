@@ -100,6 +100,7 @@ static RPCHelpMan getwalletinfo()
                                 }},
                             }},
                         }},
+                        {RPCResult::Type::OBJ, "closed_claim_reserved", /*optional=*/true, "only present while Gold Rush claims that can no longer confirm keep a funding input reserved: the amount missing from the spendable balance and the command that releases it", ClosedClaimReservationResults()},
                         RESULT_BALANCE_EXACT,
                         RESULT_BALANCE_HEIGHT,
                         RESULT_BALANCE_BLOCKHASH,
@@ -163,6 +164,7 @@ static RPCHelpMan getwalletinfo()
     obj.pushKV("immature_balance", ValueFromAmount(bal.m_mine_immature));
     obj.pushKV("lifecycle", WalletLifecycleInfoToJSON(
         lifecycle.mine, lifecycle.evaluation_height, lifecycle.evaluation_mtp));
+    AppendClosedClaimReservation(obj, *pwallet);
     AppendPolledBalanceState(obj, *pwallet, polled);
     obj.pushKV("txcount",       (int)pwallet->mapWallet.size());
     const auto kp_oldest = pwallet->GetOldestKeyPoolTime();

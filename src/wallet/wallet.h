@@ -2221,9 +2221,14 @@ public:
     mutable Mutex m_staking_telemetry_mutex;
     StakingTelemetrySnapshot m_staking_telemetry
         GUARDED_BY(m_staking_telemetry_mutex);
+    // The automatic scans skip only a tip they already scanned: the height
+    // alone cannot tell two competing blocks at one height apart, so each
+    // watermark pairs it with the tip hash. A null hash means "scan again".
     int m_demurrage_last_auto_attest_scan_height GUARDED_BY(cs_wallet){-1};
+    uint256 m_demurrage_last_auto_attest_scan_tip GUARDED_BY(cs_wallet);
     std::map<uint256, int> m_demurrage_last_auto_attest_attempt_height GUARDED_BY(cs_wallet);
     int m_shadow_signal_last_auto_scan_height GUARDED_BY(cs_wallet){-1};
+    uint256 m_shadow_signal_last_auto_scan_tip GUARDED_BY(cs_wallet);
     // The staking thread and the periodic wallet scheduler can both request an
     // automatic QQSIGNAL. Keep construction single-flight per wallet and use a
     // non-blocking retry deadline so transient validation/signing failures do
@@ -2239,6 +2244,7 @@ public:
     mutable std::atomic<uint64_t> m_cached_stake_weight{0};
     mutable std::atomic<int> m_cached_stake_weight_height{-1};
     int m_redelegation_last_auto_scan_height GUARDED_BY(cs_wallet){-1};
+    uint256 m_redelegation_last_auto_scan_tip GUARDED_BY(cs_wallet);
     std::map<std::vector<unsigned char>, int> m_redelegation_last_auto_attempt_height GUARDED_BY(cs_wallet);
     std::map<std::vector<unsigned char>, int> m_redelegation_last_auto_success_height GUARDED_BY(cs_wallet);
     std::map<std::vector<unsigned char>, int> m_redelegation_last_win_height GUARDED_BY(cs_wallet);
@@ -2257,6 +2263,14 @@ public:
     std::atomic<double> m_pow_hashrate{0.0};   // aggregate Argon2id tries/s reported by the solver
     std::atomic<int64_t> m_pow_claims_submitted{0};
     std::atomic<bool> m_stop_pow_mining_thread{false};
+    // Gold Rush end handling: the last tip the wallet saw on each side of the
+    // end of the reward window (to queue one recovery pass at the transition),
+    // and the miner settings to restore if a reorganisation returns the chain
+    // below the end after the miner was stopped for it.
+    std::atomic<bool> m_gold_rush_end_observed{false};
+    std::atomic<bool> m_pow_resume_below_end{false};
+    std::atomic<int> m_pow_resume_threads{1};
+    std::atomic<int> m_pow_resume_cpu_percent{1};
     std::atomic<uint64_t> m_pow_next_nonce{0};
     std::atomic<uint64_t> m_pow_total_tries{0};
     std::atomic<int64_t> m_pow_hashrate_start_ms{0};
@@ -2938,6 +2952,14 @@ public:
                       bool wait_for_normal_unlock = false,
                       const std::function<bool()>& cancelled = {});
     void StopPowMining();
+    /** Stop the claim miner once the next block is past the Gold Rush reward
+     *  window, and restart it if a reorganisation returns below the end. Runs
+     *  on the claim maintenance thread, which may join the workers. */
+    void ReconcilePowMinerWithGoldRushWindow();
+    /** Funds held by claims that the closed reward window left unconfirmable.
+     *  Empty before the window closes. */
+    ShadowPowClosedClaimReservation GetClosedClaimReservationLocked() const
+        EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     void StopPowMiningLocked()
         EXCLUSIVE_LOCKS_REQUIRED(m_pow_recovery_authority_mutex);
     bool IsPowMiningClosing() const;

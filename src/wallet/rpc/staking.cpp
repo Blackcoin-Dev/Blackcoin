@@ -4348,6 +4348,7 @@ static RPCHelpMan getpowclaimrecoveryinfo()
         },
         RPCResult{RPCResult::Type::OBJ, "", "", {
             {RPCResult::Type::OBJ, "policy", /*optional=*/true, "Authoritative wallet-scoped policy. Omitted when the durable database outcome is ambiguous.", ShadowPowClaimRecoveryPolicyResults()},
+            {RPCResult::Type::OBJ, "closed_claim_reserved", "Funds still reserved by Gold Rush claims that can no longer confirm because the reward window closed, why, and the command that releases them. Zero before the window closes.", ClosedClaimReservationResults()},
             {RPCResult::Type::BOOL, "policy_authoritative", "Whether the displayed policy is proven to match a durable wallet record."},
             {RPCResult::Type::STR, "policy_state_status", "Stable typed policy-state status."},
             {RPCResult::Type::STR, "policy_state_detail", "Human-readable policy authority detail."},
@@ -4449,6 +4450,7 @@ static RPCHelpMan getpowclaimrecoveryinfo()
     ShadowPowClaimRecoveryPolicyMutationResult policy_state;
     bool database_ambiguous{false};
     bool chain_ready{false};
+    ShadowPowClosedClaimReservation closed_claim_reservation;
     for (int attempt = 1;; ++attempt) {
     inventory = pwallet->GetShadowPowClaimRecoveryInventory();
     bool coherent{false};
@@ -4471,6 +4473,7 @@ static RPCHelpMan getpowclaimrecoveryinfo()
             BuildShadowPowClaimCompatibilityInventory(inventory);
         usage = pwallet->GetShadowPowClaimRecoveryUsageFromInventoryLocked(
             inventory, policy.rolling_fee_window_seconds);
+        closed_claim_reservation = pwallet->GetClosedClaimReservationLocked();
         coherent = true;
         }
     }
@@ -4483,6 +4486,8 @@ static RPCHelpMan getpowclaimrecoveryinfo()
     UninterruptibleSleep(std::chrono::milliseconds{10 * attempt});
     }
     UniValue result(UniValue::VOBJ);
+    result.pushKV("closed_claim_reserved",
+                  ClosedClaimReservationToJSON(closed_claim_reservation));
     if (policy_state.authoritative_state_available) {
         result.pushKV("policy", ShadowPowClaimRecoveryPolicyToJSON(policy));
     }
@@ -4764,7 +4769,9 @@ static RPCHelpMan getpowmininginfo()
             {RPCResult::Type::BOOL, "enabled", "Whether in-process PoW mining is enabled."},
             {RPCResult::Type::BOOL, "autostart", "Whether process-wide persistent consent was given to start PoW mining for every eligible loaded wallet."},
             {RPCResult::Type::BOOL, "allow_automatic_quantum_key_creation", "Whether process-wide background automation may create new non-HD keys in loaded wallets."},
-            {RPCResult::Type::STR, "state", "Bounded worker state: disabled, starting, chain_unavailable, wallet_locked_or_staking_only, no_spendable_legacy_fee_utxo, stake_reserve_protected, epoch_inactive, claim_in_flight, claim_quarantined, claim_evaluation_pending, claim_evaluation_capacity, ready, hashing, or error."},
+            {RPCResult::Type::STR, "state", "Bounded worker state: disabled, starting, chain_unavailable, wallet_locked_or_staking_only, no_spendable_legacy_fee_utxo, stake_reserve_protected, epoch_inactive, claim_in_flight, claim_quarantined, claim_evaluation_pending, claim_evaluation_capacity, ready, hashing, error, or gold_rush_ended (the reward window has closed and the miner is stopped)."},
+            {RPCResult::Type::BOOL, "gold_rush_ended", "Whether the next block is past the Gold Rush reward window on the current chain."},
+            {RPCResult::Type::OBJ, "closed_claim_reserved", "Funds still reserved by Gold Rush claims that can no longer confirm, why, and the command that releases them. Zero before the window closes.", ClosedClaimReservationResults()},
             {RPCResult::Type::NUM, "threads", "Worker threads configured."},
             {RPCResult::Type::NUM, "cpu_percent", "Per-worker active-work duty target, including selection and proof preparation. Explicit waits count toward the idle period. The budget is spent work first: after a new tip the worker does not sleep until its claim is submitted, then sleeps off what it owes; it may run ahead by at most two target block spacings of budget before it falls back to sleeping after every batch."},
             {RPCResult::Type::NUM, "workers_hashing", "Workers currently inside a proof batch."},
@@ -4921,6 +4928,8 @@ static RPCHelpMan getpowmininginfo()
     bool pow_mining_enabled{false};
     interfaces::WalletPowMiningState pow_mining_state{
         interfaces::WalletPowMiningState::DISABLED};
+    ShadowPowClosedClaimReservation closed_claim_reservation;
+    bool gold_rush_ended{false};
     for (int attempt = 1;; ++attempt) {
     recovery_inventory =
         pwallet->GetShadowPowClaimRecoveryInventory();
@@ -4939,6 +4948,9 @@ static RPCHelpMan getpowmininginfo()
         mining_gate_telemetry_action =
             pwallet->GetShadowPowClaimMiningGateTelemetryActionLocked(
                 mining_gate, pow_mining_enabled, pow_mining_state);
+        closed_claim_reservation = pwallet->GetClosedClaimReservationLocked();
+        gold_rush_ended = IsShadowGoldRushWindowClosedAtTip(
+            recovery_inventory.active_height);
         for (const ShadowPowClaimRecoveryComponent& component :
              recovery_inventory.components) {
             for (const ShadowPowClaimRecoveryNode& node : component.nodes) {
@@ -4977,7 +4989,14 @@ static RPCHelpMan getpowmininginfo()
     obj.pushKV("enabled", pow_mining_enabled);
     obj.pushKV("autostart", gArgs.GetBoolArg("-powmining", false));
     obj.pushKV("allow_automatic_quantum_key_creation", gArgs.GetBoolArg("-qqallowautokeycreation", DEFAULT_ALLOW_AUTO_QUANTUM_KEY_CREATION));
-    obj.pushKV("state", std::string(interfaces::WalletPowMiningStateName(pow_mining_state)));
+    // A stopped miner after the window closed is a final state, not "disabled".
+    obj.pushKV("state", std::string(interfaces::WalletPowMiningStateName(
+        gold_rush_ended && !pow_mining_enabled
+            ? interfaces::WalletPowMiningState::GOLD_RUSH_ENDED
+            : pow_mining_state)));
+    obj.pushKV("gold_rush_ended", gold_rush_ended);
+    obj.pushKV("closed_claim_reserved",
+               ClosedClaimReservationToJSON(closed_claim_reservation));
     obj.pushKV("threads", pwallet->m_pow_threads.load());
     obj.pushKV("cpu_percent", pwallet->m_pow_cpu_percent.load());
     obj.pushKV("workers_hashing", pwallet->m_pow_workers_hashing.load());

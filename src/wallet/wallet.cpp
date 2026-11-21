@@ -3982,6 +3982,33 @@ void CWallet::blockDisconnected(const interfaces::BlockInfo& block)
     if (redelegation_win_disconnected) {
         work.coinstakes_visited += RecomputeQuantumRedelegationWinHistory(batch);
     }
+    // Retry state recorded while the disconnected block was the tip belongs to
+    // the disconnected history: an attempt at height h read the tip at h, and
+    // a demurrage attempt at evaluation height h + 1 read it too. Dropping it
+    // lets the competing branch be evaluated at once; a transaction that was
+    // really created still holds its inputs, so nothing is created twice.
+    for (auto it = m_demurrage_last_auto_attest_attempt_height.begin();
+         it != m_demurrage_last_auto_attest_attempt_height.end();) {
+        it = it->second > block.height
+            ? m_demurrage_last_auto_attest_attempt_height.erase(it)
+            : std::next(it);
+    }
+    for (auto* retry_map : {&m_redelegation_last_auto_attempt_height,
+                            &m_redelegation_last_auto_success_height}) {
+        const bool attempts = retry_map == &m_redelegation_last_auto_attempt_height;
+        for (auto it = retry_map->begin(); it != retry_map->end();) {
+            if (it->second < block.height) {
+                ++it;
+                continue;
+            }
+            if (attempts) {
+                batch.EraseQuantumRedelegationLastAttemptHeight(it->first);
+            } else {
+                batch.EraseQuantumRedelegationLastSuccessHeight(it->first);
+            }
+            it = retry_map->erase(it);
+        }
+    }
     end_phase(work.redelegation);
 
     if (block_writes && !block_writes->Commit()) {
@@ -4005,14 +4032,27 @@ void CWallet::updatedBlockTip()
 {
     m_best_block_time = GetTime();
     LOCK(cs_wallet);
-    if (!m_shadow_pow_unconfirmed_claim_txids.empty() ||
+    // The end of the Gold Rush window, in either direction, is a transition
+    // the wallet must act on without a miner: queue one recovery evaluation,
+    // and let the maintenance thread stop (or restart) the claim miner.
+    const bool window_closed = IsShadowGoldRushWindowClosedAtTip(m_last_block_processed_height);
+    const bool window_changed = m_gold_rush_end_observed.exchange(window_closed) != window_closed;
+    const bool miner_follows_window = window_closed
+        ? m_pow_mining_enabled.load(std::memory_order_acquire)
+        : m_pow_resume_below_end.load(std::memory_order_acquire);
+    const bool claims_pending = !m_shadow_pow_unconfirmed_claim_txids.empty() ||
         !m_shadow_pow_unconfirmed_implicit_claim_txids.empty() ||
-        !m_shadow_pow_unclassified_claim_txids.empty()) {
+        !m_shadow_pow_unclassified_claim_txids.empty();
+    if (claims_pending || window_changed || miner_follows_window) {
         // A retained proof can become eligible on an ordinary forward tip.
         // Do not depend on mining enablement or the 12-36 hour resend timer,
         // and do not revisit inert confirmed claim history on every block.
+        // After the window closes no claim can confirm: ask for a recovery
+        // pass on every block while claims remain, since the stale-depth
+        // gate of the standing policy advances with each block.
         RequestWalletClaimMaintenance(m_claim_maintenance,
-                                      /*resolve=*/false, /*relay=*/true);
+                                      /*resolve=*/window_closed && (claims_pending || window_changed),
+                                      /*relay=*/claims_pending);
     }
 }
 
@@ -10267,6 +10307,8 @@ bool CWallet::UpgradeWallet(int version, bilingual_str& error)
 void CWallet::ReportLegacyClaimSourceCapacity(bool force)
 {
     LOCK(cs_wallet);
+    // After the Gold Rush window the advice to consolidate outputs is moot.
+    if (IsShadowGoldRushWindowClosedAtTip(m_last_block_processed_height)) return;
     const auto now = std::chrono::steady_clock::now();
     if (!force && m_legacy_source_capacity_reported &&
         now - *m_legacy_source_capacity_reported < std::chrono::hours{1}) {
@@ -10312,7 +10354,10 @@ void CWallet::postInitProcess()
     if (IsStakingAutostartEnabled()) {
         StartStake();
     }
-    if (gArgs.GetBoolArg("-powmining", false)) {
+    if (gArgs.GetBoolArg("-powmining", false) &&
+        IsShadowGoldRushWindowClosedAtTip(WITH_LOCK(cs_wallet, return m_last_block_processed_height))) {
+        WalletLogPrintf("Gold Rush has ended: -powmining is ignored and the PoW miner is not started\n");
+    } else if (gArgs.GetBoolArg("-powmining", false)) {
         bilingual_str pow_error;
         const int pow_threads = static_cast<int>(gArgs.GetIntArg("-powminingthreads", 1));
         const int pow_cpu = static_cast<int>(gArgs.GetIntArg("-powminingcpu", 1));
@@ -13706,8 +13751,17 @@ bool CWallet::SetPowMining(bool enabled, int threads, int cpu_percent, bilingual
         return true;
     };
     if (cancellation_requested()) return false;
+    if (enabled && HaveChain()) {
+        const std::optional<int> tip_height = chain().getHeight();
+        if (tip_height && IsShadowGoldRushWindowClosedAtTip(*tip_height)) {
+            error = _("Gold Rush has ended: the next block is past the reward window, so the PoW claim miner cannot start.");
+            return false;
+        }
+    }
     LOCK(m_pow_recovery_authority_mutex);
     if (cancellation_requested()) return false;
+    // An explicit request replaces any restart queued for a reorganisation.
+    m_pow_resume_below_end.store(false, std::memory_order_release);
     // Reject an interactive start/reconfiguration without changing an
     // already-enabled startup worker. In particular, an encrypted wallet may
     // intentionally retain a zero-work worker while locked or staking-only so
@@ -14087,6 +14141,89 @@ void CWallet::StopPowMiningLocked()
         m_pow_state = WalletPowMiningState::DISABLED;
     }
     m_stop_pow_mining_thread = false;
+}
+
+void CWallet::ReconcilePowMinerWithGoldRushWindow()
+{
+    if (!HaveChain()) return;
+    const std::optional<int> tip_height = chain().getHeight();
+    if (!tip_height) return;
+    const bool closed = IsShadowGoldRushWindowClosedAtTip(*tip_height);
+    if (closed && m_pow_mining_enabled.load(std::memory_order_acquire)) {
+        const int threads = m_pow_threads.load();
+        const int cpu_percent = m_pow_cpu_percent.load();
+        {
+            LOCK(m_pow_recovery_authority_mutex);
+            // Remember the settings only for a miner that was running; a
+            // later explicit request clears the memory.
+            m_pow_resume_threads.store(threads);
+            m_pow_resume_cpu_percent.store(cpu_percent);
+            m_pow_resume_below_end.store(true, std::memory_order_release);
+            StopPowMiningLocked();
+        }
+        WalletLogPrintf("Gold Rush has ended at height %d: the PoW claim miner was stopped and its workers joined\n",
+                        *tip_height);
+    } else if (!closed && m_pow_resume_below_end.exchange(false)) {
+        bilingual_str error;
+        if (SetPowMining(/*enabled=*/true, m_pow_resume_threads.load(),
+                         m_pow_resume_cpu_percent.load(), error,
+                         /*created_payout=*/nullptr,
+                         /*allow_new_payout_key=*/false,
+                         /*wait_for_normal_unlock=*/true)) {
+            WalletLogPrintf("The chain is back below the end of Gold Rush: the PoW claim miner was restarted\n");
+        } else {
+            WalletLogPrintf("The chain is back below the end of Gold Rush but the PoW claim miner could not restart: %s\n",
+                            error.original);
+        }
+    }
+}
+
+ShadowPowClosedClaimReservation CWallet::GetClosedClaimReservationLocked() const
+{
+    AssertLockHeld(cs_wallet);
+    ShadowPowClosedClaimReservation result;
+    if (!IsShadowGoldRushWindowClosedAtTip(m_last_block_processed_height)) return result;
+    std::set<COutPoint> anchors;
+    const auto visit = [&](const std::set<uint256>& txids) {
+        for (const uint256& txid : txids) {
+            const auto it = mapWallet.find(txid);
+            if (it == mapWallet.end() || !it->second.tx) continue;
+            const CWalletTx& wtx = it->second;
+            if (wtx.isConfirmed() || wtx.isConflicted() ||
+                !TransactionHasShadowProof(*wtx.tx) || wtx.tx->vin.size() != 1) {
+                continue;
+            }
+            const COutPoint& prevout = wtx.tx->vin.front().prevout;
+            const auto prev = mapWallet.find(prevout.hash);
+            if (prev == mapWallet.end() || !prev->second.tx ||
+                prevout.n >= prev->second.tx->vout.size()) {
+                continue;
+            }
+            // A claim that spends another claim's change is counted through
+            // the family's root anchor.
+            if (TransactionHasShadowProof(*prev->second.tx)) continue;
+            if (IsMine(prev->second.tx->vout[prevout.n]) == ISMINE_NO) continue;
+            bool anchor_spent_on_chain{false};
+            const auto spenders = mapTxSpends.equal_range(prevout);
+            for (auto spender = spenders.first; spender != spenders.second; ++spender) {
+                const auto spend_tx = mapWallet.find(spender->second);
+                if (spend_tx != mapWallet.end() && spend_tx->second.isConfirmed()) {
+                    anchor_spent_on_chain = true;
+                    break;
+                }
+            }
+            if (anchor_spent_on_chain) continue;
+            ++result.claims;
+            if (anchors.insert(prevout).second) {
+                result.amount += prev->second.tx->vout[prevout.n].nValue;
+            }
+        }
+    };
+    visit(m_shadow_pow_unconfirmed_claim_txids);
+    visit(m_shadow_pow_unconfirmed_implicit_claim_txids);
+    visit(m_shadow_pow_unclassified_claim_txids);
+    result.anchors = anchors.size();
+    return result;
 }
 
 bool CWallet::IsPowMiningClosing() const

@@ -220,6 +220,7 @@ void ResetAutoShadowSignalScanHeight(CWallet& wallet, int scan_height)
     LOCK(wallet.cs_wallet);
     if (wallet.m_shadow_signal_last_auto_scan_height == scan_height) {
         wallet.m_shadow_signal_last_auto_scan_height = scan_height - 1;
+        wallet.m_shadow_signal_last_auto_scan_tip.SetNull();
     }
 }
 
@@ -421,11 +422,13 @@ bool FindAutoShadowSignalCandidate(CWallet& wallet, AutoShadowSignalCandidate& c
             LogPrint(BCLog::COINSTAKE, "Gold Rush PoS auto-signal: skipped because wallet lock is busy\n");
             return false;
         }
-        if (wallet.m_shadow_signal_last_auto_scan_height >= scan_height) {
+        if (wallet.m_shadow_signal_last_auto_scan_height == scan_height &&
+            wallet.m_shadow_signal_last_auto_scan_tip == scan_tip_hash) {
             LogPrint(BCLog::COINSTAKE, "Gold Rush PoS auto-signal: already scanned height=%d\n", scan_height);
             return false;
         }
         wallet.m_shadow_signal_last_auto_scan_height = scan_height;
+        wallet.m_shadow_signal_last_auto_scan_tip = scan_tip_hash;
         if (HasPendingShadowSignal(wallet)) {
             LogPrint(BCLog::COINSTAKE, "Gold Rush PoS auto-signal: pending signal already exists\n");
             return false;
@@ -1393,12 +1396,14 @@ int MaybeAutoDemurrageAttest(CWallet& wallet)
     const Consensus::Params& consensus = Params().GetConsensus();
     int evaluation_height{-1};
     int64_t evaluation_time{0};
+    uint256 evaluation_tip;
     {
         LOCK(cs_main);
         const CBlockIndex* tip = wallet.chain().getTip();
         if (!tip) return 0;
         evaluation_height = tip->nHeight + 1;
         evaluation_time = tip->GetMedianTimePast();
+        evaluation_tip = tip->GetBlockHash();
     }
     if (!consensus.IsDemurrageActive(evaluation_height, evaluation_time)) {
         return 0;
@@ -1406,10 +1411,12 @@ int MaybeAutoDemurrageAttest(CWallet& wallet)
 
     {
         LOCK(wallet.cs_wallet);
-        if (wallet.m_demurrage_last_auto_attest_scan_height >= evaluation_height) {
+        if (wallet.m_demurrage_last_auto_attest_scan_height == evaluation_height &&
+            wallet.m_demurrage_last_auto_attest_scan_tip == evaluation_tip) {
             return 0;
         }
         wallet.m_demurrage_last_auto_attest_scan_height = evaluation_height;
+        wallet.m_demurrage_last_auto_attest_scan_tip = evaluation_tip;
     }
 
     std::vector<AutoDemurrageAttestCandidate> candidates;
@@ -1723,21 +1730,26 @@ int MaybeAutoRedelegateQuantumColdStake(CWallet& wallet)
     }
 
     int current_height{0};
+    uint256 current_tip;
     {
         LOCK(cs_main);
         const CBlockIndex* tip = wallet.chain().getTip();
         if (!tip) return 0;
         current_height = tip->nHeight;
+        current_tip = tip->GetBlockHash();
     }
 
     {
         LOCK(wallet.cs_wallet);
-        if (wallet.m_redelegation_last_auto_scan_height >= current_height) {
+        if (wallet.m_redelegation_last_auto_scan_height == current_height &&
+            wallet.m_redelegation_last_auto_scan_tip == current_tip) {
             return 0;
         }
         wallet.m_redelegation_last_auto_scan_height = current_height;
+        wallet.m_redelegation_last_auto_scan_tip = current_tip;
         WalletBatch batch(wallet.GetDatabase());
         batch.WriteQuantumRedelegationAutoScanHeight(current_height);
+        batch.WriteQuantumRedelegationAutoScanTip(current_height, current_tip);
     }
 
     std::vector<AutoRedelegationSource> sources;

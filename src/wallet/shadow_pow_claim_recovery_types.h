@@ -38,6 +38,24 @@ inline constexpr size_t SHADOW_POW_CLAIM_METADATA_TOTAL_BYTE_CAPACITY{4 * 1024 *
 
 namespace wallet {
 
+/** True when the block after a chain tip of this height lies past the Gold
+ * Rush reward window: no claim can confirm on that branch and the PoW miner
+ * has nothing left to do. A reorganisation below the end makes it false again,
+ * so callers read it from the current tip every time and never cache it. */
+inline bool IsShadowGoldRushWindowClosedAtTip(int tip_height)
+{
+    return tip_height >= SHADOW_REWARD_END_HEIGHT;
+}
+
+/** Wallet funds held by Gold Rush claims that can no longer confirm because
+ * the reward window has closed. Information only: it releases nothing. */
+struct ShadowPowClosedClaimReservation
+{
+    CAmount amount{0};
+    size_t anchors{0};
+    size_t claims{0};
+};
+
 // Durable CWalletTx metadata shared by claim creation, repair, recovery, RPC,
 // and GUI code.  The string values are wallet-database schema and must not be
 // renamed after release.

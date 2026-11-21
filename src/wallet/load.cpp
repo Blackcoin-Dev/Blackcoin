@@ -99,6 +99,7 @@ struct WalletClaimMaintenance::State {
                             test_pass(*wallet, resolve, relay);
                         } else {
                             wallet->RepairStaleShadowTransactions(/*force=*/false);
+                            wallet->ReconcilePowMinerWithGoldRushWindow();
                             if (resolve && !Cancelled(*slot)) {
                                 wallet->MaybeAutoResolveShadowPowClaims();
                             }

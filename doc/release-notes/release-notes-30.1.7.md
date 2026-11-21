@@ -93,15 +93,23 @@ outputs the wallet stakes, what it reports, and what it tells the user to do.
   so a coinbase or coinstake still shows as immature in the balance for one block longer than
   it can stake.
 - **Quantum stake readiness.** The new read-only RPC `getquantumstakereadiness` reports, for the
-  next block and for the first Final block, the quantum value the wallet's staker would select,
-  the value held back by the reserve balance, and the number and value of quantum outputs it
-  would not select, by reason: immature, locked, below the staking minimum, no signer in the
-  wallet's current unlock state (a fully locked wallet cannot stake), or another staking rule.
-  It also reports the total quantum value, the legacy value still to migrate and the state of
-  the quantum stake return address. It runs the staker's own candidate scan, not a second
-  implementation, so it follows the wallet's real reserve balance, minimum, locks and unlock
-  state. Value counted for the first Final block uses current confirmations; unconfirmed
-  outputs are not counted as eligible.
+  next block and for the first Final block, the quantum outputs the wallet's staker would select,
+  their nominal (face) value and their effective value (the kernel principal after any scheduled
+  demurrage), and the number and value of quantum outputs it would not select, by reason:
+  immature, locked, below the staking minimum, no signer in the wallet's current unlock state (a
+  fully locked wallet cannot stake), or another staking rule. A kernel is one whole output, and the
+  reserve balance is held back from the staker's whole selected set (legacy outputs included), so
+  the report gives `candidate_total`, the `allowed_balance` left after the reserve, and
+  `stakeable_outputs`: the outputs whose effective principal fits in it. It never reports a
+  fractional "stakeable" amount: a wallet whose only quantum output is 100 coins with a reserve of
+  1 coin reports no stakeable output, because the staker would refuse that kernel. The first Final
+  block is projected only from a complete height-based schedule (`final_height_known`; a
+  time-only schedule has no Final height, countdown or `at_final`), and the projection uses the
+  Gold Rush payout lock as it will be then, not as it is at the tip. It also reports the total
+  quantum value, the legacy value still to migrate and the state of the quantum stake return
+  address. It runs the staker's own candidate scan, not a second implementation, so it follows the
+  wallet's real reserve balance, minimum, locks and unlock state. Value counted for the first
+  Final block uses current confirmations; unconfirmed outputs are not counted as eligible.
 - **A fresh wallet backup after a quantum stake return key is made.** Quantum keys are
   generated at random, one by one, and are not derived from a seed, so a wallet backup made
   before the key was created cannot recover coins paid to it. When the quantum stake return

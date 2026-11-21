@@ -216,6 +216,8 @@ BASE_SCRIPTS = [
     'wallet_quantum_stake_return_durability.py',
     'wallet_quantum_stake_return_downgrade.py',
     'wallet_quantum_stake_readiness.py',
+    'wallet_quantum_stake_readiness_reserve_demurrage.py',
+    'wallet_quantum_stake_readiness_schedule.py',
     'wallet_migration_batches.py',
     'feature_quantum_final_lockout_sighash.py',
     'feature_weak_subjectivity_checkpoint.py',

@@ -12,7 +12,12 @@ selects. The wallet here holds, at tip 76 (next block 77, first Final block F=92
  * Q2 a quantum output made two blocks ago (immature now, eligible by F);
  * Q3 a quantum output that is coin-locked (the change of the payment that made Q4);
  * Q4 a quantum output of 0.05 (below the 0.1 staking minimum);
- * a reserve balance larger than the legacy stake, so part of Q1 is held back.
+ * a reserve balance larger than the legacy stake.
+
+A kernel is one whole output and the constructor refuses a kernel whose principal exceeds what is left
+of the selected set after the reserve (candidate_total less the reserve). The report says how much each
+horizon may use (allowed_balance) and how many outputs fit it whole (stakeable_outputs); it never reports a
+fractional "stakeable" amount. The last part checks that against the staker with the reserve switched ON.
 
 The report must count each under the right reason, for the next block and for F, agree with the
 staker (a block template is built for exactly the outputs the report calls eligible and refused
@@ -21,7 +26,7 @@ that would stake is counted as signer_unavailable), a staking-only unlock does.
 
 Regtest: Gold Rush ends at G=61, Migration ends at M=91 (F=92).
 """
-from decimal import Decimal
+from decimal import Decimal, ROUND_DOWN
 
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import assert_equal, assert_raises_rpc_error
@@ -96,28 +101,35 @@ class QuantumStakeReadinessTest(TransitionTFinalTestBase, BitcoinTestFramework):
         nb = r["next_block"]
         assert_equal(nb["height"], 77)
         assert_equal(nb["eligible_outputs"], 1)
-        assert_equal(nb["eligible"], q1_amount)
-        # The legacy stake (two coins) absorbs part of the reserve; the rest is held back from Q1.
-        assert_equal(nb["reserve_withheld"], RESERVE - legacy_amount)
-        assert_equal(nb["stakeable"], q1_amount - (RESERVE - legacy_amount))
+        assert_equal(nb["eligible_nominal"], q1_amount)
+        assert_equal(nb["eligible_effective"], q1_amount)  # no demurrage yet: nominal is effective
+        # The staker's set holds Q1 and the two legacy coins; the reserve comes off the whole of it.
+        assert_equal(nb["candidate_total"], legacy_amount + q1_amount)
+        allowed = max(Decimal(0), legacy_amount + q1_amount - RESERVE)
+        assert_equal(nb["allowed_balance"], allowed)
+        # Q1 is one whole kernel: it stakes only if it fits in what the reserve leaves.
+        assert_equal(nb["stakeable_outputs"], 1 if q1_amount <= allowed else 0)
+        assert_equal(nb["stakeable_effective"], q1_amount if q1_amount <= allowed else 0)
+        assert_equal(nb["largest_kernel"], q1_amount if q1_amount <= allowed else 0)
         assert_equal(nb["excluded"]["immature"], {"count": 1, "amount": q2_amount})
         assert_equal(nb["excluded"]["locked"], {"count": 1, "amount": q3_amount})
         assert_equal(nb["excluded"]["below_minimum"], {"count": 1, "amount": q4_amount})
         assert_equal(nb["excluded"]["signer_unavailable"], {"count": 0, "amount": 0})
         assert_equal(nb["excluded"]["other"], {"count": 0, "amount": 0})
-        assert_equal(Decimal(str(nb["eligible"])) + sum(Decimal(str(nb["excluded"][k]["amount"])) for k in nb["excluded"]),
+        assert_equal(Decimal(str(nb["eligible_nominal"])) + sum(Decimal(str(nb["excluded"][k]["amount"])) for k in nb["excluded"]),
                      r["quantum_total"])
 
         self.log.info("First Final block: with current maturities Q2 joins Q1")
         fb = r["at_final"]
         assert_equal(fb["height"], F)
         assert_equal(fb["eligible_outputs"], 2)
-        assert_equal(fb["eligible"], q1_amount + q2_amount)
+        assert_equal(fb["eligible_nominal"], q1_amount + q2_amount)
         assert_equal(fb["excluded"]["immature"], {"count": 0, "amount": 0})
         assert_equal(fb["excluded"]["locked"], {"count": 1, "amount": q3_amount})
         assert_equal(fb["excluded"]["below_minimum"], {"count": 1, "amount": q4_amount})
         # At Final no legacy stake is left, so the whole reserve comes off the quantum stake.
-        assert_equal(fb["reserve_withheld"], min(RESERVE, q1_amount + q2_amount))
+        assert_equal(fb["candidate_total"], q1_amount + q2_amount)
+        assert_equal(fb["allowed_balance"], max(Decimal(0), q1_amount + q2_amount - RESERVE))
 
         self.log.info("Legacy value still to migrate, as the migration status counts it")
         assert_equal(r["legacy_outputs"], 2)
@@ -147,16 +159,39 @@ class QuantumStakeReadinessTest(TransitionTFinalTestBase, BitcoinTestFramework):
         assert_equal(r["wallet_locked"], False)
         assert_equal(r["staking_only_unlock"], True)
         assert_equal(r["next_block"]["eligible_outputs"], 1)
-        assert_equal(r["next_block"]["eligible"], q1_amount)
+        assert_equal(r["next_block"]["eligible_nominal"], q1_amount)
         assert_equal(r["next_block"]["excluded"]["signer_unavailable"], {"count": 0, "amount": 0})
 
-        self.log.info("The staker agrees: a template is built for Q1 and refused for the locked Q3")
-        # Ten blocks on, Q3 is old enough for consensus to accept it as a kernel.
+        self.log.info("The staker agrees, with the reserve ON: no whole kernel fits, then Q1 exactly fits")
+        # Ten blocks on, Q2 is old enough too and Q3 is old enough for consensus to accept it as a kernel.
         self.pow_blocks(node, 84 - node.getblockcount(), quantum_miner)
-        mix.reservebalance(False)
         q1_out = self.outpoint_at(mix, q1)
+        q2_out = self.outpoint_at(mix, q2)
+        # The reserve leaves half of Q1: neither Q1 nor Q2 is a kernel that fits, though a fractional
+        # accounting would have called half of the set stakeable.
+        half = min(q1_amount, q2_amount) / 2
+        mix.reservebalance(True, (q1_amount + q2_amount - half).quantize(Decimal("0.01"), rounding=ROUND_DOWN))
+        r = mix.getquantumstakereadiness()  # the wallet keeps the reserve in whole cents
+        nb = r["next_block"]
+        assert_equal(nb["eligible_outputs"], 2)
+        assert_equal(nb["candidate_total"], q1_amount + q2_amount)
+        assert_equal(nb["allowed_balance"], q1_amount + q2_amount - Decimal(str(r["reserve_balance"])))
+        assert nb["allowed_balance"] < min(q1_amount, q2_amount)
+        assert_equal(nb["stakeable_outputs"], 0)
+        assert_equal(nb["largest_kernel"], 0)
+        self.kernel_slot_for(mix, q1_out)
+        assert_raises_rpc_error(-32603, "Couldn't create a valid proof-of-stake block template", mix.checkkernel, [q1_out], True)
+        # A reserve (in whole cents, rounded down) that leaves at least Q1's value: Q1 fits whole.
+        self.bump()  # a later slot: the staker does not search the same time twice
+        mix.reservebalance(True, q2_amount.quantize(Decimal("0.01"), rounding=ROUND_DOWN))
+        nb = mix.getquantumstakereadiness()["next_block"]
+        assert nb["allowed_balance"] >= q1_amount
+        assert nb["stakeable_outputs"] >= 1
+        assert nb["largest_kernel"] >= q1_amount
         self.kernel_slot_for(mix, q1_out)
         assert "blocktemplate" in mix.checkkernel([q1_out], True)
+        self.log.info("...and a template is refused for the locked Q3")
+        mix.reservebalance(False)
         self.bump()
         self.kernel_slot_for(mix, q3_out)
         assert_raises_rpc_error(-32603, "Couldn't create a valid proof-of-stake block template", mix.checkkernel, [q3_out], True)

@@ -160,14 +160,24 @@ struct StakeExclusionTally
     CAmount value{0};
 };
 
-/** Quantum stake as the staker sees it for one block. */
+/** Quantum stake as the staker sees it for one block.
+ *
+ * Nominal value is the output's face value, which is what the staker's reserve rule counts; effective
+ * value is the kernel principal the coinstake constructor uses (after any scheduled demurrage). The
+ * reserve balance is held back from the staker's whole selected set, legacy outputs included, and a
+ * kernel is one output, so an output stakes only when its effective principal fits in the balance that
+ * is left (candidate_total less the reserve): there is no partial kernel. */
 struct StakeHorizonReadiness
 {
     int height{0};                  //! the block this describes
     int64_t eligible_outputs{0};    //! quantum outputs the staker selects
-    CAmount eligible{0};            //! their value
-    CAmount reserve_withheld{0};    //! part of it held back by the reserve balance
-    CAmount stakeable{0};           //! eligible minus reserve_withheld
+    CAmount eligible_nominal{0};    //! their face value
+    CAmount eligible_effective{0};  //! the kernel principal they would give (after demurrage)
+    CAmount candidate_total{0};     //! face value of everything the staker selects, legacy included (the figure the reserve comes off)
+    CAmount allowed_balance{0};     //! candidate_total less the reserve balance, 0 when it does not exceed it: the most one coinstake may use
+    int64_t stakeable_outputs{0};   //! eligible outputs whose effective principal fits in allowed_balance
+    CAmount stakeable_effective{0}; //! their effective principal
+    CAmount largest_kernel{0};      //! the largest single effective principal that fits (0 when none)
     std::map<StakeExclusion, StakeExclusionTally> excluded; //! quantum outputs not selected, by reason
 };
 
@@ -175,12 +185,13 @@ struct StakeHorizonReadiness
 struct QuantumStakeReadiness
 {
     int next_height{0};
-    int final_height{0};            //! first Final block (0 when no height schedule exists)
-    int64_t blocks_to_final{0};     //! 0 once Final has started
+    bool final_height_known{false}; //! whether a complete height-authoritative schedule gives the first Final block
+    int final_height{0};            //! first Final block (meaningful only when final_height_known)
+    int64_t blocks_to_final{0};     //! 0 once Final has started (meaningful only when final_height_known)
     int64_t quantum_outputs{0};     //! quantum outputs the staker's scan considers (selected or not)
     CAmount quantum_total{0};
     StakeHorizonReadiness next_block;
-    StakeHorizonReadiness at_final; //! same as next_block once Final has started
+    StakeHorizonReadiness at_final; //! same as next_block once Final has started (only when final_height_known)
     int64_t legacy_outputs{0};      //! legacy outputs still to migrate (spendable now or waiting)
     CAmount legacy_to_migrate{0};
     bool wallet_locked{false};      //! fully locked: no signer, the staker idles

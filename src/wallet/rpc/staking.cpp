@@ -857,9 +857,13 @@ static std::vector<RPCResult> StakeHorizonReadinessDoc()
     return {
         {RPCResult::Type::NUM, "height", "the block this describes"},
         {RPCResult::Type::NUM, "eligible_outputs", "quantum outputs the staker selects for that block"},
-        {RPCResult::Type::STR_AMOUNT, "eligible", "their value, before the reserve balance"},
-        {RPCResult::Type::STR_AMOUNT, "reserve_withheld", "the part of it held back by the reserve balance (legacy stake absorbs the reserve first)"},
-        {RPCResult::Type::STR_AMOUNT, "stakeable", "eligible minus reserve_withheld: the quantum value that can stake"},
+        {RPCResult::Type::STR_AMOUNT, "eligible_nominal", "their face value (what the reserve balance counts)"},
+        {RPCResult::Type::STR_AMOUNT, "eligible_effective", "the kernel principal they would give at that block, after any scheduled demurrage"},
+        {RPCResult::Type::STR_AMOUNT, "candidate_total", "face value of everything the staker selects for that block, legacy outputs included: the set the reserve balance is taken from"},
+        {RPCResult::Type::STR_AMOUNT, "allowed_balance", "candidate_total less the reserve balance (0 when it does not exceed it): the most one coinstake may use"},
+        {RPCResult::Type::NUM, "stakeable_outputs", "eligible outputs whose effective principal fits in allowed_balance. A kernel is one whole output, so an output larger than allowed_balance cannot stake at all, whatever its share of the reserve"},
+        {RPCResult::Type::STR_AMOUNT, "stakeable_effective", "the effective principal of those outputs"},
+        {RPCResult::Type::STR_AMOUNT, "largest_kernel", "the largest single effective principal that can stake (0 when none)"},
         {RPCResult::Type::OBJ, "excluded", "quantum outputs the staker does not select, by the first rule that stops them", {
             tally("immature", "unconfirmed or too young to be a kernel at that block"),
             tally("locked", "coin-locked, a locked Gold Rush payout or locked by demurrage"),
@@ -875,9 +879,13 @@ static UniValue StakeHorizonReadinessToJSON(const StakeHorizonReadiness& horizon
     UniValue obj(UniValue::VOBJ);
     obj.pushKV("height", horizon.height);
     obj.pushKV("eligible_outputs", horizon.eligible_outputs);
-    obj.pushKV("eligible", ValueFromAmount(horizon.eligible));
-    obj.pushKV("reserve_withheld", ValueFromAmount(horizon.reserve_withheld));
-    obj.pushKV("stakeable", ValueFromAmount(horizon.stakeable));
+    obj.pushKV("eligible_nominal", ValueFromAmount(horizon.eligible_nominal));
+    obj.pushKV("eligible_effective", ValueFromAmount(horizon.eligible_effective));
+    obj.pushKV("candidate_total", ValueFromAmount(horizon.candidate_total));
+    obj.pushKV("allowed_balance", ValueFromAmount(horizon.allowed_balance));
+    obj.pushKV("stakeable_outputs", horizon.stakeable_outputs);
+    obj.pushKV("stakeable_effective", ValueFromAmount(horizon.stakeable_effective));
+    obj.pushKV("largest_kernel", ValueFromAmount(horizon.largest_kernel));
     UniValue excluded(UniValue::VOBJ);
     for (const StakeExclusion reason : {StakeExclusion::IMMATURE, StakeExclusion::LOCKED, StakeExclusion::BELOW_MINIMUM,
                                         StakeExclusion::SIGNER_UNAVAILABLE, StakeExclusion::OTHER}) {
@@ -899,16 +907,20 @@ static RPCHelpMan getquantumstakereadiness()
         "block, computed by the staker's own candidate scan (the same code that selects its kernels), so it uses the\n"
         "wallet's actual reserve balance, minimum, locks and unlock state. An output is counted under the first rule\n"
         "that excludes it. Value that will become eligible by Final counts outputs as they will be then, given their\n"
-        "current confirmations; unconfirmed outputs are not counted as eligible. Nothing is changed.\n",
+        "current confirmations, and the Gold Rush payout lock and demurrage as they will be then; unconfirmed outputs\n"
+        "are not counted as eligible. The reserve balance is held back from the staker's whole selected set and a\n"
+        "kernel is one whole output, so an output stakes only if its effective principal fits in allowed_balance\n"
+        "(candidate_total less the reserve): stakeable_outputs counts exactly those. Nothing is changed.\n",
         {},
         RPCResult{RPCResult::Type::OBJ, "", "", {
             {RPCResult::Type::NUM, "next_height", "height of the next block"},
-            {RPCResult::Type::NUM, "final_height", /*optional=*/true, "first Final block (absent when no height schedule exists)"},
-            {RPCResult::Type::NUM, "blocks_to_final", "blocks from the next block to the first Final block; 0 once Final has started"},
+            {RPCResult::Type::BOOL, "final_height_known", "whether a complete height-authoritative schedule gives the first Final block; false for a time-only or absent schedule, in which case there is no final_height, blocks_to_final or at_final"},
+            {RPCResult::Type::NUM, "final_height", /*optional=*/true, "first Final block (absent when final_height_known is false)"},
+            {RPCResult::Type::NUM, "blocks_to_final", /*optional=*/true, "blocks from the next block to the first Final block; 0 once Final has started (absent when final_height_known is false)"},
             {RPCResult::Type::STR_AMOUNT, "quantum_total", "value of every quantum output the staker's scan considers, eligible or not"},
             {RPCResult::Type::NUM, "quantum_outputs", "their number"},
             {RPCResult::Type::OBJ, "next_block", "quantum stake for the next block", StakeHorizonReadinessDoc()},
-            {RPCResult::Type::OBJ, "at_final", "quantum stake for the first Final block, with current maturities (the same as next_block once Final has started)", StakeHorizonReadinessDoc()},
+            {RPCResult::Type::OBJ, "at_final", /*optional=*/true, "quantum stake for the first Final block, with current maturities and the Gold Rush lock and demurrage as they will be then (the same as next_block once Final has started; absent when final_height_known is false)", StakeHorizonReadinessDoc()},
             {RPCResult::Type::STR_AMOUNT, "legacy_to_migrate", "legacy value still to migrate (spendable now, or waiting to mature or unlock)"},
             {RPCResult::Type::NUM, "legacy_outputs", "number of those legacy outputs"},
             {RPCResult::Type::OBJ, "stake_return", "the quantum stake return address of legacy stakes", {
@@ -935,12 +947,15 @@ static RPCHelpMan getquantumstakereadiness()
     }
     UniValue result(UniValue::VOBJ);
     result.pushKV("next_height", readiness.next_height);
-    if (readiness.final_height > 0) result.pushKV("final_height", readiness.final_height);
-    result.pushKV("blocks_to_final", readiness.blocks_to_final);
+    result.pushKV("final_height_known", readiness.final_height_known);
+    if (readiness.final_height_known) {
+        result.pushKV("final_height", readiness.final_height);
+        result.pushKV("blocks_to_final", readiness.blocks_to_final);
+    }
     result.pushKV("quantum_total", ValueFromAmount(readiness.quantum_total));
     result.pushKV("quantum_outputs", readiness.quantum_outputs);
     result.pushKV("next_block", StakeHorizonReadinessToJSON(readiness.next_block));
-    result.pushKV("at_final", StakeHorizonReadinessToJSON(readiness.at_final));
+    if (readiness.final_height_known) result.pushKV("at_final", StakeHorizonReadinessToJSON(readiness.at_final));
     result.pushKV("legacy_to_migrate", ValueFromAmount(readiness.legacy_to_migrate));
     result.pushKV("legacy_outputs", readiness.legacy_outputs);
     UniValue stake_return(UniValue::VOBJ);

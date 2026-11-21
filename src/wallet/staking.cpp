@@ -95,13 +95,14 @@ struct AutoRedelegationSource
     int last_win_height{0};
 };
 
-bool IsGeneratedQuantumStakeCandidate(const CWallet& wallet, const COutPoint& outpoint, const CScript& script_pub_key)
+/** Whether the output is a Gold Rush payout that is still locked at the given evaluation point. The
+ *  point is the block the scan describes (the next block for the staker, a later one for a projection):
+ *  a payout that is locked now is not locked in the first Final block. */
+bool IsGeneratedQuantumStakeCandidate(const CWallet& wallet, const COutPoint& outpoint, const CScript& script_pub_key,
+                                      int spend_height, int64_t spend_time)
 {
     if (!IsQuantumMigrationScript(script_pub_key)) return false;
 
-    const CBlockIndex* tip = wallet.chain().getTip();
-    const int spend_height = tip ? tip->nHeight + 1 : 0;
-    const int64_t spend_time = tip ? tip->GetMedianTimePast() : 0;
     CScript marker_script;
     return IsLockedGoldRushPayoutOutput(wallet.chain().getCoinsTip(), outpoint,
         Params().GetConsensus(), spend_time, spend_height, &marker_script) && marker_script == script_pub_key;
@@ -2306,7 +2307,8 @@ static bool EvaluateStakeCandidateReference(const CWallet& wallet, const COutPoi
         return false;
     }
 
-    if (IsGeneratedQuantumStakeCandidate(wallet, outpoint, output.scriptPubKey) ||
+    if (IsGeneratedQuantumStakeCandidate(wallet, outpoint, output.scriptPubKey,
+                                         context.spend_height, context.spend_time) ||
         IsDemurrageLockedStakeCandidate(wallet, outpoint, output.scriptPubKey,
                                         context.spend_height, context.spend_time) ||
         context.protected_rgb_seals.count(outpoint)) {
@@ -2446,7 +2448,8 @@ static bool EvaluateStakeCandidate(const CWallet& wallet, const COutPoint& outpo
         }
     }
 
-    if (IsGeneratedQuantumStakeCandidate(wallet, outpoint, output.scriptPubKey) ||
+    if (IsGeneratedQuantumStakeCandidate(wallet, outpoint, output.scriptPubKey,
+                                         context.spend_height, context.spend_time) ||
         IsDemurrageLockedStakeCandidate(wallet, outpoint, output.scriptPubKey,
                                         context.spend_height, context.spend_time)) {
         return exclude(StakeExclusion::LOCKED);
@@ -2663,9 +2666,12 @@ QuantumStakeReadiness AssessQuantumStakeReadiness(const CWallet& wallet)
 
     QuantumStakeReadiness result;
     result.next_height = tip ? tip->nHeight + 1 : 0;
-    const bool scheduled = consensus.IsMigrationEndScheduled();
-    result.final_height = scheduled ? consensus.nQuantumMigrationEndHeight + 1 : 0;
-    const int blocks_ahead_final = scheduled && result.final_height > result.next_height
+    // A Final height needs a complete height-authoritative schedule. A time-only schedule (or none)
+    // gives no block count, so it is reported as unknown instead of as a height made of default values.
+    result.final_height_known = consensus.UsesHeightLifecycle() && consensus.IsMigrationEndScheduled() &&
+                                consensus.nQuantumMigrationEndHeight < std::numeric_limits<int>::max();
+    result.final_height = result.final_height_known ? consensus.nQuantumMigrationEndHeight + 1 : 0;
+    const int blocks_ahead_final = result.final_height_known && result.final_height > result.next_height
         ? result.final_height - result.next_height : 0;
     result.blocks_to_final = blocks_ahead_final;
     result.wallet_locked = wallet.IsLocked();
@@ -2676,10 +2682,12 @@ QuantumStakeReadiness AssessQuantumStakeReadiness(const CWallet& wallet)
     // A fully locked wallet has no signing key available: the staker idles
     // (ThreadStakeMiner waits while IsLocked), so nothing it would select can stake.
     const bool cannot_sign = wallet.IsLocked() || wallet.IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS);
+    const int64_t scan_time = tip ? tip->GetMedianTimePast() : 0;
 
     const auto scan = [&](int blocks_ahead, StakeHorizonReadiness& horizon, bool count_total) {
         horizon.height = result.next_height + blocks_ahead;
         CAmount legacy_eligible{0};
+        std::vector<CAmount> effective_principals; // of each selected quantum output, in the scan's order
         std::vector<std::pair<const CWalletTx*, unsigned int>> coins;
         CCoinControl coin_control;
         // The very scan the staker runs (SelectCoinsForStaking); the observer only listens.
@@ -2697,7 +2705,16 @@ QuantumStakeReadiness AssessQuantumStakeReadiness(const CWallet& wallet)
             if (eligible) {
                 if (quantum) {
                     ++horizon.eligible_outputs;
-                    horizon.eligible += out.nValue;
+                    horizon.eligible_nominal += out.nValue;
+                    CAmount principal{0};
+                    // The constructor's own principal, for the block this describes; a coin it cannot
+                    // use (locked by demurrage, no value left) contributes none and cannot be a kernel.
+                    if (!GetCoinStakeInputPrincipal(wallet.chain().getCoinsTip(), outpoint, consensus, horizon.height,
+                                                    scan_time, principal)) {
+                        principal = 0;
+                    }
+                    effective_principals.push_back(principal);
+                    horizon.eligible_effective += principal;
                 } else {
                     legacy_eligible += out.nValue;
                 }
@@ -2708,15 +2725,22 @@ QuantumStakeReadiness AssessQuantumStakeReadiness(const CWallet& wallet)
             }
         };
         AvailableCoinsForStakingAhead(wallet, coins, &coin_control, CoinFilterParams{}, blocks_ahead, observer);
-        // The reserve balance is held back from the whole selected stake. Legacy
-        // stake absorbs it first, so the quantum figure is exact whenever legacy
-        // stake can no longer stake (Final).
-        const CAmount reserve_after_legacy = std::max<CAmount>(0, wallet.m_reserve_balance - legacy_eligible);
-        horizon.reserve_withheld = std::min(horizon.eligible, reserve_after_legacy);
-        horizon.stakeable = horizon.eligible - horizon.reserve_withheld;
+        // The constructor's condition (CreateCoinStake): the selected set must exceed the reserve, a kernel
+        // is one output, and its principal may not exceed what is left of the set after the reserve.
+        horizon.candidate_total = legacy_eligible + horizon.eligible_nominal;
+        horizon.allowed_balance = horizon.candidate_total > wallet.m_reserve_balance
+            ? horizon.candidate_total - wallet.m_reserve_balance : 0;
+        for (const CAmount principal : effective_principals) {
+            if (principal <= 0 || principal > horizon.allowed_balance) continue;
+            ++horizon.stakeable_outputs;
+            horizon.stakeable_effective += principal;
+            horizon.largest_kernel = std::max(horizon.largest_kernel, principal);
+        }
     };
     scan(0, result.next_block, /*count_total=*/true);
-    if (blocks_ahead_final > 0) {
+    if (!result.final_height_known) {
+        result.at_final = StakeHorizonReadiness{};
+    } else if (blocks_ahead_final > 0) {
         scan(blocks_ahead_final, result.at_final, /*count_total=*/false);
     } else {
         result.at_final = result.next_block;

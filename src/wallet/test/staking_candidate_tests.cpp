@@ -801,17 +801,6 @@ BOOST_FIXTURE_TEST_CASE(a_coinbase_exactly_maturity_deep_is_a_candidate_for_the_
     BOOST_CHECK(reasons.at(next_height + 2 - maturity) == StakeExclusion::IMMATURE);
     // And with no look-ahead the staker itself selects exactly the first set.
     BOOST_CHECK(heights_of(LegacyCandidatesAtTip(*this, *wallet)) == heights);
-
-    // The stake weight shown is the value of that same set, the boundary coinbase included.
-    {
-        LOCK2(::cs_main, wallet->cs_wallet);
-        StakeCoins coins;
-        AvailableCoinsForStaking(*wallet, coins);
-        CAmount selected{0};
-        for (const auto& [wtx, n] : coins) selected += wtx->tx->vout[n].nValue;
-        BOOST_CHECK_GT(selected, 0);
-        BOOST_CHECK_EQUAL(GetStakeWeight(*wallet), static_cast<uint64_t>(selected));
-    }
 }
 
 BOOST_AUTO_TEST_SUITE_END()

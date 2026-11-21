@@ -2306,7 +2306,26 @@ bool SetQuantumStakeReturn(CWallet& wallet, const CTxDestination& dest, bilingua
     return true;
 }
 
-QuantumStakeReturnPreparation PrepareQuantumStakeReturn(CWallet& wallet)
+/** Whether the wallet holds a live legacy output of a kind the staker can stake (not a quantum, cold-stake or EUTXO
+ *  script). Stops at the first one. */
+static bool WalletHoldsLegacyStakableCoin(const CWallet& wallet) EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet)
+{
+    AssertLockHeld(wallet.cs_wallet);
+    for (const COutPoint& outpoint : wallet.GetLiveUnspentStakeCandidateOutpoints()) {
+        const auto it = wallet.mapWallet.find(outpoint.hash);
+        if (it == wallet.mapWallet.end() || !it->second.tx || outpoint.n >= it->second.tx->vout.size()) continue;
+        const CTxOut& out = it->second.tx->vout[outpoint.n];
+        if (out.nValue < wallet.m_min_staking_amount) continue;
+        if (IsQuantumMigrationScript(out.scriptPubKey) || IsQuantumColdStakeScript(out.scriptPubKey) ||
+            IsEUTXOScript(out.scriptPubKey)) {
+            continue;
+        }
+        return true;
+    }
+    return false;
+}
+
+QuantumStakeReturnPreparation PrepareQuantumStakeReturn(CWallet& wallet, QuantumStakeReturnTrigger trigger)
 {
     using Outcome = QuantumStakeReturnPreparation::Outcome;
     QuantumStakeReturnPreparation prep;
@@ -2320,9 +2339,27 @@ QuantumStakeReturnPreparation PrepareQuantumStakeReturn(CWallet& wallet)
         prep.detail = "the wallet cannot create or choose a key in its current unlock state";
         return prep;
     }
-    if (WITH_LOCK(wallet.cs_wallet, return wallet.GetLastBlockHeight()) + 1 > consensus.nQuantumMigrationEndHeight) {
+    // The chain's own height: no wallet lock, and no assertion for a wallet that has not processed a block yet.
+    const std::optional<int> tip_height = wallet.HaveChain() ? wallet.chain().getHeight() : std::nullopt;
+    if (!tip_height) {
+        prep.detail = "the chain has no tip yet";
+        return prep;
+    }
+    if (int64_t{*tip_height} + 1 > int64_t{consensus.nQuantumMigrationEndHeight}) {
         prep.detail = "the window has passed";
         return prep;
+    }
+    if (trigger == QuantumStakeReturnTrigger::AUTOMATIC) {
+        // Not before Gold Rush has ended, and only for a wallet with legacy coins to return: a pre-end chain
+        // and a wallet with nothing to stake see no key, record or backup prompt appear on their own.
+        if (int64_t{*tip_height} + 1 <= int64_t{consensus.nGoldRushEndHeight}) {
+            prep.detail = "Gold Rush has not ended; the explicit command is available";
+            return prep;
+        }
+        if (!WITH_LOCK(wallet.cs_wallet, return WalletHoldsLegacyStakableCoin(wallet))) {
+            prep.detail = "this wallet holds no legacy coin the staker could stake";
+            return prep;
+        }
     }
     CTxDestination chosen;
     {
@@ -2393,7 +2430,7 @@ QuantumStakeReturnPreparation PrepareQuantumStakeReturn(CWallet& wallet)
 
 bool MaybeAutoSetQuantumStakeReturn(CWallet& wallet)
 {
-    return PrepareQuantumStakeReturn(wallet).Saved();
+    return PrepareQuantumStakeReturn(wallet, QuantumStakeReturnTrigger::AUTOMATIC).Saved();
 }
 
 /**

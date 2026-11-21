@@ -751,7 +751,7 @@ BOOST_FIXTURE_TEST_CASE(the_return_address_preparation_distinguishes_reuse_creat
     auto wallet = CreateSyncedWallet(*m_node.chain,
         WITH_LOCK(Assert(m_node.chainman)->GetMutex(), return m_node.chainman->ActiveChain()), coinbaseKey);
     // No quantum address and key creation not allowed: no action, no key, and it says why.
-    QuantumStakeReturnPreparation prep = PrepareQuantumStakeReturn(*wallet);
+    QuantumStakeReturnPreparation prep = PrepareQuantumStakeReturn(*wallet, QuantumStakeReturnTrigger::AUTOMATIC);
     BOOST_CHECK(prep.outcome == Outcome::NO_ACTION);
     BOOST_CHECK(!prep.key_created);
     BOOST_CHECK(!prep.Saved());
@@ -759,7 +759,7 @@ BOOST_FIXTURE_TEST_CASE(the_return_address_preparation_distinguishes_reuse_creat
 
     // Key creation allowed: a key is created, saved, and reported as created.
     gArgs.ForceSetArg("-qqallowautokeycreation", "1");
-    prep = PrepareQuantumStakeReturn(*wallet);
+    prep = PrepareQuantumStakeReturn(*wallet, QuantumStakeReturnTrigger::AUTOMATIC);
     gArgs.ForceSetArg("-qqallowautokeycreation", "0");
     BOOST_CHECK(prep.outcome == Outcome::CREATED_ADDRESS);
     BOOST_CHECK(prep.key_created);
@@ -768,7 +768,7 @@ BOOST_FIXTURE_TEST_CASE(the_return_address_preparation_distinguishes_reuse_creat
 
     // Set already: no action, the saved address is reported, nothing created.
     const std::string saved = prep.address;
-    prep = PrepareQuantumStakeReturn(*wallet);
+    prep = PrepareQuantumStakeReturn(*wallet, QuantumStakeReturnTrigger::AUTOMATIC);
     BOOST_CHECK(prep.outcome == Outcome::NO_ACTION);
     BOOST_CHECK(!prep.key_created);
     BOOST_CHECK_EQUAL(prep.address, saved);
@@ -778,7 +778,7 @@ BOOST_FIXTURE_TEST_CASE(the_return_address_preparation_distinguishes_reuse_creat
         WITH_LOCK(Assert(m_node.chainman)->GetMutex(), return m_node.chainman->ActiveChain()), coinbaseKey);
     const auto quantum = other->GetNewQuantumDestination("receive");
     BOOST_REQUIRE(quantum);
-    prep = PrepareQuantumStakeReturn(*other);
+    prep = PrepareQuantumStakeReturn(*other, QuantumStakeReturnTrigger::AUTOMATIC);
     BOOST_CHECK(prep.outcome == Outcome::REUSED_ADDRESS);
     BOOST_CHECK(!prep.key_created);
     BOOST_CHECK_EQUAL(prep.address, EncodeDestination(*quantum));
@@ -787,7 +787,55 @@ BOOST_FIXTURE_TEST_CASE(the_return_address_preparation_distinguishes_reuse_creat
     auto limited = CreateSyncedWallet(*m_node.chain,
         WITH_LOCK(Assert(m_node.chainman)->GetMutex(), return m_node.chainman->ActiveChain()), coinbaseKey);
     limited->m_wallet_unlock_staking_only = true;
-    BOOST_CHECK(PrepareQuantumStakeReturn(*limited).outcome == Outcome::NO_ACTION);
+    BOOST_CHECK(PrepareQuantumStakeReturn(*limited, QuantumStakeReturnTrigger::AUTOMATIC).outcome == Outcome::NO_ACTION);
+}
+
+// The automatic preparation waits for the end of Gold Rush and for legacy coins to return; the explicit command does
+// not. A pre-end chain, or a wallet with nothing to stake, sees no key, record or backup prompt appear by itself.
+BOOST_FIXTURE_TEST_CASE(the_automatic_return_address_waits_for_the_end_of_gold_rush_and_for_legacy_coins, LegacyStakeOpenSetup)
+{
+    using Outcome = QuantumStakeReturnPreparation::Outcome;
+    // Tip 100: the next block (101) is still in Gold Rush (it ends at 102); the Migration end is far away.
+    auto wallet = CreateSyncedWallet(*m_node.chain,
+        WITH_LOCK(Assert(m_node.chainman)->GetMutex(), return m_node.chainman->ActiveChain()), coinbaseKey);
+    BOOST_REQUIRE(wallet);
+    gArgs.ForceSetArg("-qqallowautokeycreation", "1");
+    const QuantumStakeReturnPreparation automatic = PrepareQuantumStakeReturn(*wallet, QuantumStakeReturnTrigger::AUTOMATIC);
+    BOOST_CHECK(automatic.outcome == Outcome::NO_ACTION);
+    BOOST_CHECK(!automatic.key_created);
+    BOOST_CHECK(WITH_LOCK(wallet->cs_wallet, return wallet->m_quantum_stake_return.empty()));
+    BOOST_CHECK_EQUAL(WITH_LOCK(wallet->cs_wallet, return wallet->ListQuantumKeyInfos().size()), size_t{0});
+    // The same wallet, asked explicitly, creates the key and saves the address.
+    const QuantumStakeReturnPreparation explicit_request = PrepareQuantumStakeReturn(*wallet, QuantumStakeReturnTrigger::EXPLICIT);
+    gArgs.ForceSetArg("-qqallowautokeycreation", "0");
+    BOOST_CHECK(explicit_request.outcome == Outcome::CREATED_ADDRESS);
+    BOOST_CHECK(explicit_request.key_created);
+    BOOST_CHECK_EQUAL(WITH_LOCK(wallet->cs_wallet, return wallet->ListQuantumKeyInfos().size()), size_t{1});
+}
+
+BOOST_FIXTURE_TEST_CASE(the_automatic_return_address_needs_a_legacy_coin_to_return, LegacyStakeWindowSetup)
+{
+    using Outcome = QuantumStakeReturnPreparation::Outcome;
+    // Tip 100 is past the Gold Rush end (60) and inside the Migration window: the phase allows it.
+    CKey nobody;
+    nobody.MakeNewKey(/*fCompressed=*/true);
+    auto empty = CreateSyncedWallet(*m_node.chain,
+        WITH_LOCK(Assert(m_node.chainman)->GetMutex(), return m_node.chainman->ActiveChain()), nobody);
+    BOOST_REQUIRE(empty);
+    BOOST_REQUIRE(WITH_LOCK(empty->cs_wallet, return empty->GetLiveUnspentStakeCandidateOutpoints().empty()));
+    gArgs.ForceSetArg("-qqallowautokeycreation", "1");
+    QuantumStakeReturnPreparation prep = PrepareQuantumStakeReturn(*empty, QuantumStakeReturnTrigger::AUTOMATIC);
+    BOOST_CHECK(prep.outcome == Outcome::NO_ACTION);
+    BOOST_CHECK(!prep.key_created);
+    BOOST_CHECK(WITH_LOCK(empty->cs_wallet, return empty->m_quantum_stake_return.empty()));
+    BOOST_CHECK_EQUAL(WITH_LOCK(empty->cs_wallet, return empty->ListQuantumKeyInfos().size()), size_t{0});
+    // A wallet that does hold legacy stakable coins gets its key.
+    auto holder = CreateSyncedWallet(*m_node.chain,
+        WITH_LOCK(Assert(m_node.chainman)->GetMutex(), return m_node.chainman->ActiveChain()), coinbaseKey);
+    prep = PrepareQuantumStakeReturn(*holder, QuantumStakeReturnTrigger::AUTOMATIC);
+    gArgs.ForceSetArg("-qqallowautokeycreation", "0");
+    BOOST_CHECK(prep.outcome == Outcome::CREATED_ADDRESS);
+    BOOST_CHECK(prep.key_created);
 }
 
 BOOST_FIXTURE_TEST_CASE(a_coinbase_exactly_maturity_deep_is_a_candidate_for_the_next_block, LegacyStakeOpenSetup)

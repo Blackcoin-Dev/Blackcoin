@@ -814,7 +814,7 @@ static RPCHelpMan setquantumstakereturn()
     if (!existing.empty()) {
         dest = DecodeDestination(existing);
     } else {
-        const QuantumStakeReturnPreparation prep = PrepareQuantumStakeReturn(*pwallet);
+        const QuantumStakeReturnPreparation prep = PrepareQuantumStakeReturn(*pwallet, QuantumStakeReturnTrigger::EXPLICIT);
         // A key the automatic path made counts as created, even when it did not finish: it needs a backup.
         if (prep.key_created) created = true;
         if (prep.key_created && !prep.Saved()) {

@@ -131,14 +131,24 @@ struct QuantumStakeReturnPreparation
     bool Saved() const { return outcome == Outcome::REUSED_ADDRESS || outcome == Outcome::CREATED_ADDRESS; }
 };
 
+/** Who asks for the preparation. An explicit request (the setquantumstakereturn RPC) is allowed at any time. The
+ *  automatic one (the wallet's own maintenance) is held to the phase where it matters: it only acts once Gold Rush
+ *  has ended (the next block is above the Gold Rush end height) and only for a wallet that holds legacy coins the
+ *  staker could stake, so that a chain still in Gold Rush, or a wallet with nothing to return, sees no new key,
+ *  no saved record and no backup prompt appear by themselves. */
+enum class QuantumStakeReturnTrigger {
+    EXPLICIT,
+    AUTOMATIC,
+};
+
 /** When the wallet is fully unlocked (or unencrypted), has no valid return
  *  address and a height schedule exists: set one. An existing wallet-owned
  *  quantum address is reused (-qqpospayoutaddress first); a key is created only
  *  when the existing policy allows it (-qqallowautokeycreation). Never creates
  *  a key otherwise. Call outside cs_main and cs_wallet. The result tells reuse,
  *  creation, no action and failure apart. */
-QuantumStakeReturnPreparation PrepareQuantumStakeReturn(CWallet& wallet);
-/** PrepareQuantumStakeReturn(wallet).Saved(). */
+QuantumStakeReturnPreparation PrepareQuantumStakeReturn(CWallet& wallet, QuantumStakeReturnTrigger trigger);
+/** PrepareQuantumStakeReturn(wallet, AUTOMATIC).Saved(). */
 bool MaybeAutoSetQuantumStakeReturn(CWallet& wallet);
 
 struct BoundedLegacyStakeCandidate

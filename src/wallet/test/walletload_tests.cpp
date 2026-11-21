@@ -43,6 +43,31 @@ struct WalletLoadTestAccess {
     {
         return wallet.m_load_inactivated_blocks;
     }
+    struct IndexContents {
+        std::set<COutPoint> live;
+        std::set<COutPoint> live_legacy_claim;
+        std::set<COutPoint> live_candidates;
+        std::map<uint256, std::set<uint256>> payouts_by_block;
+        std::set<uint256> coinstakes;
+        std::set<uint256> unconfirmed_coinstakes;
+        bool operator==(const IndexContents& other) const = default;
+    };
+    static IndexContents Indexes(CWallet& wallet) EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet)
+    {
+        return {wallet.m_live_unspent_stake_outpoints,
+                wallet.m_live_unspent_legacy_claim_outpoints,
+                wallet.m_live_unspent_stake_candidate_outpoints,
+                {wallet.m_confirmed_synthetic_payouts_by_block.begin(),
+                 wallet.m_confirmed_synthetic_payouts_by_block.end()},
+                {wallet.m_coinstake_txids.begin(), wallet.m_coinstake_txids.end()},
+                {wallet.m_unconfirmed_coinstake_txids.begin(), wallet.m_unconfirmed_coinstake_txids.end()}};
+    }
+    static void RebuildIndexes(CWallet& wallet) EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet)
+    {
+        wallet.RecomputeShadowSolveIndex();
+        wallet.RecomputeConfirmedSyntheticPayoutIndex();
+        wallet.RecomputeLiveUnspentStakeOutpoints();
+    }
     static std::unique_ptr<WalletClaimMaintenance> Maintenance(
         std::function<void(CWallet&, bool, bool)> pass)
     {
@@ -61,6 +86,86 @@ struct WalletLoadTestAccess {
 };
 
 BOOST_AUTO_TEST_SUITE(walletload_tests)
+
+BOOST_FIXTURE_TEST_CASE(load_builds_indexes_equal_to_a_rebuild, TestingSetup)
+{
+    const CScript p2pkh = CScript() << OP_DUP << OP_HASH160 << std::vector<unsigned char>(20, 0x42)
+                                    << OP_EQUALVERIFY << OP_CHECKSIG;
+    CMutableTransaction funding_tx;
+    funding_tx.vin.emplace_back(COutPoint{Txid::FromUint256(uint256{1}), 0});
+    funding_tx.vout.emplace_back(5 * COIN, p2pkh);
+    funding_tx.vout.emplace_back(3 * COIN, CScript{} << OP_TRUE);
+    funding_tx.vout.emplace_back(2 * COIN, p2pkh);
+    const CTransactionRef funding = MakeTransactionRef(funding_tx);
+    CMutableTransaction spend_tx;
+    spend_tx.vin.emplace_back(COutPoint{funding->GetHash(), 0});
+    spend_tx.vin.emplace_back(COutPoint{funding->GetHash(), 1});
+    spend_tx.vout.emplace_back(7 * COIN, p2pkh);
+    const CTransactionRef spend = MakeTransactionRef(spend_tx);
+    CMutableTransaction chain_tx;
+    chain_tx.vin.emplace_back(COutPoint{spend->GetHash(), 0});
+    chain_tx.vout.emplace_back(6 * COIN, p2pkh);
+    const CTransactionRef chained = MakeTransactionRef(chain_tx);
+
+    CWallet seed(nullptr, "", CreateMockableWalletDatabase());
+    BOOST_REQUIRE_EQUAL(seed.LoadWallet(), DBErrors::LOAD_OK);
+    {
+        LOCK(seed.cs_wallet);
+        const uint256 block_a{2};
+        const uint256 block_b{3};
+        BOOST_REQUIRE(seed.AddToWallet(funding, TxStateConfirmed{block_a, 10, 0}));
+        BOOST_REQUIRE(seed.AddToWallet(spend, TxStateConfirmed{block_b, 11, 0}));
+        BOOST_REQUIRE(seed.AddToWallet(chained, TxStateInMempool{}));
+    }
+    CWallet loaded(nullptr, "", DuplicateMockDatabase(seed.GetDatabase()));
+    BOOST_REQUIRE_EQUAL(loaded.LoadWallet(), DBErrors::LOAD_OK);
+    LOCK(loaded.cs_wallet);
+    BOOST_REQUIRE_EQUAL(loaded.mapWallet.size(), 3U);
+    const auto after_load = WalletLoadTestAccess::Indexes(loaded);
+    // The spent outputs are not live, the unspent ones are.
+    BOOST_CHECK_EQUAL(after_load.live.count(COutPoint{funding->GetHash(), 0}), 0U);
+    BOOST_CHECK_EQUAL(after_load.live.count(COutPoint{funding->GetHash(), 2}), 1U);
+    BOOST_CHECK_EQUAL(after_load.live.count(COutPoint{chained->GetHash(), 0}), 1U);
+    BOOST_CHECK(!after_load.live_candidates.empty());
+    WalletLoadTestAccess::RebuildIndexes(loaded);
+    BOOST_CHECK(after_load == WalletLoadTestAccess::Indexes(loaded));
+}
+
+BOOST_FIXTURE_TEST_CASE(adding_a_spender_unlocks_a_locked_coin_and_erases_its_record, TestingSetup)
+{
+    CMutableTransaction funding_tx;
+    funding_tx.vin.emplace_back(COutPoint{Txid::FromUint256(uint256{1}), 0});
+    funding_tx.vout.emplace_back(5 * COIN, CScript{} << OP_TRUE);
+    const CTransactionRef funding = MakeTransactionRef(funding_tx);
+    CMutableTransaction spend_tx;
+    spend_tx.vin.emplace_back(COutPoint{funding->GetHash(), 0});
+    spend_tx.vout.emplace_back(4 * COIN, CScript{} << OP_TRUE);
+    const CTransactionRef spend = MakeTransactionRef(spend_tx);
+
+    CWallet wallet(nullptr, "", CreateMockableWalletDatabase());
+    BOOST_REQUIRE_EQUAL(wallet.LoadWallet(), DBErrors::LOAD_OK);
+    const COutPoint coin{funding->GetHash(), 0};
+    LOCK(wallet.cs_wallet);
+    BOOST_REQUIRE(wallet.AddToWallet(funding, TxStateInMempool{}));
+    {
+        WalletBatch batch(wallet.GetDatabase());
+        BOOST_REQUIRE(wallet.LockCoin(coin, &batch));
+    }
+    BOOST_CHECK(wallet.IsLockedCoin(coin));
+    // Reload to prove the lock is persisted, then spend it through a plain add.
+    CWallet other(nullptr, "", DuplicateMockDatabase(wallet.GetDatabase()));
+    BOOST_REQUIRE_EQUAL(other.LoadWallet(), DBErrors::LOAD_OK);
+    {
+        LOCK(other.cs_wallet);
+        BOOST_CHECK(other.IsLockedCoin(coin));
+        BOOST_REQUIRE(other.AddToWallet(spend, TxStateInMempool{}));
+        BOOST_CHECK(!other.IsLockedCoin(coin));
+    }
+    CWallet reloaded(nullptr, "", DuplicateMockDatabase(other.GetDatabase()));
+    BOOST_REQUIRE_EQUAL(reloaded.LoadWallet(), DBErrors::LOAD_OK);
+    LOCK(reloaded.cs_wallet);
+    BOOST_CHECK(!reloaded.IsLockedCoin(coin));
+}
 
 BOOST_FIXTURE_TEST_CASE(recovery_status_is_readable_but_nonauthorizing_during_ibd, RegTestingSetup)
 {

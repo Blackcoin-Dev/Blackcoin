@@ -190,7 +190,13 @@ class GoldRushEndTransitionTest(BitcoinTestFramework):
 
         self.log.info("Recovery with the miner disabled: no standing policy means no fee-paying action")
         wm.walletpassphrase("pw", 100000)
-        self.mine(3, pow_addr)
+        declined = "[wm] Gold Rush claim recovery: no standing automatic policy"
+        for _ in range(3):
+            before = self.log_lines(node, declined)
+            self.mine(1, pow_addr)
+            # The maintenance pass for this tip has run and declined; only
+            # then is an empty mempool evidence of "no action", not of "not yet".
+            self.wait_until(lambda: self.log_lines(node, declined) > before)
         assert_equal(node.getrawmempool(), [])
         assert_equal(wm.getbalances()["closed_claim_reserved"]["amount"], ANCHOR)
 

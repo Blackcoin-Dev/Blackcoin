@@ -1489,6 +1489,50 @@ void TestStakingMiningPageControls(MiniGUI& mini_gui, const std::shared_ptr<CWal
     QTRY_COMPARE_WITH_TIMEOUT(walletModel.wallet().getPowMiningInfo().state, interfaces::WalletPowMiningState::DISABLED, 5000);
 }
 
+//! After the Gold Rush reward window closes the page says so, in the PoW
+//! status line and the shadow-ledger line, instead of "off" or "not active".
+void TestGoldRushEndStatusStrings(MiniGUI& mini_gui, const std::shared_ptr<CWallet>& core_wallet, const PlatformStyle* platform_style)
+{
+    WalletModel& wallet_model = *mini_gui.walletModel;
+    std::string error;
+    QVERIFY(wallet_model.wallet().setPowMining(false, 1, 10, error));
+
+    // The reward end height is a runtime parameter: place it below the test
+    // chain tip so the next block is past the window, and restore it after.
+    struct EndHeightGuard {
+        int saved{SHADOW_REWARD_END_HEIGHT};
+        ~EndHeightGuard() { SHADOW_REWARD_END_HEIGHT = saved; }
+    } guard;
+    const int tip_height = WITH_LOCK(core_wallet->cs_wallet, return core_wallet->GetLastBlockHeight());
+    QVERIFY(tip_height > 1);
+    SHADOW_REWARD_END_HEIGHT = tip_height - 1;
+    QVERIFY(wallet::IsShadowGoldRushWindowClosedAtTip(tip_height));
+
+    StakingMiningPage page(platform_style);
+    page.setClientModel(mini_gui.clientModel.get());
+    page.setWalletModel(&wallet_model);
+    page.show();
+    qApp->processEvents();
+
+    QLabel* pow_status = page.findChild<QLabel*>("powStatus");
+    QLabel* pow_dashboard = page.findChild<QLabel*>("stakingMiningDashboardPow");
+    QPushButton* refresh_details = page.findChild<QPushButton*>("stakingMiningRefresh");
+    QLabel* refresh_hint = page.findChild<QLabel*>("stakingMiningRefreshHint");
+    QVERIFY(pow_status);
+    QVERIFY(pow_dashboard);
+    QVERIFY(refresh_details);
+    QVERIFY(refresh_hint);
+
+    SettleChainTip(mini_gui, core_wallet);
+    refresh_details->click();
+    QTRY_VERIFY_WITH_TIMEOUT(refresh_hint->text().contains(QString("Detail panels updated")), 10000);
+    QTRY_VERIFY_WITH_TIMEOUT(pow_status->text().contains(QStringLiteral("Gold Rush has ended")), 10000);
+    QVERIFY(pow_status->text().contains(QStringLiteral("cannot be started again")) ||
+            pow_status->text().contains(QStringLiteral("reserved by")));
+    QVERIFY(!pow_status->text().contains(QStringLiteral("not active")));
+    QVERIFY(pow_dashboard->text().contains(QStringLiteral("Gold Rush has ended")));
+}
+
 void TestPowClaimRecoveryPolicyControls(
     interfaces::Node& node,
     MiniGUI& mini_gui,
@@ -5128,6 +5172,7 @@ void TestGUI(interfaces::Node& node, const std::shared_ptr<CWallet>& wallet)
         return;
     }
     if (lane != QStringLiteral("recovery-ui")) TestStakingMiningPageControls(mini_gui, wallet, platformStyle.get());
+    TestGoldRushEndStatusStrings(mini_gui, wallet, platformStyle.get());
     if (lane == QStringLiteral("pow-controls")) return;
     TestPowClaimRecoveryPolicyControls(node, mini_gui, wallet, platformStyle.get());
     TestPowClaimRecoveryStakingOnlyRequiresFullUnlock(node, platformStyle.get());

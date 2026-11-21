@@ -19,6 +19,9 @@
 
 #include <boost/test/unit_test.hpp>
 
+#include <chrono>
+#include <future>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -107,6 +110,9 @@ BOOST_AUTO_TEST_CASE(redelegation_scan_repeats_for_a_competing_tip_at_the_same_h
             LOCK(m_wallet.cs_wallet);
             m_wallet.m_redelegation_last_auto_scan_height = remembered_height;
             m_wallet.m_redelegation_last_auto_scan_tip = remembered_tip;
+            // Each case stands alone: the reorganisation rescan bound is
+            // exercised by its own test.
+            m_wallet.m_redelegation_last_reorg_scan = {};
         }
         GetMockableDatabase(m_wallet).m_records.clear();
         BOOST_CHECK_EQUAL(MaybeAutoRedelegateQuantumColdStake(m_wallet), 0);
@@ -164,6 +170,170 @@ BOOST_AUTO_TEST_CASE(redelegation_scan_tip_record_is_trusted_only_for_its_own_he
         BOOST_CHECK(reloaded.m_redelegation_last_auto_scan_tip.IsNull());
     }
 }
+
+BOOST_AUTO_TEST_CASE(auto_scan_decision_follows_growth_and_bounds_reorganisation_rescans)
+{
+    using namespace std::chrono_literals;
+    const uint256 tip_a{uint256::ONE};
+    const uint256 tip_b{uint256{2}};
+    const auto t0 = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point last_reorg{};
+
+    // Forward growth always scans, and never counts toward the bound.
+    BOOST_CHECK(DecideAutoScan(10, tip_a, 11, tip_b, last_reorg, t0) == AutoScanVerdict::SCAN);
+    BOOST_CHECK(last_reorg == std::chrono::steady_clock::time_point{});
+    // The very tip already scanned is skipped, however often it is offered.
+    BOOST_CHECK(DecideAutoScan(10, tip_a, 10, tip_a, last_reorg, t0) == AutoScanVerdict::SKIP_SAME_TIP);
+    // No remembered hash (an older wallet's record, or a reset): scan again.
+    BOOST_CHECK(DecideAutoScan(10, uint256{}, 10, tip_a, last_reorg, t0) == AutoScanVerdict::SCAN);
+    BOOST_CHECK(last_reorg == std::chrono::steady_clock::time_point{});
+
+    // A competing tip at the same height is a reorganisation: the first scans.
+    BOOST_CHECK(DecideAutoScan(10, tip_a, 10, tip_b, last_reorg, t0) == AutoScanVerdict::SCAN);
+    BOOST_CHECK(last_reorg == t0);
+    // A run of short reorganisations (A, B, A, B, a shorter tip) inside the
+    // interval is not rescanned, whatever the order of the tips.
+    BOOST_CHECK(DecideAutoScan(10, tip_b, 10, tip_a, last_reorg, t0 + 1s) == AutoScanVerdict::SKIP_REORG_BOUND);
+    BOOST_CHECK(DecideAutoScan(10, tip_a, 10, tip_b, last_reorg, t0 + 2s) == AutoScanVerdict::SKIP_REORG_BOUND);
+    BOOST_CHECK(DecideAutoScan(10, tip_b, 9, tip_a, last_reorg, t0 + 3s) == AutoScanVerdict::SKIP_REORG_BOUND);
+    BOOST_CHECK(last_reorg == t0);
+    // A skipped scan is not remembered by the caller, so growth still scans.
+    BOOST_CHECK(DecideAutoScan(10, tip_b, 11, tip_a, last_reorg, t0 + 4s) == AutoScanVerdict::SCAN);
+    // Once the interval has passed the next reorganisation scans again.
+    BOOST_CHECK(DecideAutoScan(10, tip_a, 10, tip_b, last_reorg, t0 + AUTO_SCAN_REORG_MIN_INTERVAL) == AutoScanVerdict::SCAN);
+    BOOST_CHECK(last_reorg == t0 + AUTO_SCAN_REORG_MIN_INTERVAL);
+}
+
+BOOST_AUTO_TEST_CASE(redelegation_scan_is_bounded_across_a_run_of_different_tips)
+{
+    const AutoRedelegateArgs args;
+    const CBlockIndex* tip = WITH_LOCK(::cs_main, return m_node.chainman->ActiveChain().Tip());
+    BOOST_REQUIRE(tip);
+    const int height = tip->nHeight;
+    const auto scan_records = [&] {
+        return GetMockableDatabase(m_wallet).m_records.size();
+    };
+    const auto remember = [&](const uint256& hash) {
+        LOCK(m_wallet.cs_wallet);
+        m_wallet.m_redelegation_last_auto_scan_height = height;
+        m_wallet.m_redelegation_last_auto_scan_tip = hash;
+    };
+
+    // First reorganisation scan runs.
+    remember(uint256::ONE);
+    GetMockableDatabase(m_wallet).m_records.clear();
+    BOOST_CHECK_EQUAL(MaybeAutoRedelegateQuantumColdStake(m_wallet), 0);
+    BOOST_CHECK_EQUAL(scan_records(), 2U);
+
+    // The chain flips to other tips and back: no further scan inside the
+    // interval, and nothing is written (the remembered tip stays as it was).
+    for (const uint256& other : {uint256{2}, uint256{3}, uint256::ONE}) {
+        remember(other);
+        GetMockableDatabase(m_wallet).m_records.clear();
+        BOOST_CHECK_EQUAL(MaybeAutoRedelegateQuantumColdStake(m_wallet), 0);
+        BOOST_CHECK_EQUAL(scan_records(), 0U);
+        BOOST_CHECK(WITH_LOCK(m_wallet.cs_wallet, return m_wallet.m_redelegation_last_auto_scan_tip) == other);
+    }
+
+    // After the interval the next reorganisation scans.
+    {
+        LOCK(m_wallet.cs_wallet);
+        m_wallet.m_redelegation_last_reorg_scan -= AUTO_SCAN_REORG_MIN_INTERVAL + std::chrono::seconds{1};
+    }
+    GetMockableDatabase(m_wallet).m_records.clear();
+    BOOST_CHECK_EQUAL(MaybeAutoRedelegateQuantumColdStake(m_wallet), 0);
+    BOOST_CHECK_EQUAL(scan_records(), 2U);
+}
+
+BOOST_AUTO_TEST_CASE(explicit_disable_during_end_stop_wins)
+{
+    // The maintenance thread saw the miner enabled, then an explicit disable
+    // completed before it took the authority mutex. The end-stop must not
+    // queue an automatic restart over that request.
+    m_wallet.m_pow_mining_enabled = true;
+    m_wallet.m_pow_threads = 1;
+    m_wallet.m_pow_cpu_percent = 10;
+
+    std::promise<void> reached;
+    std::promise<void> release;
+    std::shared_future<void> release_future = release.get_future().share();
+    m_wallet.m_pow_reconcile_test_hook = [&](const char* stage) {
+        if (std::string{stage} != "before_end_stop_lock") return;
+        reached.set_value();
+        release_future.wait();
+    };
+    auto worker = std::async(std::launch::async, [&] {
+        m_wallet.ReconcilePowMinerWithWindowState(/*closed=*/true, /*tip_height=*/SHADOW_REWARD_END_HEIGHT);
+    });
+    reached.get_future().wait();
+    bilingual_str error;
+    BOOST_CHECK(m_wallet.SetPowMining(/*enabled=*/false, 1, 10, error));
+    release.set_value();
+    worker.get();
+    m_wallet.m_pow_reconcile_test_hook = nullptr;
+
+    BOOST_CHECK(!m_wallet.m_pow_mining_enabled.load());
+    BOOST_CHECK(!m_wallet.m_pow_resume_below_end.load());
+}
+
+BOOST_AUTO_TEST_CASE(end_stop_without_interference_queues_the_restart)
+{
+    m_wallet.m_pow_mining_enabled = true;
+    m_wallet.m_pow_threads = 3;
+    m_wallet.m_pow_cpu_percent = 40;
+    m_wallet.ReconcilePowMinerWithWindowState(/*closed=*/true, SHADOW_REWARD_END_HEIGHT);
+    BOOST_CHECK(!m_wallet.m_pow_mining_enabled.load());
+    BOOST_CHECK(m_wallet.m_pow_resume_below_end.load());
+    BOOST_CHECK_EQUAL(m_wallet.m_pow_resume_threads.load(), 3);
+    BOOST_CHECK_EQUAL(m_wallet.m_pow_resume_cpu_percent.load(), 40);
+}
+
+BOOST_AUTO_TEST_CASE(explicit_disable_between_restart_decision_and_enable_wins)
+{
+    // The restart is queued and the maintenance thread has decided to act on
+    // it. An explicit disable completes before the automatic enable publishes:
+    // the automatic restart must be refused.
+    m_wallet.m_pow_resume_below_end = true;
+    m_wallet.m_pow_resume_threads = 1;
+    m_wallet.m_pow_resume_cpu_percent = 10;
+    const uint64_t refused_before = m_wallet.m_pow_auto_restart_refusals.load();
+
+    std::promise<void> reached;
+    std::promise<void> release;
+    std::shared_future<void> release_future = release.get_future().share();
+    m_wallet.m_pow_reconcile_test_hook = [&](const char* stage) {
+        if (std::string{stage} != "before_restart") return;
+        reached.set_value();
+        release_future.wait();
+    };
+    auto worker = std::async(std::launch::async, [&] {
+        m_wallet.ReconcilePowMinerWithWindowState(/*closed=*/false, SHADOW_REWARD_END_HEIGHT - 5);
+    });
+    reached.get_future().wait();
+    bilingual_str error;
+    BOOST_CHECK(m_wallet.SetPowMining(/*enabled=*/false, 1, 10, error));
+    release.set_value();
+    worker.get();
+    m_wallet.m_pow_reconcile_test_hook = nullptr;
+
+    BOOST_CHECK_EQUAL(m_wallet.m_pow_auto_restart_refusals.load(), refused_before + 1);
+    BOOST_CHECK(!m_wallet.m_pow_mining_enabled.load());
+    BOOST_CHECK(!m_wallet.m_pow_resume_below_end.load());
+}
+
+BOOST_AUTO_TEST_CASE(restart_proceeds_when_no_explicit_request_intervenes)
+{
+    m_wallet.m_pow_resume_below_end = true;
+    m_wallet.m_pow_resume_threads = 1;
+    m_wallet.m_pow_resume_cpu_percent = 10;
+    const uint64_t refused_before = m_wallet.m_pow_auto_restart_refusals.load();
+    m_wallet.ReconcilePowMinerWithWindowState(/*closed=*/false, SHADOW_REWARD_END_HEIGHT - 5);
+    // The consent was intact, so the restart was attempted and consumed the
+    // queue (this wallet has no keys, so the miner itself cannot start).
+    BOOST_CHECK_EQUAL(m_wallet.m_pow_auto_restart_refusals.load(), refused_before);
+    BOOST_CHECK(!m_wallet.m_pow_resume_below_end.load());
+}
+
 
 BOOST_AUTO_TEST_SUITE_END()
 } // namespace wallet

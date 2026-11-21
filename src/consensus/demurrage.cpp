@@ -538,6 +538,18 @@ int64_t DemurrageRemainingPpm(int inactive_blocks, const Params& params)
     return DEMURRAGE_PPM - ((t_ppm * t_ppm) / DEMURRAGE_PPM);
 }
 
+int DemurrageBlocksUntilFirstReduction(int inactive_blocks, const Params& params)
+{
+    const int64_t window = params.DemurrageDecayWindowBlocks();
+    if (window <= 0) return 0;
+    // The first elapsed count e with floor(e * PPM / window) >= 1000, which
+    // is the first at which t * t / PPM is at least one.
+    const int64_t first_elapsed = (window * 1000 + DEMURRAGE_PPM - 1) / DEMURRAGE_PPM;
+    const int64_t first_inactive = static_cast<int64_t>(params.DemurrageGraceBlocks()) + std::max<int64_t>(1, first_elapsed);
+    const int64_t remaining = first_inactive - std::max(0, inactive_blocks);
+    return remaining > 0 ? static_cast<int>(remaining) : 0;
+}
+
 CAmount DemurrageEffectiveValue(CAmount nominal_value, int64_t remaining_ppm)
 {
     if (nominal_value <= 0 || remaining_ppm <= 0) return 0;

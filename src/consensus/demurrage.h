@@ -107,6 +107,15 @@ static constexpr size_t MAX_DEMURRAGE_ATTESTATIONS_PER_BLOCK = 16;
 
 int64_t DemurrageRemainingPpm(int inactive_blocks);
 int64_t DemurrageRemainingPpm(int inactive_blocks, const Params& params);
+/**
+ * Status only; no consensus rule reads it. Number of further inactive blocks
+ * before the remaining fraction first falls below 100%. DemurrageRemainingPpm
+ * stays at 100% for the grace period and then for the first stretch of the
+ * decay window, because its quadratic term rounds down to zero until the
+ * elapsed time reaches one thousandth of the window. Returns 0 once the
+ * remaining fraction is already below 100%.
+ */
+int DemurrageBlocksUntilFirstReduction(int inactive_blocks, const Params& params);
 CAmount DemurrageEffectiveValue(CAmount nominal_value, int64_t remaining_ppm);
 bool IsDemurrageTreasuryExemptScript(const CScript& script_pub_key, const Params& params);
 uint256 DemurragePubKeyHash(const std::vector<unsigned char>& pubkey);

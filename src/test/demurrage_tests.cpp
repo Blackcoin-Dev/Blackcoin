@@ -252,6 +252,39 @@ BOOST_AUTO_TEST_CASE(curve_boundaries_and_flooring)
     BOOST_CHECK_EQUAL(DemurrageEffectiveValue(MAX_MONEY, DEMURRAGE_PPM), MAX_MONEY);
 }
 
+BOOST_AUTO_TEST_CASE(blocks_until_first_reduction_matches_the_curve)
+{
+    using namespace Consensus;
+
+    for (const int blocks_per_month : {1, 7, 100, 40500}) {
+        Consensus::Params params;
+        params.nDemurrageBlocksPerMonth = blocks_per_month;
+        const int grace = params.DemurrageGraceBlocks();
+        const int zero = params.DemurrageZeroBlocks();
+        // Brute force: the first inactive count whose remaining fraction is below 100%.
+        int first_reduced{-1};
+        for (int inactive = 0; inactive <= zero; ++inactive) {
+            if (DemurrageRemainingPpm(inactive, params) < DEMURRAGE_PPM) {
+                first_reduced = inactive;
+                break;
+            }
+        }
+        BOOST_REQUIRE(first_reduced > grace);
+        BOOST_CHECK_EQUAL(DemurrageBlocksUntilFirstReduction(0, params), first_reduced);
+        // The old status value reaches zero at the end of grace, which is still before any reduction.
+        BOOST_CHECK_EQUAL(DemurrageBlocksUntilFirstReduction(grace, params), first_reduced - grace);
+        BOOST_CHECK(DemurrageBlocksUntilFirstReduction(grace, params) > 0);
+        BOOST_CHECK_EQUAL(DemurrageBlocksUntilFirstReduction(first_reduced - 1, params), 1);
+        BOOST_CHECK_EQUAL(DemurrageBlocksUntilFirstReduction(first_reduced, params), 0);
+        BOOST_CHECK_EQUAL(DemurrageBlocksUntilFirstReduction(zero + 5, params), 0);
+        BOOST_CHECK(DemurrageRemainingPpm(first_reduced - 1, params) == DEMURRAGE_PPM);
+    }
+    // Mainnet shape: the first reduction is 729 blocks after the end of grace.
+    Consensus::Params mainnet_shape;
+    mainnet_shape.nDemurrageBlocksPerMonth = 40500;
+    BOOST_CHECK_EQUAL(DemurrageBlocksUntilFirstReduction(mainnet_shape.DemurrageGraceBlocks(), mainnet_shape), 729);
+}
+
 BOOST_AUTO_TEST_CASE(decay_is_destroyed_and_never_reclassified_as_transaction_fee)
 {
     using namespace Consensus;

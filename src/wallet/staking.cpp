@@ -2199,7 +2199,7 @@ bool MaybeAutoSetQuantumStakeReturn(CWallet& wallet)
         wallet.m_wallet_unlock_staking_only) {
         return false;
     }
-    if (wallet.GetLastBlockHeight() + 1 > consensus.nQuantumMigrationEndHeight) return false;
+    if (WITH_LOCK(wallet.cs_wallet, return wallet.GetLastBlockHeight()) + 1 > consensus.nQuantumMigrationEndHeight) return false;
     CTxDestination chosen;
     {
         LOCK(wallet.cs_wallet);

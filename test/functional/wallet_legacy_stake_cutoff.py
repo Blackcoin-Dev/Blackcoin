@@ -54,7 +54,7 @@ class LegacyStakeCutoffTest(TransitionTFinalTestBase, BitcoinTestFramework):
         node = self.nodes[0]
         wallet = node.get_wallet_rpc(self.default_wallet_name)
         wallet.staking(False)
-        self.set_mt((node.getblockheader(node.getbestblockhash())["time"] & ~0xf) + 16)
+        self.set_initial_mt()
 
         stake_addr = wallet.getnewaddress("", "legacy")
         pow_addr = wallet.getnewaddress("", "legacy")

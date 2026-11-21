@@ -17,6 +17,12 @@ MATURITY = 10
 MARGIN = 1
 LAST_LEGACY_STAKE_HEIGHT = M - MATURITY - MARGIN
 
+# Regtest Protocol V3.1 starts at 1713938400 (April 2024). Blocks timed before it
+# skip the proof-of-stake kernel and reward checks (ProtocolV3 gates them in
+# CheckProofOfStake and ConnectBlock), so every test that stakes starts its mock
+# clock after it. A genesis-relative clock (2014) would test nothing there.
+MOCK_START_TIME = 1750000000
+
 LIFECYCLE_ARGS = [
     "-allowunsafequantumkeyrpc=1",
     "-qqallowautokeycreation=1",
@@ -38,6 +44,11 @@ class TransitionTFinalTestBase:
 
     def skip_test_if_missing_module(self):
         self.skip_if_no_wallet()
+
+    def set_initial_mt(self):
+        """Start the mock clock after Protocol V3.1 so the PoS and reward checks run."""
+        tip_time = self.nodes[0].getblockheader(self.nodes[0].getbestblockhash())["time"]
+        self.set_mt((max(tip_time, MOCK_START_TIME) & ~0xf) + 16)
 
     def set_mt(self, t):
         self.mt = t

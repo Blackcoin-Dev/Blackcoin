@@ -19,6 +19,7 @@ from transition_t_final_util import (
     LIFECYCLE_ARGS,
     M,
     MATURITY,
+    MOCK_START_TIME,
     TransitionTFinalTestBase,
 )
 
@@ -42,7 +43,8 @@ class MigrationBatchesTest(TransitionTFinalTestBase, BitcoinTestFramework):
         node = self.nodes[0]
         wallet = node.get_wallet_rpc(self.default_wallet_name)
         wallet.staking(False)
-        self.set_mt((node.getblockheader(node.getbestblockhash())["time"] & ~0xf) + 16)
+        # After Protocol V3.1, so the proof-of-stake and reward checks run if a block is staked.
+        self.set_mt((max(node.getblockheader(node.getbestblockhash())["time"], MOCK_START_TIME) & ~0xf) + 16)
         pow_addr = wallet.getnewaddress("", "legacy")
 
         self.log.info("Fan a coinbase out into %d legacy outputs, before Gold Rush ends", OUTPUTS_PER_FAN_OUT * FAN_OUTS)
@@ -60,7 +62,10 @@ class MigrationBatchesTest(TransitionTFinalTestBase, BitcoinTestFramework):
         quantum_address = wallet.getnewquantumaddress()["address"]
         status = wallet.getmigrationstatus()
         total = status["eligible_legacy_inputs"]
-        assert_greater_than(total, OUTPUTS_PER_FAN_OUT * FAN_OUTS)
+        # The second fan-out may spend some of the first one's outputs as inputs (coinbase maturity
+        # under Protocol V3.1 leaves fewer mature coinbases than the 2014 clock did), so the count is
+        # not exactly the number sent; the test needs several full batches.
+        assert_greater_than(total, 2 * DEFAULT_LEGACY_BATCH)
         self.log.info("Wallet holds %d eligible legacy outputs", total)
 
         self.log.info("Dry run: bounded batch, accurate (maximum signed) size, fee, and what remains")

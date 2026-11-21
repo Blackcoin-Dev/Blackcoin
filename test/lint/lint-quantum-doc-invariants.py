@@ -270,8 +270,8 @@ def check_mainnet_source(root, failures):
 
     validation = read_text(root, "src/validation.cpp")
     for fragment in (
-        'reject_reason = "eutxo-spend-disabled";',
-        'reject_reason = "eutxo-output-disabled";',
+        "reject_reason = quantum_reject::EUTXO_SPEND_DISABLED;",
+        "reject_reason = quantum_reject::EUTXO_OUTPUT_DISABLED;",
     ):
         require_fragment(
             failures,
@@ -279,6 +279,19 @@ def check_mainnet_source(root, failures):
             validation,
             fragment,
             "frozen witness-v15 consensus rejection",
+        )
+    # The reject-reason strings are shared constants; their text is the frozen wire value.
+    validation_header = read_text(root, "src/validation.h")
+    for fragment in (
+        'EUTXO_SPEND_DISABLED{"eutxo-spend-disabled"}',
+        'EUTXO_OUTPUT_DISABLED{"eutxo-output-disabled"}',
+    ):
+        require_fragment(
+            failures,
+            "src/validation.h",
+            validation_header,
+            fragment,
+            "frozen witness-v15 consensus rejection text",
         )
 
     wallet = read_text(root, "src/wallet/wallet.cpp")

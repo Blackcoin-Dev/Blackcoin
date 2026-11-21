@@ -704,6 +704,24 @@ bool IsQuantumLifecycleGateRejectReason(const std::string& reject_reason)
     return gate_reasons.count(reject_reason) != 0;
 }
 
+bool PreflightMempoolDemurrageAttestations(const CTransaction& tx, const CCoinsViewCache& view,
+                                           const Consensus::Params& consensus_params,
+                                           int spend_height, int64_t spend_time,
+                                           TxValidationState& state)
+{
+    std::string reason;
+    switch (Consensus::PreflightDemurrageAttestations(tx, view, consensus_params, spend_height, spend_time, reason)) {
+    case Consensus::DemurrageAttestationPreflightResult::PASS:
+        return true;
+    case Consensus::DemurrageAttestationPreflightResult::NON_PUNITIVE:
+        return state.Invalid(TxValidationResult::TX_RECENT_CONSENSUS_CHANGE, reason,
+                             "the attestation names a state, target or interval that is not current at the next-block evaluation point; no signature was verified");
+    case Consensus::DemurrageAttestationPreflightResult::INVALID:
+        return state.Invalid(TxValidationResult::TX_CONSENSUS, reason);
+    }
+    return true;
+}
+
 bool DemurrageRejectionDependsOnNextBlock(const CTransaction& tx, const CCoinsViewCache& inputs,
                                           const CBlockIndex& tip, const Consensus::Params& consensus_params,
                                           const std::string& reject_reason, int64_t fee_time)
@@ -1275,6 +1293,10 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
                 return state.Invalid(TxValidationResult::TX_MEMPOOL_POLICY,
                                      "demurrage-attestation-target-conflict");
             }
+        }
+        // Cheap state checks first, so stale or locked candidates never reach ML-DSA verification.
+        if (!PreflightMempoolDemurrageAttestations(tx, m_view, consensus, next_height, next_block_mtp, state)) {
+            return false;
         }
         std::string demurrage_reject_reason;
         const Consensus::DemurrageAttestationValidationResult attestation_result =
@@ -1917,6 +1939,11 @@ PackageMempoolAcceptResult MemPoolAccept::AcceptMultipleTransactions(const std::
             CollectMempoolDemurrageAttestationState(m_pool, attested_keys, ignored_mempool_attestation_count);
             size_t package_attestation_count{0};
             for (Workspace& ws : workspaces) {
+                if (!PreflightMempoolDemurrageAttestations(*ws.m_ptx, m_view, consensus, next_height, next_block_mtp, ws.m_state)) {
+                    package_state.Invalid(PackageValidationResult::PCKG_TX, "transaction failed");
+                    results.emplace(ws.m_ptx->GetWitnessHash(), MempoolAcceptResult::Failure(ws.m_state));
+                    return PackageMempoolAcceptResult(package_state, std::move(results));
+                }
                 std::string demurrage_reject_reason;
                 const Consensus::DemurrageAttestationValidationResult attestation_result =
                     Consensus::CheckDemurrageAttestationsDetailed(

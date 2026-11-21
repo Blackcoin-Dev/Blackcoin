@@ -107,6 +107,11 @@ BOOST_AUTO_TEST_CASE(classifier_agrees_with_the_producing_functions)
         {"eutxo-output-disabled", quantum, eutxo},
         {"unsupported-witness-v1-output", quantum, UnknownWitness(1)},
         {"unknown-quantum-witness-output", quantum | SCRIPT_VERIFY_TAPROOT, UnknownWitness(2)},
+        // A tiered stake output before the tier rules are active.
+        {"quantum-tier-output-premature", quantum, GetScriptForDestination(WitnessUnknown{
+            QUANTUM_MIGRATION_WITNESS_VERSION,
+            QuantumTieredProgramForCommitment(QUANTUM_TIERED_STATE_BONDED, /*unbonding_blocks=*/40500,
+                                              /*unlock_height=*/0, uint256::ONE)})},
     };
     for (const auto& [expected, flags, script] : output_cases) {
         const CTransaction tx = OneInputTx(COutPoint{uint256::ONE, 0}, 1000, script);
@@ -122,6 +127,8 @@ BOOST_AUTO_TEST_CASE(classifier_agrees_with_the_producing_functions)
         {"eutxo-spend-disabled", quantum | SCRIPT_VERIFY_TAPROOT, eutxo},
         {"unsupported-witness-v1-spend", quantum, UnknownWitness(1)},
         {"unknown-quantum-witness-spend", quantum | SCRIPT_VERIFY_TAPROOT, UnknownWitness(2)},
+        // Quantum rules on, an ordinary coin with no protected lineage: nothing anchors the spend.
+        {"quantum-lineage-anchor-required", quantum, op_true},
     };
     for (const auto& [expected, flags, script] : spend_cases) {
         CCoinsView base;
@@ -135,10 +142,28 @@ BOOST_AUTO_TEST_CASE(classifier_agrees_with_the_producing_functions)
         BOOST_CHECK_EQUAL(reason, expected);
         BOOST_CHECK_MESSAGE(IsQuantumLifecycleGateRejectReason(reason), reason);
     }
-    // The gate reasons that need a Gold Rush payout marker or a tier program
-    // (blackcoin-migration-spend-premature, goldrush-payout-spend-premature,
-    // quantum-tier-output-premature, quantum-lineage-anchor-required,
-    // unsupported-nested-witness-spend) are covered by the literal pin above.
+
+    // A pay-to-script-hash coin whose redeem script is a witness v1 program: the nested spend is refused
+    // by the producing function once the quantum rules are on.
+    {
+        const CScript redeem = CScript() << OP_1 << std::vector<unsigned char>(32, 0x42);
+        CCoinsView base;
+        CCoinsViewCache view{&base};
+        const COutPoint prevout{uint256{8}, 0};
+        view.AddCoin(prevout, Coin{CTxOut{1000, GetScriptForDestination(ScriptHash(redeem))}, 1, false, false, 0}, false);
+        CMutableTransaction mtx;
+        mtx.nVersion = 2;
+        mtx.vin.emplace_back(prevout);
+        mtx.vin[0].scriptSig = CScript() << std::vector<unsigned char>(redeem.begin(), redeem.end());
+        mtx.vout.emplace_back(0, CScript());
+        std::string reason;
+        BOOST_CHECK(!CheckQuantumQuasarTransaction(CTransaction{mtx}, view, quantum, 1, Params().GetConsensus(), 0, reason));
+        BOOST_CHECK_EQUAL(reason, "unsupported-nested-witness-spend");
+        BOOST_CHECK_EQUAL(reason, std::string{quantum_reject::NESTED_WITNESS_SPEND});
+        BOOST_CHECK(IsQuantumLifecycleGateRejectReason(reason));
+    }
+    // The two gates that need an authenticated Gold Rush payout (goldrush-payout-spend-premature and
+    // blackcoin-migration-spend-premature) are produced from a real claim block in shadow_tests.
 }
 
 // The three reasons CheckTxInputs returns for the demurrage-sensitive checks

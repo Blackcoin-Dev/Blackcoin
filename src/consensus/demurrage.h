@@ -155,6 +155,32 @@ DemurrageAttestationValidationResult CheckDemurrageAttestationsDetailed(
                                 std::set<uint256>& attested_keys,
                                 size_t& attestation_count,
                                 std::string& reject_reason);
+/**
+ * Result of the cheap, mempool-only look at attestation payloads that runs before the expensive
+ * ML-DSA verification: PASS (go on to the full check), NON_PUNITIVE (the payload is well formed but
+ * names a state that moved or a target that cannot be attested now: a stale referenced state, a
+ * locked target, an attestation that came too soon; an honest peer can relay any of these after
+ * another transaction confirmed, so the relaying peer is not at fault) or INVALID (cheap structural
+ * invalidity: a bad payload, a target the transaction itself spends, a missing target or one whose
+ * controlling key is not the attesting key).
+ */
+enum class DemurrageAttestationPreflightResult {
+    PASS,
+    NON_PUNITIVE,
+    INVALID,
+};
+/**
+ * Look at every attestation of tx with checks that cost no signature verification: target identity,
+ * controlling key, referenced state, target lock state and the minimum interval. Mempool policy
+ * only: block validation does not call this and its result is unchanged. A local state read failure
+ * is not classified here (PASS) so the full check reports it as before.
+ */
+DemurrageAttestationPreflightResult PreflightDemurrageAttestations(const CTransaction& tx,
+                                                                   const CCoinsViewCache& view,
+                                                                   const Params& params,
+                                                                   int spend_height,
+                                                                   int64_t spend_time,
+                                                                   std::string& reject_reason);
 bool CheckDemurrageAttestations(const CTransaction& tx,
                                 const CCoinsViewCache& view,
                                 const Params& params,

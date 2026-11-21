@@ -204,6 +204,17 @@ bool IsQuantumLifecycleGateRejectReason(const std::string& reject_reason);
 bool DemurrageRejectionDependsOnNextBlock(const CTransaction& tx, const CCoinsViewCache& inputs,
                                           const CBlockIndex& tip, const Consensus::Params& consensus_params,
                                           const std::string& reject_reason, int64_t fee_time);
+/** Mempool only. The cheap look at a transaction's demurrage attestations that
+ * runs before any ML-DSA verification (Consensus::PreflightDemurrageAttestations).
+ * Returns true to go on to the full check. A stale referenced state, a locked
+ * target or an attestation that came too soon is rejected as
+ * TX_RECENT_CONSENSUS_CHANGE (an honest peer may relay such a transaction after
+ * another one confirmed, so it is not punished) and a cheap structural
+ * invalidity as TX_CONSENSUS. Block validation never calls this. */
+bool PreflightMempoolDemurrageAttestations(const CTransaction& tx, const CCoinsViewCache& view,
+                                           const Consensus::Params& consensus_params,
+                                           int spend_height, int64_t spend_time,
+                                           TxValidationState& state);
 bool CheckInputScripts(const CTransaction& tx, TxValidationState& state,
                        const CCoinsViewCache& inputs, unsigned int flags,
                        bool cacheSigStore, bool cacheFullScriptStore,

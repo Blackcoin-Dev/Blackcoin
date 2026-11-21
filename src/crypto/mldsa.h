@@ -58,6 +58,9 @@ public:
     /** Startup self-test for linked ML-DSA implementation */
     static bool SelfTest();
 
+    /** Number of signature verifications that reached the implementation since startup (tests assert that a cheap pre-check spares it). */
+    static uint64_t VerifyCallCount();
+
     static void SetFailureForTesting(MLDSATestFailure failure, uint64_t count = 1);
     static void ClearFailureForTesting();
 };

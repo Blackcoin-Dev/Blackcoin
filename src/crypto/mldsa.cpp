@@ -20,6 +20,7 @@ constexpr std::string_view REQUIRED_LIBOQS_VERSION{"0.15.0"};
 
 std::atomic<MLDSATestFailure> g_test_failure{MLDSATestFailure::NONE};
 std::atomic<uint64_t> g_test_failure_remaining{0};
+std::atomic<uint64_t> g_verify_calls{0};
 
 struct OQSSigDeleter {
     void operator()(OQS_SIG* sig) const { OQS_SIG_free(sig); }
@@ -201,6 +202,11 @@ bool ML_DSA::Sign(const std::vector<uint8_t>& privkey,
     return SignDetailed(privkey, hash, hash_len, signature) == MLDSAOperationResult::SUCCESS;
 }
 
+uint64_t ML_DSA::VerifyCallCount()
+{
+    return g_verify_calls.load(std::memory_order_relaxed);
+}
+
 MLDSAVerifyResult ML_DSA::VerifyDetailed(const uint8_t* pubkey,
                                          size_t pubkey_len,
                                          const uint8_t* hash,
@@ -213,6 +219,7 @@ MLDSAVerifyResult ML_DSA::VerifyDetailed(const uint8_t* pubkey,
         signature == nullptr || signature_len != SIGNATURE_BYTES) {
         return MLDSAVerifyResult::INVALID;
     }
+    g_verify_calls.fetch_add(1, std::memory_order_relaxed);
     if (ConsumeTestFailure(MLDSATestFailure::VERIFY)) return MLDSAVerifyResult::INTERNAL_ERROR;
 
     const OQS_SIG* sig = GetMLDSA44();

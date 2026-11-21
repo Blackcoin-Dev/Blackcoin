@@ -865,6 +865,72 @@ static bool CheckDemurrageAttestationsImpl(const CTransaction& tx,
     return true;
 }
 
+DemurrageAttestationPreflightResult PreflightDemurrageAttestations(const CTransaction& tx,
+                                                                   const CCoinsViewCache& view,
+                                                                   const Params& params,
+                                                                   int spend_height,
+                                                                   int64_t spend_time,
+                                                                   std::string& reject_reason)
+{
+    if (!params.IsDemurrageActive(spend_height, spend_time)) return DemurrageAttestationPreflightResult::PASS;
+    for (const DemurrageAttestation& attestation : ExtractDemurrageAttestations(tx)) {
+        if (attestation.height < 0) {
+            reject_reason = "bad-demurrage-attestation";
+            return DemurrageAttestationPreflightResult::INVALID;
+        }
+        if (std::any_of(tx.vin.begin(), tx.vin.end(), [&](const CTxIn& txin) {
+                return txin.prevout == attestation.target_outpoint;
+            })) {
+            reject_reason = "demurrage-attestation-target-conflict";
+            return DemurrageAttestationPreflightResult::INVALID;
+        }
+        Coin target_coin;
+        if (!view.GetCoin(attestation.target_outpoint, target_coin) || target_coin.IsSpent()) {
+            reject_reason = "bad-demurrage-attestation-target";
+            return DemurrageAttestationPreflightResult::INVALID;
+        }
+        const std::optional<uint256> controlling_key = DemurrageControllingKeyHashForScript(target_coin.out.scriptPubKey);
+        if (!controlling_key || *controlling_key != attestation.pubkey_hash) {
+            reject_reason = "bad-demurrage-attestation-target";
+            return DemurrageAttestationPreflightResult::INVALID;
+        }
+        DemurrageLatestRecord previous_record;
+        const LatestReadResult previous_read = ReadLatestRecord(view, attestation.pubkey_hash, previous_record);
+        if (previous_read == LatestReadResult::INVALID) return DemurrageAttestationPreflightResult::PASS;
+        const std::optional<DemurrageAttestationState> previous_state =
+            previous_read == LatestReadResult::VALID
+                ? std::optional<DemurrageAttestationState>{previous_record.state}
+                : std::nullopt;
+        if (previous_state.has_value() != attestation.previous_height.has_value() ||
+            (previous_state && (previous_state->height != *attestation.previous_height ||
+                                previous_state->time != attestation.previous_time ||
+                                previous_state->coverage_start_height != attestation.previous_coverage_start_height)) ||
+            ((previous_read == LatestReadResult::VALID) != attestation.previous_source.has_value()) ||
+            (previous_read == LatestReadResult::VALID &&
+             (previous_record.source_block_hash != attestation.previous_source->block_hash ||
+              previous_record.source_txid != attestation.previous_source->txid ||
+              previous_record.source_output_index != attestation.previous_source->output_index)) ||
+            (!previous_state && (attestation.previous_time != 0 ||
+                                 attestation.previous_coverage_start_height != 0))) {
+            reject_reason = "stale-demurrage-attestation-state";
+            return DemurrageAttestationPreflightResult::NON_PUNITIVE;
+        }
+        const DemurrageEvaluation target_evaluation = EvaluateDemurrage(
+            target_coin, params, spend_height, spend_time,
+            previous_state ? std::optional<int>{previous_state->height} : std::nullopt,
+            previous_state ? std::optional<int>{static_cast<int>(previous_state->coverage_start_height)} : std::nullopt);
+        if (target_evaluation.locked) {
+            reject_reason = "demurrage-attestation-target-locked";
+            return DemurrageAttestationPreflightResult::NON_PUNITIVE;
+        }
+        if (previous_state && spend_height - previous_state->height < params.DemurrageAutoAttestBlocks()) {
+            reject_reason = "demurrage-attestation-too-soon";
+            return DemurrageAttestationPreflightResult::NON_PUNITIVE;
+        }
+    }
+    return DemurrageAttestationPreflightResult::PASS;
+}
+
 DemurrageAttestationValidationResult CheckDemurrageAttestationsDetailed(
                                 const CTransaction& tx,
                                 const CCoinsViewCache& view,

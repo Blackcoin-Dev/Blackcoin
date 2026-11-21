@@ -32,6 +32,10 @@ F = M + 1       # first Final block, demurrage starts
 GRACE = 24      # 6 * blocks per month
 ZERO = 96       # 24 * blocks per month
 FEE = Decimal("0.01")
+SMALL = Decimal("1")  # a small coin: one block of decay is far below the minimum fee
+# Protocol V3.1 time of the regtest chain: from here the proof-of-stake, reward and
+# minimum-fee consensus checks are enforced. The mock time must be past it.
+PROTOCOL_V3_1_TIME = 1713938400
 
 
 class TransitionDemurrageNonPunitiveTest(BitcoinTestFramework):
@@ -105,7 +109,8 @@ class TransitionDemurrageNonPunitiveTest(BitcoinTestFramework):
         node = self.nodes[0]
         wallet = node.get_wallet_rpc(self.default_wallet_name)
         wallet.staking(False)
-        self.mocktime = (int(time.time()) & ~0xf) + 16
+        self.mocktime = max(int(time.time()) & ~0xf, PROTOCOL_V3_1_TIME + 86400) + 16
+        assert self.mocktime > PROTOCOL_V3_1_TIME
         node.setmocktime(self.mocktime)
 
         sources = [wallet.getnewaddress("", "legacy") for _ in range(4)]
@@ -123,9 +128,20 @@ class TransitionDemurrageNonPunitiveTest(BitcoinTestFramework):
             signed = wallet.signrawtransactionwithwallet(raw)
             assert_equal(signed["complete"], True)
             node.sendrawtransaction(signed["hex"])
+        # The fourth legacy coin becomes one small and one large quantum output.
+        small_address = wallet.getnewquantumaddress()["address"]
+        rest_address = wallet.getnewquantumaddress()["address"]
+        utxo = wallet.listunspent(1, 9999999, [sources[3]])[0]
+        raw = node.createrawtransaction(
+            [{"txid": utxo["txid"], "vout": utxo["vout"]}],
+            [{small_address: SMALL}, {rest_address: Decimal(str(utxo["amount"])) - SMALL - FEE}])
+        signed = wallet.signrawtransactionwithwallet(raw)
+        assert_equal(signed["complete"], True)
+        node.sendrawtransaction(signed["hex"])
         self.mine(1, pow_addr)
         assert_equal(node.getblockcount(), M)
         assert_equal(node.getquantumquasarinfo()["next_block_phase"], "final_lockout")
+        small_utxo = wallet.listunspent(1, 9999999, [small_address])[0]
         utxos = [wallet.listunspent(1, 9999999, [address])[0] for address in quantum]
         nominal = [Decimal(str(u["amount"])) for u in utxos]
 
@@ -141,6 +157,20 @@ class TransitionDemurrageNonPunitiveTest(BitcoinTestFramework):
         self.log.info("Value case: built for a next block at inactive == GRACE, so the input is not decayed")
         decayed_value_tx = self.spend(wallet, utxos[0], wallet.getnewquantumaddress()["address"], nominal[0] - FEE)
         assert self.accept(decayed_value_tx)["allowed"], self.accept(decayed_value_tx)
+        self.log.info("Minimum-fee case: exactly the minimum fee at the earlier block, below it one block later")
+        # The fee floor is 100 satoshis per byte of virtual size. The transaction size does
+        # not depend on the amount, so find the exact minimum at the earlier block and check
+        # that one satoshi less is refused there.
+        destination = wallet.getnewquantumaddress()["address"]
+        vsize = node.decoderawtransaction(self.spend(wallet, small_utxo, destination, SMALL - FEE))["vsize"]
+        minimum = Decimal(vsize * 100) / Decimal(10 ** 8)
+        at_minimum = self.spend(wallet, small_utxo, destination, SMALL - minimum)
+        below_minimum = self.spend(wallet, small_utxo, destination, SMALL - minimum + Decimal("0.00000001"))
+        assert self.accept(at_minimum)["allowed"], self.accept(at_minimum)
+        refused = self.accept(below_minimum)
+        assert not refused["allowed"]
+        assert_equal(refused["reject-reason"], "bad-txns-fee-not-enough")
+
         # Controls: more output than the whole input is invalid at both blocks.
         too_much = self.spend(wallet, utxos[1], wallet.getnewquantumaddress()["address"], nominal[1] + Decimal("0.00000001"))
         assert_equal(self.accept(too_much)["reject-reason"], "bad-txns-in-belowout")
@@ -154,6 +184,14 @@ class TransitionDemurrageNonPunitiveTest(BitcoinTestFramework):
         self.relay_not_punished(decayed_value_tx)
         self.log.info("An output above the whole input value is still punished")
         self.relay_punished(too_much)
+
+        self.log.info("Minimum-fee case, one block later: the decayed input still covers the output, only the fee fell below the minimum")
+        result = self.accept(at_minimum)
+        assert not result["allowed"]
+        assert_equal(result["reject-reason"], "bad-txns-fee-not-enough")
+        self.relay_not_punished(at_minimum)
+        self.log.info("A fee that was already below the minimum before the transition is still punished")
+        self.relay_punished(below_minimum)
 
         self.log.info("Terminal case: built for the last block before the coin locks")
         terminal_tip = F + ZERO - 2  # next block h = F + ZERO - 1, inactive == ZERO - 1

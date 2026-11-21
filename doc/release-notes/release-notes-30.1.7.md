@@ -59,19 +59,21 @@ and earlier.
 
 - A node no longer disconnects or discourages a peer for relaying a transaction
   that was valid one block earlier and became invalid because a lifecycle
-  boundary was crossed. This covers a legacy transaction signed before the
-  Quantum Quasar migration without the FORKID flag, a legacy-to-quantum
+  boundary was crossed. This covers a legacy transaction whose signature lacks
+  the FORKID flag required from the first Migration block, a legacy-to-quantum
   migration transaction that arrives when Final begins, and a spend whose input
-  value or lock state changed because of demurrage at the next block. The
-  transaction is still rejected and is not relayed; only the penalty for the
-  sender is gone. Blocks are validated exactly as before, and genuinely
-  malformed transactions, bad signatures and every rejection that does not
-  depend on the lifecycle phase still penalize the sender.
-- When `sendrawtransaction` refuses a transaction signed without FORKID after
-  the first block of the Migration phase, the error now says that the
-  transaction must be signed again with a current wallet. The same applies to
-  the other phase and demurrage rejections, which now say the transaction was
-  built for an earlier phase and has to be created again.
+  value, lock state or remaining fee over the minimum changed because of
+  demurrage at the next block. The transaction is still rejected and is not
+  relayed; only the penalty for the sender is gone. Blocks are validated exactly
+  as before, and genuinely malformed transactions, bad signatures, a fee that was
+  already below the minimum and every rejection that does not depend on the
+  lifecycle phase still penalize the sender.
+- The missing-FORKID case is identified by a distinct internal script error
+  value reported with the same text as before; no second script evaluation is
+  run and no block-height window applies.
+- The rejection text of `sendrawtransaction` is unchanged. The debug message only
+  states that the transaction conflicts with lifecycle-dependent or demurrage
+  rules at the current next-block evaluation point.
 
 ## The end of Gold Rush
 

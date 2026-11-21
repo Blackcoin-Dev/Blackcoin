@@ -17,7 +17,9 @@ Checked here, at the exact boundary heights:
    as a lifecycle change without punishing the peer;
  - a block that contains such a transaction stays invalid at both boundaries;
  - the rejection is not remembered across a reorganisation below the gate;
- - sendrawtransaction names the reason and tells the user to sign again.
+ - sendrawtransaction names the missing FORKID flag;
+ - there is no height cutoff: the same transaction is still not punished at the
+   last former cutoff block, the block after it, and further on.
 """
 import time
 from decimal import Decimal
@@ -33,7 +35,11 @@ from test_framework.util import (
 
 BLOCKS = 60
 G = 1 + BLOCKS  # last Gold Rush block
-M = G + 30      # last Migration block
+M = G + 800     # last Migration block, far enough for the G+720 and G+721 checks
+# Protocol V3.1 time of the regtest chain: from here the proof-of-stake, reward and
+# minimum-fee consensus checks are enforced. The mock time must be past it,
+# otherwise those checks are skipped and the test proves less than it claims.
+PROTOCOL_V3_1_TIME = 1713938400
 FEE = Decimal("0.01")
 
 
@@ -96,7 +102,8 @@ class TransitionNonPunitiveTest(BitcoinTestFramework):
         node = self.nodes[0]
         wallet = node.get_wallet_rpc(self.default_wallet_name)
         wallet.staking(False)
-        self.mocktime = (int(time.time()) & ~0xf) + 16
+        self.mocktime = max(int(time.time()) & ~0xf, PROTOCOL_V3_1_TIME + 86400) + 16
+        assert self.mocktime > PROTOCOL_V3_1_TIME
         node.setmocktime(self.mocktime)
 
         sources = [wallet.getnewaddress("", "legacy") for _ in range(8)]
@@ -123,6 +130,7 @@ class TransitionNonPunitiveTest(BitcoinTestFramework):
         assert_equal(node.getquantumquasarinfo()["next_block_phase"], "gold_rush")
         legacy_destination = wallet.getnewaddress("", "legacy")
         stale = [build(sources[0], legacy_destination), build(sources[1], legacy_destination)]
+        late = build(sources[5], legacy_destination)
         for hexstr in stale:
             assert node.testmempoolaccept([hexstr])[0]["allowed"]
 
@@ -139,8 +147,8 @@ class TransitionNonPunitiveTest(BitcoinTestFramework):
         self.log.info("Honest relay of a transaction signed before G is not punished")
         self.relay_not_punished(stale[0])
 
-        self.log.info("sendrawtransaction names the reason and says to sign again")
-        assert_raises_rpc_error(-26, "sign it again with a current wallet", node.sendrawtransaction, stale[1])
+        self.log.info("sendrawtransaction names the missing FORKID flag")
+        assert_raises_rpc_error(-26, "SIGHASH_FORKID", node.sendrawtransaction, stale[1])
 
         self.log.info("A block with the stale transaction stays invalid")
         with node.assert_debug_log(expected_msgs=["ConnectBlock: CheckQueue failed"]):
@@ -187,6 +195,21 @@ class TransitionNonPunitiveTest(BitcoinTestFramework):
         node.reconsiderblock(g_hash)
         assert_equal(node.getbestblockhash(), g_hash)
         assert tx_from_hex(stale[0]).rehash() not in node.getrawmempool()
+
+        self.log.info("No height cutoff: the same relay is not punished at G+719, G+720, G+721 and G+725 tips")
+        for tip_height in (G + 719, G + 720, G + 721, G + 725):
+            self.mine(tip_height - node.getblockcount(), pow_addr)
+            assert_equal(node.getblockcount(), tip_height)
+            assert_equal(node.getquantumquasarinfo()["next_block_phase"], "migration")
+            result = node.testmempoolaccept([late])[0]
+            assert not result["allowed"]
+            assert result["reject-reason"].startswith("mandatory-script-verify-flag-failed")
+            self.relay_not_punished(late)
+        self.log.info("Negative control at the same heights: a corrupted signature is still punished")
+        late_good = build(sources[6], legacy_destination)
+        late_corrupted = bytearray(bytes.fromhex(late_good))
+        late_corrupted[len(late_corrupted) // 2 + 20] ^= 0x01
+        self.relay_punished(bytes(late_corrupted).hex())
 
         self.log.info("Cross M: the next block is the first Final block")
         quantum_address = wallet.getnewquantumaddress()["address"]

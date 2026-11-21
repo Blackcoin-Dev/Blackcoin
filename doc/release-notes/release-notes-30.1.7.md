@@ -24,8 +24,9 @@ and earlier.
 - **Legacy stakes in the last blocks of Migration are paid out as quantum coins.** A legacy
   coinstake created at height h can only be spent from h plus the maturity (500 blocks on
   mainnet), and the Final phase rejects every legacy input, so a legacy-return stake made in the
-  last 500 blocks of Migration could never be spent. From block height 6,921,499 (the first height
-  whose legacy output would not mature before Migration ends, with one block of margin) a wallet
+  last 500 blocks of Migration could never be spent. From block height 6,921,499 (one block early, to keep a migration margin: a
+  stake at 6,921,499 would mature only in the last Migration block, and from 6,921,500 on it could not
+  mature before Final at all) a wallet
   that stakes a legacy kernel pays its principal and reward to ONE quantum output of its own
   instead (the quantum stake return address), with nothing else of value in the coinstake and no
   stake split or donation output. The legacy key still signs the block, in the usual zero-value
@@ -48,7 +49,14 @@ and earlier.
   bounded batch per call (new `max_inputs` option; defaults of 400 legacy inputs and 90 payout
   inputs; a batch is always cut to fit a standard transaction). The result lists how many outputs
   remain (`remaining_inputs`, `remaining_amount`, `more_batches`); call again with
-  `existing_address` set to the returned destination until `more_batches` is false. The dry run
+  `existing_address` set to the returned destination until `more_batches` is false. A partial batch
+  always leaves a way to finish: once no legacy anchor is left, the confirmed quantum output of the
+  earlier batch anchors and funds the next one (and funds a tail that cannot pay its own fee); its
+  value is reported separately as `auxiliary_inputs` and `auxiliary_amount`, never as legacy value
+  moved. A batch that would strand the rest is refused before it is built. `more_batches` false means
+  no ELIGIBLE input remains: `excluded_legacy_outputs`, `excluded_legacy_amount` and
+  `next_maturity_height` report legacy outputs that were not eligible yet (immature, locked,
+  unconfirmed), and the Staking page says so instead of "no legacy outputs remain". The dry run
   now reports the maximum signed size and the exact fee of the real call instead of the much smaller
   unsigned size. The Staking page buttons move one batch per click, reuse the same address for
   the next batch, and say how much remains.
@@ -61,7 +69,9 @@ and earlier.
 - **Demurrage status.** `getdemurragewalletinfo` keeps `blocks_until_decay` (the end of the
   grace period) and adds `blocks_until_first_reduction`, the number of blocks until the value is
   first actually reduced. The two differ by 729 blocks on mainnet, so `blocks_until_decay` reaching
-  zero does not mean decay has started.
+  zero does not mean decay has started. Before demurrage activates, `blocks_until_first_reduction`
+  includes the blocks left until activation, and it is absent for an exempt output or when
+  activation is not given by a block height.
 - **Faster PSBT signing.** Signing a PSBT with many inputs no longer copies the whole PSBT for
   every input.
 

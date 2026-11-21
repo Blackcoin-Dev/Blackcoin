@@ -422,9 +422,11 @@ bool FindAutoShadowSignalCandidate(CWallet& wallet, AutoShadowSignalCandidate& c
             LogPrint(BCLog::COINSTAKE, "Gold Rush PoS auto-signal: skipped because wallet lock is busy\n");
             return false;
         }
-        if (wallet.m_shadow_signal_last_auto_scan_height == scan_height &&
-            wallet.m_shadow_signal_last_auto_scan_tip == scan_tip_hash) {
-            LogPrint(BCLog::COINSTAKE, "Gold Rush PoS auto-signal: already scanned height=%d\n", scan_height);
+        if (DecideAutoScan(wallet.m_shadow_signal_last_auto_scan_height,
+                           wallet.m_shadow_signal_last_auto_scan_tip, scan_height, scan_tip_hash,
+                           wallet.m_shadow_signal_last_reorg_scan,
+                           std::chrono::steady_clock::now()) != AutoScanVerdict::SCAN) {
+            LogPrint(BCLog::COINSTAKE, "Gold Rush PoS auto-signal: already scanned height=%d (or a reorganisation rescan is rate limited)\n", scan_height);
             return false;
         }
         wallet.m_shadow_signal_last_auto_scan_height = scan_height;
@@ -1411,8 +1413,10 @@ int MaybeAutoDemurrageAttest(CWallet& wallet)
 
     {
         LOCK(wallet.cs_wallet);
-        if (wallet.m_demurrage_last_auto_attest_scan_height == evaluation_height &&
-            wallet.m_demurrage_last_auto_attest_scan_tip == evaluation_tip) {
+        if (DecideAutoScan(wallet.m_demurrage_last_auto_attest_scan_height,
+                           wallet.m_demurrage_last_auto_attest_scan_tip, evaluation_height, evaluation_tip,
+                           wallet.m_demurrage_last_reorg_scan,
+                           std::chrono::steady_clock::now()) != AutoScanVerdict::SCAN) {
             return 0;
         }
         wallet.m_demurrage_last_auto_attest_scan_height = evaluation_height;
@@ -1745,8 +1749,10 @@ int MaybeAutoRedelegateQuantumColdStake(CWallet& wallet)
 
     {
         LOCK(wallet.cs_wallet);
-        if (wallet.m_redelegation_last_auto_scan_height == current_height &&
-            wallet.m_redelegation_last_auto_scan_tip == current_tip) {
+        if (DecideAutoScan(wallet.m_redelegation_last_auto_scan_height,
+                           wallet.m_redelegation_last_auto_scan_tip, current_height, current_tip,
+                           wallet.m_redelegation_last_reorg_scan,
+                           std::chrono::steady_clock::now()) != AutoScanVerdict::SCAN) {
             return 0;
         }
         wallet.m_redelegation_last_auto_scan_height = current_height;
@@ -3218,4 +3224,20 @@ bool CreateCoinStake(CWallet& wallet, unsigned int nBits, int64_t nSearchInterva
     // Successfully generated coinstake
     return true;
 }
+
+AutoScanVerdict DecideAutoScan(int last_height, const uint256& last_tip,
+                               int height, const uint256& tip,
+                               std::chrono::steady_clock::time_point& last_reorg_scan,
+                               std::chrono::steady_clock::time_point now)
+{
+    if (height > last_height || last_tip.IsNull()) return AutoScanVerdict::SCAN;
+    if (height == last_height && tip == last_tip) return AutoScanVerdict::SKIP_SAME_TIP;
+    if (last_reorg_scan != std::chrono::steady_clock::time_point{} &&
+        now - last_reorg_scan < AUTO_SCAN_REORG_MIN_INTERVAL) {
+        return AutoScanVerdict::SKIP_REORG_BOUND;
+    }
+    last_reorg_scan = now;
+    return AutoScanVerdict::SCAN;
+}
+
 } // namespace wallet

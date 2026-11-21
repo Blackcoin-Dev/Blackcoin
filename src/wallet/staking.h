@@ -329,6 +329,32 @@ int MaybeAutoDemurrageAttest(CWallet& wallet);
 int MaybeAutoShadowSignal(CWallet& wallet);
 int MaybeAutoRedelegateQuantumColdStake(CWallet& wallet);
 
+/** Result of comparing a candidate tip with the last tip an automatic scan ran on. */
+enum class AutoScanVerdict {
+    SCAN,
+    SKIP_SAME_TIP,
+    SKIP_REORG_BOUND,
+};
+
+/** Minimum time between automatic rescans caused by reorganisations. */
+inline constexpr std::chrono::seconds AUTO_SCAN_REORG_MIN_INTERVAL{30};
+
+/**
+ * Decide whether an automatic scan runs for the tip (height, tip). A tip above
+ * the last scanned height always scans, so work follows chain growth. The tip
+ * already scanned is skipped. Any other tip (the same height with a different
+ * hash, or a lower height) is a reorganisation: it scans only if the last such
+ * rescan was at least AUTO_SCAN_REORG_MIN_INTERVAL ago, so a run of short
+ * reorganisations cannot cause a rescan storm or repeated fee-paying
+ * transactions. A skipped scan is not remembered; the next tip decides afresh.
+ * A null last_tip means "scan again". last_reorg_scan is updated when a
+ * reorganisation scan is allowed.
+ */
+AutoScanVerdict DecideAutoScan(int last_height, const uint256& last_tip,
+                               int height, const uint256& tip,
+                               std::chrono::steady_clock::time_point& last_reorg_scan,
+                               std::chrono::steady_clock::time_point now);
+
 } // namespace wallet
 
 #endif // BITCOIN_WALLET_STAKING_H

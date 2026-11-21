@@ -146,6 +146,16 @@ class GoldRushHeightScheduleMultiNodeTest(BitcoinTestFramework):
             self._bump_mocktime(16)
         raise last_error or AssertionError("failed to mine deterministic PoS block")
 
+    def _mine_plain_pow_block(self, node, address):
+        start_height = node.getblockcount()
+        for _ in range(400):
+            if node.generatetoaddress(nblocks=1, address=address, maxtries=25000, invalid_call=False):
+                break
+            self._bump_mocktime(16)
+        assert_equal(node.getblockcount(), start_height + 1)
+        self._bump_mocktime()
+        self._sync_started()
+
     def _mine_pos_to_height(self, node, wallet, target_height):
         while node.getblockcount() < target_height:
             self._mine_pos_block(node, wallet)
@@ -363,9 +373,15 @@ class GoldRushHeightScheduleMultiNodeTest(BitcoinTestFramework):
         self._assert_network_agrees()
 
         self.log.info("Crossing the migration end height %d into Final Lockout", MIGRATION_END_HEIGHT)
-        self._mine_pos_to_height(node, staker_a, MIGRATION_END_HEIGHT - 1)
+        # The wallet stops legacy staking after the last height whose coinstake
+        # can mature before Final, so this legacy staker takes the blocks up to
+        # that height and plain PoW blocks (still valid) take the rest.
+        legacy_last = staker_a.getstakinginfo()["legacy_staking_last_height"]
+        self._mine_pos_to_height(node, staker_a, min(MIGRATION_END_HEIGHT - 1, legacy_last))
+        while node.getblockcount() < MIGRATION_END_HEIGHT - 1:
+            self._mine_plain_pow_block(node, claim_fee_address)
         self._assert_phase_everywhere("migration")
-        self._mine_pos_block(node, staker_a)  # the final Migration block
+        self._mine_plain_pow_block(node, claim_fee_address)  # the final Migration block
         self._sync_started()
         assert_equal(node.getblockcount(), MIGRATION_END_HEIGHT)
         self._assert_phase_everywhere("final_lockout")

@@ -614,6 +614,10 @@ struct ShadowPowClaimRecoveryAction
     /** Exact managed bytes carry a durable local relay-revocation tombstone. */
     bool relay_revoked{false};
     bool frontier_may_advance{true};
+    /** Every claim of the family is unconfirmable only because the reward
+     * window closed before the pinned tip's next block. With the miner off,
+     * an automatic action is relayed only when this holds. */
+    bool epoch_closed_only{false};
     /** The action deliberately conflicts with an unbound proof that may
      * become valid on a descendant even though it is invalid now. */
     bool conflicts_with_revalidating_unbound_proof{false};

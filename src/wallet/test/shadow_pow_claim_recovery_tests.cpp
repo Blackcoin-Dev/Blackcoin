@@ -8112,6 +8112,116 @@ BOOST_AUTO_TEST_CASE(recovery_relay_releases_locks_and_rechecks_wallet_generatio
         "resolution_txid=" + action.transaction->GetHash().GetHex()});
 }
 
+BOOST_AUTO_TEST_CASE(automatic_relay_with_the_miner_off_requires_an_epoch_closed_family)
+{
+    // A plan built while the miner is on, for a family the window did not
+    // close, must not be relayed once the miner is off: the end-stop cannot
+    // widen what an automatic action may do.
+    RecoveryShadowScheduleGuard schedule{/*whitelist_height=*/99,
+                                         /*reward_start_height=*/100,
+                                         /*gold_rush_blocks=*/1000};
+    auto wallet = CreateSyncedWallet(
+        *m_node.chain,
+        WITH_LOCK(Assert(m_node.chainman)->GetMutex(),
+                  return m_node.chainman->ActiveChain()),
+        coinbaseKey);
+    const CBlockIndex* tip = WITH_LOCK(
+        ::cs_main, return Assert(m_node.chainman)->ActiveChain().Tip());
+    BOOST_REQUIRE(tip);
+    BOOST_REQUIRE(!IsShadowGoldRushWindowClosedAtTip(tip->nHeight));
+    const auto& anchor_tx = m_coinbase_txns.front();
+    const auto claim = MakeRecoveryTestClaim(
+        COutPoint{anchor_tx->GetHash(), 0},
+        anchor_tx->vout.front().nValue - DEFAULT_TRANSACTION_MAXFEE,
+        anchor_tx->vout.front().scriptPubKey);
+    BOOST_REQUIRE(tip->pprev);
+    const CBlockIndex* stale_observation = tip->pprev;
+    AddRecoveryTestClaim(*wallet, claim, stale_observation->nHeight,
+                         stale_observation->GetBlockHash(),
+                         stale_observation->nHeight,
+                         stale_observation->GetBlockHash());
+    wallet->SetBroadcastTransactions(true);
+    wallet->m_pow_mining_enabled.store(true);
+    ShadowPowClaimRecoveryPolicy policy = DefaultShadowPowClaimRecoveryPolicy();
+    policy.choice_recorded = 1;
+    policy.automatic_enabled = 1;
+    policy.minimum_stale_blocks = 1;
+    policy.max_actions_per_window = 10;
+    bilingual_str policy_error;
+    BOOST_REQUIRE(wallet->SetShadowPowClaimRecoveryPolicy(policy, policy_error));
+
+    ShadowPowClaimRecoveryRequest request;
+    request.mode = ShadowPowClaimRecoveryMode::COMMIT_AND_BROADCAST;
+    request.origin = ShadowPowClaimRecoveryOrigin::AUTOMATIC;
+    request.execution_authority =
+        ShadowPowClaimRecoveryExecutionAuthority::AUTOMATIC_POLICY;
+
+    // The miner goes off between planning and the relay.
+    SetShadowPowClaimRecoveryRelayHookForTesting(
+        +[](CWallet& observed_wallet) { observed_wallet.m_pow_mining_enabled.store(false); });
+    struct ResetRelayHook {
+        ~ResetRelayHook() { SetShadowPowClaimRecoveryRelayHookForTesting(nullptr); }
+    } reset_relay_hook;
+    const auto result = wallet->ResolveShadowPowClaims(request);
+    BOOST_CHECK_EQUAL(result.broadcast, 0U);
+    BOOST_CHECK_EQUAL(result.error,
+        "signed resolution was retained but relay failed: recovery-pow-miner-disabled");
+    BOOST_REQUIRE_EQUAL(result.plan.actions.size(), 1U);
+    BOOST_CHECK(!result.plan.actions.front().epoch_closed_only);
+    BOOST_CHECK(!result.plan.actions.front().in_mempool);
+}
+
+BOOST_AUTO_TEST_CASE(automatic_relay_with_the_miner_off_proceeds_for_an_epoch_closed_family)
+{
+    // The window closed at the pinned tip: the family is unconfirmable, so an
+    // automatic action may be relayed without a running miner.
+    RecoveryShadowScheduleGuard schedule{/*whitelist_height=*/99,
+                                         /*reward_start_height=*/100,
+                                         /*gold_rush_blocks=*/1};
+    auto wallet = CreateSyncedWallet(
+        *m_node.chain,
+        WITH_LOCK(Assert(m_node.chainman)->GetMutex(),
+                  return m_node.chainman->ActiveChain()),
+        coinbaseKey);
+    const CBlockIndex* tip = WITH_LOCK(
+        ::cs_main, return Assert(m_node.chainman)->ActiveChain().Tip());
+    BOOST_REQUIRE(tip);
+    BOOST_REQUIRE(tip->pprev);
+    BOOST_REQUIRE(IsShadowGoldRushWindowClosedAtTip(tip->nHeight));
+    const CBlockIndex* stale_observation = tip->pprev;
+    const auto& anchor_tx = m_coinbase_txns.front();
+    const auto claim = MakeRecoveryTestClaim(
+        COutPoint{anchor_tx->GetHash(), 0},
+        anchor_tx->vout.front().nValue - DEFAULT_TRANSACTION_MAXFEE,
+        anchor_tx->vout.front().scriptPubKey);
+    AddRecoveryTestClaim(*wallet, claim, stale_observation->nHeight,
+                         stale_observation->GetBlockHash(),
+                         stale_observation->nHeight,
+                         stale_observation->GetBlockHash());
+    wallet->SetBroadcastTransactions(true);
+    BOOST_REQUIRE(!wallet->m_pow_mining_enabled.load());
+    ShadowPowClaimRecoveryPolicy policy = DefaultShadowPowClaimRecoveryPolicy();
+    policy.choice_recorded = 1;
+    policy.automatic_enabled = 1;
+    policy.minimum_stale_blocks = 1;
+    policy.max_actions_per_window = 10;
+    bilingual_str policy_error;
+    BOOST_REQUIRE(wallet->SetShadowPowClaimRecoveryPolicy(policy, policy_error));
+
+    ShadowPowClaimRecoveryRequest request;
+    request.mode = ShadowPowClaimRecoveryMode::COMMIT_AND_BROADCAST;
+    request.origin = ShadowPowClaimRecoveryOrigin::AUTOMATIC;
+    request.execution_authority =
+        ShadowPowClaimRecoveryExecutionAuthority::AUTOMATIC_POLICY;
+    const auto result = wallet->ResolveShadowPowClaims(request);
+    BOOST_REQUIRE_EQUAL(result.plan.actions.size(), 1U);
+    BOOST_CHECK(result.plan.actions.front().epoch_closed_only);
+    BOOST_CHECK_MESSAGE(result.error.find("recovery-pow-miner-disabled") == std::string::npos &&
+                            result.error.find("authority was revoked") == std::string::npos,
+                        result.error);
+    BOOST_CHECK_EQUAL(result.signed_and_persisted, 1U);
+}
+
 BOOST_AUTO_TEST_CASE(recovery_audit_records_each_persisted_batch_action_once)
 {
     RecoveryShadowScheduleGuard schedule{/*whitelist_height=*/99,

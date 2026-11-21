@@ -5091,6 +5091,8 @@ ShadowPowClaimRecoveryPlan BuildRecoveryPlanLocked(
         action.component_state = component.state;
         action.conflicts_with_revalidating_unbound_proof =
             component.has_revalidating_unbound_proof;
+        action.epoch_closed_only =
+            IsEpochClosedClaimComponent(component, inventory.active_height);
 
         if (component.anchor_user_locked) {
             action.reason_code = "anchor-user-locked";
@@ -6454,8 +6456,10 @@ ShadowPowClaimRecoveryResult CWallet::ResolveShadowPowClaims(
                     !ValidateShadowPowClaimRecoveryPolicy(
                         m_shadow_pow_claim_recovery_policy) ||
                     (!m_pow_mining_enabled.load() &&
-                     !IsShadowGoldRushWindowClosedAtTip(
-                         result.plan.active_height))) {
+                     !(IsShadowGoldRushWindowClosedAtTip(
+                           result.plan.active_height) &&
+                       result.plan.actions.at(relay_action_indices.at(txid))
+                           .epoch_closed_only))) {
                     audit_outcome = RecoveryAuditOutcome::AUTHORITY_REVOKED;
                     result.error = "automatic recovery authority was revoked before relay";
                     return result;
@@ -6494,7 +6498,10 @@ ShadowPowClaimRecoveryResult CWallet::ResolveShadowPowClaims(
             ShadowPowClaimRecoveryOrigin::AUTOMATIC) {
             broadcast_guard.expected_automatic_policy = automatic_policy;
             broadcast_guard.require_pow_mining_enabled =
-                !IsShadowGoldRushWindowClosedAtTip(result.plan.active_height);
+                !(IsShadowGoldRushWindowClosedAtTip(
+                      result.plan.active_height) &&
+                  result.plan.actions.at(relay_action_indices.at(txid))
+                      .epoch_closed_only);
         }
         AssertLockNotHeld(::cs_main);
         AssertLockNotHeld(cs_wallet);
@@ -6821,6 +6828,17 @@ void CWallet::MaybeAutoResolveShadowPowClaims()
         GetShadowPowClaimRecoveryPolicy();
     if (!policy.HasAutomaticAuthority() ||
         !ValidateShadowPowClaimRecoveryPolicy(policy)) {
+        // Say once per pass why nothing was done, so an operator (and a test)
+        // can tell a pass that declined from one that never ran.
+        const std::optional<int> closed_height =
+            HaveChain() ? chain().getHeight() : std::nullopt;
+        if (closed_height && IsShadowGoldRushWindowClosedAtTip(*closed_height) &&
+            WITH_LOCK(cs_wallet, return !m_shadow_pow_unconfirmed_claim_txids.empty() ||
+                                        !m_shadow_pow_unconfirmed_implicit_claim_txids.empty() ||
+                                        !m_shadow_pow_unclassified_claim_txids.empty())) {
+            WalletLogPrintf("Gold Rush claim recovery: no standing automatic policy after the end at height %d, so no fee-paying recovery was attempted\n",
+                            *closed_height);
+        }
         return;
     }
     if (!m_pow_mining_enabled.load()) {

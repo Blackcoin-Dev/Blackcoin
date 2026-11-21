@@ -4035,6 +4035,8 @@ RPCHelpMan getmigrationstatus()
             {RPCResult::Type::BOOL, "legacy_stake_return_ready", /*optional=*/true, "whether a usable quantum stake return address is saved"},
             {RPCResult::Type::STR, "legacy_stake_return_address", /*optional=*/true, "the saved quantum stake return address, when ready"},
             {RPCResult::Type::STR, "legacy_stake_return_action", /*optional=*/true, "what to do before the window starts, when not ready"},
+            {RPCResult::Type::BOOL, "legacy_stake_return_backup_verified", /*optional=*/true, "whether a verified wallet backup (backupwallet) was made after the return address key was created, when the address is ready"},
+            {RPCResult::Type::STR, "legacy_stake_return_backup_action", /*optional=*/true, "make a fresh wallet backup now: a backup made before the return key existed cannot recover coins paid to it"},
             {RPCResult::Type::BOOL, "legacy_staking_stopped", /*optional=*/true, "true while in the window with no ready return address"},
             {RPCResult::Type::STR, "advice", "human-readable next step"},
         }},

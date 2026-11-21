@@ -757,6 +757,8 @@ void AddLegacyStakeReturnStatus(UniValue& obj, const CWallet& wallet, const Cons
     obj.pushKV("legacy_stake_return_ready", quantum_return.available);
     if (quantum_return.available) {
         obj.pushKV("legacy_stake_return_address", quantum_return.address);
+        obj.pushKV("legacy_stake_return_backup_verified", quantum_return.backup_verified);
+        if (!quantum_return.backup_verified) obj.pushKV("legacy_stake_return_backup_action", QuantumStakeReturnBackupAction());
     } else {
         obj.pushKV("legacy_stake_return_action", quantum_return.reason);
     }
@@ -788,6 +790,8 @@ static RPCHelpMan setquantumstakereturn()
             {RPCResult::Type::STR, "address", "the saved quantum stake return address"},
             {RPCResult::Type::BOOL, "created", "whether a new quantum key was created"},
             {RPCResult::Type::BOOL, "ready", "whether legacy stakes in the window will be paid to it"},
+            {RPCResult::Type::BOOL, "backup_verified", "whether a verified wallet backup was made after this address's key was created"},
+            {RPCResult::Type::STR, "backup_action", /*optional=*/true, "present while no verified backup holds the key: make a fresh wallet backup now"},
         }},
         RPCExamples{
             HelpExampleCli("setquantumstakereturn", "'{\"existing_address\":\"<addr>\"}'")
@@ -833,7 +837,126 @@ static RPCHelpMan setquantumstakereturn()
     result.pushKV("address", EncodeDestination(dest));
     result.pushKV("created", created);
     LOCK(pwallet->cs_wallet);
-    result.pushKV("ready", ResolveLegacyStakeQuantumReturn(*pwallet).available);
+    const LegacyStakeQuantumReturn state = ResolveLegacyStakeQuantumReturn(*pwallet);
+    result.pushKV("ready", state.available);
+    result.pushKV("backup_verified", state.available && state.backup_verified);
+    if (!state.backup_verified) result.pushKV("backup_action", QuantumStakeReturnBackupAction());
+    return result;
+},
+    };
+}
+
+static std::vector<RPCResult> StakeHorizonReadinessDoc()
+{
+    const auto tally = [](const std::string& name, const std::string& what) {
+        return RPCResult{RPCResult::Type::OBJ, name, "", {
+            {RPCResult::Type::NUM, "count", "number of outputs " + what},
+            {RPCResult::Type::STR_AMOUNT, "amount", "their value"},
+        }};
+    };
+    return {
+        {RPCResult::Type::NUM, "height", "the block this describes"},
+        {RPCResult::Type::NUM, "eligible_outputs", "quantum outputs the staker selects for that block"},
+        {RPCResult::Type::STR_AMOUNT, "eligible", "their value, before the reserve balance"},
+        {RPCResult::Type::STR_AMOUNT, "reserve_withheld", "the part of it held back by the reserve balance (legacy stake absorbs the reserve first)"},
+        {RPCResult::Type::STR_AMOUNT, "stakeable", "eligible minus reserve_withheld: the quantum value that can stake"},
+        {RPCResult::Type::OBJ, "excluded", "quantum outputs the staker does not select, by the first rule that stops them", {
+            tally("immature", "unconfirmed or too young to be a kernel at that block"),
+            tally("locked", "coin-locked, a locked Gold Rush payout or locked by demurrage"),
+            tally("below_minimum", "under the staking minimum"),
+            tally("signer_unavailable", "with no signing key available in the wallet's current unlock state"),
+            tally("other", "stopped by another staking rule"),
+        }},
+    };
+}
+
+static UniValue StakeHorizonReadinessToJSON(const StakeHorizonReadiness& horizon)
+{
+    UniValue obj(UniValue::VOBJ);
+    obj.pushKV("height", horizon.height);
+    obj.pushKV("eligible_outputs", horizon.eligible_outputs);
+    obj.pushKV("eligible", ValueFromAmount(horizon.eligible));
+    obj.pushKV("reserve_withheld", ValueFromAmount(horizon.reserve_withheld));
+    obj.pushKV("stakeable", ValueFromAmount(horizon.stakeable));
+    UniValue excluded(UniValue::VOBJ);
+    for (const StakeExclusion reason : {StakeExclusion::IMMATURE, StakeExclusion::LOCKED, StakeExclusion::BELOW_MINIMUM,
+                                        StakeExclusion::SIGNER_UNAVAILABLE, StakeExclusion::OTHER}) {
+        StakeExclusionTally tally;
+        if (const auto it = horizon.excluded.find(reason); it != horizon.excluded.end()) tally = it->second;
+        UniValue entry(UniValue::VOBJ);
+        entry.pushKV("count", tally.count);
+        entry.pushKV("amount", ValueFromAmount(tally.value));
+        excluded.pushKV(StakeExclusionName(reason), std::move(entry));
+    }
+    obj.pushKV("excluded", std::move(excluded));
+    return obj;
+}
+
+static RPCHelpMan getquantumstakereadiness()
+{
+    return RPCHelpMan{"getquantumstakereadiness",
+        "\nRead-only report of how much quantum stake this wallet can stake at the next block and at the first Final\n"
+        "block, computed by the staker's own candidate scan (the same code that selects its kernels), so it uses the\n"
+        "wallet's actual reserve balance, minimum, locks and unlock state. An output is counted under the first rule\n"
+        "that excludes it. Value that will become eligible by Final counts outputs as they will be then, given their\n"
+        "current confirmations; unconfirmed outputs are not counted as eligible. Nothing is changed.\n",
+        {},
+        RPCResult{RPCResult::Type::OBJ, "", "", {
+            {RPCResult::Type::NUM, "next_height", "height of the next block"},
+            {RPCResult::Type::NUM, "final_height", /*optional=*/true, "first Final block (absent when no height schedule exists)"},
+            {RPCResult::Type::NUM, "blocks_to_final", "blocks from the next block to the first Final block; 0 once Final has started"},
+            {RPCResult::Type::STR_AMOUNT, "quantum_total", "value of every quantum output the staker's scan considers, eligible or not"},
+            {RPCResult::Type::NUM, "quantum_outputs", "their number"},
+            {RPCResult::Type::OBJ, "next_block", "quantum stake for the next block", StakeHorizonReadinessDoc()},
+            {RPCResult::Type::OBJ, "at_final", "quantum stake for the first Final block, with current maturities (the same as next_block once Final has started)", StakeHorizonReadinessDoc()},
+            {RPCResult::Type::STR_AMOUNT, "legacy_to_migrate", "legacy value still to migrate (spendable now, or waiting to mature or unlock)"},
+            {RPCResult::Type::NUM, "legacy_outputs", "number of those legacy outputs"},
+            {RPCResult::Type::OBJ, "stake_return", "the quantum stake return address of legacy stakes", {
+                {RPCResult::Type::BOOL, "ready", "whether a usable address is saved"},
+                {RPCResult::Type::STR, "address", /*optional=*/true, "the saved address, when ready"},
+                {RPCResult::Type::STR, "action", /*optional=*/true, "what to do when it is not ready"},
+                {RPCResult::Type::BOOL, "backup_verified", "whether a verified backup was made after its key was created"},
+                {RPCResult::Type::STR, "backup_action", /*optional=*/true, "present while no verified backup holds the key"},
+            }},
+            {RPCResult::Type::BOOL, "wallet_locked", "fully locked: no signer is available and staking waits"},
+            {RPCResult::Type::BOOL, "staking_only_unlock", "unlocked for staking only"},
+            {RPCResult::Type::STR_AMOUNT, "reserve_balance", "the reserve balance held back from staking"},
+            {RPCResult::Type::STR_AMOUNT, "minimum_stake_amount", "the smallest output the wallet stakes"},
+        }},
+        RPCExamples{HelpExampleCli("getquantumstakereadiness", "") + HelpExampleRpc("getquantumstakereadiness", "")},
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
+{
+    std::shared_ptr<CWallet> const pwallet = GetWalletForJSONRPCRequest(request);
+    if (!pwallet) return UniValue::VNULL;
+    QuantumStakeReadiness readiness;
+    {
+        LOCK2(::cs_main, pwallet->cs_wallet);
+        readiness = AssessQuantumStakeReadiness(*pwallet);
+    }
+    UniValue result(UniValue::VOBJ);
+    result.pushKV("next_height", readiness.next_height);
+    if (readiness.final_height > 0) result.pushKV("final_height", readiness.final_height);
+    result.pushKV("blocks_to_final", readiness.blocks_to_final);
+    result.pushKV("quantum_total", ValueFromAmount(readiness.quantum_total));
+    result.pushKV("quantum_outputs", readiness.quantum_outputs);
+    result.pushKV("next_block", StakeHorizonReadinessToJSON(readiness.next_block));
+    result.pushKV("at_final", StakeHorizonReadinessToJSON(readiness.at_final));
+    result.pushKV("legacy_to_migrate", ValueFromAmount(readiness.legacy_to_migrate));
+    result.pushKV("legacy_outputs", readiness.legacy_outputs);
+    UniValue stake_return(UniValue::VOBJ);
+    stake_return.pushKV("ready", readiness.stake_return.available);
+    if (readiness.stake_return.available) {
+        stake_return.pushKV("address", readiness.stake_return.address);
+    } else {
+        stake_return.pushKV("action", readiness.stake_return.reason);
+    }
+    stake_return.pushKV("backup_verified", readiness.stake_return.available && readiness.stake_return.backup_verified);
+    if (!readiness.stake_return.backup_verified) stake_return.pushKV("backup_action", QuantumStakeReturnBackupAction());
+    result.pushKV("stake_return", std::move(stake_return));
+    result.pushKV("wallet_locked", readiness.wallet_locked);
+    result.pushKV("staking_only_unlock", readiness.staking_only_unlock);
+    result.pushKV("reserve_balance", ValueFromAmount(readiness.reserve_balance));
+    result.pushKV("minimum_stake_amount", ValueFromAmount(readiness.min_stake_amount));
     return result;
 },
     };
@@ -888,6 +1011,8 @@ static RPCHelpMan getstakinginfo()
                         {RPCResult::Type::BOOL, "legacy_stake_return_ready", /*optional=*/true, "Whether a usable quantum stake return address is saved in this wallet"},
                         {RPCResult::Type::STR, "legacy_stake_return_address", /*optional=*/true, "The saved quantum stake return address, when ready"},
                         {RPCResult::Type::STR, "legacy_stake_return_action", /*optional=*/true, "What to do before the window starts, when the return address is not ready"},
+                        {RPCResult::Type::BOOL, "legacy_stake_return_backup_verified", /*optional=*/true, "Whether a verified wallet backup (backupwallet) was made after the return address key was created, when the address is ready"},
+                        {RPCResult::Type::STR, "legacy_stake_return_backup_action", /*optional=*/true, "Make a fresh wallet backup now: a backup made before the return key existed cannot recover coins paid to it"},
                         {RPCResult::Type::STR, "warnings", "Current network and wallet warnings"},
                     }
                 },
@@ -6167,6 +6292,7 @@ static const CRPCCommand commands[] =
   //  ------------------    ------------------------
     { "staking",            &getstakinginfo,                 },
     { "staking",            &setquantumstakereturn,          },
+    { "staking",            &getquantumstakereadiness,       },
     { "staking",            &getstakingdonationinfo,         },
     { "staking",            &setstakingdonation,             },
     { "staking",            &getqqdevelopmentdonationinfo,   },

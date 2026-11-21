@@ -700,6 +700,65 @@ BOOST_FIXTURE_TEST_CASE(the_return_address_is_set_automatically_only_when_fully_
     BOOST_CHECK(!MaybeAutoSetQuantumStakeReturn(*wallet)); // already set
 }
 
+BOOST_FIXTURE_TEST_CASE(a_coinbase_exactly_maturity_deep_is_a_candidate_for_the_next_block, LegacyStakeOpenSetup)
+{
+    auto wallet = CreateSyncedWallet(*m_node.chain,
+        WITH_LOCK(Assert(m_node.chainman)->GetMutex(), return m_node.chainman->ActiveChain()), coinbaseKey);
+    BOOST_CHECK_EQUAL(m_node.chainman->ActiveChain().Height(), 100);
+    const int maturity = Params().GetConsensus().nCoinbaseMaturity;
+    const int next_height = 101;
+
+    // Consensus accepts a kernel when next_height - output height >= maturity, so the coinbase
+    // of height 101 - maturity (exactly `maturity` deep at tip 100) is a candidate and the
+    // one above it is not. The wallet's generic immaturity (one block more) still applies to
+    // balances.
+    const auto heights_of = [&](const StakeCoins& coins) {
+        std::set<int> heights;
+        LOCK(wallet->cs_wallet);
+        for (const auto& [wtx, n] : coins) {
+            const TxStateConfirmed* confirmed = wtx->state<TxStateConfirmed>();
+            BOOST_REQUIRE(confirmed);
+            heights.insert(confirmed->confirmed_block_height);
+        }
+        return heights;
+    };
+    const std::set<int> heights = heights_of(LegacyCandidatesAtTip(*this, *wallet)); // also fast == reference
+    BOOST_REQUIRE(!heights.empty());
+    BOOST_CHECK_EQUAL(*heights.rbegin(), next_height - maturity);
+    BOOST_CHECK(!heights.count(next_height - maturity + 1));
+
+    {
+        LOCK(wallet->cs_wallet);
+        for (const auto& [hash, wtx] : wallet->mapWallet) {
+            const TxStateConfirmed* confirmed = wtx.state<TxStateConfirmed>();
+            BOOST_REQUIRE(confirmed);
+            const bool consensus_mature = next_height - confirmed->confirmed_block_height >= maturity;
+            BOOST_CHECK_EQUAL(IsStakeSourceImmatureForNextBlock(*wallet, wtx, next_height), !consensus_mature);
+            // The wallet's own generic formula is one block stricter at exactly the boundary.
+            if (next_height - confirmed->confirmed_block_height == maturity) BOOST_CHECK(wallet->IsTxImmature(wtx));
+        }
+    }
+
+    // The readiness scan: one block ahead the next coinbase qualifies; before it, the reason is IMMATURE.
+    std::map<int, StakeExclusion> reasons;
+    std::set<int> eligible_ahead;
+    {
+        LOCK2(::cs_main, wallet->cs_wallet);
+        StakeCoins coins;
+        CCoinControl coin_control;
+        const StakeScanObserver observer = [&](const COutPoint& outpoint, const CWalletTx& wtx, bool eligible, StakeExclusion why) {
+            const int height = wtx.state<TxStateConfirmed>()->confirmed_block_height;
+            if (eligible) eligible_ahead.insert(height); else reasons[height] = why;
+        };
+        AvailableCoinsForStakingAhead(*wallet, coins, &coin_control, CoinFilterParams{}, /*blocks_ahead=*/1, observer);
+        BOOST_CHECK_EQUAL(coins.size(), eligible_ahead.size());
+    }
+    BOOST_CHECK_EQUAL(*eligible_ahead.rbegin(), next_height + 1 - maturity);
+    BOOST_CHECK(reasons.at(next_height + 2 - maturity) == StakeExclusion::IMMATURE);
+    // And with no look-ahead the staker itself selects exactly the first set.
+    BOOST_CHECK(heights_of(LegacyCandidatesAtTip(*this, *wallet)) == heights);
+}
+
 BOOST_AUTO_TEST_SUITE_END()
 } // namespace
 } // namespace wallet

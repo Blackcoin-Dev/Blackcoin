@@ -209,6 +209,7 @@ BASE_SCRIPTS = [
     'wallet_legacy_stake_quantum_return.py',
     'wallet_legacy_stake_auto_return.py',
     'wallet_migration_continuation.py',
+    'wallet_quantum_stake_maturity.py',
     'wallet_migration_batches.py',
     'feature_quantum_final_lockout_sighash.py',
     'feature_weak_subjectivity_checkpoint.py',

@@ -15,6 +15,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <functional>
 #include <map>
 #include <optional>
 #include <set>
@@ -62,7 +63,14 @@ struct LegacyStakeQuantumReturn
     CScript script;
     std::string address; // the persisted address, when it is set and usable
     std::string reason;  // what the user must do, when !available
+    //! Whether a reopen-and-sign backup verification (backupwallet) was recorded
+    //! after this address's key was created. While false, a wallet backup made
+    //! before the key existed cannot recover coins paid to it.
+    bool backup_verified{false};
 };
+
+/** What to tell the user when a quantum stake return key is not yet in a verified backup. */
+std::string QuantumStakeReturnBackupAction();
 
 /** Plain-language notice for status output: the height from which legacy
  *  stakes are paid to a quantum address, which address, whether the wallet is
@@ -120,6 +128,69 @@ struct BoundedLegacyStakeCandidates
     std::vector<BoundedLegacyStakeCandidate> candidates;
     bool capacity_exceeded{false};
 };
+
+/** Why the staker does not select an output (the first failing test). */
+enum class StakeExclusion {
+    NONE,                //! not excluded
+    IMMATURE,            //! unconfirmed, or too young to be a kernel at that block
+    LOCKED,              //! coin-locked, a locked Gold Rush payout, or locked by demurrage
+    BELOW_MINIMUM,       //! under the staking minimum (the wallet's or the scan's)
+    SIGNER_UNAVAILABLE,  //! the wallet holds no signing key for it
+    OTHER,               //! any other staking rule (phase, kernel type, reuse, protected state)
+};
+const char* StakeExclusionName(StakeExclusion reason);
+
+/** Called for every candidate the staker's scan evaluates: whether it would be
+ *  selected, and if not, why. */
+using StakeScanObserver = std::function<void(const COutPoint& outpoint, const CWalletTx& wtx, bool eligible, StakeExclusion reason)>;
+
+/** The staker's own candidate scan (AvailableCoinsForStaking) evaluated for the block
+ *  `blocks_ahead` blocks after the next one, with every candidate reported to
+ *  `observer`. blocks_ahead 0 is exactly what the staker selects now. */
+void AvailableCoinsForStakingAhead(const CWallet& wallet,
+                           std::vector<std::pair<const CWalletTx*, unsigned int> >& vCoins,
+                           const CCoinControl* coinControl,
+                           const CoinFilterParams& params,
+                           int blocks_ahead,
+                           const StakeScanObserver& observer) EXCLUSIVE_LOCKS_REQUIRED(::cs_main, wallet.cs_wallet);
+
+struct StakeExclusionTally
+{
+    int64_t count{0};
+    CAmount value{0};
+};
+
+/** Quantum stake as the staker sees it for one block. */
+struct StakeHorizonReadiness
+{
+    int height{0};                  //! the block this describes
+    int64_t eligible_outputs{0};    //! quantum outputs the staker selects
+    CAmount eligible{0};            //! their value
+    CAmount reserve_withheld{0};    //! part of it held back by the reserve balance
+    CAmount stakeable{0};           //! eligible minus reserve_withheld
+    std::map<StakeExclusion, StakeExclusionTally> excluded; //! quantum outputs not selected, by reason
+};
+
+/** Operator view of quantum staking readiness for the next block and for the first Final block. */
+struct QuantumStakeReadiness
+{
+    int next_height{0};
+    int final_height{0};            //! first Final block (0 when no height schedule exists)
+    int64_t blocks_to_final{0};     //! 0 once Final has started
+    int64_t quantum_outputs{0};     //! quantum outputs the staker's scan considers (selected or not)
+    CAmount quantum_total{0};
+    StakeHorizonReadiness next_block;
+    StakeHorizonReadiness at_final; //! same as next_block once Final has started
+    int64_t legacy_outputs{0};      //! legacy outputs still to migrate (spendable now or waiting)
+    CAmount legacy_to_migrate{0};
+    bool wallet_locked{false};      //! fully locked: no signer, the staker idles
+    bool staking_only_unlock{false};
+    CAmount reserve_balance{0};
+    CAmount min_stake_amount{0};
+    LegacyStakeQuantumReturn stake_return;
+};
+QuantumStakeReadiness AssessQuantumStakeReadiness(const CWallet& wallet)
+    EXCLUSIVE_LOCKS_REQUIRED(::cs_main, wallet.cs_wallet);
 
 /* Start staking */
 void StartStake(CWallet& wallet);
@@ -210,6 +281,15 @@ static constexpr std::chrono::seconds STAKE_SLOT_CACHE_MAX_AGE{120};
 //! Test hook and operator escape: false makes every slot select and check
 //! exactly as before the cache existed. Default true.
 extern std::atomic<bool> g_stake_slot_cache_enabled;
+
+/** True when `wtx` is a coinbase or coinstake that is not yet old enough to be a
+ * kernel or an input of a block at `spend_height` (the tip height plus one).
+ * Consensus accepts it when `spend_height - output height >= nCoinbaseMaturity`,
+ * so a block `maturity` above it may already stake it. This is for staking
+ * eligibility only: the wallet's balance and ordinary spending keep
+ * CWallet::IsTxImmature. */
+bool IsStakeSourceImmatureForNextBlock(const CWallet& wallet, const CWalletTx& wtx, int spend_height)
+    EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet);
 
 /** The selection and kernel inputs for the slot at `tip`; served from the
  * wallet's cache when it is valid, otherwise built (and kept, unless caching is

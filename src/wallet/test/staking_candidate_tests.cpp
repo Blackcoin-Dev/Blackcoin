@@ -1409,7 +1409,9 @@ BOOST_FIXTURE_TEST_CASE(a_new_key_becomes_the_return_address_after_a_verified_ba
     }
     gArgs.ForceSetArg("-quantumkeybackupdir", fs::PathToString(base));
     const std::string pending_address = WITH_LOCK(wallet->cs_wallet, return EncodeDestination(WitnessUnknown{QUANTUM_MIGRATION_WITNESS_VERSION, wallet->m_quantum_return_pending->witness_program}));
-    const QuantumStakeReturnPreparation prep = PrepareQuantumStakeReturn(*wallet, QuantumStakeReturnTrigger::AUTOMATIC);
+    // The wallet's own (automatic) retry waits a minute after a failure; an explicit call does not.
+    BOOST_CHECK(PrepareQuantumStakeReturn(*wallet, QuantumStakeReturnTrigger::AUTOMATIC).outcome == Outcome::NO_ACTION);
+    const QuantumStakeReturnPreparation prep = PrepareQuantumStakeReturn(*wallet, QuantumStakeReturnTrigger::EXPLICIT);
     BOOST_CHECK(prep.outcome == Outcome::CREATED_ADDRESS);
     BOOST_CHECK_EQUAL(prep.address, pending_address);
     {

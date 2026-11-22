@@ -2764,6 +2764,9 @@ static util::Result<CreatedTransactionResult> CreateTransactionInternal(
                                               quantum_phase.spend_height);
         }
         if (!has_protected_lineage) {
+            if (final_quantum_lockout) {
+                return util::Error{_("Selected inputs have no fork-unique Quantum Quasar lineage. Legacy coins can no longer be spent; a quantum input with protected lineage (a migrated coin, a Gold Rush payout, or their descendants) must be among the selected inputs.")};
+            }
             return util::Error{_("Selected inputs have no fork-unique Quantum Quasar lineage. Add/select a P2PKH or non-witness P2SH anchor input; native or wrapped witness-only pre-Gold-Rush coins cannot be spent alone after activation.")};
         }
         if (spends_quantum_input && nChangePosInOut != -1 &&

@@ -20,10 +20,12 @@ second, now stale, is then relayed to the first node by a peer:
  * a peer that sends a consensus-invalid transaction (value out above value in) is disconnected,
    so the test would notice if "not punished" were simply "nothing is ever punished".
 
-No signature work may precede a rejection that ends without punishment. The attestation signature
-does not cover the sequence numbers of the enclosing transaction, so variants of one current
-attestation (with a relative lock the fee input cannot meet) carry a valid attestation into the
-mempool's cheap sequence-lock decision. The node logs one line each time it verifies attestation
+The guarantee is limited to the preliminary checks identified here (the relative lock, the stale
+referenced state, the value boundary and the package limit); other rejections, such as script-policy
+failures and mempool trimming, can still follow a verification. The attestation signature does not
+cover the sequence numbers of the enclosing transaction, so variants of one current attestation
+(with a relative lock the fee input cannot meet) carry a valid attestation into the mempool's cheap
+sequence-lock decision. The node logs one line each time it verifies attestation
 signatures (-debug=mempool); the variants must produce none and must not be punished. A variant
 with a corrupted signature and the same cheap failure is reported for the cheap reason (a corrupted
 signature can only be reported by verifying it). The same current attestation with a corrupted
@@ -35,9 +37,10 @@ attestation verification pass happens at all:
 
  * the demurrage value boundary: a fee input that was still inside the grace period at the tip and
    decays at the next block (it "just crossed the boundary"). The transaction was valid when signed;
-   at the next-block evaluation point its input is worth less than its output. It is turned away as a
-   recent consensus change (not punished). The same transaction with an output no input could pay for
-   at either point is a plain consensus failure (punished). Neither reaches the verification;
+   at the next-block evaluation point its input is worth less, so the fee the wallet left falls short of
+   the minimum fee (a minimum-fee shortfall, bad-txns-fee-not-enough). It is turned away as a recent
+   consensus change (not punished). The same transaction with an output no input could pay for at
+   either point is a plain consensus failure (punished). Neither reaches the verification;
  * a package whose members pass their own checks and is rejected at the package stage (the package
    ancestor limit, node restarted with -limitancestorcount=1): nothing is verified.
 """
@@ -98,6 +101,15 @@ class DemurrageAttestationRelayTest(BitcoinTestFramework):
             self.generatetoaddress(node, 1, address, sync_fun=self.no_op)
             self.set_mt(self.mt + 16)
 
+    def settle(self):
+        """Every node has delivered its validation notifications (wallets have seen the blocks and transactions)."""
+        for n in self.nodes:
+            n.syncwithvalidationinterfacequeue()
+
+    def wait_in_mempool(self, node, txid):
+        """A transaction created through a wallet is in that node's mempool (a barrier before the next step uses it)."""
+        self.wait_until(lambda: txid in node.getrawmempool(), timeout=30)
+
     def run_test(self):
         node0, node1 = self.nodes
         self.set_mt((int(time.time()) & ~0xf) + 16)
@@ -118,9 +130,11 @@ class DemurrageAttestationRelayTest(BitcoinTestFramework):
         self.generate(COINBASE_MATURITY + 2, funder)
         self.sync_blocks()
         # One transaction funds every output, so each stays an independent, unchained coin.
-        wallet.sendmany("", {attest_addr: Decimal("11"), package_key_addr: Decimal("11"), fee_addrs[0]: Decimal("1"), fee_addrs[1]: Decimal("1"),
-                             lock_addr: Decimal("7")})
+        funding_txid = wallet.sendmany("", {attest_addr: Decimal("11"), package_key_addr: Decimal("11"), fee_addrs[0]: Decimal("1"),
+                                            fee_addrs[1]: Decimal("1"), lock_addr: Decimal("7")})
+        self.wait_in_mempool(node0, funding_txid)
         self.generate(1, funder)
+        assert_equal(node0.getrawtransaction(funding_txid, True)["confirmations"], 1)
         self.log.info("Mine through the Migration window until demurrage is active")
         for _ in range(40):
             if node0.getcirculatingsupply()["demurrage_active"]:
@@ -129,6 +143,7 @@ class DemurrageAttestationRelayTest(BitcoinTestFramework):
         assert node0.getcirculatingsupply()["demurrage_active"]
         self.generate(12, mining)  # the attestation is due, and the interval after a first one is a month
         self.sync_blocks()
+        self.settle()
 
         self.log.info("Node 1 holds the same wallet (a backup restored there)")
         backup = self.options.tmpdir + "/relay_backup.dat"
@@ -140,6 +155,7 @@ class DemurrageAttestationRelayTest(BitcoinTestFramework):
 
         self.log.info("B is signed on node 1 against the current state, from its own fee inputs")
         b_txid = copy.senddemurrageattestation(attest_addr)["txid"]
+        self.wait_in_mempool(node1, b_txid)
         b_inputs = [(v["txid"], v["vout"]) for v in node1.getrawtransaction(b_txid, True)["vin"]]
         b_hex = node1.getrawtransaction(b_txid)
         b_tx = from_hex(CTransaction(), b_hex)
@@ -190,6 +206,7 @@ class DemurrageAttestationRelayTest(BitcoinTestFramework):
         copy_package_addr = copy.getnewquantumaddress()["address"]  # node 1's own address for the parent's output
         copy_change_addr = copy.getnewquantumaddress()["address"]
         p_txid = copy.sendtoaddress(address=copy_package_addr, amount=Decimal("2"), change_address=copy_change_addr)
+        self.wait_in_mempool(node1, p_txid)
         p_hex = node1.getrawtransaction(p_txid)
         p_vout = [i for i, o in enumerate(node1.getrawtransaction(p_txid, True)["vout"])
                   if o["scriptPubKey"].get("address") == copy_package_addr][0]
@@ -200,6 +217,7 @@ class DemurrageAttestationRelayTest(BitcoinTestFramework):
                 locked.append({"txid": u["txid"], "vout": u["vout"]})
         # The child attests the second key (the first one is pending on node 1) and pays its fee from the parent's output.
         child_txid = copy.senddemurrageattestation(package_key_addr)["txid"]
+        self.wait_in_mempool(node1, child_txid)
         child_hex = node1.getrawtransaction(child_txid)
         child_tx = from_hex(CTransaction(), child_hex)
         assert any(i.prevout.hash == int(p_txid, 16) and i.prevout.n == p_vout for i in child_tx.vin), "the child must spend the parent"
@@ -271,10 +289,12 @@ class DemurrageAttestationRelayTest(BitcoinTestFramework):
         for txid, vout in b_inputs:
             wallet.lockunspent(False, [{"txid": txid, "vout": vout}])  # A must not reuse B's inputs
         a_txid = wallet.senddemurrageattestation(attest_addr)["txid"]
+        self.wait_in_mempool(node0, a_txid)
         a_inputs = [(v["txid"], v["vout"]) for v in node0.getrawtransaction(a_txid, True)["vin"]]
         assert not set(a_inputs) & set(b_inputs), (a_inputs, b_inputs)
         self.generate(1, mining)
         assert_equal(node0.getrawtransaction(a_txid, True)["confirmations"], 1)
+        self.settle()
 
         peer = node0.add_p2p_connection(P2PInterface())
         with node0.assert_debug_log(["stale-demurrage-attestation-state"], unexpected_msgs=[verify_line]):
@@ -285,6 +305,7 @@ class DemurrageAttestationRelayTest(BitcoinTestFramework):
         peer.peer_disconnect()
 
         self.log.info("Control: a consensus-invalid transaction from a peer is punished (disconnected)")
+        self.wait_until(lambda: wallet.listunspent(1, 9999999, [lock_addr]), timeout=30)
         lock_utxo = wallet.listunspent(1, 9999999, [lock_addr])[0]
         raw = node0.createrawtransaction([{"txid": lock_utxo["txid"], "vout": lock_utxo["vout"]}],
                                          [{lock_addr: Decimal("9")}])
@@ -296,16 +317,21 @@ class DemurrageAttestationRelayTest(BitcoinTestFramework):
         self.connect_nodes(0, 1)
         self.sync_blocks()
         boundary_addr = copy.getnewquantumaddress()["address"]
-        wallet.sendtoaddress(address=boundary_addr, amount=Decimal("3"), change_address=wallet.getnewquantumaddress()["address"])
+        boundary_txid = wallet.sendtoaddress(address=boundary_addr, amount=Decimal("3"), change_address=wallet.getnewquantumaddress()["address"])
+        self.wait_in_mempool(node0, boundary_txid)
         self.generate(1, mining, node=node0)
         self.sync_blocks()
+        self.settle()
+        assert_equal(node0.getrawtransaction(boundary_txid, True)["confirmations"], 1)
         boundary_height = node0.getblockcount()
         # The coin is created at boundary_height. Its grace period is 24 blocks (six months of four blocks): a
         # spend in the block at boundary_height + 24 is still free of demurrage, one block later it is not.
         # Sign at tip boundary_height + 23 (the wallet only uses a fee input that burns nothing next block).
         self.generate(23, mining, node=node0)
         self.sync_blocks()
+        self.settle()
         assert_equal(node0.getblockcount(), boundary_height + 23)
+        self.wait_until(lambda: [u for u in copy.listunspent(1) if u.get("address") == boundary_addr], timeout=30)
         boundary_utxo = [u for u in copy.listunspent(1) if u.get("address") == boundary_addr]
         assert_equal(len(boundary_utxo), 1)
         self.disconnect_nodes(0, 1)
@@ -315,6 +341,7 @@ class DemurrageAttestationRelayTest(BitcoinTestFramework):
                 copy.lockunspent(False, [{"txid": u["txid"], "vout": u["vout"]}])
                 held.append({"txid": u["txid"], "vout": u["vout"]})
         x_txid = copy.senddemurrageattestation(package_key_addr)["txid"]
+        self.wait_in_mempool(node1, x_txid)
         x_decoded = node1.getrawtransaction(x_txid, True)
         assert_equal([(v["txid"], v["vout"]) for v in x_decoded["vin"]], [(boundary_utxo[0]["txid"], boundary_utxo[0]["vout"])])
         x_hex = node1.getrawtransaction(x_txid)

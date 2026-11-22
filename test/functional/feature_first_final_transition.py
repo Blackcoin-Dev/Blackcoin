@@ -70,6 +70,21 @@ class FirstFinalTransitionTest(BitcoinTestFramework):
         tip_time = max(node.getblockheader(node.getbestblockhash())["time"] for node in self.nodes)
         self.set_mt((tip_time & ~0xf) + 16)
 
+    def sync_mempools_advancing_time(self):
+        """A transaction reaches a peer at a random time after the node's own clock passes the peer's trickle
+        timer (a few seconds on average), and this test's clock only moves when the test moves it. So the
+        pools are compared while the clock advances, instead of waiting on a clock that stands still."""
+        def synced():
+            pools = [set(node.getrawmempool()) for node in self.nodes]
+            if pools.count(pools[0]) == len(pools):
+                return True
+            self.bump(2)
+            return False
+
+        self.wait_until(synced, timeout=60)
+        for node in self.nodes:
+            node.syncwithvalidationinterfacequeue()
+
     def mine(self, node, count, address, sync=True):
         hashes = []
         for _ in range(count):
@@ -185,7 +200,7 @@ class FirstFinalTransitionTest(BitcoinTestFramework):
         assert_equal(node0.getblockcount(), M - 3)
         legacy_dest = funder.getnewaddress("", "legacy")
         legacy_txid = funder.sendtoaddress(legacy_dest, 1)
-        self.sync_mempools()
+        self.sync_mempools_advancing_time()
         # Only empty blocks from here, so the legacy spend is still pending when M connects.
         self.empty_block(node0, funder_address)
         self.empty_block(node0, funder_address)

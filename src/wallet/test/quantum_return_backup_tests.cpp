@@ -6,12 +6,15 @@
 #include <common/args.h>
 #include <test/util/setup_common.h>
 #include <util/fs.h>
+#include <util/getuniquepath.h>
 #include <util/string.h>
 #include <wallet/quantum_return_backup.h>
 
 #include <boost/test/unit_test.hpp>
 
+#include <algorithm>
 #include <fstream>
+#include <functional>
 #include <set>
 #include <string>
 #include <vector>
@@ -281,6 +284,92 @@ BOOST_AUTO_TEST_CASE(a_failed_commit_of_a_new_backup_directory_or_its_parent_ent
     const fs::path other = m_path_root / "durable-other" / "wallet";
     BOOST_CHECK_MESSAGE(EnsureQuantumKeyBackupDirectory(other, error), error);
     BOOST_CHECK(fs::is_directory(other));
+}
+
+namespace {
+/** Records every directory the backup code commits, can make named ones fail, and restores the real commit. */
+class ScopedCommitRecorder
+{
+public:
+    ScopedCommitRecorder()
+    {
+        SetQuantumKeyBackupDirectoryCommitForTest([this](const fs::path& path) {
+            committed.push_back(path);
+            return failing.count(path) == 0;
+        });
+    }
+    ~ScopedCommitRecorder() { SetQuantumKeyBackupDirectoryCommitForTest({}); }
+    bool Committed(const fs::path& path) const { return std::find(committed.begin(), committed.end(), path) != committed.end(); }
+
+    std::vector<fs::path> committed;
+    std::set<fs::path> failing;
+};
+} // namespace
+
+// A directory made by an earlier attempt that was interrupted between its creation and the commit of its parent's
+// entry exists when the retry runs: only the new directories below it are made. The retry still commits the whole
+// chain, the ancestor that holds the entry of the interrupted one included, up to the root of the file system for a
+// directory outside the data directory.
+BOOST_AUTO_TEST_CASE(a_retry_commits_every_ancestor_an_interrupted_attempt_may_have_left_uncommitted)
+{
+    const fs::path base = m_path_root / "retry-base";
+    const fs::path first = base / "a";
+    const fs::path directory = first / "b" / "wallet";
+    // The earlier attempt made "a" and stopped before the entry of "a" in "retry-base" was committed.
+    BOOST_REQUIRE(fs::create_directories(first));
+    ScopedCommitRecorder recorder;
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(EnsureQuantumKeyBackupDirectory(directory, error), error);
+    BOOST_CHECK(fs::is_directory(directory));
+    // The wallet's directory, every ancestor, and so the entry of each in the directory above it.
+    for (const fs::path& path : std::vector<fs::path>{directory, directory.parent_path(), first, base, m_path_root}) {
+        BOOST_CHECK_MESSAGE(recorder.Committed(path), "the retry did not commit " << fs::PathToString(path));
+    }
+    // Up to the data directory, which the node made, and no further for a directory below it.
+    const fs::path datadir = gArgs.GetDataDirNet();
+    BOOST_CHECK(recorder.Committed(datadir));
+    BOOST_CHECK(!recorder.Committed(datadir.parent_path()));
+}
+
+// Below the data directory the walk ends at the data directory; for a directory outside it, there is nothing known
+// that the node made, so it goes up to the root of the file system.
+BOOST_AUTO_TEST_CASE(a_directory_outside_the_data_directory_is_committed_up_to_the_root)
+{
+    const fs::path outside = GetUniquePath(fs::temp_directory_path() / "quantum-backup-outside");
+    const fs::path directory = outside / "inner" / "wallet";
+    ScopedCommitRecorder recorder;
+    std::string error;
+    const bool made = EnsureQuantumKeyBackupDirectory(directory, error);
+    std::error_code ignored;
+    fs::remove_all(outside, ignored);
+    BOOST_REQUIRE_MESSAGE(made, error);
+    for (const fs::path& path : std::vector<fs::path>{directory, directory.parent_path(), outside, outside.parent_path(), outside.root_path()}) {
+        BOOST_CHECK_MESSAGE(recorder.Committed(path), "not committed: " << fs::PathToString(path));
+    }
+}
+
+// A failed commit leaves the directories it made (nothing relies on taking them away again, which can fail too), and
+// the retry commits all of them.
+BOOST_AUTO_TEST_CASE(a_failed_commit_leaves_its_directories_and_the_retry_commits_the_whole_chain)
+{
+    const fs::path base = m_path_root / "failed-removal-base";
+    const fs::path directory = base / "a" / "wallet";
+    ScopedCommitRecorder recorder;
+    std::string error;
+    // The commit of the directory that holds the entry of "a" fails: the preparation fails.
+    recorder.failing.insert(base);
+    BOOST_CHECK(!EnsureQuantumKeyBackupDirectory(directory, error));
+    BOOST_CHECK_MESSAGE(error.find("durable") != std::string::npos, error);
+    BOOST_CHECK(fs::is_directory(directory)); // left in place
+    // The retry, with the disk working again, commits the wallet's directory, "a", the base and everything above it,
+    // although every directory exists already and nothing has to be made.
+    recorder.failing.clear();
+    recorder.committed.clear();
+    error.clear();
+    BOOST_REQUIRE_MESSAGE(EnsureQuantumKeyBackupDirectory(directory, error), error);
+    for (const fs::path& path : std::vector<fs::path>{directory, directory.parent_path(), base, m_path_root}) {
+        BOOST_CHECK_MESSAGE(recorder.Committed(path), "the retry did not commit " << fs::PathToString(path));
+    }
 }
 
 BOOST_AUTO_TEST_CASE(the_backup_directory_defaults_under_the_network_data_directory)

@@ -9,6 +9,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <set>
 #include <string>
 #include <vector>
@@ -29,9 +30,16 @@ fs::path QuantumKeyBackupBaseDirectory();
 /** The directory one wallet's backups go to: QuantumKeyBackupBaseDirectory() / the wallet's component. */
 fs::path QuantumKeyBackupDirectory(const std::string& wallet_name);
 
-/** Create the wallet's directory (mode 0700 on POSIX, tightened to 0700 when it exists and is wider).
- *  Returns false with the reason in error. */
+/** Create the wallet's directory (mode 0700 on POSIX, tightened to 0700 when it exists and is wider) and make it
+ *  durable: on every call the directory and every ancestor that this feature may have created (up to the data
+ *  directory, or the file system root for a directory outside it) are committed to disk, so a name made by an
+ *  earlier, interrupted attempt is committed too. Returns false with the reason in error; a directory that cannot be
+ *  committed is a failure (the key it protects stays pending). On Windows the directories are flushed through a
+ *  directory handle (FlushFileBuffers); that code is compiled for the Windows target only and has not been run. */
 bool EnsureQuantumKeyBackupDirectory(const fs::path& directory, std::string& error);
+
+/** Tests only: replace the commit of a directory (an empty function restores the real one). */
+void SetQuantumKeyBackupDirectoryCommitForTest(std::function<bool(const fs::path&)> hook);
 
 /** One file name of a generation: quantum-wallet-<UTC yyyymmddThhmmssZ>-h<height, 10 digits>-<suffix>.dat.
  *  The suffix is 16 lower case hex digits. */

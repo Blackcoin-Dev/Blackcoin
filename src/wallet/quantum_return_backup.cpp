@@ -19,6 +19,7 @@
 #include <array>
 #include <cerrno>
 #include <cstdio>
+#include <functional>
 #include <map>
 #include <optional>
 #include <set>
@@ -28,6 +29,8 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#else
+#include <windows.h>
 #endif
 
 namespace wallet {
@@ -52,16 +55,48 @@ bool IsLowerHex(std::string_view s)
     return !s.empty() && std::all_of(s.begin(), s.end(), [](char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'); });
 }
 
-/** Make a directory and its entry in the directory above it durable. Without the second step a power loss can
- *  keep the files below while the directory's own name is lost. On a test chain,
- *  -quantumreturnfailcommit=<name> makes the commit of the entry of the directory called <name> fail, which is
- *  how the tests show that a failure here keeps the key pending. Never reachable on a production chain. */
-bool CommitDirectoryEntry(const fs::path& directory)
+//! Test seam: replaces the commit of a directory (see SetQuantumKeyBackupDirectoryCommitForTest).
+std::function<bool(const fs::path&)> g_directory_commit_hook;
+
+#ifdef WIN32
+/** Flush a directory on Windows: open it as a directory (FILE_FLAG_BACKUP_SEMANTICS) with write access and flush the
+ *  handle. DirectoryCommit() in util/fs_helpers.cpp returns success without flushing on this platform and is left as
+ *  it is for its other callers; the backup must not take that for a commit, so an error here is a failed commit. */
+bool FlushDirectoryWindows(const fs::path& directory)
 {
-    if (!DirectoryCommit(directory)) return false;
-    if (Params().IsTestChain() && gArgs.GetArg("-quantumreturnfailcommit", "") == fs::PathToString(directory.filename())) return false;
-    const fs::path parent = directory.parent_path();
-    return DirectoryCommit(parent.empty() ? fs::path{"."} : parent);
+    const HANDLE handle = ::CreateFileW(directory.wstring().c_str(), GENERIC_WRITE,
+                                        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                                        FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    if (handle == INVALID_HANDLE_VALUE) {
+        LogPrintf("Unable to open directory %s for durable commit: %s\n", fs::PathToString(directory), Win32ErrorString(static_cast<int>(::GetLastError())));
+        return false;
+    }
+    bool committed = true;
+    if (!::FlushFileBuffers(handle)) {
+        LogPrintf("Unable to durably commit directory %s: %s\n", fs::PathToString(directory), Win32ErrorString(static_cast<int>(::GetLastError())));
+        committed = false;
+    }
+    if (!::CloseHandle(handle)) committed = false;
+    return committed;
+}
+#endif
+
+/** Make the entries of one directory durable: what has been created in it and what has been renamed into it. */
+bool CommitDirectory(const fs::path& directory)
+{
+    if (g_directory_commit_hook) return g_directory_commit_hook(directory);
+#ifdef WIN32
+    return FlushDirectoryWindows(directory);
+#else
+    return DirectoryCommit(directory);
+#endif
+}
+
+/** On a test chain, -quantumreturnfailcommit=<name> makes the commit of the entry of the directory called <name> fail,
+ *  which is how the tests show that a failure here keeps the key pending. Never reachable on a production chain. */
+bool CommitOfEntryIsInjectedToFail(const fs::path& directory)
+{
+    return Params().IsTestChain() && gArgs.GetArg("-quantumreturnfailcommit", "") == fs::PathToString(directory.filename());
 }
 
 std::string ManifestName(const std::string& file_name)
@@ -151,6 +186,11 @@ fs::path QuantumKeyBackupDirectory(const std::string& wallet_name)
     return QuantumKeyBackupBaseDirectory() / fs::PathFromString(QuantumKeyBackupWalletComponent(wallet_name));
 }
 
+void SetQuantumKeyBackupDirectoryCommitForTest(std::function<bool(const fs::path&)> hook)
+{
+    g_directory_commit_hook = std::move(hook);
+}
+
 bool EnsureQuantumKeyBackupDirectory(const fs::path& directory, std::string& error)
 {
     try {
@@ -161,7 +201,6 @@ bool EnsureQuantumKeyBackupDirectory(const fs::path& directory, std::string& err
             missing.push_back(path);
             if (path == path.parent_path()) break;
         }
-        std::set<fs::path> committed;
         for (auto it = missing.rbegin(); it != missing.rend(); ++it) {
 #ifndef WIN32
             if (::mkdir(it->c_str(), S_IRWXU) != 0 && errno != EEXIST) {
@@ -176,17 +215,6 @@ bool EnsureQuantumKeyBackupDirectory(const fs::path& directory, std::string& err
                 return false;
             }
 #endif
-            // Each directory made here is made durable, with its entry in the directory above it, before the next
-            // one and before the backup and the activation of the key it protects. When that fails the directory
-            // is taken away again (it is empty), so that the next attempt makes and commits it anew instead of
-            // finding it and taking it as durable.
-            if (!CommitDirectoryEntry(*it)) {
-                std::error_code ignored;
-                fs::remove(*it, ignored);
-                error = strprintf("cannot make the new backup directory %s durable", fs::PathToString(*it));
-                return false;
-            }
-            committed.insert(*it);
         }
         if (!fs::is_directory(directory)) {
             error = strprintf("the backup path %s is not a directory", fs::PathToString(directory));
@@ -203,12 +231,24 @@ bool EnsureQuantumKeyBackupDirectory(const fs::path& directory, std::string& err
             }
         }
 #endif
-        // The wallet's directory and the base above it are committed on every call as well: one a failed or
-        // interrupted earlier attempt left only in the page cache is not taken as durable.
-        for (const fs::path& path : std::array<fs::path, 2>{directory, directory.parent_path()}) {
-            if (path.empty() || committed.count(path)) continue;
-            if (!CommitDirectoryEntry(path)) {
+        // Durability is established on EVERY call for the whole chain of directories that this feature may have
+        // created and not yet committed: the wallet's own directory, then each ancestor, up to the data directory
+        // when the backup directory is below it (the node made that one) and to the root of the file system when it
+        // is not. Flushing a directory commits the entries made in it, so flushing the parent of each is what makes
+        // the name of the directory below it durable. A directory made by an earlier attempt that was interrupted
+        // between its creation and the commit of its parent's entry, or that could not be taken away again, is
+        // found by this walk like any other: nothing here depends on what an earlier attempt managed to undo.
+        const fs::path datadir = gArgs.GetDataDirNet();
+        for (fs::path path = directory;; path = path.parent_path()) {
+            if (!CommitDirectory(path)) {
                 error = strprintf("cannot make the backup directory %s durable", fs::PathToString(path));
+                return false;
+            }
+            const fs::path parent = path.parent_path();
+            if (path == datadir || parent.empty() || parent == path) break;
+            // The entry of `path` is in `parent`, which the next round commits.
+            if (CommitOfEntryIsInjectedToFail(path)) {
+                error = strprintf("cannot make the entry of the backup directory %s durable", fs::PathToString(path));
                 return false;
             }
         }

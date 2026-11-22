@@ -333,8 +333,34 @@ class FinalStakeReserveTest(TransitionTFinalTestBase, BitcoinTestFramework):
         assert_equal(len(sole), 1)
         sole_outpoint = {"txid": sole[0]["txid"], "vout": sole[0]["vout"]}
         assert_equal(self.reserved_keys(single), {key(sole_outpoint)})
+        # Readiness applies the reserve to the block the staker makes next: the sole output is an eligible output of the
+        # scan (and counted for F), yet it is not stakeable now and takes nothing from the reserve balance.
+        readiness = single.getquantumstakereadiness()
+        now, at_final = readiness["next_block"], readiness["at_final"]
+        assert_equal(now["height"], GUARD_START + 1)
+        assert_equal(now["eligible_outputs"], 1)
+        assert_equal(now["reserve_withheld_outputs"], 1)
+        assert_equal(now["reserve_withheld_nominal"], now["eligible_nominal"])
+        assert_equal(now["candidate_total"], 0)
+        assert_equal(now["allowed_balance"], 0)
+        assert_equal(now["stakeable_outputs"], 0)
+        assert_equal(now["stakeable_effective"], 0)
+        assert_equal(now["largest_kernel"], 0)
+        assert_equal(at_final["height"], F)
+        assert_equal(at_final["eligible_outputs"], 1)
+        assert_equal(at_final["reserve_withheld_outputs"], 0)
+        assert_equal(at_final["stakeable_outputs"], 1)
+        assert_equal(readiness["final_stake_reserve"]["eligible_count"], 1)
         self.assert_no_wallet_block(node, single, sole_outpoint, GUARD_START)
+        # The staking weight shown is what the constructor can use: nothing, while the only output is withheld.
+        self.wait_until(lambda: single.getstakinginfo()["weight"] == 0, timeout=60)
 
+        main_now = wallet.getquantumstakereadiness()["next_block"]
+        assert_equal(main_now["eligible_outputs"], K_MAIN)
+        assert_equal(main_now["reserve_withheld_outputs"], 3)
+        assert_equal(main_now["stakeable_outputs"], 3)
+        assert_equal(Decimal(str(main_now["candidate_total"])) + Decimal(str(main_now["reserve_withheld_nominal"])),
+                     Decimal(str(main_now["eligible_nominal"])))
         self.log.info("Three stakes from the unreserved outputs at 83, 84 and 85")
         stake_hashes = []
         remaining = set(free)
@@ -391,6 +417,14 @@ class FinalStakeReserveTest(TransitionTFinalTestBase, BitcoinTestFramework):
         assert_equal(released["reserved_count"], 0)
         assert_equal(wallet.getquantumstakereadiness()["next_block"]["height"], F)
         assert_equal(wallet.getquantumstakereadiness()["next_block"]["eligible_outputs"], 3)  # the reserve, mature at F
+        # Released: nothing is held back, yet the eligibility at F is reported accurately rather than zeroed.
+        assert_equal(wallet.getquantumstakereadiness()["next_block"]["reserve_withheld_outputs"], 0)
+        assert_equal(wallet.getquantumstakereadiness()["next_block"]["stakeable_outputs"], 3)
+        assert_equal(released["eligible_count"], 3)
+        assert released["eligible_weight"] > 0
+        assert_equal(released["consumed_count"], 3)
+        assert_equal(released["n"], K_MAIN)
+        assert_equal(released["shortfall"], 0)
 
         self.log.info("Block F is made by the wallet's own staker from a reserved output")
         f_hash = self.stake_from(wallet, node, set(reserved))

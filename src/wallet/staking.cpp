@@ -3445,8 +3445,10 @@ FinalStakeReserve ComputeFinalStakeReserve(const CWallet& wallet)
     reserve.schedule_known = true;
     reserve.final_height = *last_migration + 1;
     reserve.guard_first_height = reserve.final_height - int64_t{consensus.nCoinbaseMaturity};
-    if (!reserve.enabled || int64_t{reserve.candidate_height} > *last_migration) return reserve;
-    reserve.active = int64_t{reserve.candidate_height} >= reserve.guard_first_height;
+    // Beyond the first Final block there is nothing to report. At candidate F itself the guard is released: nothing
+    // is enforced and nothing is held back, but the eligibility at F is still computed and reported below.
+    if (!reserve.enabled || int64_t{reserve.candidate_height} > reserve.final_height) return reserve;
+    reserve.active = int64_t{reserve.candidate_height} >= reserve.guard_first_height && int64_t{reserve.candidate_height} <= *last_migration;
 
     // U: the staker's own candidate scan evaluated for the first Final block (maturity, lineage, covenants, locks and the
     // wallet's other staking requirements as they will be at F), restricted to the outputs the wallet stakes quantum with.
@@ -3494,6 +3496,8 @@ FinalStakeReserve ComputeFinalStakeReserve(const CWallet& wallet)
     FinalStakeReservePlan plan = PlanFinalStakeReserve(std::move(unspent), consumed);
     reserve.n = plan.n;
     reserve.target = plan.target;
+    // Released at F: n, R and the eligibility are reported, nothing is held back and nothing is short.
+    if (int64_t{reserve.candidate_height} >= reserve.final_height) return reserve;
     reserve.shortfall = plan.shortfall;
     reserve.reserved = std::move(plan.reserved);
     for (const FinalStakeReserveSource& source : reserve.reserved) {
@@ -3565,7 +3569,11 @@ QuantumStakeReadiness AssessQuantumStakeReadiness(const CWallet& wallet)
     const auto scan = [&](int blocks_ahead, StakeHorizonReadiness& horizon, bool count_total) {
         horizon.height = result.next_height + blocks_ahead;
         CAmount legacy_eligible{0};
-        std::vector<CAmount> effective_principals; // of each selected quantum output, in the scan's order
+        // What the staker leaves alone at that block: the reserve, which is enforced for the next block only (the
+        // candidate F scan has none; the guard is released there).
+        static const std::set<COutPoint> NO_RESERVE;
+        const std::set<COutPoint>& withheld = blocks_ahead == 0 ? result.final_reserve.enforced : NO_RESERVE;
+        std::vector<std::pair<CAmount, bool>> effective_principals; // of each selected quantum output, in the scan's order, and whether withheld
         std::vector<std::pair<const CWalletTx*, unsigned int>> coins;
         CCoinControl coin_control;
         // The very scan the staker runs (SelectCoinsForStaking); the observer only listens.
@@ -3591,8 +3599,13 @@ QuantumStakeReadiness AssessQuantumStakeReadiness(const CWallet& wallet)
                                                     scan_time, principal)) {
                         principal = 0;
                     }
-                    effective_principals.push_back(principal);
+                    const bool reserved = withheld.count(outpoint) > 0;
+                    effective_principals.emplace_back(principal, reserved);
                     horizon.eligible_effective += principal;
+                    if (reserved) {
+                        ++horizon.reserved_outputs;
+                        horizon.reserved_nominal += out.nValue;
+                    }
                 } else {
                     legacy_eligible += out.nValue;
                 }
@@ -3603,13 +3616,15 @@ QuantumStakeReadiness AssessQuantumStakeReadiness(const CWallet& wallet)
             }
         };
         AvailableCoinsForStakingAhead(wallet, coins, &coin_control, CoinFilterParams{}, blocks_ahead, observer);
-        // The constructor's condition (CreateCoinStake): the selected set must exceed the reserve, a kernel
-        // is one output, and its principal may not exceed what is left of the set after the reserve.
-        horizon.candidate_total = legacy_eligible + horizon.eligible_nominal;
+        // The constructor's condition (CreateCoinStake): the selected set, less the outputs the final stake reserve
+        // withholds (they are neither a kernel nor value the reserve balance may be taken from), must exceed the
+        // reserve balance; a kernel is one output, and its principal may not exceed what is left of the set after
+        // the reserve balance.
+        horizon.candidate_total = legacy_eligible + horizon.eligible_nominal - horizon.reserved_nominal;
         horizon.allowed_balance = horizon.candidate_total > wallet.m_reserve_balance
             ? horizon.candidate_total - wallet.m_reserve_balance : 0;
-        for (const CAmount principal : effective_principals) {
-            if (principal <= 0 || principal > horizon.allowed_balance) continue;
+        for (const auto& [principal, reserved] : effective_principals) {
+            if (reserved || principal <= 0 || principal > horizon.allowed_balance) continue;
             ++horizon.stakeable_outputs;
             horizon.stakeable_effective += principal;
             horizon.largest_kernel = std::max(horizon.largest_kernel, principal);
@@ -3642,10 +3657,13 @@ QuantumStakeReadiness AssessQuantumStakeReadiness(const CWallet& wallet)
 }
 
 // Publish the stake weight of a completed full scan for status RPC/GUI readers.
-static void PublishCachedStakeWeight(const CWallet& wallet, CAmount value_in)
+static void PublishCachedStakeWeight(const CWallet& wallet, CAmount value_in, CAmount withheld_value = 0)
 {
-    const CAmount available = value_in > wallet.m_reserve_balance
-        ? value_in - wallet.m_reserve_balance
+    // What the constructor can use: the selection less the outputs the final stake reserve withholds, less the
+    // reserve balance.
+    const CAmount usable = value_in - withheld_value;
+    const CAmount available = usable > wallet.m_reserve_balance
+        ? usable - wallet.m_reserve_balance
         : 0;
     // Publish the cache pair under the same mutex used to assemble the
     // typed staking snapshot. The atomics keep legacy low-latency readers
@@ -3758,6 +3776,8 @@ static std::shared_ptr<StakeSlotCache> BuildStakeSlotCache(const CWallet& wallet
         for (const auto& [wtx, n] : cache->coins) {
             if (cache->final_reserve.count(COutPoint{wtx->GetHash(), n})) cache->final_reserve_value += wtx->tx->vout[n].nValue;
         }
+        // The status weight is what the constructor can use: SelectCoinsForStaking published the whole selection.
+        PublishCachedStakeWeight(wallet, cache->value_in, cache->final_reserve_value);
     }
     // Under demurrage a kernel value depends on the live coin view, which
     // CheckKernel reads per call whatever the cache holds.
@@ -3783,7 +3803,7 @@ std::shared_ptr<const StakeSlotCache> AcquireStakeSlotCache(const CWallet& walle
     }
     if (state.cache && StakeSlotCacheIsCurrent(wallet, *state.cache, tip)) {
         ++state.stats.hits;
-        PublishCachedStakeWeight(wallet, state.cache->value_in);
+        PublishCachedStakeWeight(wallet, state.cache->value_in, state.cache->final_reserve_value);
         return state.cache;
     }
     state.cache = BuildStakeSlotCache(wallet, tip, /*with_kernels=*/true);
@@ -3813,6 +3833,8 @@ StakeSlotKernel CheckStakeSlotKernel(const CWallet& wallet, const StakeSlotCache
         CAmount target{MAX_MONEY};
         SelectCoinsForStaking(wallet, target, fresh, fresh_value);
         confirmed = fresh == slot.coins && fresh_value == slot.value_in;
+        // SelectCoinsForStaking published the whole selection; the weight shown is the usable part.
+        if (confirmed) PublishCachedStakeWeight(wallet, fresh_value, slot.final_reserve_value);
     }
     if (confirmed && slot.final_reserve_active) {
         // The reserve is derived from the wallet and the chain, so a kernel is only reported once a fresh derivation

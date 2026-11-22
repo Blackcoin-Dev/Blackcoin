@@ -904,7 +904,9 @@ static std::vector<RPCResult> StakeHorizonReadinessDoc()
         {RPCResult::Type::NUM, "eligible_outputs", "quantum outputs the staker selects for that block"},
         {RPCResult::Type::STR_AMOUNT, "eligible_nominal", "their face value (what the reserve balance counts)"},
         {RPCResult::Type::STR_AMOUNT, "eligible_effective", "the kernel principal they would give at that block, after any scheduled demurrage"},
-        {RPCResult::Type::STR_AMOUNT, "candidate_total", "face value of everything the staker selects for that block, legacy outputs included: the set the reserve balance is taken from"},
+        {RPCResult::Type::NUM, "reserve_withheld_outputs", "of those, the outputs the final stake reserve withholds from that block (the staker leaves them alone); only the next block has any, and only while the guard is active"},
+        {RPCResult::Type::STR_AMOUNT, "reserve_withheld_nominal", "their face value, which candidate_total leaves out"},
+        {RPCResult::Type::STR_AMOUNT, "candidate_total", "face value of everything the staker can use for that block, legacy outputs included and the withheld reserve left out: the set the reserve balance is taken from"},
         {RPCResult::Type::STR_AMOUNT, "allowed_balance", "candidate_total less the reserve balance (0 when it does not exceed it): the most one coinstake may use"},
         {RPCResult::Type::NUM, "stakeable_outputs", "eligible outputs whose effective principal fits in allowed_balance. A kernel is one whole output, so an output larger than allowed_balance cannot stake at all, whatever its share of the reserve"},
         {RPCResult::Type::STR_AMOUNT, "stakeable_effective", "the effective principal of those outputs"},
@@ -926,6 +928,8 @@ static UniValue StakeHorizonReadinessToJSON(const StakeHorizonReadiness& horizon
     obj.pushKV("eligible_outputs", horizon.eligible_outputs);
     obj.pushKV("eligible_nominal", ValueFromAmount(horizon.eligible_nominal));
     obj.pushKV("eligible_effective", ValueFromAmount(horizon.eligible_effective));
+    obj.pushKV("reserve_withheld_outputs", horizon.reserved_outputs);
+    obj.pushKV("reserve_withheld_nominal", ValueFromAmount(horizon.reserved_nominal));
     obj.pushKV("candidate_total", ValueFromAmount(horizon.candidate_total));
     obj.pushKV("allowed_balance", ValueFromAmount(horizon.allowed_balance));
     obj.pushKV("stakeable_outputs", horizon.stakeable_outputs);
@@ -960,9 +964,9 @@ static std::vector<RPCResult> FinalStakeReserveDoc()
         {RPCResult::Type::NUM, "guard_first_height", /*optional=*/true, "first block at which the guard holds outputs back (absent when schedule_known is false)"},
         {RPCResult::Type::NUM, "final_height", /*optional=*/true, "the first Final block, for which the reserve is kept (absent when schedule_known is false)"},
         {RPCResult::Type::NUM, "n", "N: the wallet's qualifying quantum stake sources, unspent and able to stake at the first Final block, plus those its confirmed coinstakes consumed since the guard began"},
-        {RPCResult::Type::NUM, "target", "R: the number of outputs to hold back, min(32, (N + 1) / 2)"},
+        {RPCResult::Type::NUM, "target", "R: the number of outputs to hold back, min(32, (N + 1) / 2)."},
         {RPCResult::Type::NUM, "reserved_count", "outputs actually held back (R, or fewer when too few outputs are available)"},
-        {RPCResult::Type::ARR, "reserved_outpoints", "the outputs held back, largest effective value at the first Final block first", {
+        {RPCResult::Type::ARR, "reserved_outpoints", "the outputs held back, largest effective value at the first Final block first. Equal effective values are ordered by the outpoint's internal byte order (the transaction hash as stored, not the displayed transaction id text), then by output index, both ascending", {
             {RPCResult::Type::OBJ, "", "", {
                 {RPCResult::Type::STR_HEX, "txid", "transaction id"},
                 {RPCResult::Type::NUM, "vout", "output index"},
@@ -970,7 +974,7 @@ static std::vector<RPCResult> FinalStakeReserveDoc()
             }},
         }},
         {RPCResult::Type::STR_AMOUNT, "reserved_weight", "the effective kernel value of the reserve at the first Final block"},
-        {RPCResult::Type::NUM, "eligible_count", "unspent outputs able to stake at the first Final block (mature by then, even if not mature now)"},
+        {RPCResult::Type::NUM, "eligible_count", "unspent outputs able to stake at the first Final block (mature by then, even if not mature now). Reported for the first Final block itself too, where the guard is released and nothing is held back"},
         {RPCResult::Type::STR_AMOUNT, "eligible_weight", "their effective kernel value at the first Final block"},
         {RPCResult::Type::NUM, "consumed_count", "qualifying sources consumed by this wallet's confirmed coinstakes since the guard began"},
         {RPCResult::Type::NUM, "shortfall", "target less reserved_count"},

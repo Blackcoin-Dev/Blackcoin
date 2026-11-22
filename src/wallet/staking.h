@@ -362,7 +362,9 @@ struct StakeHorizonReadiness
     int64_t eligible_outputs{0};    //! quantum outputs the staker selects
     CAmount eligible_nominal{0};    //! their face value
     CAmount eligible_effective{0};  //! the kernel principal they would give (after demurrage)
-    CAmount candidate_total{0};     //! face value of everything the staker selects, legacy included (the figure the reserve comes off)
+    int64_t reserved_outputs{0};    //! of the eligible outputs, those the final stake reserve withholds from this block (next block only)
+    CAmount reserved_nominal{0};    //! their face value, which candidate_total leaves out
+    CAmount candidate_total{0};     //! face value of everything the staker can use, legacy included, less the withheld reserve (the figure the reserve balance comes off)
     CAmount allowed_balance{0};     //! candidate_total less the reserve balance, 0 when it does not exceed it: the most one coinstake may use
     int64_t stakeable_outputs{0};   //! eligible outputs whose effective principal fits in allowed_balance
     CAmount stakeable_effective{0}; //! their effective principal

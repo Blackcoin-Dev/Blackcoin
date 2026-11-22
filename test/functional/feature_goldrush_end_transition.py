@@ -226,6 +226,14 @@ class GoldRushEndTransitionTest(BitcoinTestFramework):
         assert_equal(len(w0.listunspent(1, 9999999, [addr_b])), 1)
         assert "closed_claim_reserved" not in w0.getbalances()
 
+        self.log.info("Unloading a wallet whose miner the end stopped returns, and the reload leaves the miner stopped")
+        node.unloadwallet("wm")
+        assert "wm" not in node.listwallets()
+        node.loadwallet("wm")
+        wm = node.get_wallet_rpc("wm")
+        self.wait_until(lambda: self.miner_stopped(wm))
+        assert_equal(wm.getpowmininginfo()["gold_rush_ended"], True)
+
 
 if __name__ == '__main__':
     GoldRushEndTransitionTest().main()

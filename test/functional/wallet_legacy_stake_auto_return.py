@@ -15,7 +15,7 @@ starts at 81.
 """
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import assert_equal
-from transition_t_final_util import G, LIFECYCLE_ARGS, MATURITY, TransitionTFinalTestBase
+from transition_t_final_util import G, LAST_LEGACY_STAKE_HEIGHT, LIFECYCLE_ARGS, MATURITY, TransitionTFinalTestBase
 
 
 class LegacyStakeAutoReturnTest(TransitionTFinalTestBase, BitcoinTestFramework):
@@ -64,16 +64,67 @@ class LegacyStakeAutoReturnTest(TransitionTFinalTestBase, BitcoinTestFramework):
         auto = auto_node.get_wallet_rpc(self.default_wallet_name)
         assert_equal(auto.getstakinginfo()["legacy_stake_return_address"], address)
 
-        self.log.info("Policy off: no key is made; an existing quantum address is reused, and only when fully unlocked")
+        self.log.info("Policy off: no key is made (the key inventory is unchanged); an existing quantum address is reused, and only when fully unlocked")
         reuse.staking(True)
         self.bump(32)
         reuse.staking(False)
         assert_equal(reuse.getstakinginfo()["legacy_stake_return_ready"], False)
+        assert_equal(reuse.listquantumaddresses(), [])
         owned = reuse.getnewquantumaddress()["address"]
         reuse.staking(True)
         self.wait_until(lambda: reuse.getstakinginfo()["legacy_stake_return_ready"], timeout=60)
         reuse.staking(False)
         assert_equal(reuse.getstakinginfo()["legacy_stake_return_address"], owned)
+        self.test_unlock_matrix_and_payout()
+
+
+    def test_unlock_matrix_and_payout(self):
+        """Locked, staking-only and fully unlocked wallets; maintenance with staking switched off; an actual payout."""
+        node = self.nodes[0]
+        node.createwallet("matrix", passphrase="pw")
+        wallet = node.get_wallet_rpc("matrix")
+        wallet.walletpassphrase("pw", 100000000)
+        wallet.staking(False)
+        legacy = wallet.getnewaddress("", "legacy")
+        self.generatetoaddress(node, 3, legacy, sync_fun=self.no_op)  # (node 1 is not connected after the restart)
+        self.bump()
+        self.pow_blocks(node, MATURITY + 2, legacy)
+        self.sync_mt_tip()
+        assert node.getblockcount() > G
+        wallet.walletlock()
+
+        def keys():
+            return len(wallet.listquantumaddresses())
+
+        self.log.info("Locked: no key and no record, however often the maintenance runs")
+        node.mockscheduler(61)
+        node.mockscheduler(61)
+        assert_equal(wallet.getstakinginfo()["legacy_stake_return_ready"], False)
+        assert_equal(keys(), 0)
+        self.log.info("Unlocked for staking only: still none (a staking-only unlock cannot make a key)")
+        wallet.walletpassphrase("pw", 100000000, True)
+        node.mockscheduler(61)
+        node.mockscheduler(61)
+        assert_equal(wallet.getstakinginfo()["legacy_stake_return_ready"], False)
+        assert_equal(keys(), 0)
+        self.log.info("Fully unlocked, staking switched OFF: the maintenance still prepares the return address")
+        wallet.walletlock()
+        wallet.walletpassphrase("pw", 100000000)
+        assert_equal(wallet.getstakinginfo()["staking"], False)
+        node.mockscheduler(61)
+        node.mockscheduler(61)
+        self.wait_until(lambda: wallet.getstakinginfo()["legacy_stake_return_ready"], timeout=30)
+        assert_equal(keys(), 1)
+
+        self.log.info("An actual stake from the window pays one output to that address")
+        address = wallet.getstakinginfo()["legacy_stake_return_address"]
+        self.pow_blocks(node, LAST_LEGACY_STAKE_HEIGHT - node.getblockcount(), legacy)
+        self.sync_mt_tip()
+        block_hash = self.stake_one(wallet, node, [legacy])
+        coinstake = node.getblock(block_hash, 2)["tx"][1]
+        valued = [o for o in coinstake["vout"] if o["value"] > 0]
+        assert_equal(len(valued), 1)
+        assert_equal(valued[0]["scriptPubKey"]["address"], address)
 
 
 if __name__ == '__main__':

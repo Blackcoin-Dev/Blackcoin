@@ -76,6 +76,14 @@ struct LegacyStakeQuantumReturn
     bool backup_verified{false};
 };
 
+/** The independent guard CreateCoinStake runs on a legacy kernel in the quantum return window: empty when the
+ *  coinstake is acceptable, else why it is refused. The coinstake must have been built to return to the quantum
+ *  address, a ready return address must exist, and apart from the value-0 outputs (the marker and the legacy
+ *  block-signing key) it has exactly one output of value, paying exactly that return script. A pure function of
+ *  the transaction, so tests can feed it malformed shapes the constructor never makes. */
+std::string LegacyReturnWindowCoinstakeProblem(const CMutableTransaction& coinstake, bool returns_to_quantum,
+                                               const LegacyStakeQuantumReturn& legacy_return);
+
 /** What to tell the user when a quantum stake return key is not yet in a verified backup. */
 std::string QuantumStakeReturnBackupAction();
 

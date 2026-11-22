@@ -3154,6 +3154,26 @@ std::vector<StakeKernelHit> ScanStakeKernels(const CWallet& wallet, unsigned int
 
 // peercoin: create coin stake transaction
 typedef std::vector<unsigned char> valtype;
+std::string LegacyReturnWindowCoinstakeProblem(const CMutableTransaction& coinstake, bool returns_to_quantum,
+                                               const LegacyStakeQuantumReturn& legacy_return)
+{
+    if (!returns_to_quantum || !legacy_return.available) {
+        return "refusing a legacy-return coinstake in the quantum return window";
+    }
+    size_t valued_outputs{0};
+    for (size_t i = 1; i < coinstake.vout.size(); ++i) {
+        if (coinstake.vout[i].nValue == 0) continue;
+        ++valued_outputs;
+        if (coinstake.vout[i].scriptPubKey != legacy_return.script) {
+            return "a legacy kernel in the quantum return window may pay only its quantum return output";
+        }
+    }
+    if (valued_outputs != 1) {
+        return "a legacy kernel in the quantum return window must pay exactly one output";
+    }
+    return "";
+}
+
 bool CreateCoinStake(CWallet& wallet, unsigned int nBits, int64_t nSearchInterval,
                      CMutableTransaction& txNew, CAmount& nFees,
                      CTxDestination destination,
@@ -3551,20 +3571,8 @@ bool CreateCoinStake(CWallet& wallet, unsigned int nBits, int64_t nSearchInterva
     // the window. A legacy kernel there has exactly one output of value, a
     // quantum output of the wallet, and nothing else of value.
     if (legacy_in_window && !fQuantumKernel) {
-        if (!fReturnToQuantum || !legacy_return.available) {
-            return error("CreateCoinStake : refusing a legacy-return coinstake in the quantum return window");
-        }
-        size_t valued_outputs{0};
-        for (size_t i = 1; i < txNew.vout.size(); ++i) {
-            if (txNew.vout[i].nValue == 0) continue;
-            ++valued_outputs;
-            if (txNew.vout[i].scriptPubKey != legacy_return.script) {
-                return error("CreateCoinStake : a legacy kernel in the quantum return window may pay only its quantum return output");
-            }
-        }
-        if (valued_outputs != 1) {
-            return error("CreateCoinStake : a legacy kernel in the quantum return window must pay exactly one output");
-        }
+        const std::string shape_problem = LegacyReturnWindowCoinstakeProblem(txNew, fReturnToQuantum, legacy_return);
+        if (!shape_problem.empty()) return error("CreateCoinStake : %s", shape_problem);
     }
 
     // Sign

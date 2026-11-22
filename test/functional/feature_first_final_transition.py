@@ -240,6 +240,13 @@ class FirstFinalTransitionTest(BitcoinTestFramework):
             assert result["reject-reason"] in ("legacy-spend-disabled", "legacy-output-disabled"), result
         assert_equal(funder.getstakinginfo()["legacy_staking_stopped"], True)
         assert "legacy_staking_notice" not in funder.getstakinginfo()
+        # Even with a ready quantum return address the status says legacy staking has stopped at Final:
+        # the first Final block rejects every legacy kernel whatever the return address is.
+        assert_equal(funder.setquantumstakereturn({"allow_new_quantum_key": True})["ready"], True)
+        ready_info = funder.getstakinginfo()
+        assert_equal(ready_info["legacy_stake_return_ready"], True)
+        assert_equal(ready_info["legacy_staking_in_window"], False)
+        assert_equal(ready_info["legacy_staking_stopped"], True)
 
         self.log.info("Node 1 extends its cold-staked block; node 0 reorganises onto it")
         self.mine(node1, 1, staker_quantum, sync=False)

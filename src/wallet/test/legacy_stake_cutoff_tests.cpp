@@ -3,6 +3,8 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <consensus/params.h>
+#include <primitives/transaction.h>
+#include <script/script.h>
 #include <test/util/setup_common.h>
 #include <wallet/staking.h>
 
@@ -123,6 +125,48 @@ BOOST_AUTO_TEST_CASE(notice_names_the_window_the_return_address_and_the_migratio
 
     // In Final nothing is left to say.
     BOOST_CHECK(LegacyStakingNotice(regtest, 261, ready).empty());
+}
+
+// The independent guard of the coinstake constructor, fed shapes the constructor never makes. A legacy kernel in the
+// return window must have exactly one output of value, paying exactly the saved quantum return script, and must have
+// been built to return to quantum with a ready return address; every other shape is refused with its own reason.
+BOOST_AUTO_TEST_CASE(the_independent_guard_refuses_every_malformed_window_shape)
+{
+    LegacyStakeQuantumReturn ready;
+    ready.available = true;
+    ready.script = CScript() << OP_1 << std::vector<unsigned char>(32, 0x51);
+    const CScript other_script = CScript() << OP_1 << std::vector<unsigned char>(32, 0x52);
+    const CScript legacy_script = CScript() << OP_DUP << OP_HASH160 << std::vector<unsigned char>(20, 0x53) << OP_EQUALVERIFY << OP_CHECKSIG;
+
+    // vout[0] marks the coinstake, vout[1] is the value-0 legacy block-signing key, vout[2] the return.
+    const auto shape = [&](std::vector<CTxOut> outputs) {
+        CMutableTransaction tx;
+        tx.vout.emplace_back(0, CScript());
+        tx.vout.emplace_back(0, legacy_script);
+        for (CTxOut& out : outputs) tx.vout.push_back(std::move(out));
+        return tx;
+    };
+
+    // The one acceptable shape.
+    BOOST_CHECK(LegacyReturnWindowCoinstakeProblem(shape({CTxOut{100, ready.script}}), true, ready).empty());
+    // Extra outputs of no value (a notice, a marker) are not outputs of value.
+    BOOST_CHECK(LegacyReturnWindowCoinstakeProblem(shape({CTxOut{100, ready.script}, CTxOut{0, other_script}}), true, ready).empty());
+
+    // Not built to return to quantum, or no ready return address: refused outright.
+    BOOST_CHECK(!LegacyReturnWindowCoinstakeProblem(shape({CTxOut{100, ready.script}}), false, ready).empty());
+    LegacyStakeQuantumReturn not_ready;
+    BOOST_CHECK(!LegacyReturnWindowCoinstakeProblem(shape({CTxOut{100, ready.script}}), true, not_ready).empty());
+    BOOST_CHECK(LegacyReturnWindowCoinstakeProblem(shape({CTxOut{100, ready.script}}), false, ready).find("refusing") != std::string::npos);
+
+    // A value to a legacy script (the very output this window exists to prevent), or to any other script.
+    BOOST_CHECK(LegacyReturnWindowCoinstakeProblem(shape({CTxOut{100, legacy_script}}), true, ready).find("only its quantum return output") != std::string::npos);
+    BOOST_CHECK(LegacyReturnWindowCoinstakeProblem(shape({CTxOut{100, other_script}}), true, ready).find("only its quantum return output") != std::string::npos);
+    // A second output of value, even to the return script (a stake split or a donation).
+    BOOST_CHECK(LegacyReturnWindowCoinstakeProblem(shape({CTxOut{60, ready.script}, CTxOut{40, ready.script}}), true, ready).find("exactly one output") != std::string::npos);
+    BOOST_CHECK(LegacyReturnWindowCoinstakeProblem(shape({CTxOut{60, ready.script}, CTxOut{40, other_script}}), true, ready).find("only its quantum return output") != std::string::npos);
+    // No output of value at all.
+    BOOST_CHECK(LegacyReturnWindowCoinstakeProblem(shape({}), true, ready).find("exactly one output") != std::string::npos);
+    BOOST_CHECK(LegacyReturnWindowCoinstakeProblem(shape({CTxOut{0, ready.script}}), true, ready).find("exactly one output") != std::string::npos);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

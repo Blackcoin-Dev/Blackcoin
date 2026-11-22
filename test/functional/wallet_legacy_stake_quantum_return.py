@@ -24,6 +24,8 @@ Protocol V3.1, so the proof-of-stake kernel, signature and reward checks run). C
    window keeps the return address; a reorganisation that replaces a window block leaves
    both nodes on one chain;
  * same tip on both nodes at M and at F; after F the quantum outputs spend and stake;
+ * a window block that carries a fee-paying transaction pays principal + reward + the fees to the one
+   quantum output (the checks elsewhere run only on fee-free blocks);
  * exact balances by category: nothing that staked is left in a legacy output; legacy
    coins that never staked are final-locked legacy.
 """
@@ -91,13 +93,13 @@ class LegacyStakeQuantumReturnTest(TransitionTFinalTestBase, BitcoinTestFramewor
         spent = self.nodes[0].getrawtransaction(vin["txid"], True)
         return spent["vout"][vin["vout"]]["value"]
 
-    def assert_pays_one_quantum_output(self, block_hash, quantum_script_hex):
+    def assert_pays_one_quantum_output(self, block_hash, quantum_script_hex, fees=Decimal(0)):
         coinstake, valued = self.coinstake_of(block_hash)
         assert_equal(len(coinstake["vin"]), 1)
         assert_equal(len(valued), 1)
         assert_equal(valued[0]["scriptPubKey"]["hex"], quantum_script_hex)
         assert_equal(valued[0]["scriptPubKey"]["type"], "witness_unknown")
-        assert_equal(valued[0]["value"], self.kernel_value(coinstake) + SUBSIDY)
+        assert_equal(valued[0]["value"], self.kernel_value(coinstake) + SUBSIDY + fees)
         # vout[0] marks the coinstake; vout[1] is the value-0 legacy block signing key.
         assert_equal(coinstake["vout"][0]["value"], 0)
         assert_equal(coinstake["vout"][1]["value"], 0)
@@ -191,6 +193,7 @@ class LegacyStakeQuantumReturnTest(TransitionTFinalTestBase, BitcoinTestFramewor
         assert_equal(wallet.getmigrationstatus()["legacy_stake_return_address"], quantum_address)
 
         staked = []  # (txid, value, principal)
+        fee_total = Decimal(0)  # fees the staked blocks carried
 
         self.log.info("Window: every legacy coinstake pays one quantum output (pubkeyhash kernel)")
         for expected_height in (WINDOW_START, WINDOW_START + 1):
@@ -237,6 +240,21 @@ class LegacyStakeQuantumReturnTest(TransitionTFinalTestBase, BitcoinTestFramewor
         assert_equal(n0.getblock(block)["height"], WINDOW_START + 5)
         staked.append(self.assert_pays_one_quantum_output(block, quantum_script))
 
+        self.log.info("A block that carries a fee-paying transaction pays principal + reward + fees to the one quantum output")
+        # The coinstake collects the fees of the block's transactions; consensus checks the total of
+        # its outputs against principal + reward + fees, and the wallet's single quantum output must
+        # carry all of it (the old checks only ever saw a block with no fees).
+        pow_coin = [u for u in wallet.listunspent(1, 9999999, [pow_addr]) if u["spendable"] and u["confirmations"] > MATURITY][0]
+        fee_txid = wallet.send(outputs=[{wallet.getnewaddress("", "legacy"): Decimal("1")}],
+                               options={"inputs": [{"txid": pow_coin["txid"], "vout": pow_coin["vout"]}],
+                                        "add_inputs": False, "fee_rate": 200})["txid"]
+        block_fee = n0.getmempoolentry(fee_txid)["fees"]["base"]
+        assert block_fee > 0, block_fee
+        block = self.stake_synced(wallet, [stake_addr])
+        assert fee_txid in n0.getblock(block)["tx"], "the fee-paying transaction is in the staked block"
+        staked.append(self.assert_pays_one_quantum_output(block, quantum_script, fees=block_fee))
+        fee_total += block_fee
+
         self.log.info("Up to M: both nodes on one tip")
         self.pow_blocks(n0, M - n0.getblockcount(), pow_addr, sync=True)
         assert_equal(n0.getblockcount(), M)
@@ -258,7 +276,7 @@ class LegacyStakeQuantumReturnTest(TransitionTFinalTestBase, BitcoinTestFramewor
         categories = wallet_info["categories"]
         staked_principal = sum(p for _, _, p in staked)
         staked_value = sum(v for _, v, _ in staked)
-        assert_equal(staked_value, staked_principal + SUBSIDY * len(staked))
+        assert_equal(staked_value, staked_principal + SUBSIDY * len(staked) + fee_total)
         # Every legacy output that remains is one that never staked.
         remaining_legacy = self.legacy_total(wallet)
         assert_equal(categories["final_locked_legacy"]["nominal_amount"], remaining_legacy)
@@ -281,6 +299,11 @@ class LegacyStakeQuantumReturnTest(TransitionTFinalTestBase, BitcoinTestFramewor
         assert_equal(n1.getrawtransaction(sent["txid"], True, n1.getbestblockhash())["confirmations"], 1)
         stake_txid, stake_value, _ = staked[1]
         quantum_kernel = [{"txid": stake_txid, "vout": 2}]
+        # Lock every other output so the wallet's staker has this one kernel only: the block it makes must
+        # then be made from exactly the outpoint that was checked.
+        others = [{"txid": u["txid"], "vout": u["vout"]} for u in wallet.listunspent(0, 9999999)
+                  if (u["txid"], u["vout"]) != (quantum_kernel[0]["txid"], quantum_kernel[0]["vout"])]
+        wallet.lockunspent(False, others)
         for _ in range(3000):
             self.bump()
             if wallet.checkkernel(quantum_kernel)["found"]:
@@ -292,8 +315,13 @@ class LegacyStakeQuantumReturnTest(TransitionTFinalTestBase, BitcoinTestFramewor
         self.set_mt(kernel_time)
         self.wait_until(lambda: n0.getblockcount() > height_before, timeout=60)
         wallet.staking(False)
+        wallet.lockunspent(True, others)
         self.sync_tips()
         assert_equal(n1.getblockcount(), n0.getblockcount())
+        # The block the staker made used exactly the kernel that was checked, not some other coin.
+        post_f_coinstake = n0.getblock(n0.getbestblockhash(), 2)["tx"][1]
+        assert_equal(post_f_coinstake["vin"][0]["txid"], quantum_kernel[0]["txid"])
+        assert_equal(post_f_coinstake["vin"][0]["vout"], quantum_kernel[0]["vout"])
 
     def legacy_total(self, wallet):
         total = Decimal(0)

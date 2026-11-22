@@ -138,6 +138,15 @@ class LegacyStakeCutoffTest(TransitionTFinalTestBase, BitcoinTestFramework):
         assert_equal(info["legacy_staking_stopped"], True)
         assert_equal(node.getquantumquasarinfo()["phase"], "final_lockout")
 
+        self.log.info("Final with a ready return address: legacy staking is still reported as stopped, outside the window")
+        # (The old status said "not stopped" for a wallet with a ready return address, though Final rejects
+        # every legacy kernel.)
+        assert_equal(wallet.setquantumstakereturn({"allow_new_quantum_key": True})["ready"], True)
+        for status in (wallet.getstakinginfo(), wallet.getmigrationstatus()):
+            assert_equal(status["legacy_stake_return_ready"], True)
+            assert_equal(status["legacy_staking_in_window"], False)
+            assert_equal(status["legacy_staking_stopped"], True)
+
 
 if __name__ == '__main__':
     LegacyStakeCutoffTest().main()

@@ -276,6 +276,39 @@ BOOST_AUTO_TEST_CASE(explicit_disable_during_end_stop_wins)
     BOOST_CHECK(!m_wallet.m_pow_resume_below_end.load());
 }
 
+BOOST_AUTO_TEST_CASE(unload_stop_during_end_stop_leaves_no_restart_queued)
+{
+    // What unloading a wallet does to the miner (FlushWallets stops it) completes while the maintenance thread
+    // is poised before taking the authority mutex for the end-stop. The end-stop must find the miner already
+    // stopped: no restart is queued over the unload, nothing hangs, and the wallet's miner state is the
+    // stopped state. (The interleaving INSIDE the join of the workers cannot be pinned without a hook in
+    // StopPowMiningLocked between the stop flag and the join; none exists and none is added here.)
+    m_wallet.m_pow_mining_enabled = true;
+    m_wallet.m_pow_threads = 1;
+    m_wallet.m_pow_cpu_percent = 10;
+
+    std::promise<void> reached;
+    std::promise<void> release;
+    std::shared_future<void> release_future = release.get_future().share();
+    m_wallet.m_pow_reconcile_test_hook = [&](const char* stage) {
+        if (std::string{stage} != "before_end_stop_lock") return;
+        reached.set_value();
+        release_future.wait();
+    };
+    auto worker = std::async(std::launch::async, [&] {
+        m_wallet.ReconcilePowMinerWithWindowState(/*closed=*/true, /*tip_height=*/SHADOW_REWARD_END_HEIGHT);
+    });
+    reached.get_future().wait();
+    m_wallet.StopPowMining();
+    m_wallet.StopStake();
+    release.set_value();
+    worker.get();
+    m_wallet.m_pow_reconcile_test_hook = nullptr;
+
+    BOOST_CHECK(!m_wallet.m_pow_mining_enabled.load());
+    BOOST_CHECK(!m_wallet.m_pow_resume_below_end.load());
+}
+
 BOOST_AUTO_TEST_CASE(end_stop_without_interference_queues_the_restart)
 {
     m_wallet.m_pow_mining_enabled = true;

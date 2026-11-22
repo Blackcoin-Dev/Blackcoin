@@ -1550,6 +1550,7 @@ int MaybeAutoDemurrageAttest(CWallet& wallet)
         bool pending_scanned{false};
         std::set<uint256> suppressed_keys;
         std::set<uint256> stale_scanned_keys;
+        std::map<uint256, std::vector<const PendingWalletAttestation*>> pending_by_key;
         for (const COutput& out : available_list.All()) {
             if (!IsQuantumMigrationScript(out.txout.scriptPubKey)) continue;
             CTxDestination dest;
@@ -1582,11 +1583,27 @@ int MaybeAutoDemurrageAttest(CWallet& wallet)
             // was disconnected, or before a restart): reuse it instead of signing another.
             if (!pending_scanned) {
                 pending_attestations = PendingWalletDemurrageAttestations(wallet);
+                // Indexed by key once, so that a wallet with many outputs and many pending transactions does a
+                // lookup per key instead of walking the whole pending list for every output.
+                for (const PendingWalletAttestation& entry : pending_attestations) {
+                    pending_by_key[entry.key_hash].push_back(&entry);
+                }
                 pending_scanned = true;
             }
             const std::optional<Consensus::DemurrageAttestationRecord> latest_record =
                 Consensus::LatestDemurrageAttestationRecord(view, *key_hash);
-            if (const PendingWalletAttestation* pending = FindPendingAttestationForState(pending_attestations, *key_hash, latest_record)) {
+            const std::vector<const PendingWalletAttestation*> no_pending;
+            const auto key_pending_it = pending_by_key.find(*key_hash);
+            const std::vector<const PendingWalletAttestation*>& key_pending =
+                key_pending_it == pending_by_key.end() ? no_pending : key_pending_it->second;
+            const PendingWalletAttestation* matched = nullptr;
+            for (const PendingWalletAttestation* entry : key_pending) {
+                if (PendingAttestationReferencesRecord(*entry, latest_record)) {
+                    matched = entry;
+                    break;
+                }
+            }
+            if (const PendingWalletAttestation* pending = matched) {
                 const PendingAttestationUse use = ClassifyPendingAttestation(
                     wallet, view, consensus, evaluation_height, evaluation_time, *pending, latest_record);
                 if (use == PendingAttestationUse::UNUSABLE) {
@@ -1605,10 +1622,9 @@ int MaybeAutoDemurrageAttest(CWallet& wallet)
             }
             // Attestations of the automatic path that reference a state this key no longer has cannot confirm.
             if (stale_scanned_keys.insert(*key_hash).second) {
-                for (const PendingWalletAttestation& entry : pending_attestations) {
-                    if (entry.key_hash == *key_hash && entry.automatic && !entry.in_mempool &&
-                        !PendingAttestationReferencesRecord(entry, latest_record)) {
-                        to_abandon.insert(entry.txid);
+                for (const PendingWalletAttestation* entry : key_pending) {
+                    if (entry->automatic && !entry->in_mempool && !PendingAttestationReferencesRecord(*entry, latest_record)) {
+                        to_abandon.insert(entry->txid);
                     }
                 }
             }

@@ -260,11 +260,14 @@ BOOST_AUTO_TEST_CASE(created_backup_directories_are_private_whatever_the_umask)
 BOOST_AUTO_TEST_CASE(windows_volume_classification_accepts_only_local_ntfs)
 {
     // The pure function the Windows directory flush asks before it trusts a flush (it runs on every platform).
-    for (const unsigned drive : {QUANTUM_BACKUP_DRIVE_FIXED, QUANTUM_BACKUP_DRIVE_REMOVABLE}) {
-        BOOST_CHECK(!QuantumBackupVolumeRejection("NTFS", drive));
-        BOOST_CHECK(!QuantumBackupVolumeRejection("ntfs", drive));
-        BOOST_CHECK(!QuantumBackupVolumeRejection("Ntfs", drive));
-    }
+    BOOST_CHECK(!QuantumBackupVolumeRejection("NTFS", QUANTUM_BACKUP_DRIVE_FIXED));
+    BOOST_CHECK(!QuantumBackupVolumeRejection("ntfs", QUANTUM_BACKUP_DRIVE_FIXED));
+    BOOST_CHECK(!QuantumBackupVolumeRejection("Ntfs", QUANTUM_BACKUP_DRIVE_FIXED));
+    // A removable drive can be unplugged, so it is refused even with NTFS on it, and the message says why.
+    const auto removable = QuantumBackupVolumeRejection("NTFS", QUANTUM_BACKUP_DRIVE_REMOVABLE);
+    BOOST_REQUIRE(removable);
+    BOOST_CHECK(removable->find("removable") != std::string::npos);
+    BOOST_CHECK(removable->find("fixed local disk") != std::string::npos);
     // Another file system on a local disk: refused, and the message names it.
     for (const std::string file_system : {"ReFS", "FAT32", "exFAT", "FAT", "CDFS", "UDF"}) {
         const auto rejection = QuantumBackupVolumeRejection(file_system, QUANTUM_BACKUP_DRIVE_FIXED);
@@ -285,6 +288,44 @@ BOOST_AUTO_TEST_CASE(windows_volume_classification_accepts_only_local_ntfs)
     const auto unknown = QuantumBackupVolumeRejection("", QUANTUM_BACKUP_DRIVE_FIXED);
     BOOST_REQUIRE(unknown);
     BOOST_CHECK(unknown->find("unknown") != std::string::npos);
+}
+
+BOOST_AUTO_TEST_CASE(windows_volume_root_comes_only_from_a_local_volume_guid_path)
+{
+    // What GetFinalPathNameByHandleW(VOLUME_NAME_GUID) returns for a directory on a local volume: the root is the first
+    // 49 characters, whatever follows, and the case of the letters does not matter.
+    const std::wstring guid{L"12345678-9abc-def0-1234-56789ABCDEF0"};
+    const std::wstring root = L"\\\\?\\Volume{" + guid + L"}\\";
+    for (const std::wstring& path : {root, root + L"Users", root + L"Users\\x\\wallet", L"\\\\?\\VOLUME{" + guid + L"}\\data"}) {
+        const auto found = QuantumBackupLocalVolumeRoot(path);
+        BOOST_REQUIRE(found);
+        BOOST_CHECK(found->size() == root.size());
+    }
+    BOOST_CHECK(*QuantumBackupLocalVolumeRoot(root + L"Users\\x") == root);
+    // No GUID path: nothing, an empty or cut-off answer, a drive-letter path, a device path.
+    BOOST_CHECK(!QuantumBackupLocalVolumeRoot(L""));
+    BOOST_CHECK(!QuantumBackupLocalVolumeRoot(L"\\\\?\\Volume{"));
+    BOOST_CHECK(!QuantumBackupLocalVolumeRoot(root.substr(0, root.size() - 1)));
+    BOOST_CHECK(!QuantumBackupLocalVolumeRoot(L"\\\\?\\C:\\Users\\x"));
+    BOOST_CHECK(!QuantumBackupLocalVolumeRoot(L"C:\\Users\\x"));
+    BOOST_CHECK(!QuantumBackupLocalVolumeRoot(L"\\\\.\\Volume{" + guid + L"}\\x"));
+    BOOST_CHECK(!QuantumBackupLocalVolumeRoot(L"\\\\?\\GLOBALROOT\\Device\\HarddiskVolume1\\x"));
+    // A network share (UNC), even one whose name looks like a volume.
+    BOOST_CHECK(!QuantumBackupLocalVolumeRoot(L"\\\\?\\UNC\\server\\share\\wallet"));
+    BOOST_CHECK(!QuantumBackupLocalVolumeRoot(L"\\\\?\\UNC\\Volume{" + guid + L"}\\x"));
+    BOOST_CHECK(!QuantumBackupLocalVolumeRoot(L"\\\\server\\share\\wallet"));
+    // A GUID that is not one: a wrong length, a wrong separator, a character that is not hexadecimal, no closing brace.
+    BOOST_CHECK(!QuantumBackupLocalVolumeRoot(L"\\\\?\\Volume{" + guid.substr(1) + L"}\\x"));
+    std::wstring bad = guid;
+    bad[8] = L'_';
+    BOOST_CHECK(!QuantumBackupLocalVolumeRoot(L"\\\\?\\Volume{" + bad + L"}\\x"));
+    bad = guid;
+    bad[0] = L'g';
+    BOOST_CHECK(!QuantumBackupLocalVolumeRoot(L"\\\\?\\Volume{" + bad + L"}\\x"));
+    BOOST_CHECK(!QuantumBackupLocalVolumeRoot(L"\\\\?\\Volume{" + guid + L"]\\x"));
+    // Any path the locality check cannot tie to a local volume leaves no drive type to ask about, and a drive type that
+    // is not a fixed disk is refused whatever the file system: both ends of the pair are needed.
+    BOOST_CHECK(QuantumBackupVolumeRejection("NTFS", QUANTUM_BACKUP_DRIVE_UNKNOWN));
 }
 
 BOOST_AUTO_TEST_CASE(a_failed_commit_of_a_new_backup_directory_or_its_parent_entry_fails_the_preparation)

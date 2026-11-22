@@ -23,6 +23,8 @@
 #include <map>
 #include <optional>
 #include <set>
+#include <string>
+#include <string_view>
 #include <system_error>
 
 #ifndef WIN32
@@ -72,8 +74,41 @@ std::string DriveTypeName(unsigned drive_type)
 }
 
 #ifdef WIN32
-/** Flush a directory on Windows: open it as a directory (FILE_FLAG_BACKUP_SEMANTICS) with write access, check through
- *  the open handle that its volume is a local NTFS volume (QuantumBackupVolumeRejection), and flush the handle.
+#ifndef VOLUME_NAME_GUID
+#define VOLUME_NAME_GUID 0x1
+#endif
+
+/** The final path of an open handle with the volume named by its GUID (`\\?\Volume{...}\dir\sub`), in a buffer sized to
+ *  fit: the size the call asks for is asked for again until the answer fits, so a long path is never cut short. */
+bool FinalPathByVolumeGuid(HANDLE handle, std::wstring& final_path, std::string& reason)
+{
+    DWORD needed = ::GetFinalPathNameByHandleW(handle, nullptr, 0, VOLUME_NAME_GUID);
+    for (int attempt = 0; attempt < 4; ++attempt) {
+        if (needed == 0) break;
+        if (needed > 65536) {
+            reason = "its path is too long to be tied to one volume";
+            return false;
+        }
+        std::wstring buffer(needed, L'\0');
+        const DWORD written = ::GetFinalPathNameByHandleW(handle, buffer.data(), static_cast<DWORD>(buffer.size()), VOLUME_NAME_GUID);
+        if (written == 0) break;
+        if (written < buffer.size()) { // success: the length without the terminating null
+            buffer.resize(written);
+            final_path = std::move(buffer);
+            return true;
+        }
+        needed = written; // too small: the size it needs, with the terminating null
+    }
+    reason = strprintf("its volume cannot be identified: %s", Win32ErrorString(static_cast<int>(::GetLastError())));
+    return false;
+}
+
+/** Flush a directory on Windows: open it as a directory (FILE_FLAG_BACKUP_SEMANTICS) with write access and take both
+ *  answers about its volume from that one open handle: the volume's GUID path (GetFinalPathNameByHandleW with
+ *  VOLUME_NAME_GUID, from which the volume root and so its drive type are taken; a handle that has no local volume GUID
+ *  path, such as a network share, is refused) and its file system name (GetVolumeInformationByHandleW). The pair must
+ *  pass QuantumBackupVolumeRejection (a fixed local disk with NTFS) before the handle is flushed. Neither answer is
+ *  taken from the path that was asked for, which could name another volume by the time it is looked up.
  *  DirectoryCommit() in util/fs_helpers.cpp returns success without flushing on this platform and is left as it is
  *  for its other callers; the backup must not take that for a commit, so an error here is a failed commit, and a
  *  file system that cannot vouch for the flush is refused before it is trusted. `reason` says why it failed. */
@@ -88,19 +123,20 @@ bool FlushDirectoryWindows(const fs::path& directory, std::string& reason)
         return false;
     }
     bool committed = true;
-    // The volume is classified through the handle that is flushed, not through the path that was asked for.
+    std::wstring final_path;
     wchar_t file_system[MAX_PATH + 1] = {};
-    wchar_t volume_root[MAX_PATH + 1] = {};
-    std::string narrow_file_system;
-    unsigned drive_type{QUANTUM_BACKUP_DRIVE_UNKNOWN};
-    if (!::GetVolumeInformationByHandleW(handle, nullptr, 0, nullptr, nullptr, nullptr, file_system, MAX_PATH + 1)) {
+    if (!FinalPathByVolumeGuid(handle, final_path, reason)) {
+        committed = false;
+    } else if (const std::optional<std::wstring> volume_root = QuantumBackupLocalVolumeRoot(final_path); !volume_root) {
+        reason = "the directory is not on a local volume that has a volume GUID path (a network share, or a path that cannot be tied to one local volume); use a folder on a local NTFS volume";
+        committed = false;
+    } else if (!::GetVolumeInformationByHandleW(handle, nullptr, 0, nullptr, nullptr, nullptr, file_system, MAX_PATH + 1)) {
         reason = strprintf("its file system cannot be identified: %s", Win32ErrorString(static_cast<int>(::GetLastError())));
         committed = false;
     } else {
+        std::string narrow_file_system;
         for (const wchar_t* c = file_system; *c != L'\0'; ++c) narrow_file_system.push_back(*c < 0x80 ? static_cast<char>(*c) : '?');
-        if (::GetVolumePathNameW(directory.wstring().c_str(), volume_root, MAX_PATH + 1)) {
-            drive_type = ::GetDriveTypeW(volume_root);
-        }
+        const unsigned drive_type = ::GetDriveTypeW(volume_root->c_str());
         if (const std::optional<std::string> rejection = QuantumBackupVolumeRejection(narrow_file_system, drive_type)) {
             reason = *rejection;
             committed = false;
@@ -231,10 +267,33 @@ std::optional<std::string> QuantumBackupVolumeRejection(std::string_view file_sy
     if (name != "ntfs") {
         return strprintf("the backup directory is on a volume with file system %s, where a flush does not prove that the directory entries are on disk; use a folder on a local NTFS volume", name);
     }
-    if (drive_type != QUANTUM_BACKUP_DRIVE_FIXED && drive_type != QUANTUM_BACKUP_DRIVE_REMOVABLE) {
-        return strprintf("the backup directory is on an NTFS volume on %s, which is not a local disk; use a folder on a local NTFS volume", DriveTypeName(drive_type));
+    if (drive_type != QUANTUM_BACKUP_DRIVE_FIXED) {
+        return strprintf("the backup directory is on an NTFS volume on %s, which is not a fixed local disk; use a folder on a local NTFS volume", DriveTypeName(drive_type));
     }
     return std::nullopt;
+}
+
+std::optional<std::wstring> QuantumBackupLocalVolumeRoot(std::wstring_view final_path)
+{
+    // `\\?\Volume{` + 36 characters of GUID (8-4-4-4-12 hex digits) + `}\`, optionally followed by the path in the volume.
+    constexpr std::wstring_view PREFIX{L"\\\\?\\Volume{"};
+    constexpr size_t GUID_CHARS{36};
+    constexpr size_t ROOT_CHARS{PREFIX.size() + GUID_CHARS + 2};
+    if (final_path.size() < ROOT_CHARS) return std::nullopt;
+    const auto lower = [](wchar_t c) { return c >= L'A' && c <= L'Z' ? static_cast<wchar_t>(c + (L'a' - L'A')) : c; };
+    for (size_t i = 0; i < PREFIX.size(); ++i) {
+        if (lower(final_path[i]) != lower(PREFIX[i])) return std::nullopt;
+    }
+    for (size_t i = 0; i < GUID_CHARS; ++i) {
+        const wchar_t c = final_path[PREFIX.size() + i];
+        if (i == 8 || i == 13 || i == 18 || i == 23) {
+            if (c != L'-') return std::nullopt;
+        } else if (!((c >= L'0' && c <= L'9') || (c >= L'a' && c <= L'f') || (c >= L'A' && c <= L'F'))) {
+            return std::nullopt;
+        }
+    }
+    if (final_path[PREFIX.size() + GUID_CHARS] != L'}' || final_path[PREFIX.size() + GUID_CHARS + 1] != L'\\') return std::nullopt;
+    return std::wstring{final_path.substr(0, ROOT_CHARS)};
 }
 
 void SetQuantumKeyBackupDirectoryCommitForTest(std::function<bool(const fs::path&)> hook)

@@ -37,7 +37,8 @@ fs::path QuantumKeyBackupDirectory(const std::string& wallet_name);
  *  directory, or the file system root for a directory outside it) are committed to disk, so a name made by an
  *  earlier, interrupted attempt is committed too. Returns false with the reason in error; a directory that cannot be
  *  committed is a failure (the key it protects stays pending). On Windows the directories are flushed through a
- *  directory handle (FlushFileBuffers), and only on a local NTFS volume (see QuantumBackupVolumeRejection); that
+ *  directory handle (FlushFileBuffers), and only on an NTFS volume of a fixed local disk, with the file system name and the
+ *  drive type both taken from that handle (see QuantumBackupVolumeRejection); that
  *  code is compiled for the Windows target only and has not been run. */
 bool EnsureQuantumKeyBackupDirectory(const fs::path& directory, std::string& error);
 
@@ -53,9 +54,18 @@ constexpr unsigned QUANTUM_BACKUP_DRIVE_RAMDISK{6};
 /** Whether a Windows volume may vouch for a directory flush. Flushing a directory handle makes the directory's
  *  entries durable only on a local NTFS volume; on another file system, or through a network share, the call can
  *  succeed without doing it. Takes the volume's file system name (as GetVolumeInformationByHandleW reports it,
- *  compared without regard to case) and its GetDriveTypeW value. Returns nullopt when the volume is accepted
- *  (local NTFS, on a fixed or removable drive) and otherwise the reason it is not, naming the file system. */
+ *  compared without regard to case) and its GetDriveTypeW value, taken from the root of the same volume as the file
+ *  system name (see QuantumBackupLocalVolumeRoot). Returns nullopt when the volume is accepted (NTFS on a fixed local
+ *  disk; a removable drive is refused, because a volume that can be unplugged is not one the backup may rest on) and
+ *  otherwise the reason it is not, naming the file system. */
 std::optional<std::string> QuantumBackupVolumeRejection(std::string_view file_system, unsigned drive_type);
+
+/** The volume root, `\\?\Volume{GUID}\`, of the final path GetFinalPathNameByHandleW(VOLUME_NAME_GUID) reports for
+ *  an open directory handle: the root whose drive type is then asked of GetDriveTypeW, so the file system name and
+ *  the drive type both come from the one handle. Returns nullopt when the path is not of that form (the volume has no
+ *  local GUID path: a network share (`\\?\UNC\...`), a path that names a device or something else, an empty or
+ *  truncated answer), and the caller then refuses the directory. Pure, so it is tested on every platform. */
+std::optional<std::wstring> QuantumBackupLocalVolumeRoot(std::wstring_view final_path);
 
 /** Tests only: replace the commit of a directory (an empty function restores the real one). */
 void SetQuantumKeyBackupDirectoryCommitForTest(std::function<bool(const fs::path&)> hook);

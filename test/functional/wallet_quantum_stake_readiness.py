@@ -40,7 +40,9 @@ class QuantumStakeReadinessTest(TransitionTFinalTestBase, BitcoinTestFramework):
     def set_test_params(self):
         self.num_nodes = 1
         self.setup_clean_chain = True
-        self.extra_args = [LIFECYCLE_ARGS]
+        # The staker part of this test stakes one specific quantum output at height 85, inside the final reserve guard (82..91),
+        # which would hold that output back: the reserve has its own test (wallet_final_stake_reserve.py).
+        self.extra_args = [LIFECYCLE_ARGS + ["-finalstakereserve=0"]]
 
     def amount_at(self, wallet, address):
         return sum((Decimal(str(u["amount"])) for u in wallet.listunspent(0, 9999999, [address])), Decimal(0))

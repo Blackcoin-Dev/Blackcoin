@@ -37,7 +37,10 @@ class LegacyStakeCutoffBoundaryTest(TransitionTFinalTestBase, BitcoinTestFramewo
     def set_test_params(self):
         self.num_nodes = 1
         self.setup_clean_chain = True
-        self.extra_args = [LIFECYCLE_ARGS + ["-donatetodevfund=0", "-qqstaketierheight=1"]]
+        # No automatic key creation: a ready return address would make the wallet pay legacy stakes as quantum outputs
+        # from the opportunistic window on, and this test needs legacy outputs up to the cutoff at 80.
+        args = [a for a in LIFECYCLE_ARGS if not a.startswith("-qqallowautokeycreation")]
+        self.extra_args = [args + ["-donatetodevfund=0", "-qqstaketierheight=1"]]
 
     def kernel_slot_for(self, wallet, outpoint):
         """The shared search with a larger bound: a kernel is found with a probability of the order of one
@@ -83,9 +86,9 @@ class LegacyStakeCutoffBoundaryTest(TransitionTFinalTestBase, BitcoinTestFramewo
         small_out = outpoint(small, small_addr)
         self.pow_blocks(node, 78 - node.getblockcount(), pow_addr)
         assert_equal(node.getblockcount(), 78)
-        # The wallet's return address is ready, so after the cutoff a legacy kernel is paid to it.
-        assert_equal(wallet.setquantumstakereturn({"allow_new_quantum_key": True})["ready"], True)
-        return_script = node.validateaddress(wallet.getstakinginfo()["legacy_stake_return_address"])["scriptPubKey"]
+        # With a ready return address a legacy kernel is paid to it already in the opportunistic window (from 62), so
+        # the address is made ready only after the last legacy coinstake below, at the mandatory cutoff.
+        assert_equal(wallet.getstakinginfo()["legacy_stake_return_ready"], False)
 
         self.log.info("Height 79 from another kernel; the big and the ordinary kernel are kept for 80 and 81")
         self.stake_one(wallet, node, [pow_addr])
@@ -121,6 +124,9 @@ class LegacyStakeCutoffBoundaryTest(TransitionTFinalTestBase, BitcoinTestFramewo
         assert_equal(node.getbestblockhash(), tip)
 
         self.log.info("The same kernel built again for height 81 follows the new parent's policy: one quantum output")
+        # The wallet's return address becomes ready now: from the cutoff a legacy kernel must be paid to it.
+        assert_equal(wallet.setquantumstakereturn({"allow_new_quantum_key": True})["ready"], True)
+        return_script = node.validateaddress(wallet.getstakinginfo()["legacy_stake_return_address"])["scriptPubKey"]
         self.bump()
         self.kernel_slot_for(wallet, small_out)
         rebuilt = wallet.checkkernel([small_out], True)

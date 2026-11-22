@@ -32,7 +32,9 @@ class QuantumStakeReturnWindowKernelsTest(TransitionTFinalTestBase, BitcoinTestF
     def set_test_params(self):
         self.num_nodes = 1
         self.setup_clean_chain = True
-        self.extra_args = [LIFECYCLE_ARGS + ["-donatetodevfund=0", f"-qqstaketierheight={G + 1}", f"-qqstakesplitheight={F}"]]
+        # The tiered and cold-stake kernels stake at 81 and 82, inside the final reserve guard (82..91), which would hold the
+        # cold-stake output back: the reserve has its own test (wallet_final_stake_reserve.py).
+        self.extra_args = [LIFECYCLE_ARGS + ["-donatetodevfund=0", f"-qqstaketierheight={G + 1}", f"-qqstakesplitheight={F}", "-finalstakereserve=0"]]
 
     def script_of(self, address):
         return bytes.fromhex(self.nodes[0].validateaddress(address)["scriptPubKey"])

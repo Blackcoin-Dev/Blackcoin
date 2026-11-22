@@ -222,6 +222,7 @@ BASE_SCRIPTS = [
     'wallet_migration_residual_inventory.py',
     'wallet_quantum_stake_maturity.py',
     'wallet_first_final_block_kernels.py',
+    'wallet_final_stake_reserve.py',
     'wallet_claim_reserve_maturity.py',
     'wallet_quantum_stake_return_durability.py',
     'wallet_quantum_stake_return_downgrade.py',

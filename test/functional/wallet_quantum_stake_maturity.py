@@ -49,7 +49,9 @@ class QuantumStakeMaturityTest(TransitionTFinalTestBase, BitcoinTestFramework):
     def set_test_params(self):
         self.num_nodes = 2
         self.setup_clean_chain = True
-        self.extra_args = [LIFECYCLE_ARGS, LIFECYCLE_ARGS + ["-rpcdoccheck=0"]]
+        # Quantum outputs are staked inside the final reserve guard (82..91) here, which would hold them back: the reserve has
+        # its own test (wallet_final_stake_reserve.py).
+        self.extra_args = [LIFECYCLE_ARGS + ["-finalstakereserve=0"], LIFECYCLE_ARGS + ["-rpcdoccheck=0"]]
 
     def skip_test_if_missing_module(self):
         self.skip_if_no_wallet()

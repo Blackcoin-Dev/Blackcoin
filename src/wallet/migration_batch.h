@@ -136,6 +136,19 @@ struct MigrationContinuationParams {
 //! Later batches the continuation plan simulates before it refuses to vouch for the rest.
 constexpr unsigned int MAX_SIMULATED_MIGRATION_CONTINUATION_BATCHES{512};
 
+//! Synthetic outpoints stand for the quantum output of a simulated batch. They use a null hash and an
+//! index in this reserved high range: the base leaves 65,535 indexes below the null outpoint's
+//! 0xFFFFFFFF, far more than the simulation (one per simulated batch, plus the first batch's output).
+constexpr uint32_t MIGRATION_SYNTHETIC_OUTPOINT_BASE{0xFFFF0000U};
+static_assert(MAX_SIMULATED_MIGRATION_CONTINUATION_BATCHES < 0xFFFFU,
+              "the simulated batches must keep every synthetic index below the null outpoint");
+
+//! The synthetic outpoint of the n-th simulated output (n counts from 0, at most the batch cap).
+inline COutPoint MigrationSyntheticOutpoint(uint32_t n)
+{
+    return COutPoint{Txid{}, MIGRATION_SYNTHETIC_OUTPOINT_BASE + n};
+}
+
 struct MigrationContinuation {
     bool feasible{true};
     //! Later batches the simulation needed (each one simulated with the real planner; exact for

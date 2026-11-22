@@ -345,6 +345,47 @@ BOOST_AUTO_TEST_CASE(continuation_refuses_what_it_cannot_simulate_even_when_fund
     BOOST_CHECK(!over.reason.empty());
 }
 
+BOOST_AUTO_TEST_CASE(synthetic_outpoints_are_never_null_and_never_repeat)
+{
+    // The planner stands in for each simulated batch's output with a synthetic outpoint. One per
+    // simulated batch plus the first batch's output: none may be the null outpoint (0xFFFFFFFF)
+    // and none may wrap around into an earlier index, which the old base 0xFFFFFF00 did at 255 and 256.
+    std::set<COutPoint> seen;
+    for (uint32_t n = 0; n <= MAX_SIMULATED_MIGRATION_CONTINUATION_BATCHES + 1; ++n) {
+        const COutPoint op = MigrationSyntheticOutpoint(n);
+        BOOST_CHECK(!op.IsNull());
+        BOOST_CHECK_EQUAL(op.n, MIGRATION_SYNTHETIC_OUTPOINT_BASE + n);
+        BOOST_CHECK(op.n > MIGRATION_SYNTHETIC_OUTPOINT_BASE - 1);
+        BOOST_CHECK(seen.insert(op).second);
+    }
+    BOOST_CHECK(MigrationSyntheticOutpoint(MAX_SIMULATED_MIGRATION_CONTINUATION_BATCHES + 1).n < 0xFFFFFFFFU);
+}
+
+BOOST_AUTO_TEST_CASE(continuation_chains_across_the_old_synthetic_index_boundaries)
+{
+    // Witness-only inputs, one per later batch, each batch funded by the previous batch's output: the
+    // chain uses one synthetic outpoint per batch, crossing the indexes 255 and 256 that used to
+    // reach the null outpoint and wrap. Fees, dependency depth and the cap refusal stay exact.
+    const int64_t weight = MIGRATION_BATCH_FIXED_WEIGHT + 600 + 4000;
+    const CAmount per_batch = 1000 * ((weight + WITNESS_SCALE_FACTOR - 1) / WITNESS_SCALE_FACTOR) / 1000 + 1;
+    for (const unsigned int later : {1U, 254U, 255U, 256U, 257U, MAX_SIMULATED_MIGRATION_CONTINUATION_BATCHES - 1,
+                                     MAX_SIMULATED_MIGRATION_CONTINUATION_BATCHES,
+                                     MAX_SIMULATED_MIGRATION_CONTINUATION_BATCHES + 1}) {
+        std::vector<MigrationBatchInput> rest;
+        for (uint32_t i = 0; i < later; ++i) rest.push_back(Input(10 + i, 100000000, 600));
+        const MigrationContinuation c = PlanMigrationContinuation(rest, CheapParams(1, 50000000, true));
+        if (later > MAX_SIMULATED_MIGRATION_CONTINUATION_BATCHES) {
+            BOOST_CHECK(!c.feasible);
+            BOOST_CHECK(c.reason.find("smaller explicit steps") != std::string::npos);
+            continue;
+        }
+        BOOST_REQUIRE_MESSAGE(c.feasible, "later batches " << later);
+        BOOST_CHECK_EQUAL(c.batches, later);
+        BOOST_CHECK_EQUAL(c.fees, static_cast<CAmount>(later) * per_batch);
+        BOOST_CHECK_EQUAL(c.min_blocks, later + 1);
+    }
+}
+
 BOOST_AUTO_TEST_CASE(continuation_funding_claim_is_checked_per_batch_not_in_aggregate)
 {
     // Aggregate value is ample, but the last input is too small to pay its own batch fee and leave

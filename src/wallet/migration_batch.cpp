@@ -120,7 +120,7 @@ MigrationContinuation PlanMigrationContinuation(std::vector<MigrationBatchInput>
     uint32_t synthetic{0};
     if (p.output_can_anchor) {
         MigrationBatchInput first;
-        first.outpoint = COutPoint{Txid{}, 0xFFFFFF00U + synthetic++};
+        first.outpoint = MigrationSyntheticOutpoint(synthetic++);
         first.value = first.effective_value = p.first_output;
         first.input_weight = std::max<int64_t>(1, p.auxiliary_input_weight);
         first.anchor = true;
@@ -171,7 +171,7 @@ MigrationContinuation PlanMigrationContinuation(std::vector<MigrationBatchInput>
         pool.erase(std::remove_if(pool.begin(), pool.end(), [&](const MigrationBatchInput& c) { return used.count(c.outpoint) > 0; }), pool.end());
         if (p.output_can_anchor && legacy_left > 0) {
             MigrationBatchInput next;
-            next.outpoint = COutPoint{Txid{}, 0xFFFFFF00U + synthetic++};
+            next.outpoint = MigrationSyntheticOutpoint(synthetic++);
             next.value = next.effective_value = out;
             next.input_weight = std::max<int64_t>(1, p.auxiliary_input_weight);
             next.anchor = true;

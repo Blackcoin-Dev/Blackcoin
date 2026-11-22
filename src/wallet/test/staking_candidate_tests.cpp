@@ -4,6 +4,8 @@
 
 #include <chain.h>
 #include <chainparams.h>
+#include <univalue.h>
+#include <common/settings.h>
 #include <coins.h>
 #include <consensus/validation.h>
 #include <key.h>
@@ -18,6 +20,7 @@
 #include <wallet/coincontrol.h>
 #include <wallet/spend.h>
 #include <wallet/staking.h>
+#include <wallet/quantum_return_backup.h>
 #include <wallet/test/util.h>
 #include <wallet/wallet.h>
 
@@ -26,7 +29,9 @@
 #include <hash.h>
 #include <random.h>
 #include <wallet/walletdb.h>
+#include <fstream>
 #include <set>
+#include <thread>
 
 #include <boost/test/unit_test.hpp>
 
@@ -566,6 +571,62 @@ public:
     }
 };
 
+/** A synced wallet on a real SQLite file, so that a wallet backup (the new key's backup before it becomes the
+ *  return address) can be made. The backups go below the fixture's own directory. */
+std::unique_ptr<CWallet> CreateSyncedDiskWallet(TestChain100Setup& setup, const CKey& key, const std::string& name)
+{
+    DatabaseOptions options;
+    options.require_create = true;
+    options.require_format = DatabaseFormat::SQLITE;
+    options.create_flags = WALLET_FLAG_DESCRIPTORS;
+    DatabaseStatus status;
+    bilingual_str error;
+    auto database = MakeWalletDatabase(name, options, status, error);
+    BOOST_REQUIRE_MESSAGE(database, error.original);
+    CChain& cchain = WITH_LOCK(Assert(setup.m_node.chainman)->GetMutex(), return setup.m_node.chainman->ActiveChain());
+    auto wallet = std::make_unique<CWallet>(setup.m_node.chain.get(), name, std::move(database));
+    {
+        LOCK2(::cs_main, wallet->cs_wallet);
+        wallet->SetLastBlockProcessed(cchain.Height(), cchain.Tip()->GetBlockHash());
+    }
+    BOOST_REQUIRE_EQUAL(wallet->LoadWallet(), DBErrors::LOAD_OK);
+    {
+        LOCK(wallet->cs_wallet);
+        wallet->SetWalletFlag(WALLET_FLAG_DESCRIPTORS);
+        wallet->SetupDescriptorScriptPubKeyMans();
+        FlatSigningProvider provider;
+        std::string desc_error;
+        std::unique_ptr<Descriptor> desc = Parse("combo(" + EncodeSecret(key) + ")", provider, desc_error, /*require_checksum=*/false);
+        BOOST_REQUIRE(desc);
+        WalletDescriptor w_desc(std::move(desc), 0, 0, 1, 1);
+        BOOST_REQUIRE(wallet->AddWalletDescriptor(w_desc, provider, "", false));
+    }
+    WalletRescanReserver reserver(*wallet);
+    reserver.reserve();
+    CWallet::ScanResult result = wallet->ScanForWalletTransactions(cchain.Genesis()->GetBlockHash(), /*start_height=*/0, /*max_height=*/{}, reserver, /*fUpdate=*/false, /*save_progress=*/false);
+    BOOST_REQUIRE(result.status == CWallet::ScanResult::SUCCESS);
+    return wallet;
+}
+
+/** Restores every command line setting when the test ends. */
+class ScopedArgsRestore
+{
+public:
+    ScopedArgsRestore() { gArgs.LockSettings([&](common::Settings& settings) { m_saved = settings; }); }
+    ~ScopedArgsRestore() { gArgs.LockSettings([&](common::Settings& settings) { settings = m_saved; }); }
+
+private:
+    common::Settings m_saved;
+};
+
+/** Points the new-key backups at a directory below the fixture's own, for the length of a test. */
+class ScopedQuantumBackupDir
+{
+public:
+    explicit ScopedQuantumBackupDir(const fs::path& dir) { gArgs.ForceSetArg("-quantumkeybackupdir", fs::PathToString(dir)); }
+    ~ScopedQuantumBackupDir() { gArgs.ForceSetArg("-quantumkeybackupdir", ""); }
+};
+
 StakeCoins LegacyCandidatesAtTip(TestChain100Setup& setup, CWallet& wallet)
 {
     LOCK2(::cs_main, wallet.cs_wallet);
@@ -750,8 +811,8 @@ BOOST_FIXTURE_TEST_CASE(the_return_address_is_set_automatically_only_when_fully_
 BOOST_FIXTURE_TEST_CASE(the_return_address_preparation_distinguishes_reuse_creation_no_action_and_failure, LegacyStakeWindowSetup)
 {
     using Outcome = QuantumStakeReturnPreparation::Outcome;
-    auto wallet = CreateSyncedWallet(*m_node.chain,
-        WITH_LOCK(Assert(m_node.chainman)->GetMutex(), return m_node.chainman->ActiveChain()), coinbaseKey);
+    ScopedQuantumBackupDir backups{m_path_root / "qkb"};
+    auto wallet = CreateSyncedDiskWallet(*this, coinbaseKey, "prepare-outcomes");
     // No quantum address and key creation not allowed: no action, no key, and it says why.
     QuantumStakeReturnPreparation prep = PrepareQuantumStakeReturn(*wallet, QuantumStakeReturnTrigger::AUTOMATIC);
     BOOST_CHECK(prep.outcome == Outcome::NO_ACTION);
@@ -759,7 +820,7 @@ BOOST_FIXTURE_TEST_CASE(the_return_address_preparation_distinguishes_reuse_creat
     BOOST_CHECK(!prep.Saved());
     BOOST_CHECK(!prep.detail.empty());
 
-    // Key creation allowed: a key is created, saved, and reported as created.
+    // Key creation allowed: a key is created, backed up, saved, and reported as created.
     gArgs.ForceSetArg("-qqallowautokeycreation", "1");
     prep = PrepareQuantumStakeReturn(*wallet, QuantumStakeReturnTrigger::AUTOMATIC);
     gArgs.ForceSetArg("-qqallowautokeycreation", "0");
@@ -767,6 +828,8 @@ BOOST_FIXTURE_TEST_CASE(the_return_address_preparation_distinguishes_reuse_creat
     BOOST_CHECK(prep.key_created);
     BOOST_CHECK(prep.Saved());
     BOOST_CHECK_EQUAL(WITH_LOCK(wallet->cs_wallet, return wallet->m_quantum_stake_return), prep.address);
+    BOOST_CHECK(!WITH_LOCK(wallet->cs_wallet, return wallet->m_quantum_return_pending.has_value()));
+    BOOST_CHECK(WITH_LOCK(wallet->cs_wallet, return ResolveLegacyStakeQuantumReturn(*wallet).backup_verified));
 
     // Set already: no action, the saved address is reported, nothing created.
     const std::string saved = prep.address;
@@ -798,8 +861,8 @@ BOOST_FIXTURE_TEST_CASE(the_automatic_return_address_waits_for_the_end_of_gold_r
 {
     using Outcome = QuantumStakeReturnPreparation::Outcome;
     // Tip 100: the next block (101) is still in Gold Rush (it ends at 102); the Migration end is far away.
-    auto wallet = CreateSyncedWallet(*m_node.chain,
-        WITH_LOCK(Assert(m_node.chainman)->GetMutex(), return m_node.chainman->ActiveChain()), coinbaseKey);
+    ScopedQuantumBackupDir backups{m_path_root / "qkb"};
+    auto wallet = CreateSyncedDiskWallet(*this, coinbaseKey, "prepare-waits");
     BOOST_REQUIRE(wallet);
     gArgs.ForceSetArg("-qqallowautokeycreation", "1");
     const QuantumStakeReturnPreparation automatic = PrepareQuantumStakeReturn(*wallet, QuantumStakeReturnTrigger::AUTOMATIC);
@@ -832,8 +895,8 @@ BOOST_FIXTURE_TEST_CASE(the_automatic_return_address_needs_a_legacy_coin_to_retu
     BOOST_CHECK(WITH_LOCK(empty->cs_wallet, return empty->m_quantum_stake_return.empty()));
     BOOST_CHECK_EQUAL(WITH_LOCK(empty->cs_wallet, return empty->ListQuantumKeyInfos().size()), size_t{0});
     // A wallet that does hold legacy stakable coins gets its key.
-    auto holder = CreateSyncedWallet(*m_node.chain,
-        WITH_LOCK(Assert(m_node.chainman)->GetMutex(), return m_node.chainman->ActiveChain()), coinbaseKey);
+    ScopedQuantumBackupDir backups{m_path_root / "qkb"};
+    auto holder = CreateSyncedDiskWallet(*this, coinbaseKey, "prepare-holder");
     prep = PrepareQuantumStakeReturn(*holder, QuantumStakeReturnTrigger::AUTOMATIC);
     gArgs.ForceSetArg("-qqallowautokeycreation", "0");
     BOOST_CHECK(prep.outcome == Outcome::CREATED_ADDRESS);
@@ -1131,6 +1194,263 @@ BOOST_FIXTURE_TEST_CASE(automatic_return_gate_needs_an_owned_signable_legacy_coi
         BOOST_CHECK(open_prep.outcome != Outcome::NO_ACTION);
     }
 }
+
+// The order in which a return destination is taken, rank by rank (pure).
+BOOST_FIXTURE_TEST_CASE(the_return_destination_is_chosen_saved_then_configured_then_claim_key_then_ranked, LegacyStakeWindowSetup)
+{
+    auto wallet = CreateSyncedWallet(*m_node.chain,
+        WITH_LOCK(Assert(m_node.chainman)->GetMutex(), return m_node.chainman->ActiveChain()), coinbaseKey);
+    std::vector<CTxDestination> dests;
+    for (int i = 0; i < 4; ++i) {
+        const auto dest = wallet->GetNewQuantumDestination("k" + ToString(i));
+        BOOST_REQUIRE(dest);
+        dests.push_back(*dest);
+    }
+    const CTxDestination none;
+    const std::vector<QuantumReturnCandidate> candidates{
+        {dests[3], "", false, 100}, {dests[2], "PoS - Quantum Stake Address", false, 300}};
+    using Source = QuantumReturnSource;
+    auto choice = ChooseQuantumStakeReturn(dests[0], dests[1], dests[2], candidates);
+    BOOST_CHECK(choice.source == Source::SAVED && choice.destination == dests[0]);
+    choice = ChooseQuantumStakeReturn(none, dests[1], dests[2], candidates);
+    BOOST_CHECK(choice.source == Source::CONFIGURED && choice.destination == dests[1]);
+    choice = ChooseQuantumStakeReturn(none, none, dests[0], candidates);
+    BOOST_CHECK(choice.source == Source::CLAIM_KEY && choice.destination == dests[0]);
+    // the ranking: the PoS label beats an older key with no label
+    choice = ChooseQuantumStakeReturn(none, none, none, candidates);
+    BOOST_CHECK(choice.source == Source::RANKED && choice.destination == dests[2]);
+    // equal rank: the older key, then the smaller address
+    choice = ChooseQuantumStakeReturn(none, none, none, {{dests[3], "", false, 200}, {dests[1], "", false, 100}});
+    BOOST_CHECK(choice.source == Source::RANKED && choice.destination == dests[1]);
+    const bool first_is_smaller = EncodeDestination(dests[0]) < EncodeDestination(dests[3]);
+    choice = ChooseQuantumStakeReturn(none, none, none, {{dests[3], "", false, 100}, {dests[0], "", false, 100}});
+    BOOST_CHECK(choice.destination == (first_is_smaller ? dests[0] : dests[3]));
+    // nothing usable: the caller needs a new key
+    choice = ChooseQuantumStakeReturn(none, none, none, {});
+    BOOST_CHECK(choice.source == Source::NONE);
+}
+
+BOOST_FIXTURE_TEST_CASE(the_wallet_takes_the_configured_key_then_its_recorded_claim_key_before_other_quantum_addresses, LegacyStakeWindowSetup)
+{
+    const auto fresh = [&] {
+        return CreateSyncedWallet(*m_node.chain,
+            WITH_LOCK(Assert(m_node.chainman)->GetMutex(), return m_node.chainman->ActiveChain()), coinbaseKey);
+    };
+    // A claim-labelled key that nothing records is just another key: the label ranking and age decide.
+    {
+        auto wallet = fresh();
+        const auto older = wallet->GetNewQuantumDestination("some older key");
+        const auto labelled = wallet->GetNewQuantumDestination("PoW - Quantum Claim Address");
+        BOOST_REQUIRE(older && labelled);
+        BOOST_CHECK(WITH_LOCK(wallet->cs_wallet, return !IsValidDestination(wallet->GetRecordedPowPayoutKey())));
+        const QuantumStakeReturnPreparation prep = PrepareQuantumStakeReturn(*wallet, QuantumStakeReturnTrigger::EXPLICIT);
+        BOOST_CHECK(prep.outcome == QuantumStakeReturnPreparation::Outcome::REUSED_ADDRESS);
+        BOOST_CHECK_MESSAGE(prep.address == EncodeDestination(*older) || prep.address == EncodeDestination(*labelled), prep.address);
+    }
+    // The key the claim miner is bound to is taken before a PoS-labelled key and an older key.
+    {
+        auto wallet = fresh();
+        const auto older = wallet->GetNewQuantumDestination("some older key");
+        const auto pos = wallet->GetNewQuantumDestination("PoS - Quantum Stake Address");
+        const auto claim = wallet->GetNewQuantumDestination("PoW - Quantum Claim Address");
+        BOOST_REQUIRE(older && pos && claim);
+        WITH_LOCK(wallet->cs_wallet, wallet->m_pow_payout_quantum = EncodeDestination(*claim));
+        BOOST_CHECK(WITH_LOCK(wallet->cs_wallet, return wallet->GetRecordedPowPayoutKey()) == *claim);
+        const QuantumStakeReturnPreparation prep = PrepareQuantumStakeReturn(*wallet, QuantumStakeReturnTrigger::EXPLICIT);
+        BOOST_CHECK(prep.outcome == QuantumStakeReturnPreparation::Outcome::REUSED_ADDRESS);
+        BOOST_CHECK(!prep.key_created);
+        BOOST_CHECK_EQUAL(prep.address, EncodeDestination(*claim));
+        BOOST_CHECK_EQUAL(WITH_LOCK(wallet->cs_wallet, return wallet->ListQuantumKeyInfos().size()), size_t{3});
+    }
+    // The configured claim payout key counts too, and exactly one configured PoS payout key comes first of all.
+    {
+        ScopedArgsRestore restore_args;
+        auto wallet = fresh();
+        const auto older = wallet->GetNewQuantumDestination("some older key");
+        const auto claim = wallet->GetNewQuantumDestination("PoW - Quantum Claim Address");
+        BOOST_REQUIRE(older && claim);
+        gArgs.ForceSetArg("-qqpowpayoutaddress", EncodeDestination(*claim));
+        BOOST_CHECK(WITH_LOCK(wallet->cs_wallet, return wallet->GetRecordedPowPayoutKey()) == *claim);
+        gArgs.ForceSetArg("-qqpospayoutaddress", EncodeDestination(*older));
+        const QuantumStakeReturnPreparation prep = PrepareQuantumStakeReturn(*wallet, QuantumStakeReturnTrigger::EXPLICIT);
+        BOOST_CHECK_EQUAL(prep.address, EncodeDestination(*older));
+    }
+    // A recorded claim key that is not a key of this wallet is not used.
+    {
+        auto wallet = fresh();
+        const auto other_wallet_key = fresh()->GetNewQuantumDestination("elsewhere");
+        BOOST_REQUIRE(other_wallet_key);
+        WITH_LOCK(wallet->cs_wallet, wallet->m_pow_payout_quantum = EncodeDestination(*other_wallet_key));
+        BOOST_CHECK(WITH_LOCK(wallet->cs_wallet, return !IsValidDestination(wallet->GetRecordedPowPayoutKey())));
+    }
+}
+
+BOOST_FIXTURE_TEST_CASE(a_staking_only_unlock_binds_an_existing_key_but_never_chooses_or_creates_one, LegacyStakeWindowSetup)
+{
+    using Outcome = QuantumStakeReturnPreparation::Outcome;
+    ScopedQuantumBackupDir backups{m_path_root / "qkb"};
+    auto wallet = CreateSyncedDiskWallet(*this, coinbaseKey, "staking-only");
+    const auto existing = wallet->GetNewQuantumDestination("receive");
+    BOOST_REQUIRE(existing);
+    wallet->m_wallet_unlock_staking_only = true;
+    for (const auto trigger : {QuantumStakeReturnTrigger::AUTOMATIC, QuantumStakeReturnTrigger::EXPLICIT}) {
+        for (const bool allow_new : {false, true}) {
+            const QuantumStakeReturnPreparation prep = PrepareQuantumStakeReturn(*wallet, trigger, allow_new);
+            BOOST_CHECK(prep.outcome == Outcome::NO_ACTION);
+            BOOST_CHECK(!prep.key_created);
+        }
+    }
+    BOOST_CHECK(WITH_LOCK(wallet->cs_wallet, return wallet->m_quantum_stake_return.empty()));
+    BOOST_CHECK(!WITH_LOCK(wallet->cs_wallet, return wallet->m_quantum_return_pending.has_value()));
+    BOOST_CHECK_EQUAL(WITH_LOCK(wallet->cs_wallet, return wallet->ListQuantumKeyInfos().size()), size_t{1});
+    // the explicit binding of a key the wallet already has is allowed
+    bilingual_str error;
+    BOOST_CHECK_MESSAGE(SetQuantumStakeReturn(*wallet, *existing, error), error.original);
+    BOOST_CHECK_EQUAL(WITH_LOCK(wallet->cs_wallet, return wallet->m_quantum_stake_return), EncodeDestination(*existing));
+    // and the key creation itself refuses
+    BOOST_CHECK(!wallet->AddQuantumStakeReturnKey("PoS - Quantum Stake Address", "explicit"));
+}
+
+// A new key whose backup fails stays pending, is not usable as the return address in any way, and is retried as the
+// same key. The mock database writes no file, so every backup there fails.
+BOOST_FIXTURE_TEST_CASE(a_new_key_whose_backup_fails_stays_pending_and_is_retried_as_the_same_key, LegacyStakeWindowSetup)
+{
+    using Outcome = QuantumStakeReturnPreparation::Outcome;
+    ScopedQuantumBackupDir backups{m_path_root / "qkb"};
+    auto wallet = CreateSyncedWallet(*m_node.chain,
+        WITH_LOCK(Assert(m_node.chainman)->GetMutex(), return m_node.chainman->ActiveChain()), coinbaseKey);
+    QuantumStakeReturnPreparation prep = PrepareQuantumStakeReturn(*wallet, QuantumStakeReturnTrigger::EXPLICIT, /*allow_new_key=*/true);
+    BOOST_CHECK(prep.outcome == Outcome::PENDING_BACKUP);
+    BOOST_CHECK(prep.key_created);
+    BOOST_CHECK(!prep.Saved());
+    BOOST_CHECK(!prep.detail.empty());
+    const std::string pending_address = prep.address;
+    const auto pending_dest = DecodeDestination(pending_address);
+    BOOST_REQUIRE(IsValidDestination(pending_dest));
+
+    {
+        LOCK(wallet->cs_wallet);
+        BOOST_REQUIRE(wallet->m_quantum_return_pending.has_value());
+        BOOST_CHECK_EQUAL(wallet->m_quantum_return_pending->consent, "explicit");
+        BOOST_CHECK(wallet->m_quantum_stake_return.empty());
+        BOOST_CHECK(wallet->IsQuantumStakeReturnPendingKey(pending_dest));
+        const LegacyStakeQuantumReturn state = ResolveLegacyStakeQuantumReturn(*wallet);
+        BOOST_CHECK(!state.available);
+        BOOST_CHECK(state.pending);
+        BOOST_CHECK_EQUAL(state.pending_address, pending_address);
+        BOOST_CHECK_EQUAL(state.pending_error, prep.detail);
+        const std::string notice = LegacyStakingNotice(Params().GetConsensus(), 101, state);
+        BOOST_CHECK(notice.find("NOT active") != std::string::npos);
+        BOOST_CHECK(notice.find(pending_address) != std::string::npos);
+    }
+    // not through the explicit binding either
+    bilingual_str error;
+    BOOST_CHECK(!SetQuantumStakeReturn(*wallet, pending_dest, error));
+    BOOST_CHECK(error.original.find("waiting for its first verified wallet backup") != std::string::npos);
+    BOOST_CHECK(WITH_LOCK(wallet->cs_wallet, return wallet->m_quantum_stake_return.empty()));
+    // and not as a candidate of the automatic choice: asking again retries this key, it makes no second one
+    gArgs.ForceSetArg("-qqallowautokeycreation", "1");
+    prep = PrepareQuantumStakeReturn(*wallet, QuantumStakeReturnTrigger::AUTOMATIC);
+    prep = PrepareQuantumStakeReturn(*wallet, QuantumStakeReturnTrigger::EXPLICIT, true);
+    gArgs.ForceSetArg("-qqallowautokeycreation", "0");
+    BOOST_CHECK(prep.outcome == Outcome::PENDING_BACKUP);
+    BOOST_CHECK_EQUAL(prep.address, pending_address);
+    BOOST_CHECK_EQUAL(WITH_LOCK(wallet->cs_wallet, return wallet->ListQuantumKeyInfos().size()), size_t{1});
+    // a second key for the return address cannot be made while one waits
+    BOOST_CHECK(!wallet->AddQuantumStakeReturnKey("PoS - Quantum Stake Address", "explicit"));
+
+    // The record round trip: key and record are in the same database, and a reload finds both.
+    const MockableData records = GetMockableDatabase(*wallet).m_records;
+    CWallet reloaded(m_node.chain.get(), "", CreateMockableWalletDatabase(records));
+    BOOST_REQUIRE_EQUAL(reloaded.LoadWallet(), DBErrors::LOAD_OK);
+    {
+        LOCK(reloaded.cs_wallet);
+        BOOST_REQUIRE(reloaded.m_quantum_return_pending.has_value());
+        BOOST_CHECK(reloaded.m_quantum_return_pending->witness_program == WITH_LOCK(wallet->cs_wallet, return wallet->m_quantum_return_pending->witness_program));
+        BOOST_CHECK_EQUAL(reloaded.m_quantum_return_pending->consent, "explicit");
+        BOOST_CHECK(reloaded.IsQuantumStakeReturnPendingKey(pending_dest));
+        BOOST_CHECK(reloaded.m_quantum_stake_return.empty());
+        BOOST_CHECK(!ResolveLegacyStakeQuantumReturn(reloaded).available);
+    }
+    // a record that names no key of the wallet is dropped, the wallet loads
+    MockableData orphaned = records;
+    for (auto it = orphaned.begin(); it != orphaned.end();) {
+        // erase the key records, keep the pending record
+        DataStream key{it->first};
+        std::string type;
+        key >> type;
+        if (type == DBKeys::QUANTUM_KEY || type == DBKeys::QUANTUM_KEY_BACKUP_STATE || type == DBKeys::NAME || type == DBKeys::PURPOSE) {
+            it = orphaned.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    CWallet without_key(m_node.chain.get(), "", CreateMockableWalletDatabase(orphaned));
+    BOOST_REQUIRE_EQUAL(without_key.LoadWallet(), DBErrors::LOAD_OK);
+    BOOST_CHECK(!WITH_LOCK(without_key.cs_wallet, return without_key.m_quantum_return_pending.has_value()));
+}
+
+// The same on a real database: the backup is made, verified and recorded, and only then the address is active.
+BOOST_FIXTURE_TEST_CASE(a_new_key_becomes_the_return_address_after_a_verified_backup_and_a_failed_one_is_retried, LegacyStakeWindowSetup)
+{
+    using Outcome = QuantumStakeReturnPreparation::Outcome;
+    const fs::path base = m_path_root / "qkb-retry";
+    ScopedQuantumBackupDir backups{base};
+    auto wallet = CreateSyncedDiskWallet(*this, coinbaseKey, "retry-wallet");
+    // The backup directory cannot be made: a regular file stands where its parent should be.
+    {
+        std::ofstream{m_path_root / "blocked"} << "a file";
+        gArgs.ForceSetArg("-quantumkeybackupdir", fs::PathToString(m_path_root / "blocked" / "below"));
+        const QuantumStakeReturnPreparation prep = PrepareQuantumStakeReturn(*wallet, QuantumStakeReturnTrigger::EXPLICIT, true);
+        BOOST_CHECK(prep.outcome == Outcome::PENDING_BACKUP);
+        BOOST_CHECK(WITH_LOCK(wallet->cs_wallet, return wallet->m_quantum_stake_return.empty()));
+        BOOST_CHECK(WITH_LOCK(wallet->cs_wallet, return wallet->m_quantum_return_pending.has_value()));
+        BOOST_CHECK(!WITH_LOCK(wallet->cs_wallet, return wallet->m_quantum_return_pending_error.empty()));
+    }
+    gArgs.ForceSetArg("-quantumkeybackupdir", fs::PathToString(base));
+    const std::string pending_address = WITH_LOCK(wallet->cs_wallet, return EncodeDestination(WitnessUnknown{QUANTUM_MIGRATION_WITNESS_VERSION, wallet->m_quantum_return_pending->witness_program}));
+    const QuantumStakeReturnPreparation prep = PrepareQuantumStakeReturn(*wallet, QuantumStakeReturnTrigger::AUTOMATIC);
+    BOOST_CHECK(prep.outcome == Outcome::CREATED_ADDRESS);
+    BOOST_CHECK_EQUAL(prep.address, pending_address);
+    {
+        LOCK(wallet->cs_wallet);
+        BOOST_CHECK(!wallet->m_quantum_return_pending.has_value());
+        BOOST_CHECK(wallet->m_quantum_return_pending_error.empty());
+        BOOST_CHECK_EQUAL(wallet->m_quantum_stake_return, pending_address);
+        BOOST_CHECK_EQUAL(wallet->ListQuantumKeyInfos().size(), size_t{1});
+        const LegacyStakeQuantumReturn state = ResolveLegacyStakeQuantumReturn(*wallet);
+        BOOST_CHECK(state.available);
+        BOOST_CHECK(state.backup_verified);
+        BOOST_CHECK(!state.pending);
+    }
+    const fs::path directory = base / fs::PathFromString(QuantumKeyBackupWalletComponent("retry-wallet"));
+    const auto generations = ListQuantumKeyBackupGenerations(directory);
+    BOOST_REQUIRE_EQUAL(generations.size(), size_t{1});
+    BOOST_CHECK(generations[0].verified);
+    BOOST_CHECK_EQUAL(generations[0].keys.size(), size_t{1});
+    BOOST_CHECK(fs::exists(directory / fs::PathFromString(generations[0].file_name)));
+}
+
+BOOST_FIXTURE_TEST_CASE(concurrent_preparations_make_one_key_and_one_backup, LegacyStakeWindowSetup)
+{
+    ScopedQuantumBackupDir backups{m_path_root / "qkb-concurrent"};
+    auto wallet = CreateSyncedDiskWallet(*this, coinbaseKey, "concurrent-wallet");
+    std::vector<std::thread> threads;
+    std::vector<std::string> addresses(6);
+    for (size_t i = 0; i < addresses.size(); ++i) {
+        threads.emplace_back([&, i] {
+            const QuantumStakeReturnPreparation prep = PrepareQuantumStakeReturn(*wallet, QuantumStakeReturnTrigger::EXPLICIT, true);
+            addresses[i] = prep.address;
+        });
+    }
+    for (std::thread& thread : threads) thread.join();
+    BOOST_CHECK_EQUAL(WITH_LOCK(wallet->cs_wallet, return wallet->ListQuantumKeyInfos().size()), size_t{1});
+    for (const std::string& address : addresses) BOOST_CHECK_EQUAL(address, addresses[0]);
+    BOOST_CHECK_EQUAL(WITH_LOCK(wallet->cs_wallet, return wallet->m_quantum_stake_return), addresses[0]);
+    const fs::path directory = m_path_root / "qkb-concurrent" / fs::PathFromString(QuantumKeyBackupWalletComponent("concurrent-wallet"));
+    BOOST_CHECK_EQUAL(ListQuantumKeyBackupGenerations(directory).size(), size_t{1});
+}
+
 
 BOOST_AUTO_TEST_SUITE_END()
 } // namespace

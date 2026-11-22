@@ -96,6 +96,14 @@ PINNED_IDENTITY_EXCEPTIONS = {
         (EXPECTED_NAME, EXPECTED_EMAIL),
         ("GitHub", "noreply@github.com"),
     ),
+    # Exact GitHub-verified PR #60 merge by Blackcoin-Dev, preserving the
+    # published v30.1.6 source. Its immutable parents are:
+    # 02672ab80857f063f1bf0dd00f2ceabee73c3f0d
+    # 8aaa4257c52997a33c0e6499f3d9ba92effc5e1c
+    "38d57d41cc0c1fbdc623cf29a1d8df4fdc3e8746": (
+        (EXPECTED_NAME, EXPECTED_EMAIL),
+        ("GitHub", "noreply@github.com"),
+    ),
 }
 FULL_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 ATTRIBUTION_TRAILER_RE = re.compile(r"^(?:co-authored-by|co-developed-by):", re.IGNORECASE)

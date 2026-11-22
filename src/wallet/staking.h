@@ -454,7 +454,8 @@ bool CreateDemurrageAttestationTransaction(
     const CCoinControl& coin_control,
     bool sign,
     DemurrageAttestationTxResult& result,
-    bilingual_str& error);
+    bilingual_str& error,
+    const std::optional<COutPoint>& preferred_target = std::nullopt);
 
 bool CreateQuantumColdStakeRedelegationTransaction(
     CWallet& wallet,
@@ -465,6 +466,70 @@ bool CreateQuantumColdStakeRedelegationTransaction(
     bilingual_str& error);
 
 int MaybeAutoDemurrageAttest(CWallet& wallet);
+
+//! At most this many failed attempts (a construction that fails, or a commit the mempool refuses) in one
+//! automatic pass, next to the existing cap of MAX_DEMURRAGE_ATTESTATIONS_PER_BLOCK successful submissions:
+//! no more than 32 attempts per pass whatever the number of keys and fee inputs.
+static constexpr int MAX_AUTO_DEMURRAGE_ATTEST_FAILED_ATTEMPTS_PER_PASS{16};
+
+//! A key the automatic path attests, and the output that made it due.
+struct AutoDemurrageAttestCandidate
+{
+    std::vector<unsigned char> witness_program;
+    uint256 key_hash;
+    int inactive_blocks{0};
+    COutPoint outpoint;
+    //! The key's latest confirmed attestation state: what the attestation to be made would reference.
+    std::optional<Consensus::DemurrageAttestationState> state;
+};
+
+//! The outcome of one attempt (one key, one fee input): construction and commit.
+struct AutoDemurrageAttestAttempt
+{
+    bool success{false};
+    //! The mempool's reject reason when the commit was refused (empty otherwise).
+    std::string reject_reason;
+    //! What the pass logs for a failure.
+    std::string error;
+    //! The attested target, on success.
+    COutPoint target;
+};
+using AutoDemurrageAttestAttemptFn =
+    std::function<AutoDemurrageAttestAttempt(const AutoDemurrageAttestCandidate&, const COutPoint& fee_outpoint)>;
+
+//! What one pass did; the counters are what the tests observe (the pass also logs them).
+struct AutoDemurrageAttestPassStats
+{
+    int submitted{0};
+    //! Construction or commit attempts that failed, counted even when construction never reached the commit.
+    int failed{0};
+    int attempts{0};
+    //! Keys given up on after a rejection that no other fee input can cure.
+    int terminal_keys{0};
+    //! Keys of the pass not visited because a budget ran out.
+    size_t deferred_keys{0};
+    //! Keys visited, in order.
+    std::vector<uint256> visited;
+};
+
+/** Whether a mempool reject reason of an automatic attestation cannot be cured by another fee input, so the
+ *  key is given up on at once: demurrage-attestation-target-unconfirmed, stale-demurrage-attestation-state,
+ *  demurrage-attestation-target-locked, demurrage-attestation-too-soon, and demurrage-attestation-target-conflict
+ *  unless the fee input is itself the target of a pending attestation (the mempool refuses a spend of a
+ *  pending target, and a different fee input avoids that). */
+bool IsTerminalAutoAttestRejection(const std::string& reject_reason, bool fee_input_is_pending_target);
+
+/** The attempt loop of one automatic pass. Keys are taken least recently attempted first (a key never
+ *  attempted before all others, then by key hash), so that when a budget runs out the keys not reached come
+ *  first in the next pass and are not stamped as attempted here. Each key is stamped when it is visited.
+ *  `attempt` does the construction and commit (and the cleanup of a failed commit); `pending_targets` are the
+ *  targets of the wallet's pending attestations. */
+AutoDemurrageAttestPassStats RunAutoDemurrageAttestAttempts(CWallet& wallet,
+                                                            std::vector<AutoDemurrageAttestCandidate> candidates,
+                                                            const std::vector<COutPoint>& fee_outpoints,
+                                                            std::set<COutPoint> pending_targets,
+                                                            int evaluation_height,
+                                                            const AutoDemurrageAttestAttemptFn& attempt);
 
 /** Whether the wallet owns, and can sign for, a live legacy output the staker could stake. */
 bool WalletHoldsLegacyStakableCoin(const CWallet& wallet) EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet);

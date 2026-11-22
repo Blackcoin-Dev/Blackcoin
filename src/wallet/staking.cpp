@@ -77,16 +77,6 @@ static bool CoinStakeSpendsKnownColdStake(CWallet& wallet, const CMutableTransac
 
 namespace {
 
-struct AutoDemurrageAttestCandidate
-{
-    std::vector<unsigned char> witness_program;
-    uint256 key_hash;
-    int inactive_blocks{0};
-    COutPoint outpoint;
-    //! The key's latest confirmed attestation state: what the attestation to be made would reference.
-    std::optional<Consensus::DemurrageAttestationState> state;
-};
-
 struct AutoRedelegationSource
 {
     CTxDestination source_dest;
@@ -1061,7 +1051,8 @@ bool CreateDemurrageAttestationTransaction(
     const CCoinControl& coin_control,
     bool sign,
     DemurrageAttestationTxResult& result,
-    bilingual_str& error)
+    bilingual_str& error,
+    const std::optional<COutPoint>& preferred_target)
 {
     result = {};
     result.witness_program = witness_program;
@@ -1136,19 +1127,27 @@ bool CreateDemurrageAttestationTransaction(
             if (out.txout.scriptPubKey == target_script) candidates.push_back(out.outpoint);
         }
         std::sort(candidates.begin(), candidates.end());
-        std::map<COutPoint, Coin> target_coins;
-        for (const COutPoint& outpoint : candidates) target_coins.emplace(outpoint, Coin{});
-        wallet.chain().findCoins(target_coins);
-        for (const COutPoint& outpoint : candidates) {
-            const auto it = target_coins.find(outpoint);
-            if (it == target_coins.end() || it->second.IsSpent()) continue;
+        // The target must be a coin of the confirmed chain view: the mempool refuses an attestation whose
+        // target is not (demurrage-attestation-target-unconfirmed), so an unconfirmed output of the key
+        // (trusted change, say) is never chosen. The caller's own candidate output is preferred.
+        const auto usable_target = [&](const COutPoint& outpoint) {
+            Coin target_coin;
+            if (!coins_view.GetCoin(outpoint, target_coin) || target_coin.IsSpent()) return false;
             const Consensus::DemurrageEvaluation target_evaluation = Consensus::EvaluateDemurrage(
-                it->second, consensus, evaluation_height, evaluation_time,
+                target_coin, consensus, evaluation_height, evaluation_time,
                 previous_state ? std::optional<int>{previous_state->height} : std::nullopt,
                 previous_state ? std::optional<int>{static_cast<int>(previous_state->coverage_start_height)} : std::nullopt);
-            if (target_evaluation.locked) continue;
-            target_outpoint = outpoint;
-            break;
+            return !target_evaluation.locked;
+        };
+        if (preferred_target && std::binary_search(candidates.begin(), candidates.end(), *preferred_target) &&
+            usable_target(*preferred_target)) {
+            target_outpoint = *preferred_target;
+        } else {
+            for (const COutPoint& outpoint : candidates) {
+                if (!usable_target(outpoint)) continue;
+                target_outpoint = outpoint;
+                break;
+            }
         }
         if (target_outpoint.IsNull()) {
             cleanse_private_key_bytes();
@@ -1616,6 +1615,7 @@ int MaybeAutoDemurrageAttest(CWallet& wallet)
     std::vector<COutPoint> fee_outpoints;
     std::set<uint256> to_resubmit; // pending attestations of the wallet that are not in the mempool
     std::set<uint256> to_abandon;  // pending attestations of the automatic path that can no longer confirm
+    std::set<COutPoint> pending_targets; // targets of the wallet's pending attestations
     {
         LOCK2(cs_main, wallet.cs_wallet);
         CoinsResult available_list = AvailableCoinsListUnspent(wallet);
@@ -1741,6 +1741,9 @@ int MaybeAutoDemurrageAttest(CWallet& wallet)
         for (auto& [key_hash, candidate] : by_key) {
             candidates.push_back(std::move(candidate));
         }
+        for (const PendingWalletAttestation& entry : pending_attestations) {
+            pending_targets.insert(entry.target);
+        }
     }
 
     // Reuse: offer a pending attestation that the mempool does not hold again (after a restart that did not
@@ -1767,51 +1770,131 @@ int MaybeAutoDemurrageAttest(CWallet& wallet)
         }
     }
 
-    int submitted{0};
+    const AutoDemurrageAttestAttemptFn attempt = [&](const AutoDemurrageAttestCandidate& candidate, const COutPoint& fee_outpoint) {
+        AutoDemurrageAttestAttempt result;
+        CCoinControl coin_control = automatic_change_control;
+        coin_control.m_allow_other_inputs = false;
+        coin_control.m_avoid_address_reuse = false;
+        coin_control.Select(fee_outpoint);
+
+        DemurrageAttestationTxResult tx_result;
+        bilingual_str error;
+        if (!CreateDemurrageAttestationTransaction(wallet, candidate.witness_program, coin_control, /*sign=*/true, tx_result, error, candidate.outpoint)) {
+            result.error = error.original;
+            return result;
+        }
+
+        mapValue_t map_value;
+        map_value["comment"] = AUTO_DEMURRAGE_ATTEST_COMMENT;
+        std::string broadcast_error;
+        if (!wallet.CommitTransaction(tx_result.tx, std::move(map_value), {}, &broadcast_error)) {
+            if (!wallet.AbandonTransaction(tx_result.tx->GetHash())) {
+                wallet.WalletLogPrintf("Demurrage auto-attestation could not be abandoned after broadcast failure: txid=%s\n", tx_result.tx->GetHash().ToString());
+            }
+            result.reject_reason = broadcast_error;
+            result.error = strprintf("broadcast failed: %s", broadcast_error.empty() ? "transaction was not accepted into the mempool" : broadcast_error);
+            return result;
+        }
+        wallet.WalletLogPrintf("Demurrage auto-attested demurrage key %s at height %d with tx %s (inactive %d blocks, fee %d)\n",
+                               candidate.key_hash.ToString(), evaluation_height, tx_result.tx->GetHash().ToString(), candidate.inactive_blocks, tx_result.fee);
+        result.success = true;
+        result.target = tx_result.target_outpoint;
+        return result;
+    };
+    return RunAutoDemurrageAttestAttempts(wallet, std::move(candidates), fee_outpoints, std::move(pending_targets),
+                                          evaluation_height, attempt).submitted;
+}
+
+bool IsTerminalAutoAttestRejection(const std::string& reject_reason, bool fee_input_is_pending_target)
+{
+    static constexpr std::array<std::string_view, 4> TERMINAL_REJECTS{
+        "demurrage-attestation-target-unconfirmed",
+        "stale-demurrage-attestation-state",
+        "demurrage-attestation-target-locked",
+        "demurrage-attestation-too-soon",
+    };
+    static constexpr std::string_view TARGET_CONFLICT{"demurrage-attestation-target-conflict"};
+    const auto starts_with = [&](std::string_view reason) { return reject_reason.compare(0, reason.size(), reason) == 0; };
+    if (std::any_of(TERMINAL_REJECTS.begin(), TERMINAL_REJECTS.end(), starts_with)) return true;
+    // The mempool also uses the conflict reason when the fee input is a pending attestation's target; another
+    // fee input cures that one.
+    return starts_with(TARGET_CONFLICT) && !fee_input_is_pending_target;
+}
+
+AutoDemurrageAttestPassStats RunAutoDemurrageAttestAttempts(CWallet& wallet,
+                                                            std::vector<AutoDemurrageAttestCandidate> candidates,
+                                                            const std::vector<COutPoint>& fee_outpoints,
+                                                            std::set<COutPoint> pending_targets,
+                                                            int evaluation_height,
+                                                            const AutoDemurrageAttestAttemptFn& attempt)
+{
+    AutoDemurrageAttestPassStats stats;
+    {
+        // Least recently attempted first. Keys the pass could not reach are not stamped, so they come first in
+        // the next pass, and the keys visited (which failed or were given up on) go behind them. Memory only:
+        // the stamps are the existing attempt heights.
+        LOCK(wallet.cs_wallet);
+        std::vector<std::pair<int, AutoDemurrageAttestCandidate>> ordered;
+        ordered.reserve(candidates.size());
+        for (AutoDemurrageAttestCandidate& candidate : candidates) {
+            const auto stamp = wallet.m_demurrage_last_auto_attest_attempt_height.find(candidate.key_hash);
+            const int last = stamp == wallet.m_demurrage_last_auto_attest_attempt_height.end() ? std::numeric_limits<int>::min() : stamp->second;
+            ordered.emplace_back(last, std::move(candidate));
+        }
+        std::stable_sort(ordered.begin(), ordered.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+        candidates.clear();
+        for (auto& entry : ordered) candidates.push_back(std::move(entry.second));
+    }
+
     bool logged_no_fee{false};
+    bool budget_exhausted{false};
     std::set<COutPoint> used_fee_outpoints;
-    for (const AutoDemurrageAttestCandidate& candidate : candidates) {
-        if (submitted >= static_cast<int>(Consensus::MAX_DEMURRAGE_ATTESTATIONS_PER_BLOCK)) {
+    for (size_t index = 0; index < candidates.size(); ++index) {
+        const AutoDemurrageAttestCandidate& candidate = candidates[index];
+        if (stats.submitted >= static_cast<int>(Consensus::MAX_DEMURRAGE_ATTESTATIONS_PER_BLOCK)) {
             wallet.WalletLogPrintf("Demurrage auto-attest deferred %u additional key(s) to a later block to respect the consensus attestation cap\n",
-                                   static_cast<unsigned int>(candidates.size() - submitted));
+                                   static_cast<unsigned int>(candidates.size() - index));
+            stats.deferred_keys = candidates.size() - index;
+            break;
+        }
+        if (stats.failed >= MAX_AUTO_DEMURRAGE_ATTEST_FAILED_ATTEMPTS_PER_PASS) {
+            budget_exhausted = true;
+            stats.deferred_keys = candidates.size() - index;
             break;
         }
         {
             LOCK(wallet.cs_wallet);
             wallet.m_demurrage_last_auto_attest_attempt_height[candidate.key_hash] = evaluation_height;
         }
+        stats.visited.push_back(candidate.key_hash);
 
         bool committed{false};
-        bilingual_str last_error;
+        bool terminal{false};
+        std::string last_error;
         for (const COutPoint& fee_outpoint : fee_outpoints) {
             if (used_fee_outpoints.count(fee_outpoint)) continue;
-
-            CCoinControl coin_control = automatic_change_control;
-            coin_control.m_allow_other_inputs = false;
-            coin_control.m_avoid_address_reuse = false;
-            coin_control.Select(fee_outpoint);
-
-            DemurrageAttestationTxResult tx_result;
-            bilingual_str error;
-            if (!CreateDemurrageAttestationTransaction(wallet, candidate.witness_program, coin_control, /*sign=*/true, tx_result, error)) {
-                last_error = error;
-                continue;
+            if (stats.failed >= MAX_AUTO_DEMURRAGE_ATTEST_FAILED_ATTEMPTS_PER_PASS) {
+                budget_exhausted = true;
+                break;
             }
 
-            mapValue_t map_value;
-            map_value["comment"] = AUTO_DEMURRAGE_ATTEST_COMMENT;
-            std::string broadcast_error;
-            if (!wallet.CommitTransaction(tx_result.tx, std::move(map_value), {}, &broadcast_error)) {
-                if (!wallet.AbandonTransaction(tx_result.tx->GetHash())) {
-                    wallet.WalletLogPrintf("Demurrage auto-attestation could not be abandoned after broadcast failure: txid=%s\n", tx_result.tx->GetHash().ToString());
+            ++stats.attempts;
+            const AutoDemurrageAttestAttempt result = attempt(candidate, fee_outpoint);
+            if (!result.success) {
+                ++stats.failed;
+                last_error = result.error;
+                // The failed attempt has already been cleaned up by `attempt`; a rejection that no other fee
+                // input can cure ends the key's turn.
+                if (IsTerminalAutoAttestRejection(result.reject_reason, pending_targets.count(fee_outpoint) > 0)) {
+                    terminal = true;
+                    ++stats.terminal_keys;
+                    break;
                 }
-                last_error = Untranslated(strprintf("broadcast failed: %s", broadcast_error.empty() ? "transaction was not accepted into the mempool" : broadcast_error));
                 continue;
             }
             used_fee_outpoints.insert(fee_outpoint);
-            wallet.WalletLogPrintf("Demurrage auto-attested demurrage key %s at height %d with tx %s (inactive %d blocks, fee %d)\n",
-                                   candidate.key_hash.ToString(), evaluation_height, tx_result.tx->GetHash().ToString(), candidate.inactive_blocks, tx_result.fee);
-            ++submitted;
+            pending_targets.insert(result.target);
+            ++stats.submitted;
             committed = true;
             break;
         }
@@ -1821,11 +1904,25 @@ int MaybeAutoDemurrageAttest(CWallet& wallet)
                 wallet.WalletLogPrintf("Demurrage auto-attest skipped: no safe spendable fee input is available\n");
                 logged_no_fee = true;
             } else if (!last_error.empty()) {
-                wallet.WalletLogPrintf("Demurrage auto-attest skipped for key %s: %s\n", candidate.key_hash.ToString(), last_error.original);
+                wallet.WalletLogPrintf("Demurrage auto-attest skipped for key %s%s: %s\n", candidate.key_hash.ToString(),
+                                       terminal ? " (no other fee input can cure it)" : "", last_error);
             }
         }
+        if (budget_exhausted) {
+            stats.deferred_keys = candidates.size() - index - 1;
+            break;
+        }
     }
-    return submitted;
+    if (budget_exhausted) {
+        wallet.WalletLogPrintf("Demurrage auto-attest stopped after %d failed attempt(s) in one pass; %u key(s) not reached are tried first in the next pass\n",
+                               stats.failed, static_cast<unsigned int>(stats.deferred_keys));
+    }
+    if (stats.attempts > 0) {
+        wallet.WalletLogPrintf("Demurrage auto-attest pass: attempts=%d submitted=%d failed=%d terminal_keys=%d deferred_keys=%u\n",
+                               stats.attempts, stats.submitted, stats.failed, stats.terminal_keys,
+                               static_cast<unsigned int>(stats.deferred_keys));
+    }
+    return stats;
 }
 
 int MaybeAutoShadowSignal(CWallet& wallet)

@@ -4,6 +4,7 @@
 
 #include <addresstype.h>
 #include <chainparams.h>
+#include <common/args.h>
 #include <coins.h>
 #include <consensus/demurrage.h>
 #include <crypto/mldsa.h>
@@ -624,6 +625,200 @@ BOOST_AUTO_TEST_CASE(a_malformed_local_attestation_state_is_not_an_absent_record
     BOOST_CHECK(decision.suppress_construction); // the manual entry references the (absent) state and is usable
     BOOST_REQUIRE_EQUAL(decision.to_abandon.size(), size_t{1});
     BOOST_CHECK(decision.to_abandon.front() == automatic);
+}
+
+namespace {
+//! The automatic pass's attempt loop, driven by a fake attempt function: the tests count what it is asked to do.
+struct AutoPassFixture {
+    std::unique_ptr<CWallet> wallet;
+    std::vector<AutoDemurrageAttestCandidate> candidates;
+    std::vector<COutPoint> fee_outpoints;
+    std::vector<std::pair<uint256, COutPoint>> calls; //! (key, fee input) of every attempt asked for
+    int call_count{0};
+
+    AutoPassFixture(TestChain100Setup& setup, size_t keys, size_t fee_inputs)
+    {
+        CKey wallet_key;
+        wallet_key.MakeNewKey(true);
+        wallet = CreateSyncedWallet(*setup.m_node.chain,
+            WITH_LOCK(Assert(setup.m_node.chainman)->GetMutex(), return setup.m_node.chainman->ActiveChain()), wallet_key);
+        for (size_t i = 0; i < keys; ++i) {
+            AutoDemurrageAttestCandidate candidate;
+            candidate.key_hash = uint256S(strprintf("%02x", 0x10 + i));
+            candidate.inactive_blocks = 100;
+            candidates.push_back(candidate);
+        }
+        for (size_t i = 0; i < fee_inputs; ++i) fee_outpoints.emplace_back(uint256S("fe"), static_cast<uint32_t>(i));
+    }
+
+    AutoDemurrageAttestPassStats Run(int height, const AutoDemurrageAttestAttemptFn& attempt, std::set<COutPoint> pending_targets = {})
+    {
+        return RunAutoDemurrageAttestAttempts(*wallet, candidates, fee_outpoints, std::move(pending_targets), height,
+                                              [&](const AutoDemurrageAttestCandidate& candidate, const COutPoint& fee) {
+                                                  ++call_count;
+                                                  calls.emplace_back(candidate.key_hash, fee);
+                                                  return attempt(candidate, fee);
+                                              });
+    }
+
+    bool Stamped(const uint256& key) const
+    {
+        LOCK(wallet->cs_wallet);
+        return wallet->m_demurrage_last_auto_attest_attempt_height.count(key) > 0;
+    }
+};
+
+AutoDemurrageAttestAttempt Failure(const std::string& reject_reason)
+{
+    AutoDemurrageAttestAttempt result;
+    result.reject_reason = reject_reason;
+    result.error = "broadcast failed: " + reject_reason;
+    return result;
+}
+
+AutoDemurrageAttestAttempt Success(const COutPoint& target)
+{
+    AutoDemurrageAttestAttempt result;
+    result.success = true;
+    result.target = target;
+    return result;
+}
+} // namespace
+
+BOOST_AUTO_TEST_CASE(a_pass_makes_at_most_sixteen_failed_attempts_however_many_keys_and_fee_inputs)
+{
+    AutoPassFixture fx(*this, /*keys=*/5, /*fee_inputs=*/60);
+    const AutoDemurrageAttestPassStats stats = fx.Run(200, [](const auto&, const auto&) { return Failure("scriptpubkey"); });
+    BOOST_CHECK_EQUAL(MAX_AUTO_DEMURRAGE_ATTEST_FAILED_ATTEMPTS_PER_PASS, 16);
+    BOOST_CHECK_EQUAL(fx.call_count, 16);
+    BOOST_CHECK_EQUAL(stats.attempts, 16);
+    BOOST_CHECK_EQUAL(stats.failed, 16);
+    BOOST_CHECK_EQUAL(stats.submitted, 0);
+    BOOST_CHECK_EQUAL(stats.visited.size(), size_t{1});
+    BOOST_CHECK_EQUAL(stats.deferred_keys, size_t{4});
+}
+
+BOOST_AUTO_TEST_CASE(a_construction_that_never_reaches_the_commit_counts_as_a_failed_attempt)
+{
+    AutoPassFixture fx(*this, 2, 60);
+    AutoDemurrageAttestAttempt construction_failed;
+    construction_failed.error = "Unable to select a fee input for demurrage attestation"; // no reject reason: no commit
+    const AutoDemurrageAttestPassStats stats = fx.Run(200, [&](const auto&, const auto&) { return construction_failed; });
+    BOOST_CHECK_EQUAL(stats.failed, 16);
+    BOOST_CHECK_EQUAL(fx.call_count, 16);
+}
+
+BOOST_AUTO_TEST_CASE(successes_and_failures_together_stay_within_thirty_two_attempts)
+{
+    // Every key fails its first three fee inputs and then succeeds: the failure budget ends the pass long
+    // before sixteen keys are attested.
+    AutoPassFixture fx(*this, 40, 200);
+    int tries_for_key{0};
+    uint256 current;
+    const AutoDemurrageAttestPassStats stats = fx.Run(200, [&](const AutoDemurrageAttestCandidate& candidate, const COutPoint& fee) {
+        if (candidate.key_hash != current) {
+            current = candidate.key_hash;
+            tries_for_key = 0;
+        }
+        return ++tries_for_key <= 3 ? Failure("scriptpubkey") : Success(COutPoint{uint256S("a1"), fee.n});
+    });
+    BOOST_CHECK_EQUAL(stats.failed, 16);
+    BOOST_CHECK_EQUAL(stats.submitted, 5);
+    BOOST_CHECK_LE(stats.attempts, 32);
+    BOOST_CHECK_EQUAL(stats.attempts, 21);
+    BOOST_CHECK_EQUAL(fx.call_count, 21);
+}
+
+BOOST_AUTO_TEST_CASE(the_sixteen_success_cap_stays_and_the_keys_it_defers_are_not_stamped)
+{
+    AutoPassFixture fx(*this, 20, 60);
+    const AutoDemurrageAttestPassStats stats = fx.Run(200, [](const auto&, const auto& fee) { return Success(COutPoint{uint256S("a1"), fee.n}); });
+    BOOST_CHECK_EQUAL(stats.submitted, 16);
+    BOOST_CHECK_EQUAL(stats.attempts, 16);
+    BOOST_CHECK_EQUAL(stats.failed, 0);
+    BOOST_CHECK_EQUAL(stats.deferred_keys, size_t{4});
+    for (size_t i = 0; i < 16; ++i) BOOST_CHECK(fx.Stamped(fx.candidates[i].key_hash));
+    for (size_t i = 16; i < 20; ++i) BOOST_CHECK(!fx.Stamped(fx.candidates[i].key_hash)); // never visited: not stamped
+}
+
+BOOST_AUTO_TEST_CASE(a_rejection_no_other_fee_input_can_cure_ends_the_keys_turn_after_one_attempt)
+{
+    for (const std::string reason : {"demurrage-attestation-target-unconfirmed", "stale-demurrage-attestation-state",
+                                     "demurrage-attestation-target-locked", "demurrage-attestation-too-soon",
+                                     "demurrage-attestation-target-conflict"}) {
+        AutoPassFixture fx(*this, 3, 40);
+        const AutoDemurrageAttestPassStats stats = fx.Run(200, [&](const auto&, const auto&) { return Failure(reason); });
+        BOOST_CHECK_MESSAGE(stats.attempts == 3 && stats.failed == 3 && stats.terminal_keys == 3 && stats.visited.size() == 3,
+                            reason << ": attempts=" << stats.attempts << " terminal=" << stats.terminal_keys);
+        // One attempt per key, each with the first fee input.
+        BOOST_CHECK_EQUAL(fx.calls.size(), size_t{3});
+        for (const auto& [key, fee] : fx.calls) BOOST_CHECK(fee == fx.fee_outpoints.front());
+    }
+}
+
+BOOST_AUTO_TEST_CASE(other_failures_and_a_conflict_caused_by_the_fee_input_try_the_next_fee_input)
+{
+    {
+        AutoPassFixture fx(*this, 1, 5);
+        const AutoDemurrageAttestPassStats stats = fx.Run(200, [](const auto&, const auto& fee) {
+            return fee.n < 3 ? Failure("scriptpubkey") : Success(COutPoint{uint256S("a1"), fee.n});
+        });
+        BOOST_CHECK_EQUAL(stats.failed, 3);
+        BOOST_CHECK_EQUAL(stats.submitted, 1);
+        BOOST_CHECK_EQUAL(stats.terminal_keys, 0);
+    }
+    {
+        // The first two fee inputs are targets of pending attestations: the mempool's conflict reason is the
+        // fee input's fault there, and the third fee input works.
+        AutoPassFixture fx(*this, 1, 5);
+        const std::set<COutPoint> pending_targets{fx.fee_outpoints[0], fx.fee_outpoints[1]};
+        const AutoDemurrageAttestPassStats stats = fx.Run(200, [&](const auto&, const auto& fee) {
+            return pending_targets.count(fee) ? Failure("demurrage-attestation-target-conflict") : Success(COutPoint{uint256S("a1"), fee.n});
+        }, pending_targets);
+        BOOST_CHECK_EQUAL(stats.failed, 2);
+        BOOST_CHECK_EQUAL(stats.submitted, 1);
+        BOOST_CHECK_EQUAL(stats.terminal_keys, 0);
+    }
+    BOOST_CHECK(!IsTerminalAutoAttestRejection("scriptpubkey", false));
+    BOOST_CHECK(!IsTerminalAutoAttestRejection("", false));
+    BOOST_CHECK(!IsTerminalAutoAttestRejection("demurrage-attestation-target-conflict", true));
+    BOOST_CHECK(IsTerminalAutoAttestRejection("demurrage-attestation-target-conflict", false));
+    BOOST_CHECK(IsTerminalAutoAttestRejection("demurrage-attestation-target-unconfirmed", true));
+}
+
+BOOST_AUTO_TEST_CASE(later_keys_make_progress_across_passes_when_the_first_keys_keep_failing)
+{
+    AutoPassFixture fx(*this, 4, 60);
+    const auto failing = [](const auto&, const auto&) { return Failure("scriptpubkey"); };
+    // Each pass exhausts its budget on one key; the keys not reached are not stamped and come first next time.
+    std::vector<uint256> order;
+    for (int pass = 0; pass < 5; ++pass) {
+        const AutoDemurrageAttestPassStats stats = fx.Run(200 + pass, failing);
+        BOOST_REQUIRE_EQUAL(stats.visited.size(), size_t{1});
+        BOOST_CHECK_EQUAL(stats.failed, 16);
+        order.push_back(stats.visited.front());
+        if (pass == 0) {
+            for (size_t i = 1; i < 4; ++i) BOOST_CHECK(!fx.Stamped(fx.candidates[i].key_hash));
+        }
+    }
+    BOOST_CHECK(order[0] == fx.candidates[0].key_hash);
+    BOOST_CHECK(order[1] == fx.candidates[1].key_hash);
+    BOOST_CHECK(order[2] == fx.candidates[2].key_hash);
+    BOOST_CHECK(order[3] == fx.candidates[3].key_hash);
+    BOOST_CHECK(order[4] == fx.candidates[0].key_hash); // a full rotation, then round again
+}
+
+BOOST_AUTO_TEST_CASE(the_automatic_pass_is_not_entered_before_demurrage_is_active)
+{
+    AutoPassFixture fx(*this, 0, 0);
+    gArgs.ForceSetArg("-qqautodemurrageattest", "1");
+    fx.wallet->m_enabled_staking = true;
+    BOOST_CHECK(!Params().GetConsensus().IsDemurrageActive(WITH_LOCK(cs_main, return m_node.chainman->ActiveChain().Height()) + 1, 0));
+    BOOST_CHECK_EQUAL(MaybeAutoDemurrageAttest(*fx.wallet), 0);
+    // The pass stopped at the activation check: it did not even record a scan.
+    BOOST_CHECK_EQUAL(WITH_LOCK(fx.wallet->cs_wallet, return fx.wallet->m_demurrage_last_auto_attest_scan_height), -1);
+    BOOST_CHECK(WITH_LOCK(fx.wallet->cs_wallet, return fx.wallet->m_demurrage_last_auto_attest_attempt_height.empty()));
+    gArgs.ForceSetArg("-qqautodemurrageattest", "0");
 }
 
 BOOST_AUTO_TEST_SUITE_END()

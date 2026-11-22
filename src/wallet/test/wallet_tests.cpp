@@ -9154,6 +9154,52 @@ BOOST_AUTO_TEST_CASE(QuantumWalletBackupDestinationWorkRunsWithoutTheWalletLock)
     }
 }
 
+// The encryption state is part of what the verified copy was made from. A wallet encrypted while the file is being
+// installed (the wallet lock is free then) holds the same keys, yet the copy is of the unencrypted wallet: it is not
+// reported as a completed backup, and no key is marked as backed up.
+BOOST_AUTO_TEST_CASE(QuantumWalletBackupIsNotCompleteWhenTheWalletIsEncryptedWhileItIsInstalled)
+{
+    for (DatabaseFormat format : DATABASE_FORMATS) {
+        const std::string name{strprintf("quantum-wallet-backup-encrypted-late-%i", format)};
+        const fs::path backup_dir = m_path_root / fs::PathFromString(strprintf("quantum-encrypted-late-backup-%i", format));
+        BOOST_REQUIRE(fs::create_directory(backup_dir));
+        auto wallet{TestLoadQuantumWallet(name, format)};
+        auto key = wallet->GetNewQuantumDestination("encrypted-late");
+        BOOST_REQUIRE(key);
+        BOOST_REQUIRE(!wallet->IsCrypted());
+
+        bool encrypted_now{false};
+        wallet->m_quantum_backup_failpoint = [&](std::string_view point) {
+            if (point == "before_installed_identity_revalidation" && !encrypted_now) {
+                encrypted_now = wallet->EncryptWallet("pass");
+            }
+            return false;
+        };
+        bilingual_str error;
+        BOOST_CHECK(!wallet->BackupWallet(fs::PathToString(backup_dir), &error));
+        wallet->m_quantum_backup_failpoint = {};
+        BOOST_REQUIRE(encrypted_now);
+        BOOST_CHECK(wallet->IsCrypted());
+        BOOST_CHECK_MESSAGE(error.original.find("inventory changed while finalizing") != std::string::npos, error.original);
+        {
+            LOCK(wallet->cs_wallet);
+            const auto info = wallet->GetQuantumKeyInfo(*key);
+            BOOST_REQUIRE(info.has_value());
+            BOOST_CHECK(!info->backup_verified);
+        }
+        // Unlocked, the next backup is of the encrypted wallet and completes.
+        BOOST_REQUIRE(wallet->Unlock("pass"));
+        error.clear();
+        BOOST_REQUIRE_MESSAGE(wallet->BackupWallet(fs::PathToString(backup_dir), &error), error.original);
+        {
+            LOCK(wallet->cs_wallet);
+            const auto info = wallet->GetQuantumKeyInfo(*key);
+            BOOST_REQUIRE(info.has_value());
+            BOOST_CHECK(info->backup_verified);
+        }
+    }
+}
+
 BOOST_AUTO_TEST_CASE(QuantumWalletEncryptedBackupAndOldWalletCompatibility)
 {
     for (DatabaseFormat format : DATABASE_FORMATS) {

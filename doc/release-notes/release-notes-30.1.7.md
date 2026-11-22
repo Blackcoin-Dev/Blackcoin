@@ -23,6 +23,13 @@ Release qualification is pending.
 - The unused stake weight refresh was removed from the wallet model and from the
   wallet, interface and chain functions that only it used. The staking weight
   shown in the window is unchanged.
+- **Fixed: a newly created encrypted legacy-format wallet could miss incoming confirmed
+  transactions.** A legacy (Berkeley DB) wallet created with a passphrase generated its first keys
+  after encryption without recording their creation time as the wallet's birth time, so every block
+  counted as older than the wallet and a payment to one of those keys that confirmed in a block the
+  wallet had not first seen in its memory pool stayed invisible until the node was restarted and the
+  missed blocks were rescanned with `rescanblockchain`. The wallet now records the time when it
+  creates the keys. This was present in 30.1.6. Descriptor wallets were not affected.
 
 ## Migration and the Final transition
 
@@ -441,11 +448,6 @@ operator can see before the last Gold Rush block (height 6,192,999), in plain la
   pending record, so it may treat a new quantum key that is still waiting for its first verified
   backup like any other key. Finish the pending backup (`setquantumstakereturn`) before
   downgrading, and do not use a pending key for anything while 30.1.6 runs.
-- **A newly created encrypted legacy-format wallet can miss incoming confirmed transactions.** A legacy
-  (Berkeley DB) wallet that is created with a passphrase does not refresh its cached birth time when its key
-  generation runs after encryption, so every block counts as older than the wallet and nothing in it is added
-  until the node is restarted and the blocks that were missed are rescanned (`rescanblockchain`). This is present
-  in 30.1.6 as well and is not changed in 30.1.7. Descriptor wallets are not affected.
 
 ## Version identity
 

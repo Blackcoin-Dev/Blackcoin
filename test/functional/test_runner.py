@@ -230,6 +230,7 @@ BASE_SCRIPTS = [
     'wallet_quantum_stake_return_durability.py',
     'wallet_quantum_stake_return_downgrade.py',
     'wallet_quantum_return_backup.py',
+    'wallet_legacy_encrypted_birth_time.py --legacy-wallet',
     'wallet_quantum_return_old_backup_recovery.py --descriptors',
     'wallet_quantum_return_old_backup_recovery.py --legacy-wallet',
     'wallet_quantum_return_pending_downgrade.py --descriptors',

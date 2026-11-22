@@ -89,16 +89,10 @@ class OldBackupRecoveryTest(TransitionTFinalTestBase, BitcoinTestFramework):
             legacy_addr = wallet.getnewaddress("", "legacy")
             self.generatetoaddress(n0, 1, legacy_addr, sync_fun=self.sync_all)
             self.bump()
-            if passphrase and not self.options.descriptors:
-                # A legacy (BDB) wallet created with a passphrase: its key manager exists before the post-encryption
-                # key generation, and the key-time notifications of that generation happen BEFORE PublishRuntimeWallet
-                # connects the notifiers, so the cached wallet birth time is never refreshed. Every block then counts
-                # as older than the wallet and nothing is added to it ("0 live wallet outputs indexed for staking").
-                # v30.1.6 does the same; descriptor wallets are not affected. Not fixed in 30.1.7 (see the release
-                # notes): a rescan reads the block that was missed.
-                n0.syncwithvalidationinterfacequeue()
-                wallet.rescanblockchain()
-                assert_equal(wallet.getwalletinfo()["txcount"], 1)
+            # No restart and no rescan: the block that pays an initial-keypool key of an encrypted legacy wallet
+            # is recognised by the wallet as soon as it connects.
+            n0.syncwithvalidationinterfacequeue()
+            assert_equal(wallet.getwalletinfo()["txcount"], 1)
             coinbase = n0.getblock(n0.getblockhash(index + 1), 2)["tx"][0]
             records.append({"name": name, "kind": kind, "passphrase": passphrase,
                             "kernel": {"txid": coinbase["txid"], "vout": 0}, "coinbase_value": coinbase["vout"][0]["value"]})

@@ -1782,6 +1782,10 @@ std::shared_ptr<CWallet> CreateWallet(WalletContext& context, const std::string&
                             status = DatabaseStatus::FAILED_CREATE;
                             return nullptr;
                         }
+                        // The initial keys exist before the wallet is published and its first-key
+                        // notification is connected: record their creation time as the wallet's
+                        // birth time here, or a block that pays one of them can be skipped.
+                        wallet->MaybeUpdateBirthTime(spk_man->GetTimeFirstKey());
                     }
                 }
             }

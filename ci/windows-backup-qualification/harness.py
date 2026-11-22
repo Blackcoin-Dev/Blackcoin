@@ -125,7 +125,8 @@ def generation_manifest(file_name, sequence, keys=()):
 def seed_generation(directory):
     """Put one valid earlier generation into directory (a wallet file and its manifest); return its file name."""
     os.makedirs(directory, exist_ok=True)
-    with open(os.path.join(directory, SEED_GENERATION), "wb") as handle:
+    wallet_path = os.path.join(directory, SEED_GENERATION)
+    with open(wallet_path, "wb") as handle:
         handle.write(b"earlier generation, not a real wallet\n")
     with open(os.path.join(directory, SEED_GENERATION + ".keys"), "w", encoding="utf-8", newline="\n") as handle:
         handle.write(generation_manifest(SEED_GENERATION, 1))
@@ -291,7 +292,8 @@ class Node:
             os.remove(self.cookie)
         arguments = [self.env.daemon] + BASE_ARGS + LIFECYCLE_ARGS + [
             "-datadir=" + self.datadir, "-port=%d" % self.port, "-rpcport=%d" % self.rpc_port] + self.extra_args
-        self.stdout = open(os.path.join(self.env.logs, "%s-%s.out" % (safe_name(self.env.case), self.label)), "ab")
+        console_path = os.path.join(self.env.logs, "%s-%s.out" % (safe_name(self.env.case), self.label))
+        self.stdout = open(console_path, "ab")
         self.process = subprocess.Popen(arguments, stdout=self.stdout, stderr=subprocess.STDOUT)
         if self not in self.env.nodes:
             self.env.nodes.append(self)

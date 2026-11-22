@@ -168,10 +168,12 @@ def selftest():
         contents = {names["portable"]: b"zip", names["installer"]: b"exe", names["source_commit"]: (sha + "\n").encode()}
         for name, data in contents.items():
             for directory in (build, canary):
-                with open(os.path.join(directory, name), "wb") as handle:
+                path = os.path.join(directory, name)
+                with open(path, "wb") as handle:
                     handle.write(data)
         marker = names["prefix"] + "-UNSIGNED-CANARY.txt"
-        with open(os.path.join(canary, marker), "wb") as handle:
+        marker_path = os.path.join(canary, marker)
+        with open(marker_path, "wb") as handle:
             handle.write(b"unsigned")
         manifest = {"source": {"commit": sha}, "workflow": {"run_id": "42"}, "release": {"published": False},
                     "artifacts": [{"name": n, "sha256": hashlib.sha256(d).hexdigest()} for n, d in contents.items()]}
@@ -188,13 +190,18 @@ def selftest():
             os.makedirs(copy_canary)
             for src, dst in ((build, copy_build), (canary, copy_canary)):
                 for name in os.listdir(src):
-                    with open(os.path.join(src, name), "rb") as a, open(os.path.join(dst, name), "wb") as b:
-                        b.write(a.read())
+                    source_path, target_path = os.path.join(src, name), os.path.join(dst, name)
+                    with open(source_path, "rb") as a:
+                        with open(target_path, "wb") as b:
+                            b.write(a.read())
             run_id = 42
             if attack == "extra":
-                open(os.path.join(copy_build, "extra.txt"), "wb").close()
+                extra = os.path.join(copy_build, "extra.txt")
+                with open(extra, "wb"):
+                    pass
             elif attack == "tamper":
-                with open(os.path.join(copy_build, names["portable"]), "wb") as handle:
+                tampered = os.path.join(copy_build, names["portable"])
+                with open(tampered, "wb") as handle:
                     handle.write(b"other")
             elif attack == "wrong-run":
                 run_id = 43

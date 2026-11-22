@@ -14,6 +14,7 @@
 # The real src/wallet/quantum_return_backup.cpp is included by flush_probe.cpp. The other real source files below are the
 # smallest closure the linker asked for (measured on a host build); the stubs in flush_probe.cpp stand for random.cpp,
 # chainparams.cpp, util/check.cpp and util/getuniquepath.cpp, which would pull in the rest of the node.
+export LC_ALL=C
 set -euo pipefail
 
 SRC=${1:?usage: build-probe.sh <checkout> <output directory>}

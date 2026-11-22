@@ -137,8 +137,24 @@ Release qualification is pending.
   nothing is added to the wallet file); the staker leaves the reserve out of kernels and of
   added inputs, and automatic coin selection (an ordinary send, `sendall`, the migration batches,
   the automatic demurrage-attestation fee input and the automatic redelegation) leaves it alone
-  and rechecks it before it commits. Explicit coin control can still spend a reserved output; the
-  readiness report then shows the reduction. `getquantumstakereadiness` reports the guard in
+  and rechecks it before it commits. The commit itself derives the reserve again under the same
+  locks the transaction is published under, so a block, a reorganisation or another operation
+  after a transaction was built (a payment confirmed in a dialog, say) cannot slip a reserved
+  input through: a transaction whose inputs the wallet chose itself and that now includes a
+  reserved output is refused with a clear error and leaves no record and no lock. The UTXO
+  optimiser (`optimizeutxoset`, with or without a from-address) and the demurrage sweep choose
+  their inputs through the same filter. Explicit coin control can still spend a reserved output,
+  and `send` and `sendall` then report which reserved outputs were consumed and the reduction of
+  the reserve and of the eligibility for the first Final block (`final_stake_reserve_spent`); the
+  readiness report shows the reduction as well. The readiness for the next block and the staking
+  weight leave the reserved outputs out (an N = 1 wallet inside the guard reports no stakeable
+  output now and one at the first Final block; `reserve_withheld_outputs` and
+  `reserve_withheld_nominal` say how many and what they are worth), and for the first Final block
+  itself, where the guard is released, the eligibility is still reported.
+  Equal effective values are ordered by the outpoint's internal byte order (the transaction hash
+  as stored, which is the reverse of the transaction id as displayed), then by output index, both
+  ascending: a tie does not sort by the displayed id text.
+  `getquantumstakereadiness` reports the guard in
   `final_stake_reserve`: whether it is enabled and active, N, the target R, the reserved
   outpoints and their weight, the outputs and weight eligible at the first Final block, any
   shortfall, and what excluded an output (a missing key is told apart from a locked wallet).
@@ -416,6 +432,15 @@ operator can see before the last Gold Rush block (height 6,192,999), in plain la
   Likewise 30.1.6 does not know the opportunistic window (from 6,917,000) or the final stake
   reserve: it pays legacy stakes to legacy outputs in that window, and it stakes every quantum
   output in the last 500 blocks of Migration.
+  Record compatibility is not command-line compatibility. `-finalstakereserve` and
+  `-quantumkeybackupdir` are new in 30.1.7, and 30.1.6 refuses to start with an option it does
+  not know: remove both from the command line and from the configuration file before starting
+  30.1.6, and put them back when you upgrade again (the wallet keeps working without them; the
+  backup directory then falls back to its default, and the reserve to its default, on). While
+  30.1.6 is running it also cannot enforce the pending-key quarantine: it does not know the
+  pending record, so it may treat a new quantum key that is still waiting for its first verified
+  backup like any other key. Finish the pending backup (`setquantumstakereturn`) before
+  downgrading, and do not use a pending key for anything while 30.1.6 runs.
 
 ## Version identity
 

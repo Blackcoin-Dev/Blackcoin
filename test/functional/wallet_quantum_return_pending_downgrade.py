@@ -10,10 +10,14 @@ directory is unwritable), closes the node, opens the same data directory with th
 v30.1.6 binary (the wallet loads, works and still has the key), then opens it with this build
 again: the pending state is intact (same key, no active address), and the next preparation
 retries that key and completes.
+
+The two options new in 30.1.7 (-quantumkeybackupdir, -finalstakereserve) are unknown to v30.1.6, which refuses to
+start with either of them; the downgrade takes them off the command line, and the re-upgrade puts them back.
 """
 import os
 
 from test_framework.test_framework import BitcoinTestFramework
+from test_framework.test_node import ErrorMatch
 from test_framework.util import assert_equal, assert_raises_rpc_error
 from transition_t_final_util import LIFECYCLE_ARGS, TransitionTFinalTestBase
 
@@ -60,9 +64,16 @@ class PendingReturnDowngradeTest(TransitionTFinalTestBase, BitcoinTestFramework)
         assert_equal(list(wallet.getaddressesbylabel(LABEL)), [pending_address])
         before = {"balances": wallet.getbalances()["mine"], "txcount": wallet.getwalletinfo()["txcount"]}
 
-        self.log.info("Open the same data directory with the unmodified v30.1.6: it skips the record")
+        self.log.info("Options new in 30.1.7 are not command-line compatible: v30.1.6 refuses to start with them")
         self.stop_node(0)
         node.args[0] = self.v30_1_6
+        for option in ("-quantumkeybackupdir=qkbackups", "-finalstakereserve=0"):
+            node.assert_start_raises_init_error(
+                extra_args=self.old_args + [option],
+                expected_msg="Invalid parameter " + option,
+                match=ErrorMatch.PARTIAL_REGEX)
+
+        self.log.info("Open the same data directory with the unmodified v30.1.6 without them: it skips the record")
         self.start_node(0, extra_args=self.old_args)
         assert_equal(node.getnetworkinfo()["subversion"], "/Blackcoin:30.1.6(testnode0)/")
         old = node.get_wallet_rpc("pd")

@@ -54,26 +54,30 @@ and earlier.
   always leaves a way to finish: once no legacy anchor is left, the confirmed quantum output of the
   earlier batch anchors and funds the next one (and funds a tail that cannot pay its own fee); its
   value is reported separately as `auxiliary_inputs` and `auxiliary_amount`, never as legacy value
-  moved. A batch that would strand the rest is refused before it is built. `more_batches` false means
+  moved. A batch that would strand the rest is refused before anything is committed or broadcast (the first
+  transaction has been constructed by then, and signed on the signed path, and is discarded). `more_batches` false means
   no ELIGIBLE input remains: `excluded_legacy_outputs`, `excluded_legacy_amount` and
   `next_maturity_height` report legacy outputs that were not eligible yet (immature, locked,
   unconfirmed), and the Staking page says so instead of "no legacy outputs remain". The dry run
   now reports the maximum signed size and the exact fee of the real call instead of the much smaller
   unsigned size. The Staking page buttons move one batch per click, reuse the same address for
   the next batch, and say how much remains.
-- **A partial migration batch is authorised only when the rest can finish.** Before the first
-  batch is built the wallet simulates every later batch with the planner it will use: the actual
-  signed size of spending the earlier batch's quantum output (the anchor and fee source of a
-  later batch), the `max_inputs` in force, the fee rate (no lower than this batch's, the relay
-  minimum and the wallet's required fee) and the dust limit, and refuses the batch when a later
-  batch would have no anchor, would not fit, or could not pay its fee and leave an output above
-  dust. A wallet whose remainder needs several batches that each spend the previous batch's
-  output is told how many batches (`continuation_batches`), what they are expected to pay
-  (`continuation_fees`) and the fewest blocks the whole migration needs
-  (`minimum_blocks_to_finish`: a later batch that spends an earlier batch's output waits for it to
-  confirm). When even that cannot finish by the last Migration block the result carries
-  `completion_warning`. A passing funding estimate is not a promise to finish before the Final
-  phase.
+- **A partial migration batch is authorised only when the rest is proven to finish.** Before
+  anything is committed or broadcast the wallet simulates every later batch with the planner it
+  will use: the actual signed size of spending the earlier batch's quantum output (the anchor and
+  fee source of a later batch), the `max_inputs` in force, the fee rate (no lower than this batch's,
+  the relay minimum and the wallet's required fee) and the dust limit. It refuses the batch when a
+  simulated later batch would have no anchor, would not fit, or could not pay its fee and leave an
+  output above dust. The simulation covers at most 512 later batches. When the rest needs more, the
+  wallet does not guess: it refuses, and says to raise `max_inputs` or to migrate in smaller
+  explicit steps (a tiered destination's outputs cannot anchor a later batch, so an aggregate
+  estimate could not prove that anchors last). For a plan that passed, `continuation_batches` and
+  `continuation_fees` are those of the simulated batches. `minimum_blocks_to_finish` is only a lower
+  bound: the longest chain of later batches that each spend the quantum output of the one before and
+  so wait for it to confirm, counting this batch. Batches that do not depend on each other can
+  share a block, and nothing here predicts when a migration will finish or promises that it will
+  finish before the Final phase. When even that lower bound passes the last Migration block the
+  result carries `completion_warning`.
 - **The leftover report is an inventory.** `excluded_legacy_outputs` and `excluded_legacy_amount`
   now cover every unspent legacy output the wallet owns that the batch did not move, not only
   what the coin-selection view shows, and `excluded_legacy_by_reason` files each one under
@@ -172,8 +176,9 @@ outputs the wallet stakes, what it reports, and what it tells the user to do.
   looks at the target, the controlling key, the referenced state, the lock state
   and the minimum interval, in the mempool only; a flood of such candidates
   costs no signature verification. A bad signature on a current state, a target
-  the transaction itself spends, a missing target and a key that does not
-  control the target are still rejected and still penalize the sender. Block
+  the transaction itself spends and a key that does not control the target are still
+  rejected and still penalize the sender. A target that is not a confirmed unspent coin is
+  turned away earlier, as mempool policy, without a penalty. Block
   validation does not use the check and is unchanged: the same attestation in a
   block is still invalid.
 - The rejection text of `sendrawtransaction` is unchanged. The debug message only
@@ -238,8 +243,12 @@ operator can see before the last Gold Rush block (height 6,192,999), in plain la
 - **The quantum stake return address is not prepared by itself before Gold Rush ends.** The
   wallet's own maintenance saves a return address (or, with `-qqallowautokeycreation`, creates a
   key) only once the next block is above the last Gold Rush block and only for a wallet that
-  holds legacy coins the staker could stake. No key, saved record or backup prompt appears on its
-  own before that. The `setquantumstakereturn` command works at any time; calling it can create a
+  holds legacy coins the staker could stake that it owns and can sign for. No key, saved record or
+  backup prompt appears from this preparation before that. (Other automatic maintenance is not
+  changed by this: with automatic redelegation and automatic key creation enabled, the redelegation
+  scan records its last scanned height, and the same-height reorganisation rescan of automatic
+  attestations and Gold Rush signals can reach the existing automatic signal path, which under the
+  existing consent settings can create a payout key and ask for a backup.) The `setquantumstakereturn` command works at any time; calling it can create a
   key and changes the saved choice, and it reports `created` whenever a key was made, including by
   its automatic path.
 - **New status fields and commands exist now.** `getquantumstakereadiness`,
@@ -281,5 +290,7 @@ operator can see before the last Gold Rush block (height 6,192,999), in plain la
 - **Downgrade.** A wallet written by 30.1.7 opens in 30.1.6 with the same balances, unspent outputs
   and transactions, and 30.1.7 finds its quantum stake return record again. 30.1.6 does not know the
   late-Migration policy: do not use 30.1.6 to stake legacy coins in the last Migration window (from
-  height 6,921,499), because it would pay a legacy return that could not be spent before Final.
-  Switch legacy staking off there, or stay on 30.1.7.
+  height 6,921,499). A legacy return created at 6,921,499 matures at 6,921,999, the last Migration
+  block, so it has only that one block (the margin) to be spent before Final; a return created from
+  6,921,500 on matures too late and can never be spent. Switch legacy staking off from height
+  6,921,499, or stay on 30.1.7.

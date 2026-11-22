@@ -18,7 +18,7 @@ Protocol V3.1, so the proof-of-stake kernel, signature and reward checks run). C
  * outside the window a legacy stake still returns to a legacy output, unchanged;
  * not ready: with no return address the wallet reports exactly what to do and builds no
    legacy-return coinstake in the window (the refusal fallback);
- * ready: every window coinstake of a legacy wallet (a pubkeyhash kernel and a bech32
+ * ready: the window coinstakes checked below (see the loop bounds) of a legacy wallet (a pubkeyhash kernel and a bech32
    kernel) has one valued output, a quantum output of the wallet, worth principal plus the
    scheduled reward (no split although the kernel is large, no donation); a restart in the
    window keeps the return address; a reorganisation that replaces a window block leaves

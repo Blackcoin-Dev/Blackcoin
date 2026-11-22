@@ -82,6 +82,15 @@ class QuantumStakeReturnStatusTest(TransitionTFinalTestBase, BitcoinTestFramewor
         helptext = node.help("setquantumstakereturn")
         assert "could not mature before the Final phase" not in helptext
         assert "last Migration block" in helptext
+        for command in ("getstakinginfo", "getmigrationstatus"):
+            # The help of the last-height field: a ready wallet keeps staking legacy kernels, so it must not say
+            # that the wallet stops or that every later legacy stake is lost.
+            text = node.help(command)
+            start = text.index("legacy_staking_last_height")
+            entry = text[start:start + 700]
+            assert "would be lost, so the wallet stops" not in entry, entry
+            assert "could not mature before the Final phase" not in entry, entry
+            assert "quantum stake return address" in entry, entry
         info = wallet.getstakinginfo()
         notice = info["legacy_staking_notice"]
         assert "so not inside the window" not in notice

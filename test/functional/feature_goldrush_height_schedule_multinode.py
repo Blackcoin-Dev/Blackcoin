@@ -393,7 +393,8 @@ class GoldRushHeightScheduleMultiNodeTest(BitcoinTestFramework):
         valued = [o for o in coinstake["vout"] if o["value"] > 0]
         assert_equal(len(valued), 1)
         assert_equal(valued[0]["scriptPubKey"]["type"], "witness_unknown")
-        # Every window block after the address is ready, not only the first: a legacy kernel is paid back in
+        # The window blocks from the one after the address is ready up to M - 1 (block M is produced and checked
+        # after this loop), not only the first: a legacy kernel is paid back in
         # full (principal plus the scheduled reward, plus fees when the block carries transactions) to ONE
         # output, the return address; a quantum kernel keeps paying quantum outputs.
         legacy_returns = 0

@@ -55,3 +55,10 @@ PREVIOUS_RELEASES_DIR="$PWD/.ci/previous-releases" \
   python3 test/functional/test_runner.py --jobs=1 \
   feature_goldrush_mixed_version.py --previous-releases
 ```
+
+The v30.1.6 entry is built from the pinned annotated tag (tag object and peeled
+commit) and its `Source commit:` banner is checked. The gate then runs the
+functional tests that compare the candidate with the published 30.1.6 daemon
+(`BLACKCOIN_V30_1_6_BINARY` points at the pinned build). That step fails if the
+binary is absent, if any of those tests is skipped, or if fewer tests pass than
+were listed.

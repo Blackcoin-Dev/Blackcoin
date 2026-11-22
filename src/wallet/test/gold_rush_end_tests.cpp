@@ -19,9 +19,12 @@
 
 #include <boost/test/unit_test.hpp>
 
+#include <atomic>
 #include <chrono>
 #include <future>
+#include <memory>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -281,8 +284,7 @@ BOOST_AUTO_TEST_CASE(unload_stop_during_end_stop_leaves_no_restart_queued)
     // What unloading a wallet does to the miner (FlushWallets stops it) completes while the maintenance thread
     // is poised before taking the authority mutex for the end-stop. The end-stop must find the miner already
     // stopped: no restart is queued over the unload, nothing hangs, and the wallet's miner state is the
-    // stopped state. (The interleaving INSIDE the join of the workers cannot be pinned without a hook in
-    // StopPowMiningLocked between the stop flag and the join; none exists and none is added here.)
+    // stopped state. (The interleaving inside the join of real workers is the next test.)
     m_wallet.m_pow_mining_enabled = true;
     m_wallet.m_pow_threads = 1;
     m_wallet.m_pow_cpu_percent = 10;
@@ -307,6 +309,100 @@ BOOST_AUTO_TEST_CASE(unload_stop_during_end_stop_leaves_no_restart_queued)
 
     BOOST_CHECK(!m_wallet.m_pow_mining_enabled.load());
     BOOST_CHECK(!m_wallet.m_pow_resume_below_end.load());
+}
+
+BOOST_AUTO_TEST_CASE(unload_overlapping_the_end_stop_join_completes_the_shutdown)
+{
+    // A real joinable worker keeps running after the end-stop has set the stop flag, so the join is genuinely
+    // pending when the hook fires; the unload path (FlushWallets: stop the miner, stop staking) then runs and
+    // must wait for the join, not race it. Everything is released through bounded waits, the last reference
+    // to the wallet is dropped by whichever thread finishes last (as the claim maintenance pass and the
+    // unload do), and the miner ends stopped with no worker left and none started.
+    const auto bound = std::chrono::seconds{60};
+    auto wallet = std::make_shared<CWallet>(m_node.chain.get(), "", CreateMockableWalletDatabase());
+    wallet->LoadWallet();
+    wallet->m_pow_mining_enabled = true;
+    wallet->m_pow_threads = 1;
+    wallet->m_pow_cpu_percent = 10;
+
+    std::atomic<bool> worker_may_exit{false};
+    std::atomic<bool> worker_exited{false};
+    struct ReleaseWorker {
+        std::atomic<bool>& flag;
+        ~ReleaseWorker() { flag = true; }
+    } release_worker{worker_may_exit}; // a failed check cannot leave the worker (and the join) hanging
+    CWallet* raw = wallet.get();
+    {
+        auto group = std::make_unique<std::vector<std::thread>>();
+        group->emplace_back([&, raw] {
+            const auto deadline = std::chrono::steady_clock::now() + bound;
+            while (!(raw->m_stop_pow_mining_thread.load() && worker_may_exit.load()) &&
+                   std::chrono::steady_clock::now() < deadline) {
+                std::this_thread::sleep_for(std::chrono::milliseconds{1});
+            }
+            worker_exited = true;
+        });
+        LOCK(wallet->m_pow_miner_mutex);
+        wallet->threadPowMinerGroup = std::move(group);
+    }
+
+    std::promise<void> join_reached;
+    std::atomic<int> join_hook_calls{0};
+    wallet->m_pow_reconcile_test_hook = [&](const char* stage) {
+        // Every stop passes the point (the unload's own stop too, once it gets the authority mutex); only the
+        // first, the end-stop's, is the synchronization point.
+        if (std::string{stage} != "before_end_stop_join") return;
+        if (join_hook_calls.fetch_add(1) == 0) join_reached.set_value();
+    };
+    // The maintenance pass owns a reference to the wallet, as the claim maintenance does.
+    auto maintenance = std::async(std::launch::async, [wallet] {
+        wallet->ReconcilePowMinerWithWindowState(/*closed=*/true, /*tip_height=*/SHADOW_REWARD_END_HEIGHT);
+    });
+    auto reached = join_reached.get_future();
+    BOOST_REQUIRE(reached.wait_for(bound) == std::future_status::ready);
+    // The stop flag is set, the worker is alive, and the join is pending.
+    BOOST_CHECK(raw->m_stop_pow_mining_thread.load());
+    BOOST_CHECK(!worker_exited.load());
+
+    // The unload runs now, on its own reference, and drops it when done.
+    auto unload = std::async(std::launch::async, [wallet] {
+        wallet->StopPowMining();
+        wallet->StopStake();
+    });
+    // Both are blocked behind the join while the worker lives (a negative check: it can only pass early).
+    BOOST_CHECK(unload.wait_for(std::chrono::milliseconds{200}) == std::future_status::timeout);
+    BOOST_CHECK(maintenance.wait_for(std::chrono::milliseconds{0}) == std::future_status::timeout);
+    BOOST_CHECK(!worker_exited.load());
+
+    worker_may_exit = true;
+    BOOST_REQUIRE(unload.wait_for(bound) == std::future_status::ready);
+    BOOST_REQUIRE(maintenance.wait_for(bound) == std::future_status::ready);
+    unload.get();
+    maintenance.get();
+
+    // Completed shutdown: the worker has exited and been joined, nothing is enabled, no worker group is left
+    // and none was started, the stop flag is reset, and the state is the stopped state.
+    BOOST_CHECK(worker_exited.load());
+    BOOST_CHECK(!wallet->m_pow_mining_enabled.load());
+    BOOST_CHECK(!wallet->m_stop_pow_mining_thread.load());
+    {
+        LOCK(wallet->m_pow_miner_mutex);
+        BOOST_CHECK(wallet->threadPowMinerGroup == nullptr);
+    }
+    BOOST_CHECK(wallet->m_pow_state.load() == interfaces::WalletPowMiningState::DISABLED);
+    BOOST_CHECK_EQUAL(join_hook_calls.load(), 2); // the end-stop's join, then the unload's own (empty) stop
+    // The end-stop had already decided when the unload arrived, so it did queue the resume memory; the wallet is
+    // unloaded and unregistered from the maintenance, so nothing acts on it. What must hold is that nothing
+    // restarted: reconciling again with the window still closed does not start a worker.
+    wallet->ReconcilePowMinerWithWindowState(/*closed=*/true, /*tip_height=*/SHADOW_REWARD_END_HEIGHT);
+    BOOST_CHECK(!wallet->m_pow_mining_enabled.load());
+    {
+        LOCK(wallet->m_pow_miner_mutex);
+        BOOST_CHECK(wallet->threadPowMinerGroup == nullptr);
+    }
+    wallet->m_pow_reconcile_test_hook = nullptr;
+    // The last reference is dropped here: the destructor stops a stopped miner and a stopped stake.
+    wallet.reset();
 }
 
 BOOST_AUTO_TEST_CASE(end_stop_without_interference_queues_the_restart)

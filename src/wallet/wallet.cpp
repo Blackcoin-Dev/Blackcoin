@@ -14140,6 +14140,8 @@ void CWallet::StopPowMiningLocked()
         m_pow_claim_inflight = false;
         m_pow_wallet_wide_tip_wait = false;
     }
+    // Test-only synchronization point: the stop flag is set and the workers are not joined yet.
+    if (m_pow_reconcile_test_hook) m_pow_reconcile_test_hook("before_end_stop_join");
     if (group) {
         for (std::thread& thread : *group) {
             if (thread.joinable()) thread.join();

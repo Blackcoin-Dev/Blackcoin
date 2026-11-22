@@ -2285,7 +2285,9 @@ public:
     // Automatic restarts refused because an explicit request superseded them.
     std::atomic<uint64_t> m_pow_auto_restart_refusals{0};
     // Test-only: called at the named point of the automatic end-stop or
-    // restart so a test can interleave an explicit request deterministically.
+    // restart (and, as "before_end_stop_join", between setting the stop flag
+    // and joining the workers in StopPowMiningLocked) so a test can interleave
+    // an explicit request deterministically. Unset, it does nothing.
     std::function<void(const char* stage)> m_pow_reconcile_test_hook;
     std::atomic<int> m_pow_resume_threads{1};
     std::atomic<int> m_pow_resume_cpu_percent{1};

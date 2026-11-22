@@ -6299,6 +6299,8 @@ static RPCHelpMan sweepdemurragedecay()
     filter.only_spendable = true;
     filter.skip_locked = true;
     filter.include_immature_coinbase = false;
+    // The sweep picks its inputs itself: it leaves the final stake reserve alone, as the commit would refuse it.
+    filter.avoid_final_stake_reserve = true;
 
     CoinsResult available = AvailableCoins(*pwallet, &coin_control, std::nullopt, filter);
     std::map<COutPoint, Coin> chain_coins;

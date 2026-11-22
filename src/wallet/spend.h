@@ -586,6 +586,10 @@ struct CoinFilterParams {
     // reserve guard is on, see FinalStakeReserve). Always read fresh. Explicitly selected coins are not affected
     // because they never pass through this scan.
     bool avoid_final_stake_reserve{false};
+    // Outputs whose coin lock the staking scan ignores. Only the commit-time reserve check sets it: a lock the wallet
+    // itself put on the automatic inputs of the transaction it is committing (lock_unspents) must not take them out
+    // of the reserve. Not owned; the set outlives the scan.
+    const std::set<COutPoint>* staking_scan_ignores_lock_of{nullptr};
     // Optional cooperative cancellation for long read-only listings. Checked
     // every INTERRUPT_CHECK_INTERVAL transaction/output visits; when true
     // the walk stops early and CoinsResult::interrupted is set. Funding paths

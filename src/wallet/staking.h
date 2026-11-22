@@ -335,18 +335,27 @@ std::set<COutPoint> FinalStakeReserveConsumedSources(const CWallet& wallet, int6
                                                      int64_t last_source_height)
     EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet);
 
-/** Compute the reserve for the next block (tip height + 1) from one consistent wallet and active-chain snapshot. */
-FinalStakeReserve ComputeFinalStakeReserve(const CWallet& wallet)
+/** Compute the reserve for the next block (tip height + 1) from one consistent wallet and active-chain snapshot.
+ *  ignore_lock_of, when given, names outputs whose coin lock does not take them out of the scan (see
+ *  CoinFilterParams::staking_scan_ignores_lock_of). */
+FinalStakeReserve ComputeFinalStakeReserve(const CWallet& wallet, const std::set<COutPoint>* ignore_lock_of = nullptr)
     EXCLUSIVE_LOCKS_REQUIRED(::cs_main, wallet.cs_wallet);
 
 /** The outputs automatic spending must not select: the reserve while the guard is active, otherwise empty. Always
  *  computed fresh (a spend never reads a cached reserve). Cheap when the guard is off. */
-std::set<COutPoint> FinalStakeReserveEnforcedOutpoints(const CWallet& wallet)
+std::set<COutPoint> FinalStakeReserveEnforcedOutpoints(const CWallet& wallet, const std::set<COutPoint>* ignore_lock_of = nullptr)
     EXCLUSIVE_LOCKS_REQUIRED(::cs_main, wallet.cs_wallet);
 
 /** The recheck before an automatic spend is committed: true when any input of tx is in the enforced reserve. Takes
  *  cs_main and cs_wallet itself; call with neither held. */
 bool SpendsFinalStakeReserve(CWallet& wallet, const CTransaction& tx)
+    LOCKS_EXCLUDED(::cs_main, wallet.cs_wallet);
+
+/** Whether CWallet::CommitTransaction has to take cs_main to derive the reserve again: the option is on, the height
+ *  schedule is known and the tip is at most a safety margin of blocks from the guard (or inside it), and not past it.
+ *  The margin covers the blocks that could connect between this reading and the lock. Reads the tip height itself;
+ *  call with neither cs_main nor cs_wallet held. */
+bool FinalStakeReserveCommitRecheckNeeded(const CWallet& wallet)
     LOCKS_EXCLUDED(::cs_main, wallet.cs_wallet);
 
 /** Quantum stake as the staker sees it for one block.

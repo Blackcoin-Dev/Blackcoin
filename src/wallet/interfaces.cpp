@@ -2716,15 +2716,32 @@ public:
         fee = txr.fee;
         change_pos = txr.change_pos;
 
+        // The GUI commits the transaction later, from the transaction alone. What the user selected with coin control
+        // is remembered for it (the only inputs that may spend the final stake reserve at the commit); every other
+        // input is the wallet's own choice.
+        if (const std::vector<COutPoint> selected = coin_control.ListSelected(); !selected.empty()) {
+            LOCK(m_explicit_inputs_mutex);
+            if (m_explicit_inputs.size() >= MAX_REMEMBERED_EXPLICIT_INPUTS) m_explicit_inputs.erase(m_explicit_inputs.begin());
+            m_explicit_inputs[txr.tx->GetHash()] = std::set<COutPoint>(selected.begin(), selected.end());
+        }
         return txr.tx;
     }
     void commitTransaction(CTransactionRef tx,
         WalletValueMap value_map,
         WalletOrderForm order_form) override
     {
+        std::set<COutPoint> explicit_inputs;
+        {
+            LOCK(m_explicit_inputs_mutex);
+            if (const auto it = m_explicit_inputs.find(tx->GetHash()); it != m_explicit_inputs.end()) {
+                explicit_inputs = it->second;
+                m_explicit_inputs.erase(it);
+            }
+        }
         std::string broadcast_error;
         WalletCommitStatus status;
-        if (!m_wallet->CommitTransaction(tx, std::move(value_map), std::move(order_form), &broadcast_error, &status)) {
+        if (!m_wallet->CommitTransaction(tx, std::move(value_map), std::move(order_form), &broadcast_error, &status,
+                                         /*shadow_pow_authority=*/std::nullopt, &explicit_inputs)) {
             if (status == WalletCommitStatus::PERSISTED_PENDING) return;
             throw std::runtime_error(broadcast_error.empty()
                 ? "Transaction could not be committed"
@@ -4129,6 +4146,10 @@ public:
 
     WalletContext& m_context;
     std::shared_ptr<CWallet> m_wallet;
+    //! Coin control selections of the transactions created for the GUI and not yet committed, by txid.
+    static constexpr size_t MAX_REMEMBERED_EXPLICIT_INPUTS{64};
+    Mutex m_explicit_inputs_mutex;
+    std::map<uint256, std::set<COutPoint>> m_explicit_inputs GUARDED_BY(m_explicit_inputs_mutex);
     std::mutex m_display_mutex;
     std::shared_ptr<WalletDisplayBalance> m_display;
     bool m_display_released{false};

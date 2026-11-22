@@ -142,18 +142,27 @@ static std::string DurableQuantumKeyFailureMessage(
             : failure);
 }
 
+/** The outputs a user selected with coin control: the only inputs allowed to spend the final stake reserve. */
+static std::set<COutPoint> ExplicitInputs(const CCoinControl& coin_control)
+{
+    const std::vector<COutPoint> selected = coin_control.ListSelected();
+    return {selected.begin(), selected.end()};
+}
+
 static void CommitWalletTransactionOrThrow(
     CWallet& wallet,
     const CTransactionRef& tx,
     mapValue_t map_value,
     const std::string& action,
-    const std::optional<CTxDestination>& created_destination = std::nullopt)
+    const std::optional<CTxDestination>& created_destination = std::nullopt,
+    const std::set<COutPoint>& explicit_inputs = {})
 {
     std::string broadcast_error;
     WalletCommitStatus status;
     bool committed{false};
     try {
-        committed = wallet.CommitTransaction(tx, std::move(map_value), {}, &broadcast_error, &status);
+        committed = wallet.CommitTransaction(tx, std::move(map_value), {}, &broadcast_error, &status,
+                                             /*shadow_pow_authority=*/std::nullopt, &explicit_inputs);
     } catch (const std::exception& e) {
         ThrowQuantumActionError(
             RPC_WALLET_ERROR,
@@ -261,7 +270,7 @@ UniValue SendMoneyToScript(CWallet& wallet, const CScript scriptPubKey, CAmount 
         throw JSONRPCError(RPC_WALLET_INSUFFICIENT_FUNDS, util::ErrorString(res).original);
     }
     const CTransactionRef& tx = res->tx;
-    CommitWalletTransactionOrThrow(wallet, tx, std::move(map_value), "Blackcoin send");
+    CommitWalletTransactionOrThrow(wallet, tx, std::move(map_value), "Blackcoin send", std::nullopt, ExplicitInputs(coin_control));
     return tx->GetHash().GetHex();
 }
 
@@ -269,7 +278,8 @@ static UniValue FinishTransaction(
     const std::shared_ptr<CWallet> pwallet,
     const UniValue& options,
     const CMutableTransaction& rawTx,
-    const std::optional<CTxDestination>& created_quantum_change = std::nullopt)
+    const std::optional<CTxDestination>& created_quantum_change = std::nullopt,
+    const std::set<COutPoint>& explicit_inputs = {})
 {
     // Make a blank psbt
     PartiallySignedTransaction psbtx(rawTx);
@@ -317,9 +327,20 @@ static UniValue FinishTransaction(
         CTransactionRef tx(MakeTransactionRef(std::move(mtx)));
         result.pushKV("txid", tx->GetHash().GetHex());
         if (add_to_wallet && !psbt_opt_in) {
-            CommitWalletTransactionOrThrow(
-                *pwallet, tx, {}, "Blackcoin wallet transaction",
-                created_quantum_change);
+            try {
+                CommitWalletTransactionOrThrow(
+                    *pwallet, tx, {}, "Blackcoin wallet transaction",
+                    created_quantum_change, explicit_inputs);
+            } catch (const UniValue& refused) {
+                // A commit refused because the reserve changed after the transaction was built leaves no trace: the
+                // inputs this call locked (lock_unspents) are released as well.
+                if (options.exists("lock_unspents") && options["lock_unspents"].get_bool() &&
+                    refused.write().find("held back as the final stake reserve") != std::string::npos) {
+                    LOCK(pwallet->cs_wallet);
+                    for (const CTxIn& txin : tx->vin) pwallet->UnlockCoin(txin.prevout);
+                }
+                throw;
+            }
         } else {
             result.pushKV("hex", hex);
         }
@@ -407,7 +428,7 @@ UniValue SendMoney(CWallet& wallet, const CCoinControl &coin_control, std::vecto
         throw JSONRPCError(RPC_WALLET_INSUFFICIENT_FUNDS, util::ErrorString(res).original);
     }
     const CTransactionRef& tx = res->tx;
-    CommitWalletTransactionOrThrow(wallet, tx, std::move(map_value), "Blackcoin send");
+    CommitWalletTransactionOrThrow(wallet, tx, std::move(map_value), "Blackcoin send", std::nullopt, ExplicitInputs(coin_control));
     if (verbose) {
         UniValue entry(UniValue::VOBJ);
         entry.pushKV("txid", tx->GetHash().GetHex());
@@ -550,7 +571,7 @@ RPCHelpMan burnwallet()
         throw JSONRPCError(RPC_WALLET_INSUFFICIENT_FUNDS, util::ErrorString(res).original);
     }
     const CTransactionRef& tx = res->tx;
-    CommitWalletTransactionOrThrow(*pwallet, tx, std::move(mapValue), "Blackcoin burn");
+    CommitWalletTransactionOrThrow(*pwallet, tx, std::move(mapValue), "Blackcoin burn", std::nullopt, ExplicitInputs(coin_control));
 
     return tx->GetHash().GetHex();
 },
@@ -1499,6 +1520,9 @@ RPCHelpMan send()
             CAmount fee;
             int change_position;
             CMutableTransaction rawTx = ConstructTransaction(options["inputs"], request.params[0], options["locktime"]);
+            // The inputs the user named are explicit; anything the wallet adds is its own choice.
+            std::set<COutPoint> explicit_inputs;
+            for (const CTxIn& txin : rawTx.vin) explicit_inputs.insert(txin.prevout);
             CCoinControl coin_control;
             // Automatically select coins, unless at least one is manually selected. Can
             // be overridden by options.add_inputs.
@@ -1509,7 +1533,7 @@ RPCHelpMan send()
                 *pwallet, rawTx, fee, change_position, options, coin_control,
                 /*override_min_fee=*/false, &created_quantum_change);
 
-            return FinishTransaction(pwallet, options, rawTx, created_quantum_change);
+            return FinishTransaction(pwallet, options, rawTx, created_quantum_change, explicit_inputs);
         }
     };
 }
@@ -1767,7 +1791,12 @@ RPCHelpMan sendall()
                 }
             }
 
-            return FinishTransaction(pwallet, options, rawTx);
+            // Inputs the user named are explicit; the ones sendall picked itself are not.
+            std::set<COutPoint> explicit_inputs;
+            if (options.exists("inputs")) {
+                for (const CTxIn& txin : rawTx.vin) explicit_inputs.insert(txin.prevout);
+            }
+            return FinishTransaction(pwallet, options, rawTx, std::nullopt, explicit_inputs);
         }
     };
 }

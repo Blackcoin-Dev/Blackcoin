@@ -632,6 +632,9 @@ static const CAmount DEFAULT_MIN_STAKING_AMOUNT = 0.1 * COIN;
 static const CAmount DEFAULT_RESERVE_BALANCE = 0;
 //! Optional wallet automation is opt-in. Consensus lifecycle and demurrage
 //! rules are independent and remain mandatory at their configured heights.
+//! The error of a commit refused because an input the wallet chose itself is in the final stake reserve.
+static constexpr const char* FINAL_STAKE_RESERVE_COMMIT_ERROR{
+    "the transaction would spend outputs held back as the final stake reserve (they changed after it was built); build it again, or select those outputs explicitly"};
 static constexpr bool DEFAULT_AUTOSTART_STAKING{false};
 static constexpr bool DEFAULT_AUTO_SHADOW_SIGNAL{false};
 static constexpr bool DEFAULT_AUTO_DEMURRAGE_ATTEST{false};
@@ -2164,9 +2167,15 @@ public:
      * @param[in] mapValue key-values to be set on the transaction.
      * @param[in] orderForm BIP 70 / BIP 21 order form details to be set on the transaction.
      */
+    /** Commit a transaction the wallet created. While the final stake reserve guard may be on, the reserve is derived
+     *  again under cs_main and cs_wallet, the locks the transaction is published under, and a transaction with an input
+     *  in it is refused (nothing is stored, FINAL_STAKE_RESERVE_COMMIT_ERROR is the error). Every input is treated as
+     *  one the wallet chose itself unless it is listed in explicit_inputs, the outputs a user selected with coin
+     *  control; those keep their right to spend the reserve. */
     bool CommitTransaction(CTransactionRef tx, mapValue_t mapValue, std::vector<std::pair<std::string, std::string>> orderForm,
                            std::string* broadcast_error = nullptr, WalletCommitStatus* commit_status = nullptr,
-                           std::optional<ShadowPowClaimCommitAuthority> shadow_pow_authority = std::nullopt);
+                           std::optional<ShadowPowClaimCommitAuthority> shadow_pow_authority = std::nullopt,
+                           const std::set<COutPoint>* explicit_inputs = nullptr);
     bool CommitRGBTransaction(CTransactionRef tx, mapValue_t mapValue, std::vector<std::pair<std::string, std::string>> orderForm, const RGBTxCommitData& rgb_data, std::string& error);
 
     /** Pass this transaction to node for mempool insertion and relay to peers if flag set to true */

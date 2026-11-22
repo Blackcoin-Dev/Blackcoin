@@ -2976,7 +2976,10 @@ static bool EvaluateStakeCandidateReference(const CWallet& wallet, const COutPoi
         output.nValue > context.params.max_amount) {
         return false;
     }
-    if (wallet.IsLockedCoin(outpoint) && context.params.skip_locked) return false;
+    if (wallet.IsLockedCoin(outpoint) && context.params.skip_locked &&
+        !(context.params.staking_scan_ignores_lock_of && context.params.staking_scan_ignores_lock_of->count(outpoint))) {
+        return false;
+    }
 
     // The exact live-unspent index should make this redundant. Keep the check
     // as a fail-closed invariant guard if a future wallet mutation path is
@@ -3075,7 +3078,10 @@ static bool EvaluateStakeCandidate(const CWallet& wallet, const COutPoint& outpo
         return exclude(StakeExclusion::BELOW_MINIMUM);
     }
     if (output.nValue > context.params.max_amount) return exclude(StakeExclusion::OTHER);
-    if (wallet.IsLockedCoin(outpoint) && context.params.skip_locked) return exclude(StakeExclusion::LOCKED);
+    if (wallet.IsLockedCoin(outpoint) && context.params.skip_locked &&
+        !(context.params.staking_scan_ignores_lock_of && context.params.staking_scan_ignores_lock_of->count(outpoint))) {
+        return exclude(StakeExclusion::LOCKED);
+    }
 
     const bool quantum_output = IsQuantumMigrationScript(output.scriptPubKey) ||
                                 IsQuantumColdStakeScript(output.scriptPubKey);
@@ -3430,7 +3436,7 @@ std::set<COutPoint> FinalStakeReserveConsumedSources(const CWallet& wallet, int6
     return consumed;
 }
 
-FinalStakeReserve ComputeFinalStakeReserve(const CWallet& wallet)
+FinalStakeReserve ComputeFinalStakeReserve(const CWallet& wallet, const std::set<COutPoint>* ignore_lock_of)
 {
     AssertLockHeld(::cs_main);
     AssertLockHeld(wallet.cs_wallet);
@@ -3483,7 +3489,9 @@ FinalStakeReserve ComputeFinalStakeReserve(const CWallet& wallet)
     };
     std::vector<std::pair<const CWalletTx*, unsigned int>> scanned;
     CCoinControl coin_control;
-    AvailableCoinsForStakingAhead(wallet, scanned, &coin_control, CoinFilterParams{}, blocks_ahead, observer);
+    CoinFilterParams scan_params;
+    scan_params.staking_scan_ignores_lock_of = ignore_lock_of;
+    AvailableCoinsForStakingAhead(wallet, scanned, &coin_control, scan_params, blocks_ahead, observer);
 
     // S: sources already consumed by this wallet's confirmed coinstakes since the guard began; a source qualifies when it
     // was created at or before F - maturity.
@@ -3507,14 +3515,14 @@ FinalStakeReserve ComputeFinalStakeReserve(const CWallet& wallet)
     return reserve;
 }
 
-std::set<COutPoint> FinalStakeReserveEnforcedOutpoints(const CWallet& wallet)
+std::set<COutPoint> FinalStakeReserveEnforcedOutpoints(const CWallet& wallet, const std::set<COutPoint>* ignore_lock_of)
 {
     AssertLockHeld(::cs_main);
     AssertLockHeld(wallet.cs_wallet);
     if (!gArgs.GetBoolArg("-finalstakereserve", DEFAULT_FINAL_STAKE_RESERVE)) return {};
     const CBlockIndex* tip = wallet.chain().getTip();
     if (!tip || !IsFinalStakeReserveGuardActive(Params().GetConsensus(), tip->nHeight + 1)) return {};
-    return ComputeFinalStakeReserve(wallet).enforced;
+    return ComputeFinalStakeReserve(wallet, ignore_lock_of).enforced;
 }
 
 bool SpendsFinalStakeReserve(CWallet& wallet, const CTransaction& tx)
@@ -3523,6 +3531,20 @@ bool SpendsFinalStakeReserve(CWallet& wallet, const CTransaction& tx)
     const std::set<COutPoint> reserve = FinalStakeReserveEnforcedOutpoints(wallet);
     if (reserve.empty()) return false;
     return std::any_of(tx.vin.begin(), tx.vin.end(), [&reserve](const CTxIn& txin) { return reserve.count(txin.prevout) > 0; });
+}
+
+bool FinalStakeReserveCommitRecheckNeeded(const CWallet& wallet)
+{
+    if (!gArgs.GetBoolArg("-finalstakereserve", DEFAULT_FINAL_STAKE_RESERVE) || !wallet.HaveChain()) return false;
+    const Consensus::Params& consensus = Params().GetConsensus();
+    const std::optional<int64_t> last_migration = FinalStakeReserveLastMigrationHeight(consensus);
+    if (!last_migration) return false;
+    const std::optional<int> height = wallet.chain().getHeight();
+    if (!height) return false;
+    constexpr int64_t SAFETY_MARGIN_BLOCKS{100};
+    const int64_t candidate = int64_t{*height} + 1;
+    const int64_t guard_first = *last_migration + 1 - int64_t{consensus.nCoinbaseMaturity};
+    return candidate + SAFETY_MARGIN_BLOCKS >= guard_first && candidate <= *last_migration;
 }
 
 const char* StakeExclusionName(StakeExclusion reason)

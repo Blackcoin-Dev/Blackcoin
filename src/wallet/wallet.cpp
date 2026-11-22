@@ -6582,9 +6582,19 @@ OutputType CWallet::TransactionChangeType(const std::optional<OutputType>& chang
 
 bool CWallet::CommitTransaction(CTransactionRef tx, mapValue_t mapValue, std::vector<std::pair<std::string, std::string>> orderForm,
                                 std::string* broadcast_error, WalletCommitStatus* commit_status,
-                                std::optional<ShadowPowClaimCommitAuthority> shadow_pow_authority)
+                                std::optional<ShadowPowClaimCommitAuthority> shadow_pow_authority,
+                                const std::set<COutPoint>* explicit_inputs)
 {
     if (commit_status) *commit_status = WalletCommitStatus::REJECTED_NOT_ADDED;
+    if (Params().IsTestChain()) {
+        // Test chains only: a pause before any lock is taken, in which a test moves the chain after a transaction was
+        // built and before it is committed.
+        const int64_t delay_ms = std::clamp<int64_t>(gArgs.GetIntArg("-finalstakereservecommitdelaymillis", 0), 0, 10000);
+        if (delay_ms > 0) {
+            WalletLogPrintf("Wallet commit test pause reached for %s; waiting %dms\n", tx->GetHash().ToString(), delay_ms);
+            std::this_thread::sleep_for(std::chrono::milliseconds{delay_ms});
+        }
+    }
     const bool shadow_pow_claim = TransactionHasShadowProof(*tx);
     std::optional<ShadowPowClaimRecoveryBroadcastGuard>
         shadow_pow_broadcast_guard;
@@ -6625,10 +6635,31 @@ bool CWallet::CommitTransaction(CTransactionRef tx, mapValue_t mapValue, std::ve
         // identity at the same wallet-publication boundary as AddToWallet.
         // Acquire cs_main first only for this optional path; ordinary wallet
         // commits retain their existing wallet-only critical section.
-        UniqueLock<RecursiveMutex> shadow_pow_chain_lock(
-            shadow_pow_authority ? &::cs_main : nullptr,
+        // The final stake reserve is derived again under the same two locks the record is published under, so a
+        // block, a reorganisation or another wallet operation after the transaction was built cannot slip a
+        // reserved input through. Decided before any lock is taken (lock order: cs_main, then cs_wallet).
+        const bool recheck_final_stake_reserve = FinalStakeReserveCommitRecheckNeeded(*this);
+        UniqueLock<RecursiveMutex> commit_chain_lock(
+            (shadow_pow_authority || recheck_final_stake_reserve) ? &::cs_main : nullptr,
             "::cs_main", __FILE__, __LINE__);
         LOCK(cs_wallet);
+        if (recheck_final_stake_reserve) {
+            // The inputs the wallet chose itself are looked at as they were before any lock the caller put on them
+            // for this transaction (lock_unspents): that lock must not take them out of the reserve.
+            std::set<COutPoint> automatic_inputs;
+            for (const CTxIn& txin : tx->vin) {
+                if (!(explicit_inputs && explicit_inputs->count(txin.prevout) > 0)) automatic_inputs.insert(txin.prevout);
+            }
+            const std::set<COutPoint> reserve = FinalStakeReserveEnforcedOutpoints(*this, &automatic_inputs);
+            const auto spends_reserve = std::any_of(tx->vin.begin(), tx->vin.end(), [&](const CTxIn& txin) {
+                return reserve.count(txin.prevout) > 0 && !(explicit_inputs && explicit_inputs->count(txin.prevout) > 0);
+            });
+            if (spends_reserve) {
+                if (broadcast_error) *broadcast_error = FINAL_STAKE_RESERVE_COMMIT_ERROR;
+                WalletLogPrintf("CommitTransaction(): refusing %s, %s\n", tx->GetHash().ToString(), FINAL_STAKE_RESERVE_COMMIT_ERROR);
+                return false;
+            }
+        }
         BumpBalanceScanMarker();
         // Formatting the whole transaction is not worth doing under both
         // locks; the txid finds it. The dump stays available for debugging.

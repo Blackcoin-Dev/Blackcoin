@@ -3119,7 +3119,8 @@ bool FundTransaction(
     bool lockUnspents,
     const std::set<int>& setSubtractFeeFromOutputs,
     CCoinControl coinControl,
-    std::optional<CTxDestination>* created_quantum_change)
+    std::optional<CTxDestination>* created_quantum_change,
+    std::set<COutPoint>* operation_locks)
 {
     std::vector<CRecipient> vecSend;
 
@@ -3192,6 +3193,8 @@ bool FundTransaction(
 
         }
         if (lockUnspents) {
+            // Only a lock made here is this operation's own; one that was there already is the user's.
+            if (!wallet.IsLockedCoin(txin.prevout) && operation_locks) operation_locks->insert(txin.prevout);
             wallet.LockCoin(txin.prevout);
         }
 

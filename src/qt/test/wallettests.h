@@ -31,6 +31,7 @@ private Q_SLOTS:
     void receiveCapabilityContention();
     void receiveCapabilityLifecycle();
     void workerOutlivesShutdownRequest();
+    void finalStakeReservePreparedTransactions();
     void historyScaleBenchmark_data();
     void historyScaleBenchmark();
     void historyInitialLoad();

@@ -1709,7 +1709,11 @@ void WalletModel::sendCoins(WalletModelTransaction& transaction)
         }
 
         auto& newTx = transaction.getWtx();
-        wallet().commitTransaction(newTx, /*value_map=*/{}, std::move(vOrderForm));
+        const std::string commit_warning = wallet().commitTransaction(newTx, /*value_map=*/{}, std::move(vOrderForm));
+        if (!commit_warning.empty()) {
+            // e.g. the transaction spent outputs the final stake reserve holds back: it is done, the user is told.
+            Q_EMIT message(tr("Send Coins"), QString::fromStdString(commit_warning), CClientUIInterface::MSG_WARNING);
+        }
 
         DataStream ssTx;
         ssTx << TX_WITH_WITNESS(*newTx);

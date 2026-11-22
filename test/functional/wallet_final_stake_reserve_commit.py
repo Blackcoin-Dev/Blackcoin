@@ -114,23 +114,60 @@ class FinalStakeReserveCommitTest(TransitionTFinalTestBase, BitcoinTestFramework
         nothing_left("optimizeutxoset")
         self.back_to_before_guard()
 
-        self.log.info("The same payment with the reserved output selected explicitly is accepted")
+        self.log.info("send with lock_unspents: the locks of the operation are released with the refusal, a lock the user put on an input is not")
+        wallet.lockunspent(False, [{"txid": self.free[0], "vout": self.free[1]}])  # the user's own lock
+        error = self.send_while_guard_starts(
+            lambda rpc: rpc.send(outputs=[{self.destination: self.total - 1}],
+                                 options={"inputs": [{"txid": self.free[0], "vout": self.free[1]}], "add_inputs": True,
+                                          "lock_unspents": True, "change_address": self.destination}))
+        assert error is not None and REFUSED in error, error
+        assert_equal(node.getrawmempool(), [])
+        assert_equal(wallet.getwalletinfo()["txcount"], records)
+        assert_equal({(lock["txid"], lock["vout"]) for lock in wallet.listlockunspent()}, {self.free})  # the user's lock only
+        wallet.lockunspent(True, [{"txid": self.free[0], "vout": self.free[1]}])
+        self.back_to_before_guard()
+
+        self.log.info("Built for the first Final block (the guard released), committed after the chain went back one block: refused")
+        self.pow_blocks(node, F - 1 - node.getblockcount(), pow_addr)  # the tip is M, the candidate is F
+        assert_equal(node.getblockcount(), F - 1)
+        error = self.send_while(
+            lambda rpc: rpc.sendtoaddress(address=self.destination, amount=self.total - 1, change_address=self.destination),
+            lambda: node.invalidateblock(node.getbestblockhash()))  # the tip is M - 1 again: the candidate is M, in the guard
+        assert error is not None and REFUSED in error, error
+        nothing_left("first Final block")
+        self.back_to_before_guard()
+
+        self.log.info("The same payment with the reserved output selected explicitly is accepted, and the commit reports it")
         reserved_value = Decimal(str(outputs[self.reserved]["amount"]))
         result = {}
         error = self.send_while_guard_starts(
             lambda rpc: rpc.send(outputs=[{self.destination: reserved_value / 2}],
                                  options={"inputs": [{"txid": self.reserved[0], "vout": self.reserved[1]}],
-                                          "add_inputs": False, "change_address": self.destination}),
+                                          "add_inputs": False, "lock_unspents": True, "change_address": self.destination}),
             result)
         assert error is None, error
         txid = result["value"]["txid"]
         assert_equal(node.getrawmempool(), [txid])
         spent = {(i["txid"], i["vout"]) for i in node.decoderawtransaction(wallet.gettransaction(txid)["hex"])["vin"]}
         assert_equal(spent, {self.reserved})
+        # Built before the guard, with its own coin lock on the explicit input: the report still comes out of the commit.
+        report = result["value"]["final_stake_reserve_spent"]
+        assert_equal({(o["txid"], o["vout"]) for o in report["outpoints"]}, {self.reserved})
+        assert_equal(report["reserved_before"], 1)
+        assert_equal(report["eligible_before"], K_OUTPUTS)
+        assert_equal(report["eligible_after"], K_OUTPUTS - 1)
+        assert Decimal(str(report["eligible_weight_after"])) < Decimal(str(report["eligible_weight_before"]))
 
     def send_while_guard_starts(self, call, result=None):
-        """Run `call(wallet rpc)` in a thread. Its commit pauses before any lock is taken; two blocks are mined in the
-        meantime, so the guard is on when the commit continues. Returns the error text, or None when it succeeded."""
+        """Two blocks are mined while the commit pauses, so the guard is on when the commit continues."""
+        def mine():
+            self.pow_blocks(self.nodes[0], 2, self.nodes[0].get_wallet_rpc(self.default_wallet_name).getnewaddress("", "legacy"))
+            assert_equal(self.nodes[0].getblockcount(), BEFORE_GUARD + 2)
+        return self.send_while(call, mine, result)
+
+    def send_while(self, call, during, result=None):
+        """Run `call(wallet rpc)` in a thread. Its commit pauses before any lock is taken (a test-chain-only option);
+        `during()` runs meanwhile. Returns the error text, or None when the call succeeded."""
         node = self.nodes[0]
         outcome = {}
 
@@ -148,8 +185,7 @@ class FinalStakeReserveCommitTest(TransitionTFinalTestBase, BitcoinTestFramework
         except AssertionError:
             thread.join(timeout=5)
             raise AssertionError("the commit never paused: %s" % outcome)
-        self.pow_blocks(node, 2, self.nodes[0].get_wallet_rpc(self.default_wallet_name).getnewaddress("", "legacy"))
-        assert_equal(node.getblockcount(), BEFORE_GUARD + 2)
+        during()
         thread.join(timeout=60)
         assert not thread.is_alive(), "the commit did not finish"
         if result is not None and "value" in outcome:

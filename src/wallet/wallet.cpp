@@ -6583,8 +6583,11 @@ OutputType CWallet::TransactionChangeType(const std::optional<OutputType>& chang
 bool CWallet::CommitTransaction(CTransactionRef tx, mapValue_t mapValue, std::vector<std::pair<std::string, std::string>> orderForm,
                                 std::string* broadcast_error, WalletCommitStatus* commit_status,
                                 std::optional<ShadowPowClaimCommitAuthority> shadow_pow_authority,
-                                const std::set<COutPoint>* explicit_inputs)
+                                const CommitSpendProvenance* provenance,
+                                FinalStakeReserveSpendReport* reserve_report)
 {
+    // Entry contract (see the declaration): cs_main is taken below, before cs_wallet, so no wallet lock may be held.
+    AssertLockNotHeld(cs_wallet);
     if (commit_status) *commit_status = WalletCommitStatus::REJECTED_NOT_ADDED;
     if (Params().IsTestChain()) {
         // Test chains only: a pause before any lock is taken, in which a test moves the chain after a transaction was
@@ -6631,32 +6634,37 @@ bool CWallet::CommitTransaction(CTransactionRef tx, mapValue_t mapValue, std::ve
     }
 
     {
-        // A guarded QQSPROOF commit must revalidate the complete cheap gate
-        // identity at the same wallet-publication boundary as AddToWallet.
-        // Acquire cs_main first only for this optional path; ordinary wallet
-        // commits retain their existing wallet-only critical section.
-        // The final stake reserve is derived again under the same two locks the record is published under, so a
-        // block, a reorganisation or another wallet operation after the transaction was built cannot slip a
-        // reserved input through. Decided before any lock is taken (lock order: cs_main, then cs_wallet).
-        const bool recheck_final_stake_reserve = FinalStakeReserveCommitRecheckNeeded(*this);
+        // cs_main is taken first, and kept with cs_wallet to the end of the publication of the wallet record. A guarded
+        // QQSPROOF commit needs it to revalidate the complete cheap gate identity at the same boundary as
+        // AddToWallet. The final stake reserve needs it too: whether the guard is on, the reserve itself and the
+        // publication of the record must all see the same chain, so a block, a reorganisation or another wallet
+        // operation after the transaction was built cannot slip a reserved input through. Whether the guard is on is
+        // decided below, under this lock and never before it; a decision taken before the lock is not a decision.
         UniqueLock<RecursiveMutex> commit_chain_lock(
-            (shadow_pow_authority || recheck_final_stake_reserve) ? &::cs_main : nullptr,
+            (shadow_pow_authority || HaveChain()) ? &::cs_main : nullptr,
             "::cs_main", __FILE__, __LINE__);
         LOCK(cs_wallet);
-        if (recheck_final_stake_reserve) {
-            // The inputs the wallet chose itself are looked at as they were before any lock the caller put on them
-            // for this transaction (lock_unspents): that lock must not take them out of the reserve.
-            std::set<COutPoint> automatic_inputs;
-            for (const CTxIn& txin : tx->vin) {
-                if (!(explicit_inputs && explicit_inputs->count(txin.prevout) > 0)) automatic_inputs.insert(txin.prevout);
-            }
-            const std::set<COutPoint> reserve = FinalStakeReserveEnforcedOutpoints(*this, &automatic_inputs);
+        std::optional<FinalStakeReserve> reserve_before;
+        if (commit_chain_lock.owns_lock() && FinalStakeReserveGuardActiveNow(*this)) {
+            AssertLockHeld(::cs_main);
+            // Locks this operation put on its own inputs (lock_unspents) must not take them out of the reserve.
+            const std::set<COutPoint>* operation_locks = provenance ? &provenance->operation_locks : nullptr;
+            const auto is_explicit = [&](const COutPoint& outpoint) {
+                return provenance && provenance->explicit_inputs.count(outpoint) > 0;
+            };
+            reserve_before = ComputeFinalStakeReserve(*this, operation_locks);
             const auto spends_reserve = std::any_of(tx->vin.begin(), tx->vin.end(), [&](const CTxIn& txin) {
-                return reserve.count(txin.prevout) > 0 && !(explicit_inputs && explicit_inputs->count(txin.prevout) > 0);
+                return reserve_before->enforced.count(txin.prevout) > 0 && !is_explicit(txin.prevout);
             });
             if (spends_reserve) {
                 if (broadcast_error) *broadcast_error = FINAL_STAKE_RESERVE_COMMIT_ERROR;
                 WalletLogPrintf("CommitTransaction(): refusing %s, %s\n", tx->GetHash().ToString(), FINAL_STAKE_RESERVE_COMMIT_ERROR);
+                // A refused commit leaves nothing of this operation behind: the locks it took are released here.
+                if (operation_locks) {
+                    for (const COutPoint& outpoint : *operation_locks) {
+                        if (!UnlockCoin(outpoint)) WalletLogPrintf("CommitTransaction(): could not release the lock on %s\n", outpoint.ToString());
+                    }
+                }
                 return false;
             }
         }
@@ -6899,6 +6907,14 @@ bool CWallet::CommitTransaction(CTransactionRef tx, mapValue_t mapValue, std::ve
                     "Gold Rush PoW claim wallet write failed after an in-memory record may have been installed; mining and recovery remain fail-closed until wallet reload\n");
             }
             throw std::runtime_error(std::string(__func__) + ": Wallet db error, transaction commit failed");
+        }
+
+        // The consumed-reserve report is made here, from the inventory derived before the record was added and the
+        // one derived now, in the same critical section.
+        if (reserve_report && reserve_before) {
+            AssertLockHeld(::cs_main);
+            *reserve_report = MakeFinalStakeReserveSpendReport(*this, *reserve_before, *tx,
+                                                               provenance ? &provenance->operation_locks : nullptr);
         }
 
         if (shadow_pow_claim) {

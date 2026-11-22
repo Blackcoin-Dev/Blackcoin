@@ -52,6 +52,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <deque>
 #include <limits>
 #include <map>
 #include <memory>
@@ -2277,6 +2278,8 @@ util::Result<WalletQuantumActionTx> CreateWalletDemurrageSweep(CWallet& wallet, 
     filter.only_spendable = true;
     filter.skip_locked = true;
     filter.include_immature_coinbase = false;
+    // The sweep picks its inputs itself: it leaves the final stake reserve alone, as the commit would refuse it.
+    filter.avoid_final_stake_reserve = true;
 
     CoinsResult available = AvailableCoins(wallet, &coin_control, std::nullopt, filter);
     std::map<COutPoint, Coin> chain_coins;
@@ -2718,35 +2721,55 @@ public:
 
         // The GUI commits the transaction later, from the transaction alone. What the user selected with coin control
         // is remembered for it (the only inputs that may spend the final stake reserve at the commit); every other
-        // input is the wallet's own choice.
-        if (const std::vector<COutPoint> selected = coin_control.ListSelected(); !selected.empty()) {
+        // input is the wallet's own choice. Every preparation writes its own record, an empty selection included, so a
+        // later preparation of a transaction with the same id never inherits the selection of an earlier one that was
+        // abandoned.
+        {
+            const std::vector<COutPoint> selected = coin_control.ListSelected();
+            const uint256 txid = txr.tx->GetHash();
             LOCK(m_explicit_inputs_mutex);
-            if (m_explicit_inputs.size() >= MAX_REMEMBERED_EXPLICIT_INPUTS) m_explicit_inputs.erase(m_explicit_inputs.begin());
-            m_explicit_inputs[txr.tx->GetHash()] = std::set<COutPoint>(selected.begin(), selected.end());
+            if (const auto it = m_explicit_inputs.find(txid); it != m_explicit_inputs.end()) {
+                m_explicit_inputs_order.erase(std::remove(m_explicit_inputs_order.begin(), m_explicit_inputs_order.end(), txid), m_explicit_inputs_order.end());
+            }
+            m_explicit_inputs[txid] = std::set<COutPoint>(selected.begin(), selected.end());
+            m_explicit_inputs_order.push_back(txid);
+            while (m_explicit_inputs_order.size() > MAX_REMEMBERED_EXPLICIT_INPUTS) {
+                m_explicit_inputs.erase(m_explicit_inputs_order.front());
+                m_explicit_inputs_order.pop_front();
+            }
         }
         return txr.tx;
     }
-    void commitTransaction(CTransactionRef tx,
+    std::string commitTransaction(CTransactionRef tx,
         WalletValueMap value_map,
         WalletOrderForm order_form) override
     {
-        std::set<COutPoint> explicit_inputs;
+        CommitSpendProvenance provenance;
         {
             LOCK(m_explicit_inputs_mutex);
             if (const auto it = m_explicit_inputs.find(tx->GetHash()); it != m_explicit_inputs.end()) {
-                explicit_inputs = it->second;
+                provenance.explicit_inputs = std::move(it->second);
                 m_explicit_inputs.erase(it);
+                m_explicit_inputs_order.erase(std::remove(m_explicit_inputs_order.begin(), m_explicit_inputs_order.end(), tx->GetHash()), m_explicit_inputs_order.end());
             }
         }
         std::string broadcast_error;
         WalletCommitStatus status;
+        FinalStakeReserveSpendReport reserve_report;
         if (!m_wallet->CommitTransaction(tx, std::move(value_map), std::move(order_form), &broadcast_error, &status,
-                                         /*shadow_pow_authority=*/std::nullopt, &explicit_inputs)) {
-            if (status == WalletCommitStatus::PERSISTED_PENDING) return;
+                                         /*shadow_pow_authority=*/std::nullopt, &provenance, &reserve_report)) {
+            if (status == WalletCommitStatus::PERSISTED_PENDING) return {};
             throw std::runtime_error(broadcast_error.empty()
                 ? "Transaction could not be committed"
                 : broadcast_error);
         }
+        // A deliberate spend of the final stake reserve is reported to the user.
+        if (reserve_report.spent.empty()) return {};
+        return strprintf("This transaction spends %d output(s) worth %s that the final stake reserve holds back for the first Final block. "
+                         "The reserve went from %d to %d held-back outputs, and the outputs able to stake at the first Final block from %d to %d.",
+                         reserve_report.spent.size(), FormatMoney(reserve_report.spent_effective_value),
+                         reserve_report.reserved_before, reserve_report.reserved_after,
+                         reserve_report.eligible_before, reserve_report.eligible_after);
     }
     bool transactionCanBeAbandoned(const uint256& txid) override { return m_wallet->TransactionCanBeAbandoned(txid); }
     bool abandonTransaction(const uint256& txid) override
@@ -4150,6 +4173,7 @@ public:
     static constexpr size_t MAX_REMEMBERED_EXPLICIT_INPUTS{64};
     Mutex m_explicit_inputs_mutex;
     std::map<uint256, std::set<COutPoint>> m_explicit_inputs GUARDED_BY(m_explicit_inputs_mutex);
+    std::deque<uint256> m_explicit_inputs_order GUARDED_BY(m_explicit_inputs_mutex); //! oldest preparation first
     std::mutex m_display_mutex;
     std::shared_ptr<WalletDisplayBalance> m_display;
     bool m_display_released{false};

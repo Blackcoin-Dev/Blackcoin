@@ -11,6 +11,8 @@
 #include <script/script.h>
 #include <test/util/setup_common.h>
 #include <validation.h>
+#include <wallet/coincontrol.h>
+#include <wallet/spend.h>
 #include <wallet/staking.h>
 #include <wallet/test/util.h>
 #include <wallet/wallet.h>
@@ -452,6 +454,155 @@ BOOST_FIXTURE_TEST_CASE(a_policy_change_invalidates_the_cached_selection, Candid
     BOOST_CHECK(!rebuilt->final_reserve_active);
     BOOST_CHECK(rebuilt->final_reserve.empty());
     BOOST_CHECK_EQUAL(wallet->GetStakeSlotCacheStateLocked().stats.rebuilds, after_first.rebuilds + 1);
+}
+
+namespace {
+/** Put a quantum stake source of `value` for `dest` into the wallet as confirmed at `height`, and into the coin view. */
+COutPoint AddQuantumStakeSource(TestChain100Setup& setup, CWallet& wallet, const CTxDestination& dest, CAmount value, int height, uint32_t salt)
+{
+    const CTransactionRef tx = Paying({CTxOut{value, GetScriptForDestination(dest)}}, salt);
+    const CBlockIndex* index = WITH_LOCK(::cs_main, return setup.m_node.chainman->ActiveChain()[height]);
+    BOOST_REQUIRE(index);
+    {
+        LOCK2(::cs_main, wallet.cs_wallet);
+        BOOST_REQUIRE(wallet.AddToWallet(tx, TxStateConfirmed{index->GetBlockHash(), height, 0}));
+        wallet.chain().getCoinsTip().AddCoin(COutPoint{tx->GetHash(), 0}, Coin(tx->vout[0], height, false, false, index->nTime), true);
+    }
+    return COutPoint{tx->GetHash(), 0};
+}
+} // namespace
+
+namespace {
+/** A wallet with two quantum stake sources, the larger one (N = 2, R = 1) the reserve while the guard is on. */
+struct ReserveWallet
+{
+    std::unique_ptr<CWallet> wallet;
+    CTxDestination dest_big, dest_small;
+    COutPoint big, small;
+    CTxDestination recipient;
+};
+
+ReserveWallet MakeReserveWallet(TestChain100Setup& setup, const CKey& key)
+{
+    ReserveWallet rw;
+    rw.wallet = CreateSyncedWallet(*setup.m_node.chain, WITH_LOCK(Assert(setup.m_node.chainman)->GetMutex(), return setup.m_node.chainman->ActiveChain()), key);
+    const auto a = rw.wallet->GetNewQuantumDestination("a");
+    const auto b = rw.wallet->GetNewQuantumDestination("b");
+    BOOST_REQUIRE(a && b);
+    rw.dest_big = *a;
+    rw.dest_small = *b;
+    rw.big = AddQuantumStakeSource(setup, *rw.wallet, *a, 20 * COIN, 70, 1);
+    rw.small = AddQuantumStakeSource(setup, *rw.wallet, *b, 10 * COIN, 71, 2);
+    // Quantum inputs may only pay quantum outputs: the payee is a third key of the wallet.
+    const auto payee = rw.wallet->GetNewQuantumDestination("payee");
+    BOOST_REQUIRE(payee);
+    rw.recipient = *payee;
+    return rw;
+}
+} // namespace
+
+namespace {
+//! A transaction built while the guard is off (the option is off), paying `amount`. The option is left off.
+CTransactionRef BuildBeforeTheGuard(ReserveWallet& rw, CAmount amount, CCoinControl coin_control = {})
+{
+    gArgs.ForceSetArg("-finalstakereserve", "0");
+    coin_control.destChange = rw.dest_small; // a fixed change output: the same inputs give the same transaction id
+    const auto created = CreateTransaction(*rw.wallet, {CRecipient{rw.recipient, amount, false}}, /*change_pos=*/1, coin_control);
+    BOOST_REQUIRE_MESSAGE(created, util::ErrorString(created).original);
+    return created->tx;
+}
+
+bool Recorded(const ReserveWallet& rw, const CTransactionRef& tx)
+{
+    return WITH_LOCK(rw.wallet->cs_wallet, return rw.wallet->mapWallet.count(tx->GetHash()) > 0);
+}
+} // namespace
+
+// The reserve of the first Final block holds the larger of two sources. A transaction built before the guard that
+// takes both is refused at the commit, inside the guard: nothing is stored. The coin lock this operation put on its
+// input (lock_unspents) does not take it out of the reserve and is released with the refusal; a lock the user put on
+// another input is not this operation's and stays.
+BOOST_FIXTURE_TEST_CASE(a_commit_inside_the_guard_refuses_the_reserve_and_releases_only_its_own_locks, CandidateAtGuardStart)
+{
+    ReserveWallet rw = MakeReserveWallet(*this, coinbaseKey);
+    const CTransactionRef tx = BuildBeforeTheGuard(rw, 25 * COIN);
+    BOOST_REQUIRE_EQUAL(tx->vin.size(), 2U);
+    gArgs.ForceSetArg("-finalstakereserve", "1");
+    BOOST_REQUIRE(ReserveOf(*rw.wallet).active);
+    {
+        LOCK(rw.wallet->cs_wallet);
+        rw.wallet->LockCoin(rw.big);   // by this operation (lock_unspents)
+        rw.wallet->LockCoin(rw.small); // by the user, after the transaction was built
+    }
+    CommitSpendProvenance provenance;
+    provenance.operation_locks = {rw.big};
+    std::string error;
+    WalletCommitStatus status;
+    BOOST_CHECK(!rw.wallet->CommitTransaction(tx, {}, {}, &error, &status, std::nullopt, &provenance));
+    BOOST_CHECK_EQUAL(error, FINAL_STAKE_RESERVE_COMMIT_ERROR);
+    BOOST_CHECK(status == WalletCommitStatus::REJECTED_NOT_ADDED);
+    BOOST_CHECK(!Recorded(rw, tx));
+    LOCK(rw.wallet->cs_wallet);
+    BOOST_CHECK(!rw.wallet->IsLockedCoin(rw.big));
+    BOOST_CHECK(rw.wallet->IsLockedCoin(rw.small));
+}
+
+// An explicit input may spend the reserve, and the commit reports what it consumed from one inventory before and
+// after, derived inside its critical section: for a transaction built before the guard and committed inside it, and
+// with the coin lock the operation put on that explicit input (lock_unspents).
+BOOST_FIXTURE_TEST_CASE(an_explicit_spend_of_the_reserve_is_reported_from_the_commit_itself, CandidateAtGuardStart)
+{
+    ReserveWallet rw = MakeReserveWallet(*this, coinbaseKey);
+    CCoinControl coin_control;
+    coin_control.Select(rw.big);
+    coin_control.m_allow_other_inputs = false;
+    const CTransactionRef tx = BuildBeforeTheGuard(rw, 15 * COIN, coin_control);
+    BOOST_REQUIRE_EQUAL(tx->vin.size(), 1U);
+    BOOST_REQUIRE(tx->vin[0].prevout == rw.big);
+    gArgs.ForceSetArg("-finalstakereserve", "1");
+    {
+        LOCK(rw.wallet->cs_wallet);
+        rw.wallet->LockCoin(rw.big); // lock_unspents on the explicit input
+    }
+    CommitSpendProvenance provenance;
+    provenance.explicit_inputs = {rw.big};
+    provenance.operation_locks = {rw.big};
+    std::string error;
+    FinalStakeReserveSpendReport report;
+    BOOST_REQUIRE_MESSAGE(rw.wallet->CommitTransaction(tx, {}, {}, &error, nullptr, std::nullopt, &provenance, &report), error);
+    BOOST_CHECK(Recorded(rw, tx));
+    BOOST_REQUIRE_EQUAL(report.spent.size(), 1U);
+    BOOST_CHECK(report.spent[0].outpoint == rw.big);
+    BOOST_CHECK_EQUAL(report.reserved_before, 1);
+    BOOST_CHECK_EQUAL(report.reserved_after, 1); // the other source is the whole reserve now (N = 1, R = 1)
+    BOOST_CHECK_EQUAL(report.eligible_before, 2);
+    BOOST_CHECK_EQUAL(report.eligible_after, 1);
+    BOOST_CHECK_GT(report.eligible_weight_before, report.eligible_weight_after);
+    BOOST_CHECK_EQUAL(report.spent_effective_value, report.spent[0].effective_value);
+}
+
+// Explicit and automatic inputs in one transaction: the explicit one keeps its right, the automatic one is checked.
+BOOST_FIXTURE_TEST_CASE(a_mixed_transaction_is_refused_when_its_automatic_input_is_in_the_reserve, CandidateAtGuardStart)
+{
+    ReserveWallet rw = MakeReserveWallet(*this, coinbaseKey);
+    CCoinControl coin_control;
+    coin_control.Select(rw.small); // the user chose the small one; the wallet adds the large one itself
+    const CTransactionRef tx = BuildBeforeTheGuard(rw, 25 * COIN, coin_control);
+    BOOST_REQUIRE_EQUAL(tx->vin.size(), 2U);
+    gArgs.ForceSetArg("-finalstakereserve", "1");
+    CommitSpendProvenance provenance;
+    provenance.explicit_inputs = {rw.small};
+    std::string error;
+    FinalStakeReserveSpendReport report;
+    BOOST_CHECK(!rw.wallet->CommitTransaction(tx, {}, {}, &error, nullptr, std::nullopt, &provenance, &report));
+    BOOST_CHECK_EQUAL(error, FINAL_STAKE_RESERVE_COMMIT_ERROR);
+    BOOST_CHECK(!Recorded(rw, tx));
+    BOOST_CHECK(report.spent.empty());
+    // The same transaction with both inputs named by the user is the user's decision.
+    provenance.explicit_inputs = {rw.small, rw.big};
+    BOOST_REQUIRE_MESSAGE(rw.wallet->CommitTransaction(tx, {}, {}, &error, nullptr, std::nullopt, &provenance, &report), error);
+    BOOST_CHECK(Recorded(rw, tx));
+    BOOST_CHECK_EQUAL(report.spent.size(), 1U);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

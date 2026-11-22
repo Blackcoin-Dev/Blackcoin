@@ -218,8 +218,9 @@ public:
         int& change_pos,
         CAmount& fee) = 0;
 
-    //! Commit transaction.
-    virtual void commitTransaction(CTransactionRef tx,
+    //! Commit transaction. Returns a warning to show the user (empty when there is none), e.g. that the
+    //! transaction spent outputs the final stake reserve holds back.
+    virtual std::string commitTransaction(CTransactionRef tx,
         WalletValueMap value_map,
         WalletOrderForm order_form) = 0;
 

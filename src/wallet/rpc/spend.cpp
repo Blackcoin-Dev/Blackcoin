@@ -155,14 +155,15 @@ static void CommitWalletTransactionOrThrow(
     mapValue_t map_value,
     const std::string& action,
     const std::optional<CTxDestination>& created_destination = std::nullopt,
-    const std::set<COutPoint>& explicit_inputs = {})
+    const CommitSpendProvenance& provenance = {},
+    FinalStakeReserveSpendReport* reserve_report = nullptr)
 {
     std::string broadcast_error;
     WalletCommitStatus status;
     bool committed{false};
     try {
         committed = wallet.CommitTransaction(tx, std::move(map_value), {}, &broadcast_error, &status,
-                                             /*shadow_pow_authority=*/std::nullopt, &explicit_inputs);
+                                             /*shadow_pow_authority=*/std::nullopt, &provenance, reserve_report);
     } catch (const std::exception& e) {
         ThrowQuantumActionError(
             RPC_WALLET_ERROR,
@@ -270,7 +271,8 @@ UniValue SendMoneyToScript(CWallet& wallet, const CScript scriptPubKey, CAmount 
         throw JSONRPCError(RPC_WALLET_INSUFFICIENT_FUNDS, util::ErrorString(res).original);
     }
     const CTransactionRef& tx = res->tx;
-    CommitWalletTransactionOrThrow(wallet, tx, std::move(map_value), "Blackcoin send", std::nullopt, ExplicitInputs(coin_control));
+    CommitWalletTransactionOrThrow(wallet, tx, std::move(map_value), "Blackcoin send", std::nullopt,
+                                   CommitSpendProvenance{ExplicitInputs(coin_control), {}});
     return tx->GetHash().GetHex();
 }
 
@@ -300,7 +302,7 @@ static UniValue FinishTransaction(
     const UniValue& options,
     const CMutableTransaction& rawTx,
     const std::optional<CTxDestination>& created_quantum_change = std::nullopt,
-    const std::set<COutPoint>& explicit_inputs = {})
+    const CommitSpendProvenance& provenance = {})
 {
     // Make a blank psbt
     PartiallySignedTransaction psbtx(rawTx);
@@ -349,25 +351,13 @@ static UniValue FinishTransaction(
         result.pushKV("txid", tx->GetHash().GetHex());
         if (add_to_wallet && !psbt_opt_in) {
             // A deliberate spend of the final stake reserve (explicit inputs) is reported: which reserved outputs it
-            // consumed and what that took from the readiness for the first Final block.
+            // consumed and what that took from the readiness for the first Final block. The report comes out of the
+            // commit's own critical section.
             FinalStakeReserveSpendReport reserve_spend;
-            if (!explicit_inputs.empty()) reserve_spend = DescribeFinalStakeReserveSpend(*pwallet, *tx);
-            try {
-                CommitWalletTransactionOrThrow(
-                    *pwallet, tx, {}, "Blackcoin wallet transaction",
-                    created_quantum_change, explicit_inputs);
-            } catch (const UniValue& refused) {
-                // A commit refused because the reserve changed after the transaction was built leaves no trace: the
-                // inputs this call locked (lock_unspents) are released as well.
-                if (options.exists("lock_unspents") && options["lock_unspents"].get_bool() &&
-                    refused.write().find("held back as the final stake reserve") != std::string::npos) {
-                    LOCK(pwallet->cs_wallet);
-                    for (const CTxIn& txin : tx->vin) pwallet->UnlockCoin(txin.prevout);
-                }
-                throw;
-            }
+            CommitWalletTransactionOrThrow(
+                *pwallet, tx, {}, "Blackcoin wallet transaction",
+                created_quantum_change, provenance, &reserve_spend);
             if (!reserve_spend.spent.empty()) {
-                const FinalStakeReserve after = SnapshotFinalStakeReserve(*pwallet);
                 UniValue spent(UniValue::VOBJ);
                 UniValue outpoints(UniValue::VARR);
                 for (const FinalStakeReserveSource& source : reserve_spend.spent) {
@@ -380,11 +370,11 @@ static UniValue FinishTransaction(
                 spent.pushKV("outpoints", std::move(outpoints));
                 spent.pushKV("effective_value", ValueFromAmount(reserve_spend.spent_effective_value));
                 spent.pushKV("reserved_before", reserve_spend.reserved_before);
-                spent.pushKV("reserved_after", static_cast<int64_t>(after.reserved.size()));
+                spent.pushKV("reserved_after", reserve_spend.reserved_after);
                 spent.pushKV("eligible_before", reserve_spend.eligible_before);
-                spent.pushKV("eligible_after", after.eligible_count);
+                spent.pushKV("eligible_after", reserve_spend.eligible_after);
                 spent.pushKV("eligible_weight_before", ValueFromAmount(reserve_spend.eligible_weight_before));
-                spent.pushKV("eligible_weight_after", ValueFromAmount(after.eligible_weight));
+                spent.pushKV("eligible_weight_after", ValueFromAmount(reserve_spend.eligible_weight_after));
                 result.pushKV("final_stake_reserve_spent", std::move(spent));
             }
         } else {
@@ -474,7 +464,8 @@ UniValue SendMoney(CWallet& wallet, const CCoinControl &coin_control, std::vecto
         throw JSONRPCError(RPC_WALLET_INSUFFICIENT_FUNDS, util::ErrorString(res).original);
     }
     const CTransactionRef& tx = res->tx;
-    CommitWalletTransactionOrThrow(wallet, tx, std::move(map_value), "Blackcoin send", std::nullopt, ExplicitInputs(coin_control));
+    CommitWalletTransactionOrThrow(wallet, tx, std::move(map_value), "Blackcoin send", std::nullopt,
+                                   CommitSpendProvenance{ExplicitInputs(coin_control), {}});
     if (verbose) {
         UniValue entry(UniValue::VOBJ);
         entry.pushKV("txid", tx->GetHash().GetHex());
@@ -617,7 +608,8 @@ RPCHelpMan burnwallet()
         throw JSONRPCError(RPC_WALLET_INSUFFICIENT_FUNDS, util::ErrorString(res).original);
     }
     const CTransactionRef& tx = res->tx;
-    CommitWalletTransactionOrThrow(*pwallet, tx, std::move(mapValue), "Blackcoin burn", std::nullopt, ExplicitInputs(coin_control));
+    CommitWalletTransactionOrThrow(*pwallet, tx, std::move(mapValue), "Blackcoin burn", std::nullopt,
+                                   CommitSpendProvenance{ExplicitInputs(coin_control), {}});
 
     return tx->GetHash().GetHex();
 },
@@ -987,7 +979,8 @@ void FundTransaction(
     const UniValue& options,
     CCoinControl& coinControl,
     bool override_min_fee,
-    std::optional<CTxDestination>* created_quantum_change = nullptr)
+    std::optional<CTxDestination>* created_quantum_change = nullptr,
+    std::set<COutPoint>* operation_locks = nullptr)
 {
     // Make sure the results are valid at least up to the most recent block
     // the user could have gotten from another RPC command prior to now
@@ -1201,7 +1194,7 @@ void FundTransaction(
 
     if (!FundTransaction(
             wallet, tx, fee_out, change_position, error, lockUnspents,
-            setSubtractFeeFromOutputs, coinControl, created_quantum_change)) {
+            setSubtractFeeFromOutputs, coinControl, created_quantum_change, operation_locks)) {
         throw JSONRPCError(RPC_WALLET_ERROR, error.original);
     }
 }
@@ -1576,11 +1569,13 @@ RPCHelpMan send()
             coin_control.m_allow_other_inputs = rawTx.vin.size() == 0;
             SetOptionsInputWeights(options["inputs"], options);
             std::optional<CTxDestination> created_quantum_change;
+            // The coin locks this call itself takes (lock_unspents) travel with it to the commit.
+            CommitSpendProvenance provenance{std::move(explicit_inputs), {}};
             FundTransaction(
                 *pwallet, rawTx, fee, change_position, options, coin_control,
-                /*override_min_fee=*/false, &created_quantum_change);
+                /*override_min_fee=*/false, &created_quantum_change, &provenance.operation_locks);
 
-            return FinishTransaction(pwallet, options, rawTx, created_quantum_change, explicit_inputs);
+            return FinishTransaction(pwallet, options, rawTx, created_quantum_change, provenance);
         }
     };
 }
@@ -1725,6 +1720,7 @@ RPCHelpMan sendall()
             }
 
             CMutableTransaction rawTx{ConstructTransaction(options["inputs"], recipient_key_value_pairs, options["locktime"])};
+            CommitSpendProvenance provenance; //! the explicit inputs and the coin locks this call takes, carried to the commit
             // FinishTransaction snapshots active-chain policy before FillPSBT
             // acquires cs_wallet. Keep input selection atomic here, then release
             // both locks before crossing that public wallet boundary.
@@ -1834,17 +1830,18 @@ RPCHelpMan sendall()
                 const bool lock_unspents{options.exists("lock_unspents") ? options["lock_unspents"].get_bool() : false};
                 if (lock_unspents) {
                     for (const CTxIn& txin : rawTx.vin) {
+                        // Only a lock made here is this call's own; one that was there already is the user's.
+                        if (!pwallet->IsLockedCoin(txin.prevout)) provenance.operation_locks.insert(txin.prevout);
                         pwallet->LockCoin(txin.prevout);
                     }
                 }
             }
 
             // Inputs the user named are explicit; the ones sendall picked itself are not.
-            std::set<COutPoint> explicit_inputs;
             if (options.exists("inputs")) {
-                for (const CTxIn& txin : rawTx.vin) explicit_inputs.insert(txin.prevout);
+                for (const CTxIn& txin : rawTx.vin) provenance.explicit_inputs.insert(txin.prevout);
             }
-            return FinishTransaction(pwallet, options, rawTx, std::nullopt, explicit_inputs);
+            return FinishTransaction(pwallet, options, rawTx, std::nullopt, provenance);
         }
     };
 }

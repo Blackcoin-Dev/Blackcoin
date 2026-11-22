@@ -3533,47 +3533,36 @@ bool SpendsFinalStakeReserve(CWallet& wallet, const CTransaction& tx)
     return std::any_of(tx.vin.begin(), tx.vin.end(), [&reserve](const CTxIn& txin) { return reserve.count(txin.prevout) > 0; });
 }
 
-FinalStakeReserveSpendReport DescribeFinalStakeReserveSpend(CWallet& wallet, const CTransaction& tx)
+FinalStakeReserveSpendReport MakeFinalStakeReserveSpendReport(const CWallet& wallet, const FinalStakeReserve& before,
+                                                              const CTransaction& tx, const std::set<COutPoint>* ignore_lock_of)
 {
-    LOCK2(::cs_main, wallet.cs_wallet);
+    AssertLockHeld(::cs_main);
+    AssertLockHeld(wallet.cs_wallet);
     FinalStakeReserveSpendReport report;
-    const CBlockIndex* tip = wallet.chain().getTip();
-    if (!tip || !gArgs.GetBoolArg("-finalstakereserve", DEFAULT_FINAL_STAKE_RESERVE) ||
-        !IsFinalStakeReserveGuardActive(Params().GetConsensus(), tip->nHeight + 1)) {
-        return report;
-    }
-    const FinalStakeReserve reserve = ComputeFinalStakeReserve(wallet);
-    if (!reserve.active) return report;
-    report.reserved_before = static_cast<int64_t>(reserve.reserved.size());
-    report.eligible_before = reserve.eligible_count;
-    report.eligible_weight_before = reserve.eligible_weight;
-    for (const FinalStakeReserveSource& source : reserve.reserved) {
+    if (!before.active) return report;
+    for (const FinalStakeReserveSource& source : before.reserved) {
         if (std::any_of(tx.vin.begin(), tx.vin.end(), [&](const CTxIn& txin) { return txin.prevout == source.outpoint; })) {
             report.spent.push_back(source);
             report.spent_effective_value += source.effective_value;
         }
     }
+    if (report.spent.empty()) return report;
+    report.reserved_before = static_cast<int64_t>(before.reserved.size());
+    report.eligible_before = before.eligible_count;
+    report.eligible_weight_before = before.eligible_weight;
+    const FinalStakeReserve after = ComputeFinalStakeReserve(wallet, ignore_lock_of);
+    report.reserved_after = static_cast<int64_t>(after.reserved.size());
+    report.eligible_after = after.eligible_count;
+    report.eligible_weight_after = after.eligible_weight;
     return report;
 }
 
-FinalStakeReserve SnapshotFinalStakeReserve(CWallet& wallet)
+bool FinalStakeReserveGuardActiveNow(const CWallet& wallet)
 {
-    LOCK2(::cs_main, wallet.cs_wallet);
-    return ComputeFinalStakeReserve(wallet);
-}
-
-bool FinalStakeReserveCommitRecheckNeeded(const CWallet& wallet)
-{
-    if (!gArgs.GetBoolArg("-finalstakereserve", DEFAULT_FINAL_STAKE_RESERVE) || !wallet.HaveChain()) return false;
-    const Consensus::Params& consensus = Params().GetConsensus();
-    const std::optional<int64_t> last_migration = FinalStakeReserveLastMigrationHeight(consensus);
-    if (!last_migration) return false;
-    const std::optional<int> height = wallet.chain().getHeight();
-    if (!height) return false;
-    constexpr int64_t SAFETY_MARGIN_BLOCKS{100};
-    const int64_t candidate = int64_t{*height} + 1;
-    const int64_t guard_first = *last_migration + 1 - int64_t{consensus.nCoinbaseMaturity};
-    return candidate + SAFETY_MARGIN_BLOCKS >= guard_first && candidate <= *last_migration;
+    AssertLockHeld(::cs_main);
+    if (!wallet.HaveChain() || !gArgs.GetBoolArg("-finalstakereserve", DEFAULT_FINAL_STAKE_RESERVE)) return false;
+    const CBlockIndex* tip = wallet.chain().getTip();
+    return tip && IsFinalStakeReserveGuardActive(Params().GetConsensus(), tip->nHeight + 1);
 }
 
 const char* StakeExclusionName(StakeExclusion reason)
@@ -3726,6 +3715,14 @@ static void PublishCachedStakeWeight(const CWallet& wallet, CAmount value_in, CA
     wallet.m_cached_stake_weight_height.store(tip ? tip->nHeight : -1, std::memory_order_release);
 }
 
+// A published weight that is no longer to be trusted: no figure and no tip, so a reader shows none until the next scan.
+static void InvalidateCachedStakeWeight(const CWallet& wallet)
+{
+    LOCK(wallet.m_staking_telemetry_mutex);
+    wallet.m_cached_stake_weight.store(0, std::memory_order_relaxed);
+    wallet.m_cached_stake_weight_height.store(-1, std::memory_order_release);
+}
+
 // Select some coins without random shuffle or best subset approximation
 bool SelectCoinsForStaking(const CWallet& wallet, CAmount& nTargetValue, std::set<std::pair<const CWalletTx *, unsigned int> > &setCoinsRet, CAmount& nValueRet)
 {
@@ -3765,11 +3762,9 @@ bool SelectCoinsForStaking(const CWallet& wallet, CAmount& nTargetValue, std::se
         }
     }
 
-    // Both current callers request the complete staking set. Publish that
-    // completed scan for status RPC/GUI readers so they never need to repeat
-    // the O(wallet history) walk on a latency-sensitive thread.
-    if (nTargetValue == MAX_MONEY) PublishCachedStakeWeight(wallet, nValueRet);
-
+    // The selection publishes no status weight: it is the unfiltered set, and the figure status readers see is
+    // what the constructor can use (the final stake reserve withheld, the reserve balance taken off). The callers
+    // that complete a scan publish that figure themselves, once the reserve is known.
     return true;
 }
 
@@ -3827,9 +3822,10 @@ static std::shared_ptr<StakeSlotCache> BuildStakeSlotCache(const CWallet& wallet
         for (const auto& [wtx, n] : cache->coins) {
             if (cache->final_reserve.count(COutPoint{wtx->GetHash(), n})) cache->final_reserve_value += wtx->tx->vout[n].nValue;
         }
-        // The status weight is what the constructor can use: SelectCoinsForStaking published the whole selection.
-        PublishCachedStakeWeight(wallet, cache->value_in, cache->final_reserve_value);
     }
+    // Publish the stake weight of the completed full scan for status RPC/GUI readers so they never need to repeat
+    // the O(wallet history) walk on a latency-sensitive thread: only the final figure, the reserve already left out.
+    PublishCachedStakeWeight(wallet, cache->value_in, cache->final_reserve_value);
     // Under demurrage a kernel value depends on the live coin view, which
     // CheckKernel reads per call whatever the cache holds.
     if (with_kernels &&
@@ -3884,8 +3880,6 @@ StakeSlotKernel CheckStakeSlotKernel(const CWallet& wallet, const StakeSlotCache
         CAmount target{MAX_MONEY};
         SelectCoinsForStaking(wallet, target, fresh, fresh_value);
         confirmed = fresh == slot.coins && fresh_value == slot.value_in;
-        // SelectCoinsForStaking published the whole selection; the weight shown is the usable part.
-        if (confirmed) PublishCachedStakeWeight(wallet, fresh_value, slot.final_reserve_value);
     }
     if (confirmed && slot.final_reserve_active) {
         // The reserve is derived from the wallet and the chain, so a kernel is only reported once a fresh derivation
@@ -3897,7 +3891,14 @@ StakeSlotKernel CheckStakeSlotKernel(const CWallet& wallet, const StakeSlotCache
             return StakeSlotKernel::NONE;
         }
     }
+    if (confirmed) {
+        // Verified in full (selection and reserve): the fresh selection equals the slot's, so the weight shown is
+        // the usable part of it.
+        PublishCachedStakeWeight(wallet, slot.value_in, slot.final_reserve_value);
+    }
     if (!confirmed) {
+        // What the rejected cache published is not to be shown any more; the next scan publishes a figure of its own.
+        InvalidateCachedStakeWeight(wallet);
         StakeSlotCacheState& state = wallet.GetStakeSlotCacheStateLocked();
         ++state.stats.rejections;
         state.cache.reset();

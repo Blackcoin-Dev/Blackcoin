@@ -169,6 +169,19 @@ enum class WalletCommitStatus {
     REJECTED_ABANDONED,
 };
 
+struct FinalStakeReserveSpendReport;
+
+/** How the inputs of a transaction came to be chosen, carried with the operation from construction to commitment. */
+struct CommitSpendProvenance
+{
+    //! Outputs the user selected with coin control: the only inputs allowed to spend the final stake reserve.
+    std::set<COutPoint> explicit_inputs;
+    //! Coin locks THIS operation put on its inputs (lock_unspents); a lock that was there before is not listed. They
+    //! do not take an input out of the reserve when it is derived at the commit, and they are released when the commit
+    //! is refused because of the reserve.
+    std::set<COutPoint> operation_locks;
+};
+
 /** Optional exact precondition checked while the wallet transaction is
  * reserved for broadcast. The successful check is the recovery relay's
  * linearization point: later wallet changes do not retroactively revoke bytes
@@ -2167,15 +2180,25 @@ public:
      * @param[in] mapValue key-values to be set on the transaction.
      * @param[in] orderForm BIP 70 / BIP 21 order form details to be set on the transaction.
      */
-    /** Commit a transaction the wallet created. While the final stake reserve guard may be on, the reserve is derived
-     *  again under cs_main and cs_wallet, the locks the transaction is published under, and a transaction with an input
-     *  in it is refused (nothing is stored, FINAL_STAKE_RESERVE_COMMIT_ERROR is the error). Every input is treated as
-     *  one the wallet chose itself unless it is listed in explicit_inputs, the outputs a user selected with coin
-     *  control; those keep their right to spend the reserve. */
+    /** Commit a transaction the wallet created.
+     *
+     *  Entry contract: the caller holds no wallet lock (cs_wallet) of this wallet. The function takes cs_main and then
+     *  cs_wallet itself, in that order, and keeps both from the decision whether the final stake reserve guard is on
+     *  to the end of the wallet record's publication (it is not safe to hold cs_wallet without cs_main on entry, since
+     *  cs_main would then be taken after it). A caller that holds cs_main may keep it. Enforced by AssertLockNotHeld
+     *  (lock-order builds) and by LOCKS_EXCLUDED (thread-safety analysis).
+     *
+     *  While the guard is on, the reserve is derived again under those two locks and a transaction with an input
+     *  in it is refused (nothing is stored, FINAL_STAKE_RESERVE_COMMIT_ERROR is the error). An input counts as one the
+     *  wallet chose itself unless the provenance lists it as explicit (selected by the user with coin control).
+     *  When the commit is refused for the reserve, the coin locks the provenance lists as this operation's own are
+     *  released inside the same critical section. When an explicit input spends reserved outputs and reserve_report is
+     *  given, it receives the outputs consumed and the reserve before and after, derived inside the critical section. */
     bool CommitTransaction(CTransactionRef tx, mapValue_t mapValue, std::vector<std::pair<std::string, std::string>> orderForm,
                            std::string* broadcast_error = nullptr, WalletCommitStatus* commit_status = nullptr,
                            std::optional<ShadowPowClaimCommitAuthority> shadow_pow_authority = std::nullopt,
-                           const std::set<COutPoint>* explicit_inputs = nullptr);
+                           const CommitSpendProvenance* provenance = nullptr,
+                           FinalStakeReserveSpendReport* reserve_report = nullptr) LOCKS_EXCLUDED(cs_wallet);
     bool CommitRGBTransaction(CTransactionRef tx, mapValue_t mapValue, std::vector<std::pair<std::string, std::string>> orderForm, const RGBTxCommitData& rgb_data, std::string& error);
 
     /** Pass this transaction to node for mempool insertion and relay to peers if flag set to true */

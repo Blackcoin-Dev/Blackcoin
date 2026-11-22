@@ -347,13 +347,16 @@ std::set<COutPoint> FinalStakeReserveEnforcedOutpoints(const CWallet& wallet, co
     EXCLUSIVE_LOCKS_REQUIRED(::cs_main, wallet.cs_wallet);
 
 /** The recheck before an automatic spend is committed: true when any input of tx is in the enforced reserve. Takes
- *  cs_main and cs_wallet itself; call with neither held. */
+ *  cs_main and cs_wallet itself; call with neither held. This is an early look only (the construction paths use it
+ *  before they release their own locks); CWallet::CommitTransaction derives the reserve again under the locks the
+ *  transaction is published under, and that check is the one that decides. */
 bool SpendsFinalStakeReserve(CWallet& wallet, const CTransaction& tx)
     LOCKS_EXCLUDED(::cs_main, wallet.cs_wallet);
 
 /** What a deliberate spend of the final stake reserve takes: the reserved outputs a transaction spends, with the
- *  reserve and the eligibility at the first Final block as they stand before it. Empty `spent` when the guard is not
- *  on or no input is reserved. Takes cs_main and cs_wallet itself; call with neither held. */
+ *  reserve and the eligibility at the first Final block as they stood before it and as they stand after it. Empty
+ *  `spent` when the guard is not on or no input is reserved. Made by CWallet::CommitTransaction inside its critical
+ *  section (cs_main and cs_wallet held from the inventory before to the inventory after the record is added). */
 struct FinalStakeReserveSpendReport
 {
     std::vector<FinalStakeReserveSource> spent;
@@ -361,21 +364,23 @@ struct FinalStakeReserveSpendReport
     int64_t reserved_before{0};
     int64_t eligible_before{0};
     CAmount eligible_weight_before{0};
+    int64_t reserved_after{0};
+    int64_t eligible_after{0};
+    CAmount eligible_weight_after{0};
 };
-FinalStakeReserveSpendReport DescribeFinalStakeReserveSpend(CWallet& wallet, const CTransaction& tx)
-    LOCKS_EXCLUDED(::cs_main, wallet.cs_wallet);
 
-/** The reserve as it stands now (after a transaction was committed): for the reduction a deliberate spend caused.
- *  Takes cs_main and cs_wallet itself; call with neither held. */
-FinalStakeReserve SnapshotFinalStakeReserve(CWallet& wallet)
-    LOCKS_EXCLUDED(::cs_main, wallet.cs_wallet);
+/** The report for tx from the reserve derived before it was added to the wallet. When it spends reserved outputs the
+ *  inventory is derived again (same lock provenance) for the "after" figures. Call with cs_main and cs_wallet held,
+ *  after the wallet record of tx exists. */
+FinalStakeReserveSpendReport MakeFinalStakeReserveSpendReport(const CWallet& wallet, const FinalStakeReserve& before,
+                                                              const CTransaction& tx, const std::set<COutPoint>* ignore_lock_of)
+    EXCLUSIVE_LOCKS_REQUIRED(::cs_main, wallet.cs_wallet);
 
-/** Whether CWallet::CommitTransaction has to take cs_main to derive the reserve again: the option is on, the height
- *  schedule is known and the tip is at most a safety margin of blocks from the guard (or inside it), and not past it.
- *  The margin covers the blocks that could connect between this reading and the lock. Reads the tip height itself;
- *  call with neither cs_main nor cs_wallet held. */
-bool FinalStakeReserveCommitRecheckNeeded(const CWallet& wallet)
-    LOCKS_EXCLUDED(::cs_main, wallet.cs_wallet);
+/** Whether the final stake reserve guard is active for the next block: the option is on, the height schedule is
+ *  known and the next block is inside the guard. Decided from the tip as it is NOW, so it must be called with
+ *  cs_main held, and the answer is only good while that lock is kept. */
+bool FinalStakeReserveGuardActiveNow(const CWallet& wallet)
+    EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
 
 /** Quantum stake as the staker sees it for one block.
  *

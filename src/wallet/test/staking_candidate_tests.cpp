@@ -416,6 +416,9 @@ BOOST_AUTO_TEST_CASE(a_poisoned_cache_cannot_produce_a_stake)
     for (const auto& hit : poisoned) BOOST_CHECK(hit.first != foreign_outpoint);
     BOOST_CHECK_EQUAL(wallet->GetStakeSlotCacheStateLocked().stats.rejections, rejections_before + 1);
     BOOST_CHECK(!wallet->GetStakeSlotCacheStateLocked().cache); // dropped
+    // The weight the rejected cache published is withdrawn with it.
+    BOOST_CHECK_EQUAL(wallet->m_cached_stake_weight_height.load(), -1);
+    BOOST_CHECK_EQUAL(wallet->m_cached_stake_weight.load(), uint64_t{0});
 
     // The next slot rebuilds from scratch and no longer carries the foreign coin.
     const KernelHits recovered = AsPairs(ScanStakeKernels(*wallet, EASY_BITS, time, 1, true, &rejected));
@@ -962,10 +965,13 @@ BOOST_FIXTURE_TEST_CASE(a_coinbase_exactly_maturity_deep_is_a_candidate_for_the_
     BOOST_CHECK(heights_of(LegacyCandidatesAtTip(*this, *wallet)) == heights);
 
     // The staker's complete selection (SelectCoinsForStaking, which the slot cache and the weight status
-    // are built from) holds the boundary coinbase too, and the weight it publishes is exactly its value
-    // (no reserve here), tagged with the tip it was scanned at.
+    // are built from) holds the boundary coinbase too. The selection itself publishes no weight (it is the
+    // unfiltered set); the slot cache built from it publishes the figure, exactly its value here (no reserve),
+    // tagged with the tip it was scanned at.
     {
         LOCK2(::cs_main, wallet->cs_wallet);
+        const uint64_t weight_before = wallet->m_cached_stake_weight.load();
+        const int weight_height_before = wallet->m_cached_stake_weight_height.load();
         CAmount target{MAX_MONEY};
         CAmount value_in{0};
         std::set<std::pair<const CWalletTx*, unsigned int>> selection;
@@ -978,6 +984,9 @@ BOOST_FIXTURE_TEST_CASE(a_coinbase_exactly_maturity_deep_is_a_candidate_for_the_
         BOOST_CHECK_EQUAL(selection.size(), coins.size());
         BOOST_CHECK_EQUAL(value_in, expected);
         BOOST_CHECK(heights_of(coins) == heights);
+        BOOST_CHECK_EQUAL(wallet->m_cached_stake_weight.load(), weight_before);
+        BOOST_CHECK_EQUAL(wallet->m_cached_stake_weight_height.load(), weight_height_before);
+        AcquireStakeSlotCache(*wallet, wallet->chain().getTip());
         BOOST_CHECK_EQUAL(wallet->m_cached_stake_weight.load(), static_cast<uint64_t>(value_in));
         BOOST_CHECK_EQUAL(wallet->m_cached_stake_weight_height.load(), 100);
     }

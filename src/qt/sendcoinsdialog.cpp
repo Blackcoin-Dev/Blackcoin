@@ -538,8 +538,15 @@ void SendCoinsDialog::sendButtonClicked([[maybe_unused]] bool checked)
         // failed, or more signatures are needed.
         if (broadcast) {
             // now send the prepared transaction
-            model->sendCoins(*m_current_transaction);
-            Q_EMIT coinsSent(m_current_transaction->getWtx()->GetHash());
+            try {
+                model->sendCoins(*m_current_transaction);
+                Q_EMIT coinsSent(m_current_transaction->getWtx()->GetHash());
+            } catch (const std::runtime_error& e) {
+                // The wallet refused or could not commit the transaction (for instance because an input it chose
+                // is now held back as the final stake reserve): nothing was sent, and the user is told why.
+                send_failure = true;
+                Q_EMIT message(tr("Send Coins"), QString::fromStdString(e.what()), CClientUIInterface::MSG_ERROR);
+            }
         }
     }
     if (!send_failure) {

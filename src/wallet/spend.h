@@ -763,7 +763,8 @@ util::Result<CreatedTransactionResult> CreateUTXOOptimizationTransaction(CWallet
 
 /**
  * Insert additional inputs into the transaction by
- * calling CreateTransaction();
+ * calling CreateTransaction(). With lockUnspents the inputs are locked; operation_locks, when given, receives
+ * the ones this call locked itself (an input that was locked before is not listed).
  */
 bool FundTransaction(
     CWallet& wallet,
@@ -774,7 +775,8 @@ bool FundTransaction(
     bool lockUnspents,
     const std::set<int>& setSubtractFeeFromOutputs,
     CCoinControl,
-    std::optional<CTxDestination>* created_quantum_change = nullptr);
+    std::optional<CTxDestination>* created_quantum_change = nullptr,
+    std::set<COutPoint>* operation_locks = nullptr);
 } // namespace wallet
 
 #endif // BITCOIN_WALLET_SPEND_H

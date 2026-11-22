@@ -361,9 +361,13 @@ outputs the wallet stakes, what it reports, and what it tells the user to do.
   the same ordinary liquid legacy stake online, the first expected block interval after G is about
   four times the usual one. That is the initial expectation, not a multiplier for later blocks: with
   the retarget interval of 15, a block that follows four target spacings raises the target by about
-  22/16, so the expected spacing falls block by block. Fewer producers online lengthen the first interval in
+  22/16, so the expected spacing falls block by block (in the model of
+  `doc/migration-start-readiness.md`, to within 10% of normal in about 16 blocks, roughly half an
+  hour, if every producer is online). Fewer producers online lengthen the first interval in
   proportion. Wallets that stake in that window are not at fault and need no action; keep them online
-  and unlocked for staking.
+  and unlocked for staking. `doc/migration-start-readiness.md` has the calculation, a table for 100%,
+  75%, 50% and 25% of producers upgraded and online, and the checks to make before and after the
+  height.
 
 ## Behaviour that changes before the end of Gold Rush
 

@@ -14,11 +14,14 @@
 #include <crypto/mldsa.h>
 #include <crypto/sha256.h>
 #include <eutxo/transition.h>
+#include <chain.h>
 #include <chainparams.h>
+#include <hash.h>
 #include <key_io.h>
 #include <policy/feerate.h>
 #include <policy/policy.h>
 #include <pos.h>
+#include <pow.h>
 #include <primitives/transaction.h>
 #include <script/interpreter.h>
 #include <script/script.h>
@@ -213,7 +216,7 @@ BOOST_AUTO_TEST_CASE(mainnet_migration_start_quarters_ordinary_legacy_stake_weig
     // multiplier (GetStakeWeightContext in pos.cpp), so a tiered stake can weigh more, up to its full value. The
     // difficulty target changes only from produced blocks (pow.cpp), so with an unchanged target and unchanged
     // participating liquid stake the first expected wait is about four times the usual one; that is the initial
-    // expectation only, not a multiplier for later blocks.
+    // expectation only, not a multiplier for later blocks (see migration_start_expected_interval_follows_the_retarget_rule).
     SetShadowTestSchedule(/*whitelist_height=*/1, /*reward_start_height=*/2, /*gold_rush_blocks=*/10);
     const auto main_params = CreateChainParams(ArgsManager{}, ChainType::MAIN);
     SetShadowTestSchedule(MAINNET_SHADOW_WHITELIST_HEIGHT,
@@ -265,6 +268,118 @@ BOOST_AUTO_TEST_CASE(mainnet_migration_start_quarters_ordinary_legacy_stake_weig
     small_product *= weight_G;
     BOOST_CHECK(KernelProductLE(small_target, weight_G, ArithToUint256(small_product)));
     BOOST_CHECK(!KernelProductLE(small_target, weight_G, ArithToUint256(small_product + 1)));
+
+    // The real kernel check, called at G and at G+1 with the weight context each height gets: it must take the
+    // wraparound product at G and the full-width product at G+1, whatever the helpers do on their own. The hash is
+    // recomputed here exactly as CheckStakeKernelHash forms it, so a time at which the two rules disagree is found.
+    {
+        CBlockIndex prev_at_G, prev_at_G1; // the parents of the blocks at heights G and G+1
+        for (CBlockIndex* index : {&prev_at_G, &prev_at_G1}) {
+            index->nTime = static_cast<uint32_t>(mtp);
+            index->nStakeModifier = uint256::ONE;
+        }
+        prev_at_G.nHeight = G - 1;
+        prev_at_G1.nHeight = G;
+        BOOST_REQUIRE(!IsQuantumWitnessSpendActive(consensus, prev_at_G.GetMedianTimePast(), prev_at_G.nHeight + 1));
+        BOOST_REQUIRE(IsQuantumWitnessSpendActive(consensus, prev_at_G1.GetMedianTimePast(), prev_at_G1.nHeight + 1));
+
+        const CAmount value = 1000 * COIN;
+        const COutPoint prevout{uint256::ONE, 0};
+        const uint32_t block_from_time = 1'700'000'000;
+        const unsigned int bits = arith_uint256{arith_uint256{1} << 230}.GetCompact();
+        arith_uint256 bn_target;
+        bn_target.SetCompact(bits);
+        const arith_uint256 weight_at_G = EffectiveStakeWeight(value, at_G.multiplier_ppm10k, at_G.pool_ppm10k);
+        const arith_uint256 weight_at_G1 = EffectiveStakeWeight(value, at_G1.multiplier_ppm10k, at_G1.pool_ppm10k);
+        arith_uint256 wrapped_target = bn_target;
+        wrapped_target *= weight_at_G;
+
+        int disagreements{0};
+        for (uint32_t time_tx = block_from_time; time_tx < block_from_time + 400; ++time_tx) {
+            CHashWriter ss{};
+            ss << prev_at_G.nStakeModifier;
+            ss << block_from_time << prevout.hash << prevout.n << time_tx;
+            const uint256 hash = ss.GetHash();
+            const bool wraparound_accepts = UintToArith256(hash) <= wrapped_target;
+            const bool full_width_accepts = KernelProductLE(bn_target, weight_at_G1, hash);
+            BOOST_CHECK_EQUAL(CheckStakeKernelHash(&prev_at_G, bits, block_from_time, value, prevout, legacy_script, time_tx, at_G, false), wraparound_accepts);
+            BOOST_CHECK_EQUAL(CheckStakeKernelHash(&prev_at_G1, bits, block_from_time, value, prevout, legacy_script, time_tx, at_G1, false), full_width_accepts);
+            if (wraparound_accepts != full_width_accepts) ++disagreements;
+        }
+        // At this target the product crosses 2^256: the full-width rule accepts every hash and the wraparound rule
+        // does not, so the loop proves the branch inside the check and not only the helpers.
+        BOOST_CHECK_GT(disagreements, 0);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(migration_start_expected_interval_follows_the_retarget_rule)
+{
+    // The numbers of doc/migration-start-readiness.md. The retarget rule of pow.cpp (CalculateNextTargetRequired) is
+    // run as it is, one block at a time. On mainnet the target timespan is 16 minutes and the target spacing 64
+    // seconds, so the interval is 15; each block moves the target to target * (14 * 64 + 2 * A) / (16 * 64), where A is
+    // the spacing of the last block, capped at ten target spacings. A mean-field model of the wait follows: the expected
+    // spacing of the next block is the expected spacing of this one divided by the factor the target just grew by (the
+    // stakers and their weight stay the same), starting from 1 / (share of the pre-switch weight that is upgraded and
+    // online times the average weight factor after the switch) target spacings.
+    const Consensus::Params& consensus = Params().GetConsensus();
+    const int64_t S = consensus.nTargetSpacing;
+    BOOST_REQUIRE_EQUAL(S, 64);
+    BOOST_REQUIRE_EQUAL(consensus.nTargetTimespan / S, 15);
+
+    CBlockIndex last;
+    last.nHeight = consensus.nGoldRushEndHeight + 100;
+    last.nTime = static_cast<uint32_t>(consensus.nQuantumMigrationDeadlineTime + 1);
+    const unsigned int start_bits = arith_uint256{arith_uint256{1} << 192}.GetCompact();
+    const auto next_target = [&](unsigned int bits, int64_t spacing) {
+        last.nBits = bits;
+        return CalculateNextTargetRequired(&last, last.GetBlockTime() - spacing, consensus, /*fProofOfStake=*/true);
+    };
+    const auto ratio = [](unsigned int old_bits, unsigned int new_bits) {
+        arith_uint256 a, b;
+        a.SetCompact(old_bits);
+        b.SetCompact(new_bits);
+        return b.getdouble() / a.getdouble();
+    };
+
+    // One step: a block at the target spacing leaves the target alone, a block after four spacings raises it by 22/16
+    // (1.375), an instant block lowers it by 14/16, and a spacing beyond ten target spacings counts as ten.
+    BOOST_CHECK_CLOSE(ratio(start_bits, next_target(start_bits, S)), 1.0, 1e-4);
+    BOOST_CHECK_CLOSE(ratio(start_bits, next_target(start_bits, 4 * S)), 22.0 / 16.0, 1e-4);
+    BOOST_CHECK_CLOSE(ratio(start_bits, next_target(start_bits, 0)), 14.0 / 16.0, 1e-4);
+    BOOST_CHECK_CLOSE(ratio(start_bits, next_target(start_bits, 10 * S)), 34.0 / 16.0, 1e-4);
+    BOOST_CHECK_EQUAL(next_target(start_bits, 20 * S), next_target(start_bits, 10 * S));
+
+    struct Row {
+        double upgraded;       //! share of the pre-switch staking weight on upgraded nodes that are online
+        double weight_factor;  //! average weight factor after the switch of that stake (0.25 = all ordinary liquid legacy)
+        int64_t first_seconds; //! expected first interval, to the second
+        int blocks;            //! blocks until the expected spacing is within 10% of the target spacing
+        int64_t total_seconds; //! the time those blocks take
+    };
+    const Row rows[] = {
+        {1.00, 0.25, 256, 16, 1745}, {0.75, 0.25, 341, 17, 2000}, {0.50, 0.25, 512, 17, 2297}, {0.25, 0.25, 1024, 18, 3273},
+        {1.00, 0.50, 128, 13, 1150}, {0.75, 0.50, 171, 15, 1442}, {0.50, 0.50, 256, 16, 1745}, {0.25, 0.50, 512, 17, 2297},
+        {0.75, 1.00, 85, 8, 614},    {0.50, 1.00, 128, 13, 1150}, {0.25, 1.00, 256, 16, 1745},
+    };
+    for (const Row& row : rows) {
+        double expected_spacings = 1.0 / (row.upgraded * row.weight_factor); // in target spacings
+        BOOST_CHECK_EQUAL(static_cast<int64_t>(expected_spacings * S + 0.5), row.first_seconds);
+        unsigned int bits = start_bits;
+        int blocks{0};
+        int64_t total{0};
+        while (expected_spacings > 1.1 && blocks < 1000) {
+            const int64_t spacing = static_cast<int64_t>(expected_spacings * S + 0.5);
+            total += spacing;
+            const unsigned int next_bits = next_target(bits, spacing);
+            expected_spacings /= ratio(bits, next_bits);
+            bits = next_bits;
+            ++blocks;
+        }
+        BOOST_CHECK_MESSAGE(blocks == row.blocks && total == row.total_seconds,
+                            "upgraded " << row.upgraded << " weight " << row.weight_factor << ": " << blocks << " blocks, " << total << " s");
+    }
+    // Every producer upgraded and every stake at full weight leaves the spacing where it was: no easing is needed.
+    BOOST_CHECK_LE(1.0 / (1.00 * 1.00), 1.1);
 }
 
 BOOST_AUTO_TEST_CASE(mainnet_gold_rush_v2_missing_time_is_deterministic)

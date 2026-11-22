@@ -20,7 +20,7 @@ from decimal import Decimal
 
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import assert_equal
-from transition_t_final_util import F, G, LAST_LEGACY_STAKE_HEIGHT, LIFECYCLE_ARGS, MATURITY, TransitionTFinalTestBase
+from transition_t_final_util import F, G, LAST_LEGACY_STAKE_HEIGHT, LIFECYCLE_ARGS, TransitionTFinalTestBase
 
 TIER_AMOUNT = Decimal("5000")
 COLD_AMOUNT = Decimal("4000")

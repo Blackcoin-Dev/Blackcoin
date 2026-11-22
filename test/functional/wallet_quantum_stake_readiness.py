@@ -166,7 +166,6 @@ class QuantumStakeReadinessTest(TransitionTFinalTestBase, BitcoinTestFramework):
         # Ten blocks on, Q2 is old enough too and Q3 is old enough for consensus to accept it as a kernel.
         self.pow_blocks(node, 84 - node.getblockcount(), quantum_miner)
         q1_out = self.outpoint_at(mix, q1)
-        q2_out = self.outpoint_at(mix, q2)
         # The reserve leaves half of Q1: neither Q1 nor Q2 is a kernel that fits, though a fractional
         # accounting would have called half of the set stakeable.
         half = min(q1_amount, q2_amount) / 2

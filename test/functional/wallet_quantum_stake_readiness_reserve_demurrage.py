@@ -21,7 +21,7 @@ from decimal import Decimal, ROUND_DOWN, ROUND_UP
 
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import assert_equal, assert_raises_rpc_error
-from transition_t_final_util import F, G, LIFECYCLE_ARGS, M, TransitionTFinalTestBase
+from transition_t_final_util import F, G, LIFECYCLE_ARGS, TransitionTFinalTestBase
 
 CENT = Decimal("0.01")
 

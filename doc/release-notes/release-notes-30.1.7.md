@@ -296,6 +296,11 @@ operator can see before the last Gold Rush block (height 6,192,999), in plain la
   and stays at that value when staking is switched off. It is not the weight the staker would use
   now; `weight_cached` and `weight_cache_height` say how old it is. Use `getquantumstakereadiness`
   for the current figures. This predates 30.1.7.
+- **`send` does not fall back to legacy inputs during Migration.** For a quantum recipient,
+  `sendtoaddress` and `sendmany` retry with legacy inputs during Migration when quantum inputs
+  cannot pay. `send` does not: a wallet funded only with legacy coins gets `Insufficient funds`
+  from it while a migration transaction is permitted. Use `migratetoquantum`, `sendtoaddress`, or
+  select the inputs explicitly. This is unchanged from 30.1.6.
 - **Downgrade.** A wallet written by 30.1.7 opens in 30.1.6 with the same balances, unspent outputs
   and transactions, and 30.1.7 finds its quantum stake return record again. 30.1.6 does not know the
   late-Migration policy: do not use 30.1.6 to stake legacy coins in the last Migration window (from

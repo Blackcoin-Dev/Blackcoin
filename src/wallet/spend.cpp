@@ -34,6 +34,7 @@
 #include <wallet/fees.h>
 #include <wallet/receive.h>
 #include <wallet/spend.h>
+#include <wallet/staking.h>
 #include <wallet/transaction.h>
 #include <wallet/wallet.h>
 #include <validation.h>
@@ -1780,6 +1781,9 @@ CoinsResult AvailableCoins(const CWallet& wallet,
 
     // Never auto-select UTXOs carrying live RGB single-use-seal or EUTXO state.
     const std::set<COutPoint> protected_rgb_seals = wallet.GetProtectedRGBSeals();
+    // The final stake reserve, derived now (never cached), for an automatic selection that must leave it alone.
+    const std::set<COutPoint> final_stake_reserve = params.avoid_final_stake_reserve
+        ? FinalStakeReserveEnforcedOutpoints(wallet) : std::set<COutPoint>{};
 
     std::set<uint256> trusted_parents;
     size_t walked{0};
@@ -1847,6 +1851,9 @@ CoinsResult AvailableCoins(const CWallet& wallet,
                 continue;
 
             if (wallet.IsSpent(outpoint))
+                continue;
+
+            if (!final_stake_reserve.empty() && final_stake_reserve.count(outpoint))
                 continue;
 
             // Spending an RGB seal / EUTXO-state UTXO as ordinary coin burns the asset; never
@@ -2702,7 +2709,11 @@ static util::Result<CreatedTransactionResult> CreateTransactionInternal(
     // allowed (coins automatically selected by the wallet)
     CoinsResult available_coins;
     if (coin_control.m_allow_other_inputs) {
-        available_coins = AvailableCoins(wallet, &coin_control, coin_selection_params.m_effective_feerate);
+        // Ordinary automatic selection avoids the final stake reserve; explicitly selected coins (coin control) may
+        // still spend it.
+        CoinFilterParams automatic_params;
+        automatic_params.avoid_final_stake_reserve = true;
+        available_coins = AvailableCoins(wallet, &coin_control, coin_selection_params.m_effective_feerate, automatic_params);
     }
 
     // Choose coins to use

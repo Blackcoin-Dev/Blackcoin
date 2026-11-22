@@ -93,6 +93,7 @@ void DummyWalletInit::AddWalletOptions(ArgsManager& argsman) const
         "-donatetodevfund=<n>",
         "-qqdevelopmentdonation=<n>",
         "-qqdevelopmentdonationrecipient=<address>",
+        "-finalstakereserve=<true/false>",
         "-qqautoredelegate=<true/false>",
         "-qqredelegationtriggermultiplier=<n>",
         "-qqredelegationmaxpatienceblocks=<n>",

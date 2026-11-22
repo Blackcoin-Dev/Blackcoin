@@ -201,6 +201,7 @@ BITCOIN_TESTS += \
   wallet/test/migration_batch_tests.cpp \
   wallet/test/migration_residual_tests.cpp \
   wallet/test/legacy_stake_cutoff_tests.cpp \
+  wallet/test/final_stake_reserve_tests.cpp \
   wallet/test/demurrage_pending_attestation_tests.cpp \
   wallet/test/status_countdown_tests.cpp \
   wallet/test/block_connect_activity_tests.cpp \

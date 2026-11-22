@@ -198,7 +198,8 @@ bool IsMigrationAuxiliaryOutput(const CWallet& wallet, const COutPoint& outpoint
 util::Result<MigrationBatch> BuildMigrationBatch(CWallet& wallet, const CCoinControl& base_control,
                                                  const CTxDestination& destination,
                                                  const std::vector<MigrationBatchInput>& candidates,
-                                                 size_t max_inputs, bool require_anchor, bool sign)
+                                                 size_t max_inputs, bool require_anchor, bool sign,
+                                                 const std::set<COutPoint>& final_stake_reserve)
 {
     AssertLockHeld(wallet.cs_wallet);
     CAmount total_value{0};
@@ -224,6 +225,14 @@ util::Result<MigrationBatch> BuildMigrationBatch(CWallet& wallet, const CCoinCon
         }
         if (plan.selected.empty()) {
             return util::Error{_("No input fits in a standard-size transaction.")};
+        }
+
+        // The recheck before anything is signed: the plan never spends the final stake reserve.
+        for (const MigrationBatchInput& in : plan.selected) {
+            if (final_stake_reserve.count(in.outpoint)) return util::Error{_("The migration batch would spend the final stake reserve.")};
+        }
+        for (const MigrationBatchInput& in : plan.auxiliary) {
+            if (final_stake_reserve.count(in.outpoint)) return util::Error{_("The migration batch would spend the final stake reserve.")};
         }
 
         CCoinControl control = base_control;

@@ -773,6 +773,8 @@ std::vector<COutPoint> SafeDemurrageAttestationFeeOutpoints(CWallet& wallet, con
     fee_filter.only_spendable = true;
     fee_filter.skip_locked = true;
     fee_filter.include_immature_coinbase = false;
+    // The wallet's own choice of a fee input never takes the final stake reserve.
+    fee_filter.avoid_final_stake_reserve = true;
     CCoinControl fee_scan_control;
     CoinsResult fee_outputs = AvailableCoins(wallet, &fee_scan_control, std::nullopt, fee_filter);
     std::vector<COutput> sorted_fee_outputs = fee_outputs.All();
@@ -1417,6 +1419,7 @@ bool CreateQuantumColdStakeRedelegationTransaction(
         CoinFilterParams filter;
         filter.only_spendable = true;
         filter.skip_locked = true;
+        filter.avoid_final_stake_reserve = options.avoid_final_stake_reserve;
         for (const COutput& out : AvailableCoins(wallet, &coin_control, std::nullopt, filter).All()) {
             CTxDestination dest;
             if (!ExtractDestination(out.txout.scriptPubKey, dest) || !(dest == source_dest) || !out.spendable) continue;
@@ -1554,6 +1557,9 @@ bool CreateQuantumColdStakeRedelegationTransaction(
     result.tx = tx;
 
     if (!options.dry_run) {
+        if (options.avoid_final_stake_reserve && SpendsFinalStakeReserve(wallet, *tx)) {
+            return fail_after_created_key(_("Redelegation would spend the final stake reserve"));
+        }
         mapValue_t map_value;
         map_value["comment"] = "Quantum Quasar cold-stake redelegation";
         std::string broadcast_error;
@@ -1724,6 +1730,7 @@ int MaybeAutoDemurrageAttest(CWallet& wallet)
         fee_filter.only_spendable = true;
         fee_filter.skip_locked = true;
         fee_filter.include_immature_coinbase = false;
+        fee_filter.avoid_final_stake_reserve = true;
         CCoinControl fee_scan_control;
         CoinsResult fee_outputs = AvailableCoins(wallet, &fee_scan_control, std::nullopt, fee_filter);
         std::vector<COutput> sorted_fee_outputs = fee_outputs.All();
@@ -1781,6 +1788,11 @@ int MaybeAutoDemurrageAttest(CWallet& wallet)
         bilingual_str error;
         if (!CreateDemurrageAttestationTransaction(wallet, candidate.witness_program, coin_control, /*sign=*/true, tx_result, error, candidate.outpoint)) {
             result.error = error.original;
+            return result;
+        }
+        // The recheck before the commit: the attestation's fee input must not be in the final stake reserve.
+        if (SpendsFinalStakeReserve(wallet, *tx_result.tx)) {
+            result.error = "the fee input is in the final stake reserve";
             return result;
         }
 
@@ -2125,6 +2137,7 @@ int MaybeAutoRedelegateQuantumColdStake(CWallet& wallet)
         filter.only_spendable = true;
         filter.skip_locked = true;
         filter.include_immature_coinbase = false;
+        filter.avoid_final_stake_reserve = true;
         CCoinControl coin_control;
         const CoinsResult available = AvailableCoins(wallet, &coin_control, std::nullopt, filter);
         std::map<std::vector<unsigned char>, AutoRedelegationSource> grouped;
@@ -2249,6 +2262,7 @@ int MaybeAutoRedelegateQuantumColdStake(CWallet& wallet)
         options.allow_new_quantum_key = gArgs.GetBoolArg("-qqallowautokeycreation", DEFAULT_ALLOW_AUTO_QUANTUM_KEY_CREATION);
         options.enforce_pool_cap = true;
         options.require_verified_operator = true;
+        options.avoid_final_stake_reserve = true;
         options.label = "auto-redelegated-coldstake";
 
         QuantumColdStakeRedelegationResult redelegation;
@@ -2405,6 +2419,22 @@ bool IsLegacyStakeBarredByMigrationEnd(const Consensus::Params& consensus, int s
     return last && int64_t{stake_height} > *last;
 }
 
+std::optional<int64_t> FirstOpportunisticLegacyReturnHeight(const Consensus::Params& consensus)
+{
+    if (!LastLegacyStakeHeight(consensus)) return std::nullopt;
+    const int64_t final_height = int64_t{consensus.nQuantumMigrationEndHeight} + 1;
+    const int64_t first_migration = int64_t{consensus.nGoldRushEndHeight} + 1;
+    return std::max(first_migration,
+                    final_height - int64_t{LEGACY_STAKE_OPPORTUNISTIC_RETURN_MATURITIES} * int64_t{consensus.nCoinbaseMaturity});
+}
+
+bool IsLegacyStakeInOpportunisticReturnWindow(const Consensus::Params& consensus, int stake_height)
+{
+    const std::optional<int64_t> last = LastLegacyStakeHeight(consensus);
+    const std::optional<int64_t> first = FirstOpportunisticLegacyReturnHeight(consensus);
+    return last && first && int64_t{stake_height} >= *first && int64_t{stake_height} <= *last;
+}
+
 std::optional<int64_t> DemurrageFirstReductionCountdown(const Consensus::Params& consensus,
                                                         const CScript& script_pub_key,
                                                         const Consensus::DemurrageEvaluation& eval,
@@ -2469,7 +2499,25 @@ std::string LegacyStakingNotice(const Consensus::Params& consensus, int next_hei
         ready = strprintf("Return address NOT READY: %s Until it is, this wallet will not stake legacy coins from height %d.",
                           quantum_return.reason, first_quantum);
     }
-    return head + " " + ready + " " + unstaked;
+    // The opportunistic window opens earlier: with a ready return address a legacy stake is already paid as
+    // quantum coins; without one it stakes as before, and the return address is the action to take.
+    std::string opportunistic;
+    if (const std::optional<int64_t> first_opportunistic = FirstOpportunisticLegacyReturnHeight(consensus);
+        first_opportunistic && *first_opportunistic < first_quantum) {
+        if (int64_t{next_height} >= *first_opportunistic) {
+            opportunistic = quantum_return.available
+                ? strprintf("Opportunistic return is ON: since height %d a legacy stake is paid to that address as one quantum output.",
+                            *first_opportunistic)
+                : strprintf("Opportunistic return is OFF since height %d because the return address is not ready, so legacy stakes "
+                            "still pay legacy outputs. Make it ready now: %s",
+                            *first_opportunistic, quantum_return.reason);
+        } else {
+            opportunistic = strprintf("From height %d (%d blocks from now) a legacy stake is already paid to that address as one "
+                                      "quantum output when it is ready; without one it stakes as before.",
+                                      *first_opportunistic, *first_opportunistic - int64_t{next_height});
+        }
+    }
+    return head + " " + ready + (opportunistic.empty() ? "" : " " + opportunistic) + " " + unstaked;
 }
 
 std::optional<CTxDestination> ChooseLegacyStakeQuantumReturn(const std::vector<QuantumReturnCandidate>& candidates)
@@ -3106,6 +3154,187 @@ void AvailableCoinsForStakingReference(const CWallet& wallet,
     AvailableCoinsForStakingImpl</*REFERENCE=*/true>(wallet, vCoins, coinControl, params);
 }
 
+int64_t FinalStakeReserveTarget(int64_t n)
+{
+    if (n <= 0) return 0;
+    return std::min(MAX_FINAL_STAKE_RESERVE_OUTPUTS, (n + 1) / 2);
+}
+
+/** M and F for the reserve guard, or nullopt without a complete height schedule. */
+static std::optional<int64_t> FinalStakeReserveLastMigrationHeight(const Consensus::Params& consensus)
+{
+    if (!consensus.UsesHeightLifecycle() || !consensus.IsMigrationEndScheduled() ||
+        consensus.nQuantumMigrationEndHeight == std::numeric_limits<int>::max()) {
+        return std::nullopt;
+    }
+    return int64_t{consensus.nQuantumMigrationEndHeight};
+}
+
+bool IsFinalStakeReserveGuardActive(const Consensus::Params& consensus, int candidate_height)
+{
+    const std::optional<int64_t> last = FinalStakeReserveLastMigrationHeight(consensus);
+    if (!last) return false;
+    return int64_t{candidate_height} >= *last + 1 - int64_t{consensus.nCoinbaseMaturity} && int64_t{candidate_height} <= *last;
+}
+
+FinalStakeReservePlan PlanFinalStakeReserve(std::vector<FinalStakeReserveSource> unspent, const std::set<COutPoint>& consumed)
+{
+    // One entry per outpoint, whatever the caller passed.
+    std::set<COutPoint> distinct;
+    unspent.erase(std::remove_if(unspent.begin(), unspent.end(),
+                                 [&distinct](const FinalStakeReserveSource& source) { return !distinct.insert(source.outpoint).second; }),
+                  unspent.end());
+    std::sort(unspent.begin(), unspent.end(), [](const FinalStakeReserveSource& a, const FinalStakeReserveSource& b) {
+        if (a.effective_value != b.effective_value) return a.effective_value > b.effective_value;
+        return a.outpoint < b.outpoint; // transaction hash, then output index, both ascending
+    });
+    std::set<COutPoint> all(consumed);
+    all.insert(distinct.begin(), distinct.end());
+
+    FinalStakeReservePlan plan;
+    plan.n = static_cast<int64_t>(all.size());
+    plan.target = FinalStakeReserveTarget(plan.n);
+    const size_t take = static_cast<size_t>(std::min<int64_t>(plan.target, static_cast<int64_t>(unspent.size())));
+    plan.reserved.assign(unspent.begin(), unspent.begin() + take);
+    plan.shortfall = plan.target - static_cast<int64_t>(take);
+    return plan;
+}
+
+bool IsFinalStakeReserveSourceScript(const CWallet& wallet, const CScript& script)
+{
+    AssertLockHeld(wallet.cs_wallet);
+    if (IsQuantumMigrationScript(script)) {
+        return (wallet.IsMine(script) & ISMINE_SPENDABLE) != ISMINE_NO;
+    }
+    if (IsQuantumColdStakeScript(script)) {
+        int witness_version{0};
+        std::vector<unsigned char> witness_program;
+        if (!script.IsWitnessProgram(witness_version, witness_program)) return false;
+        const auto delegation = wallet.GetQuantumColdStakeDelegationInfo(witness_program);
+        return delegation && delegation->has_staker_key;
+    }
+    return false;
+}
+
+std::set<COutPoint> FinalStakeReserveConsumedSources(const CWallet& wallet, int64_t first_guard_height, int64_t last_height,
+                                                     int64_t last_source_height)
+{
+    AssertLockHeld(wallet.cs_wallet);
+    std::set<COutPoint> consumed;
+    for (const auto& entry : wallet.mapWallet) {
+        const CWalletTx& wtx = entry.second;
+        if (!wtx.tx || !wtx.tx->IsCoinStake()) continue;
+        const TxStateConfirmed* confirmed = wtx.state<TxStateConfirmed>();
+        if (!confirmed) continue;
+        if (int64_t{confirmed->confirmed_block_height} < first_guard_height || int64_t{confirmed->confirmed_block_height} > last_height) continue;
+        if (wallet.GetTxDepthInMainChain(wtx) <= 0) continue;
+        for (const CTxIn& txin : wtx.tx->vin) {
+            const auto parent_it = wallet.mapWallet.find(txin.prevout.hash);
+            if (parent_it == wallet.mapWallet.end() || !parent_it->second.tx) continue;
+            const CWalletTx& parent = parent_it->second;
+            if (txin.prevout.n >= parent.tx->vout.size()) continue;
+            const TxStateConfirmed* parent_state = parent.state<TxStateConfirmed>();
+            if (!parent_state || int64_t{parent_state->confirmed_block_height} > last_source_height) continue;
+            const CTxOut& out = parent.tx->vout[txin.prevout.n];
+            if (out.nValue < wallet.m_min_staking_amount) continue;
+            if (!IsFinalStakeReserveSourceScript(wallet, out.scriptPubKey)) continue;
+            consumed.insert(txin.prevout);
+        }
+    }
+    return consumed;
+}
+
+FinalStakeReserve ComputeFinalStakeReserve(const CWallet& wallet)
+{
+    AssertLockHeld(::cs_main);
+    AssertLockHeld(wallet.cs_wallet);
+    FinalStakeReserve reserve;
+    reserve.enabled = gArgs.GetBoolArg("-finalstakereserve", DEFAULT_FINAL_STAKE_RESERVE);
+    const Consensus::Params& consensus = Params().GetConsensus();
+    const CBlockIndex* tip = wallet.chain().getTip();
+    if (!tip) return reserve;
+    reserve.candidate_height = tip->nHeight + 1;
+    const std::optional<int64_t> last_migration = FinalStakeReserveLastMigrationHeight(consensus);
+    if (!last_migration) return reserve;
+    reserve.schedule_known = true;
+    reserve.final_height = *last_migration + 1;
+    reserve.guard_first_height = reserve.final_height - int64_t{consensus.nCoinbaseMaturity};
+    if (!reserve.enabled || int64_t{reserve.candidate_height} > *last_migration) return reserve;
+    reserve.active = int64_t{reserve.candidate_height} >= reserve.guard_first_height;
+
+    // U: the staker's own candidate scan evaluated for the first Final block (maturity, lineage, covenants, locks and the
+    // wallet's other staking requirements as they will be at F), restricted to the outputs the wallet stakes quantum with.
+    std::vector<FinalStakeReserveSource> unspent;
+    const int blocks_ahead = static_cast<int>(reserve.final_height - int64_t{reserve.candidate_height});
+    const int64_t scan_time = tip->GetMedianTimePast();
+    const StakeScanObserver observer = [&](const COutPoint& outpoint, const CWalletTx& wtx, bool eligible, StakeExclusion why) {
+        const CScript& script = wtx.tx->vout[outpoint.n].scriptPubKey;
+        const bool cold_stake = IsQuantumColdStakeScript(script);
+        if (!IsQuantumMigrationScript(script) && !cold_stake) return;
+        if (!eligible) {
+            StakeExclusionTally& tally = reserve.excluded[why == StakeExclusion::NONE ? StakeExclusion::OTHER : why];
+            ++tally.count;
+            tally.value += wtx.tx->vout[outpoint.n].nValue;
+            return;
+        }
+        if (!IsFinalStakeReserveSourceScript(wallet, script)) {
+            if (cold_stake) {
+                ++reserve.missing_staker_key.count;
+                reserve.missing_staker_key.value += wtx.tx->vout[outpoint.n].nValue;
+            }
+            return;
+        }
+        CAmount principal{0};
+        if (!GetCoinStakeInputPrincipal(wallet.chain().getCoinsTip(), outpoint, consensus, static_cast<int>(reserve.final_height),
+                                        scan_time, principal)) {
+            ++reserve.no_effective_value.count;
+            reserve.no_effective_value.value += wtx.tx->vout[outpoint.n].nValue;
+            return;
+        }
+        unspent.push_back({outpoint, principal});
+    };
+    std::vector<std::pair<const CWalletTx*, unsigned int>> scanned;
+    CCoinControl coin_control;
+    AvailableCoinsForStakingAhead(wallet, scanned, &coin_control, CoinFilterParams{}, blocks_ahead, observer);
+
+    // S: sources already consumed by this wallet's confirmed coinstakes since the guard began; a source qualifies when it
+    // was created at or before F - maturity.
+    const std::set<COutPoint> consumed = FinalStakeReserveConsumedSources(
+        wallet, reserve.guard_first_height, *last_migration, reserve.guard_first_height);
+
+    for (const FinalStakeReserveSource& source : unspent) reserve.eligible_weight += source.effective_value;
+    reserve.eligible_count = static_cast<int64_t>(unspent.size());
+    reserve.consumed = static_cast<int64_t>(consumed.size());
+    FinalStakeReservePlan plan = PlanFinalStakeReserve(std::move(unspent), consumed);
+    reserve.n = plan.n;
+    reserve.target = plan.target;
+    reserve.shortfall = plan.shortfall;
+    reserve.reserved = std::move(plan.reserved);
+    for (const FinalStakeReserveSource& source : reserve.reserved) {
+        reserve.reserved_weight += source.effective_value;
+        if (reserve.active) reserve.enforced.insert(source.outpoint);
+    }
+    return reserve;
+}
+
+std::set<COutPoint> FinalStakeReserveEnforcedOutpoints(const CWallet& wallet)
+{
+    AssertLockHeld(::cs_main);
+    AssertLockHeld(wallet.cs_wallet);
+    if (!gArgs.GetBoolArg("-finalstakereserve", DEFAULT_FINAL_STAKE_RESERVE)) return {};
+    const CBlockIndex* tip = wallet.chain().getTip();
+    if (!tip || !IsFinalStakeReserveGuardActive(Params().GetConsensus(), tip->nHeight + 1)) return {};
+    return ComputeFinalStakeReserve(wallet).enforced;
+}
+
+bool SpendsFinalStakeReserve(CWallet& wallet, const CTransaction& tx)
+{
+    LOCK2(::cs_main, wallet.cs_wallet);
+    const std::set<COutPoint> reserve = FinalStakeReserveEnforcedOutpoints(wallet);
+    if (reserve.empty()) return false;
+    return std::any_of(tx.vin.begin(), tx.vin.end(), [&reserve](const CTxIn& txin) { return reserve.count(txin.prevout) > 0; });
+}
+
 const char* StakeExclusionName(StakeExclusion reason)
 {
     switch (reason) {
@@ -3141,6 +3370,7 @@ QuantumStakeReadiness AssessQuantumStakeReadiness(const CWallet& wallet)
     result.reserve_balance = wallet.m_reserve_balance;
     result.min_stake_amount = wallet.m_min_staking_amount;
     result.stake_return = ResolveLegacyStakeQuantumReturn(wallet);
+    result.final_reserve = ComputeFinalStakeReserve(wallet);
     // A fully locked wallet has no signing key available: the staker idles
     // (ThreadStakeMiner waits while IsLocked), so nothing it would select can stake.
     const bool cannot_sign = wallet.IsLocked() || wallet.IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS);
@@ -3314,6 +3544,7 @@ static bool StakeSlotCacheIsCurrent(const CWallet& wallet, const StakeSlotCache&
            cache.wallet_locked == wallet.IsLocked() &&
            cache.staking_only == wallet.m_wallet_unlock_staking_only.load() &&
            cache.protected_rgb_seals == wallet.GetProtectedRGBSeals() &&
+           cache.final_reserve_enabled == gArgs.GetBoolArg("-finalstakereserve", DEFAULT_FINAL_STAKE_RESERVE) &&
            std::chrono::steady_clock::now() - cache.built_at < STAKE_SLOT_CACHE_MAX_AGE;
 }
 
@@ -3328,9 +3559,20 @@ static std::shared_ptr<StakeSlotCache> BuildStakeSlotCache(const CWallet& wallet
     cache->wallet_locked = wallet.IsLocked();
     cache->staking_only = wallet.m_wallet_unlock_staking_only.load();
     cache->protected_rgb_seals = wallet.GetProtectedRGBSeals();
+    cache->final_reserve_enabled = gArgs.GetBoolArg("-finalstakereserve", DEFAULT_FINAL_STAKE_RESERVE);
     cache->built_at = std::chrono::steady_clock::now();
     CAmount target{MAX_MONEY};
     SelectCoinsForStaking(wallet, target, cache->coins, cache->value_in);
+    // The final stake reserve of this tip: outputs the staker must leave alone while the guard is on. They stay in
+    // `coins` (the selection is what the status weight reports), and every user of the cache skips them.
+    if (cache->final_reserve_enabled && IsFinalStakeReserveGuardActive(Params().GetConsensus(), tip->nHeight + 1)) {
+        FinalStakeReserve reserve = ComputeFinalStakeReserve(wallet);
+        cache->final_reserve_active = reserve.active;
+        cache->final_reserve = std::move(reserve.enforced);
+        for (const auto& [wtx, n] : cache->coins) {
+            if (cache->final_reserve.count(COutPoint{wtx->GetHash(), n})) cache->final_reserve_value += wtx->tx->vout[n].nValue;
+        }
+    }
     // Under demurrage a kernel value depends on the live coin view, which
     // CheckKernel reads per call whatever the cache holds.
     if (with_kernels &&
@@ -3385,6 +3627,16 @@ StakeSlotKernel CheckStakeSlotKernel(const CWallet& wallet, const StakeSlotCache
         CAmount target{MAX_MONEY};
         SelectCoinsForStaking(wallet, target, fresh, fresh_value);
         confirmed = fresh == slot.coins && fresh_value == slot.value_in;
+    }
+    if (confirmed && slot.final_reserve_active) {
+        // The reserve is derived from the wallet and the chain, so a kernel is only reported once a fresh derivation
+        // agrees with the cached one, and never from an output that is in it.
+        const std::set<COutPoint> fresh_reserve = ComputeFinalStakeReserve(wallet).enforced;
+        if (fresh_reserve != slot.final_reserve) {
+            confirmed = false;
+        } else if (fresh_reserve.count(prevout)) {
+            return StakeSlotKernel::NONE;
+        }
     }
     if (!confirmed) {
         StakeSlotCacheState& state = wallet.GetStakeSlotCacheStateLocked();
@@ -3488,16 +3740,26 @@ bool CreateCoinStake(CWallet& wallet, unsigned int nBits, int64_t nSearchInterva
     // reward split (which fixes the return script) were already active, no
     // legacy kernel may stake: a legacy-return coinstake this late could never
     // be spent before Final.
-    const bool legacy_in_window = IsLegacyStakeBarredByMigrationEnd(consensus, stake_height);
-    const LegacyStakeQuantumReturn legacy_return = legacy_in_window ? ResolveLegacyStakeQuantumReturn(wallet) : LegacyStakeQuantumReturn{};
-    const bool legacy_stake_barred = legacy_in_window && (!legacy_return.available || stake_reward_split_active);
+    const bool legacy_mandatory_window = IsLegacyStakeBarredByMigrationEnd(consensus, stake_height);
+    // Earlier, in the opportunistic window, a legacy self-stake is also paid as one quantum output, but only while a
+    // return destination is ready (and no exact reward split fixes the return script); without one it stakes as
+    // it always did. The mandatory predicate above is never widened by it.
+    const bool legacy_opportunistic_window = IsLegacyStakeInOpportunisticReturnWindow(consensus, stake_height);
+    const LegacyStakeQuantumReturn legacy_return = (legacy_mandatory_window || legacy_opportunistic_window)
+        ? ResolveLegacyStakeQuantumReturn(wallet) : LegacyStakeQuantumReturn{};
+    const bool legacy_stake_barred = legacy_mandatory_window && (!legacy_return.available || stake_reward_split_active);
+    const bool legacy_in_window = legacy_mandatory_window ||
+        (legacy_opportunistic_window && legacy_return.available && !stake_reward_split_active);
     bool fReturnToQuantum = false;
 
     // Select coins with suitable depth. The selection and the kernel inputs
     // are shared by every slot of this tip (see StakeSlotCache).
     const std::shared_ptr<const StakeSlotCache> stake_slot = AcquireStakeSlotCache(wallet, pindexPrev);
     const std::set<std::pair<const CWalletTx*, unsigned int>>& setCoins = stake_slot->coins;
-    nValueIn = stake_slot->value_in;
+    // The final stake reserve is not available to this coinstake: not as the kernel, not as an added input, and not
+    // as value the reserve balance may be taken from.
+    const std::set<COutPoint>& final_reserve = stake_slot->final_reserve;
+    nValueIn = stake_slot->value_in - stake_slot->final_reserve_value;
 
     if (setCoins.empty() || nValueIn <= wallet.m_reserve_balance)
         return false;
@@ -3534,6 +3796,7 @@ bool CreateCoinStake(CWallet& wallet, unsigned int nBits, int64_t nSearchInterva
         const COutPoint prevoutStake{pcoin.first->GetHash(), pcoin.second};
         if (forced_kernel && prevoutStake != *forced_kernel) continue;
         if (selected_tx_reserved_outpoints.count(prevoutStake)) continue;
+        if (final_reserve.count(prevoutStake)) continue;
         if (final_quantum_lockout &&
             !IsQuantumMigrationScript(pcoin.first->tx->vout[pcoin.second].scriptPubKey) &&
             !IsQuantumColdStakeScript(pcoin.first->tx->vout[pcoin.second].scriptPubKey)) {
@@ -3716,6 +3979,7 @@ bool CreateCoinStake(CWallet& wallet, unsigned int nBits, int64_t nSearchInterva
     for (const std::pair<const CWalletTx*, unsigned int> &pcoin : setCoins)
     {
         if (selected_tx_reserved_outpoints.count(COutPoint(pcoin.first->GetHash(), pcoin.second))) continue;
+        if (final_reserve.count(COutPoint(pcoin.first->GetHash(), pcoin.second))) continue;
         CTransactionRef tx = pcoin.first->tx;
         if (!tx) {
             LogPrint(BCLog::COINSTAKE, "CreateCoinStake : wallet transaction unavailable for %s\n", pcoin.first->GetHash().ToString());
@@ -3846,6 +4110,18 @@ bool CreateCoinStake(CWallet& wallet, unsigned int nBits, int64_t nSearchInterva
     if (legacy_in_window && !fQuantumKernel) {
         const std::string shape_problem = LegacyReturnWindowCoinstakeProblem(txNew, fReturnToQuantum, legacy_return);
         if (!shape_problem.empty()) return error("CreateCoinStake : %s", shape_problem);
+    }
+
+    // The recheck before the coinstake is committed: a fresh derivation of the reserve, from the same wallet and chain
+    // state the coinstake was built from, must not contain any of its inputs.
+    if (stake_slot->final_reserve_active) {
+        const std::set<COutPoint> fresh_reserve = ComputeFinalStakeReserve(wallet).enforced;
+        for (const CTxIn& txin : txNew.vin) {
+            if (fresh_reserve.count(txin.prevout)) {
+                LogPrint(BCLog::COINSTAKE, "CreateCoinStake : refusing a coinstake that spends the final stake reserve\n");
+                return false;
+            }
+        }
     }
 
     // Sign

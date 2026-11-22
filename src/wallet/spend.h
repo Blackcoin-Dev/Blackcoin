@@ -582,6 +582,10 @@ struct CoinFilterParams {
     // Fully decayed demurrage outputs are consensus-locked. Listing views opt in
     // so users can diagnose them, but ordinary funding skips them.
     bool include_demurrage_locked_outputs{false};
+    // Automatic selection leaves the final stake reserve alone (outputs held back for the first Final block while the
+    // reserve guard is on, see FinalStakeReserve). Always read fresh. Explicitly selected coins are not affected
+    // because they never pass through this scan.
+    bool avoid_final_stake_reserve{false};
     // Optional cooperative cancellation for long read-only listings. Checked
     // every INTERRUPT_CHECK_INTERVAL transaction/output visits; when true
     // the walk stops early and CoinsResult::interrupted is set. Funding paths

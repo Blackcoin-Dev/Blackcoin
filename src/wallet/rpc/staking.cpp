@@ -757,6 +757,10 @@ void AddLegacyStakeReturnStatus(UniValue& obj, const CWallet& wallet, const Cons
     obj.pushKV("legacy_staking_window_start_height", *last + 1);
     obj.pushKV("legacy_staking_in_window", in_window);
     obj.pushKV("legacy_staking_pays_quantum", true);
+    if (const std::optional<int64_t> first_opportunistic = FirstOpportunisticLegacyReturnHeight(consensus)) {
+        obj.pushKV("legacy_staking_opportunistic_start_height", *first_opportunistic);
+        obj.pushKV("legacy_staking_in_opportunistic_window", IsLegacyStakeInOpportunisticReturnWindow(consensus, static_cast<int>(next_height)));
+    }
     obj.pushKV("legacy_stake_return_ready", quantum_return.available);
     if (quantum_return.available) {
         obj.pushKV("legacy_stake_return_address", quantum_return.address);
@@ -914,6 +918,99 @@ static UniValue StakeHorizonReadinessToJSON(const StakeHorizonReadiness& horizon
     return obj;
 }
 
+static std::vector<RPCResult> FinalStakeReserveDoc()
+{
+    const auto tally = [](const std::string& name, const std::string& what) {
+        return RPCResult{RPCResult::Type::OBJ, name, "", {
+            {RPCResult::Type::NUM, "count", "number of outputs " + what},
+            {RPCResult::Type::STR_AMOUNT, "amount", "their value"},
+        }};
+    };
+    return {
+        {RPCResult::Type::BOOL, "enabled", "whether the guard is on (-finalstakereserve)"},
+        {RPCResult::Type::BOOL, "active", "whether the guard holds outputs back at the next block: from one maturity before the first Final block up to the last Migration block, released for the first Final block itself"},
+        {RPCResult::Type::BOOL, "schedule_known", "whether a complete height schedule gives the first Final block; false means the guard never acts"},
+        {RPCResult::Type::NUM, "guard_first_height", /*optional=*/true, "first block at which the guard holds outputs back (absent when schedule_known is false)"},
+        {RPCResult::Type::NUM, "final_height", /*optional=*/true, "the first Final block, for which the reserve is kept (absent when schedule_known is false)"},
+        {RPCResult::Type::NUM, "n", "N: the wallet's qualifying quantum stake sources, unspent and able to stake at the first Final block, plus those its confirmed coinstakes consumed since the guard began"},
+        {RPCResult::Type::NUM, "target", "R: the number of outputs to hold back, min(32, (N + 1) / 2)"},
+        {RPCResult::Type::NUM, "reserved_count", "outputs actually held back (R, or fewer when too few outputs are available)"},
+        {RPCResult::Type::ARR, "reserved_outpoints", "the outputs held back, largest effective value at the first Final block first", {
+            {RPCResult::Type::OBJ, "", "", {
+                {RPCResult::Type::STR_HEX, "txid", "transaction id"},
+                {RPCResult::Type::NUM, "vout", "output index"},
+                {RPCResult::Type::STR_AMOUNT, "effective_value", "kernel value at the first Final block"},
+            }},
+        }},
+        {RPCResult::Type::STR_AMOUNT, "reserved_weight", "the effective kernel value of the reserve at the first Final block"},
+        {RPCResult::Type::NUM, "eligible_count", "unspent outputs able to stake at the first Final block (mature by then, even if not mature now)"},
+        {RPCResult::Type::STR_AMOUNT, "eligible_weight", "their effective kernel value at the first Final block"},
+        {RPCResult::Type::NUM, "consumed_count", "qualifying sources consumed by this wallet's confirmed coinstakes since the guard began"},
+        {RPCResult::Type::NUM, "shortfall", "target less reserved_count"},
+        {RPCResult::Type::BOOL, "wallet_locked", "the wallet is fully locked: signing is temporarily unavailable, which is not the same as a missing key"},
+        {RPCResult::Type::OBJ, "exclusions", "quantum outputs that cannot be counted for the first Final block, by the first rule that stops them", {
+            tally("immature", "too young to be a kernel at the first Final block, or unconfirmed"),
+            tally("locked", "coin-locked by the user, or locked by a Gold Rush payout lock or demurrage"),
+            tally("below_minimum", "under the staking minimum"),
+            tally("missing_keys", "with no signing key in the wallet (a cold-stake output with the owner key but not the staker key is counted here)"),
+            tally("no_effective_value", "with no kernel value left at the first Final block"),
+            tally("other", "stopped by another staking rule"),
+        }},
+    };
+}
+
+static UniValue FinalStakeReserveToJSON(const FinalStakeReserve& reserve, bool wallet_locked)
+{
+    UniValue obj(UniValue::VOBJ);
+    obj.pushKV("enabled", reserve.enabled);
+    obj.pushKV("active", reserve.active);
+    obj.pushKV("schedule_known", reserve.schedule_known);
+    if (reserve.schedule_known) {
+        obj.pushKV("guard_first_height", reserve.guard_first_height);
+        obj.pushKV("final_height", reserve.final_height);
+    }
+    obj.pushKV("n", reserve.n);
+    obj.pushKV("target", reserve.target);
+    obj.pushKV("reserved_count", static_cast<int64_t>(reserve.reserved.size()));
+    UniValue outpoints(UniValue::VARR);
+    for (const FinalStakeReserveSource& source : reserve.reserved) {
+        UniValue entry(UniValue::VOBJ);
+        entry.pushKV("txid", source.outpoint.hash.GetHex());
+        entry.pushKV("vout", static_cast<int64_t>(source.outpoint.n));
+        entry.pushKV("effective_value", ValueFromAmount(source.effective_value));
+        outpoints.push_back(std::move(entry));
+    }
+    obj.pushKV("reserved_outpoints", std::move(outpoints));
+    obj.pushKV("reserved_weight", ValueFromAmount(reserve.reserved_weight));
+    obj.pushKV("eligible_count", reserve.eligible_count);
+    obj.pushKV("eligible_weight", ValueFromAmount(reserve.eligible_weight));
+    obj.pushKV("consumed_count", reserve.consumed);
+    obj.pushKV("shortfall", reserve.shortfall);
+    obj.pushKV("wallet_locked", wallet_locked);
+    const auto tally_json = [](const StakeExclusionTally& tally) {
+        UniValue entry(UniValue::VOBJ);
+        entry.pushKV("count", tally.count);
+        entry.pushKV("amount", ValueFromAmount(tally.value));
+        return entry;
+    };
+    const auto scan_tally = [&reserve](StakeExclusion reason) {
+        const auto it = reserve.excluded.find(reason);
+        return it == reserve.excluded.end() ? StakeExclusionTally{} : it->second;
+    };
+    StakeExclusionTally missing_keys = scan_tally(StakeExclusion::SIGNER_UNAVAILABLE);
+    missing_keys.count += reserve.missing_staker_key.count;
+    missing_keys.value += reserve.missing_staker_key.value;
+    UniValue exclusions(UniValue::VOBJ);
+    exclusions.pushKV("immature", tally_json(scan_tally(StakeExclusion::IMMATURE)));
+    exclusions.pushKV("locked", tally_json(scan_tally(StakeExclusion::LOCKED)));
+    exclusions.pushKV("below_minimum", tally_json(scan_tally(StakeExclusion::BELOW_MINIMUM)));
+    exclusions.pushKV("missing_keys", tally_json(missing_keys));
+    exclusions.pushKV("no_effective_value", tally_json(reserve.no_effective_value));
+    exclusions.pushKV("other", tally_json(scan_tally(StakeExclusion::OTHER)));
+    obj.pushKV("exclusions", std::move(exclusions));
+    return obj;
+}
+
 static RPCHelpMan getquantumstakereadiness()
 {
     return RPCHelpMan{"getquantumstakereadiness",
@@ -948,6 +1045,7 @@ static RPCHelpMan getquantumstakereadiness()
             {RPCResult::Type::BOOL, "staking_only_unlock", "unlocked for staking only"},
             {RPCResult::Type::STR_AMOUNT, "reserve_balance", "the reserve balance held back from staking"},
             {RPCResult::Type::STR_AMOUNT, "minimum_stake_amount", "the smallest output the wallet stakes"},
+            {RPCResult::Type::OBJ, "final_stake_reserve", "the final stake reserve: quantum outputs held back from staking and from automatic spending in the last maturity period of Migration so that they are mature and can stake the first Final block. Derived on every pass from the wallet and the chain; nothing is stored. Outputs spent by explicit coin control reduce it, and the outputs affected are listed in reserved_outpoints", FinalStakeReserveDoc()},
         }},
         RPCExamples{HelpExampleCli("getquantumstakereadiness", "") + HelpExampleRpc("getquantumstakereadiness", "")},
         [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
@@ -986,6 +1084,7 @@ static RPCHelpMan getquantumstakereadiness()
     result.pushKV("staking_only_unlock", readiness.staking_only_unlock);
     result.pushKV("reserve_balance", ValueFromAmount(readiness.reserve_balance));
     result.pushKV("minimum_stake_amount", ValueFromAmount(readiness.min_stake_amount));
+    result.pushKV("final_stake_reserve", FinalStakeReserveToJSON(readiness.final_reserve, readiness.wallet_locked));
     return result;
 },
     };
@@ -1036,6 +1135,8 @@ static RPCHelpMan getstakinginfo()
                         {RPCResult::Type::STR, "legacy_staking_notice", /*optional=*/true, "Plain-language notice: from legacy_staking_window_start_height legacy stakes are paid to a quantum address of this wallet, whether that return address is ready, what to do if not, and the need to migrate legacy coins that do not stake before Final"},
                         {RPCResult::Type::NUM, "legacy_staking_window_start_height", /*optional=*/true, "First block height at which a legacy stake is paid to a quantum address instead of a legacy one"},
                         {RPCResult::Type::BOOL, "legacy_staking_in_window", /*optional=*/true, "Whether the next block is already inside that window; the window ends with the last Migration block"},
+                        {RPCResult::Type::NUM, "legacy_staking_opportunistic_start_height", /*optional=*/true, "First block height at which a legacy self-stake is already paid to a quantum address of this wallet when its return address is ready; without one it stakes as before. Runs up to the block before legacy_staking_window_start_height, where paying quantum becomes mandatory"},
+                        {RPCResult::Type::BOOL, "legacy_staking_in_opportunistic_window", /*optional=*/true, "Whether the next block is inside that opportunistic window"},
                         {RPCResult::Type::BOOL, "legacy_staking_pays_quantum", /*optional=*/true, "Always true when a schedule exists: legacy stakes in the window are paid to a quantum address"},
                         {RPCResult::Type::BOOL, "legacy_stake_return_ready", /*optional=*/true, "Whether a usable quantum stake return address is saved in this wallet"},
                         {RPCResult::Type::STR, "legacy_stake_return_address", /*optional=*/true, "The saved quantum stake return address, when ready"},

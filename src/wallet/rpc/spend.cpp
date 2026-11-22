@@ -1682,6 +1682,8 @@ RPCHelpMan sendall()
                 } else {
                     CoinFilterParams coins_params;
                     coins_params.min_amount = 0;
+                    // Ordinary automatic selection leaves the final stake reserve alone; explicit inputs may spend it.
+                    coins_params.avoid_final_stake_reserve = true;
                     for (const COutput& output : AvailableCoins(*pwallet, &coin_control, fee_rate, coins_params).All()) {
                         CHECK_NONFATAL(output.input_bytes > 0);
                         if (send_max && fee_rate.GetFee(output.input_bytes) > output.txout.nValue) {
@@ -2159,6 +2161,8 @@ RPCHelpMan migratetoquantum()
         // valid to spend in that block. Without this, an output maturing exactly
         // in the last Migration block could not be moved.
         filter.include_next_block_mature_coinbase = true;
+        // The wallet's own choice of inputs leaves the final stake reserve alone.
+        filter.avoid_final_stake_reserve = true;
 
         const bool anchor_required_early = IsQuantumWitnessSpendActive(consensus, mtp, next_height);
         CAmount eligible_amount = 0;
@@ -2212,7 +2216,8 @@ RPCHelpMan migratetoquantum()
                 created_destination);
         }
 
-        auto batch = BuildMigrationBatch(*pwallet, coin_control, dest, batch_candidates, batch_limit, anchor_required, /*sign=*/!dry_run);
+        auto batch = BuildMigrationBatch(*pwallet, coin_control, dest, batch_candidates, batch_limit, anchor_required, /*sign=*/!dry_run,
+                                         FinalStakeReserveEnforcedOutpoints(*pwallet));
         if (!batch) {
             ThrowQuantumActionError(
                 RPC_WALLET_ERROR,
@@ -2443,6 +2448,7 @@ RPCHelpMan migrategoldrushrewards()
         filter.skip_locked = true;
         filter.include_immature_coinbase = false;
         filter.include_generated_quantum_inputs = true;
+        filter.avoid_final_stake_reserve = true;
 
         ChainstateManager& chainman = pwallet->chain().chainman();
         const CCoinsViewCache& view = chainman.ActiveChainstate().CoinsTip();
@@ -2480,7 +2486,8 @@ RPCHelpMan migrategoldrushrewards()
                 created_destination);
         }
 
-        auto batch = BuildMigrationBatch(*pwallet, coin_control, dest, batch_candidates, batch_limit, /*require_anchor=*/false, /*sign=*/!dry_run);
+        auto batch = BuildMigrationBatch(*pwallet, coin_control, dest, batch_candidates, batch_limit, /*require_anchor=*/false, /*sign=*/!dry_run,
+                                         FinalStakeReserveEnforcedOutpoints(*pwallet));
         if (!batch) {
             ThrowQuantumActionError(
                 RPC_WALLET_ERROR,
@@ -4066,6 +4073,8 @@ RPCHelpMan getmigrationstatus()
             {RPCResult::Type::STR, "legacy_staking_notice", /*optional=*/true, "plain-language notice: when legacy stakes start to be paid to a quantum address, whether the return address is ready, and migrating legacy coins that do not stake before Final"},
             {RPCResult::Type::NUM, "legacy_staking_window_start_height", /*optional=*/true, "first block height at which a legacy stake is paid to a quantum address"},
             {RPCResult::Type::BOOL, "legacy_staking_in_window", /*optional=*/true, "whether the next block is inside that window"},
+            {RPCResult::Type::NUM, "legacy_staking_opportunistic_start_height", /*optional=*/true, "first block height at which a legacy self-stake is already paid to a quantum address of this wallet when its return address is ready (otherwise it stakes as before)"},
+            {RPCResult::Type::BOOL, "legacy_staking_in_opportunistic_window", /*optional=*/true, "whether the next block is inside that opportunistic window"},
             {RPCResult::Type::BOOL, "legacy_staking_pays_quantum", /*optional=*/true, "true when a height schedule exists"},
             {RPCResult::Type::BOOL, "legacy_stake_return_ready", /*optional=*/true, "whether a usable quantum stake return address is saved"},
             {RPCResult::Type::STR, "legacy_stake_return_address", /*optional=*/true, "the saved quantum stake return address, when ready"},

@@ -2057,6 +2057,8 @@ util::Result<WalletQuantumActionTx> CreateQuantumMigrationSweep(
         // migratetoquantum RPC).
         filter.include_next_block_mature_coinbase = !goldrush_rewards_only;
         filter.include_generated_quantum_inputs = goldrush_rewards_only;
+        // The wallet's own choice of inputs leaves the final stake reserve alone.
+        filter.avoid_final_stake_reserve = true;
 
         const CCoinsViewCache& view = wallet.chain().chainman().ActiveChainstate().CoinsTip();
         unsigned int migration_anchor_inputs{0};
@@ -2128,7 +2130,8 @@ util::Result<WalletQuantumActionTx> CreateQuantumMigrationSweep(
         const size_t batch_limit = max_inputs > 0
             ? max_inputs
             : (goldrush_rewards_only ? DEFAULT_GOLDRUSH_CONSOLIDATION_BATCH_INPUTS : DEFAULT_LEGACY_MIGRATION_BATCH_INPUTS);
-        auto batch = BuildMigrationBatch(wallet, coin_control, destination, candidates, batch_limit, anchor_required, /*sign=*/true);
+        auto batch = BuildMigrationBatch(wallet, coin_control, destination, candidates, batch_limit, anchor_required, /*sign=*/true,
+                                         FinalStakeReserveEnforcedOutpoints(wallet));
         if (!batch) {
             return fail(util::ErrorString(batch));
         }

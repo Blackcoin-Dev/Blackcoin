@@ -31,6 +31,7 @@
 #include <wallet/display_balance.h>
 #include <wallet/scheduler_stats.h>
 #include <wallet/shadow_pow_claim_recovery_args.h>
+#include <wallet/staking.h>
 #include <wallet/wallet.h>
 #include <walletinitinterface.h>
 
@@ -109,6 +110,7 @@ void WalletInit::AddWalletOptions(ArgsManager& argsman) const
     argsman.AddArg("-autostartstaking=<true/false>", strprintf("Automatically start staking for every eligible private-key wallet loaded by this process (default: %u). This explicit process-wide setting takes precedence over legacy -staking autostart consent and does not unlock encrypted wallets.", wallet::DEFAULT_AUTOSTART_STAKING), ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
     argsman.AddArg("-qqautoshadowsignal=<true/false>", strprintf("Automatically submit eligible fee-paying Gold Rush PoS QQSIGNAL transactions from every eligible loaded wallet (default: %u). This is process-wide optional wallet automation, not a consensus activation switch, and does not unlock wallets.", wallet::DEFAULT_AUTO_SHADOW_SIGNAL), ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
     argsman.AddArg("-qqautodemurrageattest=<true/false>", strprintf("Automatically submit eligible fee-paying demurrage liveness attestations from every eligible loaded wallet after Final activation (default: %u). This is process-wide optional wallet automation. Consensus demurrage and its burn activate independently and cannot be disabled by this option.", wallet::DEFAULT_AUTO_DEMURRAGE_ATTEST), ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
+    argsman.AddArg("-finalstakereserve=<true/false>", strprintf("Hold back part of this wallet's quantum stake outputs from staking and from every automatic spend during the last maturity period of Migration, so that enough of them are still mature when the first Final block is staked (up to %d outputs, half of the wallet's qualifying outputs; default: %u). Wallet policy only: no block or transaction is judged by it. Explicit coin control can still spend them.", wallet::MAX_FINAL_STAKE_RESERVE_OUTPUTS, wallet::DEFAULT_FINAL_STAKE_RESERVE), ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
     argsman.AddArg("-stakecache=<true/false>", strprintf("Enables or disables the staking cache; significantly improves staking performance, but can use a lot of memory (default: %u)", node::DEFAULT_STAKE_CACHE), ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
     argsman.AddArg("-staketimio=<n>", strprintf("Proof of stake timeout. (default: %u)", node::DEFAULT_STAKETIMIO), ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
     argsman.AddArg("-solostaking=<true/false>", strprintf("Stake on an isolated private chain without peers or a public-chain sync estimate (testnet/regtest only on this branch) (default: %u)", node::DEFAULT_SOLO_STAKING), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::WALLET);

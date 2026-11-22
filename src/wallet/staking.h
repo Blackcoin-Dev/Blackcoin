@@ -46,6 +46,22 @@ std::optional<int64_t> LastLegacyStakeHeight(const Consensus::Params& consensus)
  *  candidate filtering, status weight and the check inside CreateCoinStake. */
 bool IsLegacyStakeBarredByMigrationEnd(const Consensus::Params& consensus, int stake_height);
 
+/** Blocks before the last legacy-return height from which the wallet already pays a legacy self-stake to a
+ *  quantum output of its own when one is ready (the opportunistic return window): ten maturities before the
+ *  first Final block, never before the first Migration block. */
+static constexpr int LEGACY_STAKE_OPPORTUNISTIC_RETURN_MATURITIES{10};
+
+/** First height of the opportunistic return window, max(first Migration height, F - 10 * maturity) with F the
+ *  first Final block, or nullopt when the Migration end height is not known. 64-bit arithmetic throughout. */
+std::optional<int64_t> FirstOpportunisticLegacyReturnHeight(const Consensus::Params& consensus);
+
+/** True when stake_height lies in the opportunistic return window: from FirstOpportunisticLegacyReturnHeight up to
+ *  and including the last height at which a legacy-return coinstake is still made (the height before the
+ *  mandatory window, see IsLegacyStakeBarredByMigrationEnd, which this predicate never reads). Wallet policy only.
+ *  With a ready return destination a legacy self-stake pays everything to one quantum output; without one it
+ *  stakes as it always did. */
+bool IsLegacyStakeInOpportunisticReturnWindow(const Consensus::Params& consensus, int stake_height);
+
 /** Blocks from evaluation_height until an output's value is first reduced by
  *  demurrage, for status display. Before activation the distance to the activation
  *  height is added to the curve's own count.
@@ -208,6 +224,92 @@ struct StakeExclusionTally
     CAmount value{0};
 };
 
+/** Option: hold back part of the wallet's quantum stake sources for the first Final block (see FinalStakeReserve). */
+static constexpr bool DEFAULT_FINAL_STAKE_RESERVE{true};
+//! The most outputs the reserve ever holds back.
+static constexpr int64_t MAX_FINAL_STAKE_RESERVE_OUTPUTS{32};
+
+/** A quantum output that can be a kernel at the first Final block, with its effective kernel value there. */
+struct FinalStakeReserveSource
+{
+    COutPoint outpoint;
+    CAmount effective_value{0};
+};
+
+/** The reserve target R for N sources: min(32, (N + 1) / 2) by integer division. */
+int64_t FinalStakeReserveTarget(int64_t n);
+
+/** True when the reserve guard is on for the candidate height h: F - maturity <= h <= M, with M the last Migration
+ *  block and F = M + 1. It is released for candidate F. False without a known height schedule. */
+bool IsFinalStakeReserveGuardActive(const Consensus::Params& consensus, int candidate_height);
+
+/** The reserve choice as a pure function. `unspent` is U, the sources that are unspent and can stake at the first
+ *  Final block; `consumed` is S, the sources already consumed by the wallet's confirmed coinstakes since the guard
+ *  began. N = |U union S|, R = FinalStakeReserveTarget(N), and the reserve is the first min(R, |U|) members of U
+ *  ordered by effective value descending, then transaction hash ascending, then output index ascending. */
+struct FinalStakeReservePlan
+{
+    int64_t n{0};
+    int64_t target{0};
+    std::vector<FinalStakeReserveSource> reserved;
+    int64_t shortfall{0}; //! target less what is reserved, when U has fewer members than R
+};
+FinalStakeReservePlan PlanFinalStakeReserve(std::vector<FinalStakeReserveSource> unspent, const std::set<COutPoint>& consumed);
+
+/** The reserve of one staking pass: a derived set, recomputed from the wallet and the active chain every time
+ *  (nothing about it is stored in the wallet file). */
+struct FinalStakeReserve
+{
+    bool enabled{false};         //! -finalstakereserve
+    bool schedule_known{false};  //! a complete height schedule gives the first Final block
+    bool active{false};          //! the guard is on for the candidate height (and enabled)
+    int candidate_height{0};
+    int64_t final_height{0};     //! F
+    int64_t guard_first_height{0}; //! F - maturity
+    int64_t consumed{0};         //! |S|: sources consumed by confirmed coinstakes of the wallet since the guard began
+    int64_t eligible_count{0};   //! |U|: sources unspent and able to stake at F
+    CAmount eligible_weight{0};  //! their effective value at F
+    int64_t n{0};                //! |U union S|
+    int64_t target{0};           //! R
+    int64_t shortfall{0};
+    std::vector<FinalStakeReserveSource> reserved; //! in reserve order
+    CAmount reserved_weight{0};
+    //! Reserved outputs, only while the guard is active: what automatic spending and the staker must leave alone.
+    std::set<COutPoint> enforced;
+    //! Quantum outputs the staker's scan sees that cannot be counted at F, by the first rule that stops them.
+    std::map<StakeExclusion, StakeExclusionTally> excluded;
+    StakeExclusionTally missing_staker_key; //! cold-stake outputs for which the wallet holds the owner key only
+    StakeExclusionTally no_effective_value; //! outputs with no kernel value at F (locked by demurrage, nothing left)
+};
+
+/** Whether the script is a quantum output this wallet can stake with: a v16 migration output the wallet holds the key
+ *  for, or a v14 cold-stake output the wallet holds the STAKER key for (the owner key alone does not stake). */
+bool IsFinalStakeReserveSourceScript(const CWallet& wallet, const CScript& script)
+    EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet);
+
+/** S: the qualifying sources consumed by this wallet's coinstakes that are confirmed on the active chain at heights
+ *  first_guard_height..last_height. EVERY input of such a coinstake counts, not only its kernel. A source qualifies when
+ *  its creating transaction is confirmed at or before last_source_height (so it is mature at F), it is at least the
+ *  wallet's staking minimum, and IsFinalStakeReserveSourceScript holds. Orphaned, abandoned, conflicted and
+ *  unconfirmed coinstakes are ignored. */
+std::set<COutPoint> FinalStakeReserveConsumedSources(const CWallet& wallet, int64_t first_guard_height, int64_t last_height,
+                                                     int64_t last_source_height)
+    EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet);
+
+/** Compute the reserve for the next block (tip height + 1) from one consistent wallet and active-chain snapshot. */
+FinalStakeReserve ComputeFinalStakeReserve(const CWallet& wallet)
+    EXCLUSIVE_LOCKS_REQUIRED(::cs_main, wallet.cs_wallet);
+
+/** The outputs automatic spending must not select: the reserve while the guard is active, otherwise empty. Always
+ *  computed fresh (a spend never reads a cached reserve). Cheap when the guard is off. */
+std::set<COutPoint> FinalStakeReserveEnforcedOutpoints(const CWallet& wallet)
+    EXCLUSIVE_LOCKS_REQUIRED(::cs_main, wallet.cs_wallet);
+
+/** The recheck before an automatic spend is committed: true when any input of tx is in the enforced reserve. Takes
+ *  cs_main and cs_wallet itself; call with neither held. */
+bool SpendsFinalStakeReserve(CWallet& wallet, const CTransaction& tx)
+    LOCKS_EXCLUDED(::cs_main, wallet.cs_wallet);
+
 /** Quantum stake as the staker sees it for one block.
  *
  * Nominal value is the output's face value, which is what the staker's reserve rule counts; effective
@@ -247,6 +349,7 @@ struct QuantumStakeReadiness
     CAmount reserve_balance{0};
     CAmount min_stake_amount{0};
     LegacyStakeQuantumReturn stake_return;
+    FinalStakeReserve final_reserve; //! the reserve guard for the next block (see ComputeFinalStakeReserve)
 };
 QuantumStakeReadiness AssessQuantumStakeReadiness(const CWallet& wallet)
     EXCLUSIVE_LOCKS_REQUIRED(::cs_main, wallet.cs_wallet);
@@ -294,7 +397,7 @@ bool SelectCoinsForStaking(const CWallet& wallet, CAmount& nTargetValue, std::se
  * phase rule, the coin set and every depth), the live-unspent index generation,
  * the wallet's balance scan marker (every mapWallet, spend-map, key, script and
  * flag change), the coin-lock generation, the lock and staking-only unlock
- * state, and the set of RGB-protected seals. A cache older than
+ * state, the set of RGB-protected seals and the final-reserve policy. A cache older than
  * STAKE_SLOT_CACHE_MAX_AGE is rebuilt regardless, as a bound on any wallet
  * change that does not advance one of the counters.
  *
@@ -311,6 +414,13 @@ struct StakeSlotCache
     bool wallet_locked{false};
     bool staking_only{false};
     std::set<COutPoint> protected_rgb_seals;
+    //! The reserve policy the cache was built under (-finalstakereserve), part of its validity key.
+    bool final_reserve_enabled{true};
+    //! True while the reserve guard was on at this tip; `final_reserve` is then the reserve of this tip and
+    //! `final_reserve_value` the face value of its members that are in `coins`.
+    bool final_reserve_active{false};
+    std::set<COutPoint> final_reserve;
+    CAmount final_reserve_value{0};
     std::chrono::steady_clock::time_point built_at;
     //! Output of SelectCoinsForStaking (nTargetValue = MAX_MONEY), same order.
     std::set<std::pair<const CWalletTx*, unsigned int>> coins;
@@ -404,6 +514,9 @@ struct QuantumColdStakeRedelegationOptions
     bool allow_new_quantum_key{false};
     bool enforce_pool_cap{true};
     bool require_verified_operator{true};
+    //! The automatic path leaves the final stake reserve out of the inputs it selects and rechecks it before
+    //! the commit. A manual redelegation keeps its explicit behaviour.
+    bool avoid_final_stake_reserve{false};
     std::optional<CFeeRate> fee_rate;
     std::string label{"redelegated-coldstake"};
 };

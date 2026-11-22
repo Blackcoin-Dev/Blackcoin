@@ -17,6 +17,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <set>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -170,12 +171,14 @@ MigrationContinuation PlanMigrationContinuation(std::vector<MigrationBatchInput>
  * false). The batch is cut down and rebuilt, up to a few times, if the wallet
  * still finds it too large. base_control carries the fee rate, change
  * destination and input-family settings; its selection is replaced by the batch.
- * Requires the wallet lock.
+ * Requires the wallet lock. `final_stake_reserve` is the automatic-spend policy: outputs the batch must not spend
+ * (the caller derives it fresh under cs_main); a plan that would take one is refused, as a recheck before signing.
  */
 util::Result<MigrationBatch> BuildMigrationBatch(CWallet& wallet, const CCoinControl& base_control,
                                                  const CTxDestination& destination,
                                                  const std::vector<MigrationBatchInput>& candidates,
-                                                 size_t max_inputs, bool require_anchor, bool sign)
+                                                 size_t max_inputs, bool require_anchor, bool sign,
+                                                 const std::set<COutPoint>& final_stake_reserve = {})
     EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet);
 
 /** True when out can be an auxiliary migration input: a confirmed, wallet-owned,

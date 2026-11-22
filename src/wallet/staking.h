@@ -465,6 +465,9 @@ bool CreateQuantumColdStakeRedelegationTransaction(
     bilingual_str& error);
 
 int MaybeAutoDemurrageAttest(CWallet& wallet);
+
+/** Whether the wallet owns, and can sign for, a live legacy output the staker could stake. */
+bool WalletHoldsLegacyStakableCoin(const CWallet& wallet) EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet);
 int MaybeAutoShadowSignal(CWallet& wallet);
 int MaybeAutoRedelegateQuantumColdStake(CWallet& wallet);
 

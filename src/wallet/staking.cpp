@@ -2306,11 +2306,17 @@ bool SetQuantumStakeReturn(CWallet& wallet, const CTxDestination& dest, bilingua
     return true;
 }
 
-/** Whether the wallet holds a live legacy output of a kind the staker can stake (not a quantum, cold-stake or EUTXO
- *  script). Stops at the first one. */
-static bool WalletHoldsLegacyStakableCoin(const CWallet& wallet) EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet)
+/** Whether the wallet holds a live legacy output of a kind the staker can stake: of a script class kernels can
+ *  be built for (not a quantum, cold-stake or EUTXO script), owned by this wallet with a spendable key and
+ *  signable here, and not a protected asset. The live candidate index is only a prefilter on script shape
+ *  (it also holds outputs of other parties that sit in the wallet's transaction history), so ownership and
+ *  signability are decided here, with the tests the staking evaluator applies. Stops at the first one. */
+bool WalletHoldsLegacyStakableCoin(const CWallet& wallet)
 {
     AssertLockHeld(wallet.cs_wallet);
+    if (wallet.IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS)) return false;
+    const std::set<COutPoint> protected_seals = wallet.GetProtectedRGBSeals();
+    std::map<CScript, bool> signable; // per script, looked up once
     for (const COutPoint& outpoint : wallet.GetLiveUnspentStakeCandidateOutpoints()) {
         const auto it = wallet.mapWallet.find(outpoint.hash);
         if (it == wallet.mapWallet.end() || !it->second.tx || outpoint.n >= it->second.tx->vout.size()) continue;
@@ -2320,6 +2326,11 @@ static bool WalletHoldsLegacyStakableCoin(const CWallet& wallet) EXCLUSIVE_LOCKS
             IsEUTXOScript(out.scriptPubKey)) {
             continue;
         }
+        if (!IsStakeCandidateScript(out.scriptPubKey) || protected_seals.count(outpoint)) continue;
+        if ((wallet.IsMine(out) & ISMINE_SPENDABLE) == ISMINE_NO) continue;
+        auto [sign_it, inserted] = signable.try_emplace(out.scriptPubKey, false);
+        if (inserted) sign_it->second = CalculateMaximumSignedInputSize(out, &wallet, /*coin_control=*/nullptr) > 0;
+        if (!sign_it->second) continue;
         return true;
     }
     return false;

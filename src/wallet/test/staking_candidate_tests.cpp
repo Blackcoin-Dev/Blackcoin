@@ -9,12 +9,14 @@
 #include <key.h>
 #include <key_io.h>
 #include <pos.h>
+#include <script/descriptor.h>
 #include <script/solver.h>
 #include <shadow.h>
 #include <test/util/random.h>
 #include <test/util/setup_common.h>
 #include <validation.h>
 #include <wallet/coincontrol.h>
+#include <wallet/spend.h>
 #include <wallet/staking.h>
 #include <wallet/test/util.h>
 #include <wallet/wallet.h>
@@ -970,6 +972,115 @@ BOOST_FIXTURE_TEST_CASE(the_claim_reserve_keeps_the_wallet_maturity_rule_while_t
     BOOST_CHECK(reserve_heights == expected);
     BOOST_CHECK(reserve_heights.count(boundary_height - 1) == 1);
     BOOST_CHECK(reserve_heights.count(boundary_height) == 0);
+}
+
+namespace {
+/** A watch-only wallet: it knows the public key (a combo descriptor without the private key) and has
+ *  private keys disabled, the way the wallet itself represents watch-only. */
+std::unique_ptr<CWallet> CreateWatchOnlyKeyWallet(interfaces::Chain& chain, CChain& cchain, const CPubKey& pubkey)
+{
+    auto wallet = std::make_unique<CWallet>(&chain, "", CreateMockableWalletDatabase());
+    {
+        LOCK2(::cs_main, wallet->cs_wallet);
+        wallet->SetLastBlockProcessed(cchain.Height(), cchain.Tip()->GetBlockHash());
+    }
+    wallet->LoadWallet();
+    LOCK(wallet->cs_wallet);
+    wallet->SetWalletFlag(WALLET_FLAG_DESCRIPTORS);
+    wallet->SetupDescriptorScriptPubKeyMans();
+    FlatSigningProvider provider;
+    std::string error;
+    std::unique_ptr<Descriptor> desc = Parse("combo(" + HexStr(pubkey) + ")", provider, error, /*require_checksum=*/false);
+    assert(desc);
+    WalletDescriptor w_desc(std::move(desc), 0, 0, 1, 1);
+    if (!wallet->AddWalletDescriptor(w_desc, provider, "", false)) assert(false);
+    wallet->SetWalletFlag(WALLET_FLAG_DISABLE_PRIVATE_KEYS);
+    return wallet;
+}
+
+CTransactionRef PayTo(const CScript& script, CAmount amount, uint8_t seed)
+{
+    CMutableTransaction tx;
+    tx.vin.emplace_back(COutPoint{uint256{seed}, 0});
+    tx.vout.emplace_back(amount, script);
+    return MakeTransactionRef(std::move(tx));
+}
+} // namespace
+
+BOOST_FIXTURE_TEST_CASE(automatic_return_gate_needs_an_owned_signable_legacy_coin, LegacyStakeWindowSetup)
+{
+    CKey own_key;
+    own_key.MakeNewKey(true);
+    CKey stranger;
+    stranger.MakeNewKey(true);
+    const CScript own_pkh = GetScriptForDestination(PKHash(own_key.GetPubKey()));
+    const CScript own_pk = GetScriptForRawPubKey(own_key.GetPubKey());
+    const CScript foreign_pkh = GetScriptForDestination(PKHash(stranger.GetPubKey()));
+    const CScript foreign_pk = GetScriptForRawPubKey(stranger.GetPubKey());
+    const CScript foreign_wpkh = GetScriptForDestination(WitnessV0KeyHash(stranger.GetPubKey()));
+    const uint256 block_hash = WITH_LOCK(::cs_main, return m_node.chainman->ActiveChain()[1]->GetBlockHash());
+    const TxState confirmed = TxStateConfirmed{block_hash, 1, 0};
+    const CAmount amount = 100 * COIN;
+
+    auto wallet = CreateSyncedWallet(*m_node.chain,
+        WITH_LOCK(Assert(m_node.chainman)->GetMutex(), return m_node.chainman->ActiveChain()), own_key);
+
+    // Foreign legacy outputs sit in the wallet's transaction history (an outgoing payment's recipient
+    // output, for one) and in its candidate index, but the wallet owns no legacy coin: no gate opens.
+    {
+        LOCK2(::cs_main, wallet->cs_wallet);
+        BOOST_REQUIRE(wallet->AddToWallet(PayTo(foreign_pkh, amount, 1), confirmed));
+        BOOST_REQUIRE(wallet->AddToWallet(PayTo(foreign_pk, amount, 2), confirmed));
+        BOOST_REQUIRE(wallet->AddToWallet(PayTo(foreign_wpkh, amount, 3), confirmed));
+        // The candidate index holds them: the shape alone would have opened the gate.
+        BOOST_CHECK(!wallet->GetLiveUnspentStakeCandidateOutpoints().empty());
+        BOOST_CHECK(!WalletHoldsLegacyStakableCoin(*wallet));
+    }
+    {
+        // The automatic preparation, with key creation allowed, in the Migration window: no key, no
+        // saved record, no prompt for a wallet that holds only other people's legacy outputs.
+        using Outcome = QuantumStakeReturnPreparation::Outcome;
+        gArgs.ForceSetArg("-qqallowautokeycreation", "1");
+        const QuantumStakeReturnPreparation prep = PrepareQuantumStakeReturn(*wallet, QuantumStakeReturnTrigger::AUTOMATIC);
+        gArgs.ForceSetArg("-qqallowautokeycreation", "0");
+        BOOST_CHECK(prep.outcome == Outcome::NO_ACTION);
+        BOOST_CHECK(!prep.key_created);
+        BOOST_CHECK(WITH_LOCK(wallet->cs_wallet, return wallet->m_quantum_stake_return.empty()));
+        BOOST_CHECK_EQUAL(WITH_LOCK(wallet->cs_wallet, return wallet->ListQuantumKeyInfos().size()), size_t{0});
+    }
+
+    // An owned output below the staking minimum does not count either.
+    {
+        LOCK2(::cs_main, wallet->cs_wallet);
+        BOOST_REQUIRE(wallet->AddToWallet(PayTo(own_pkh, 1, 4), confirmed));
+        BOOST_CHECK(!WalletHoldsLegacyStakableCoin(*wallet));
+    }
+
+    // An owned, signable legacy output of a stakable class opens it.
+    {
+        LOCK2(::cs_main, wallet->cs_wallet);
+        BOOST_REQUIRE(wallet->AddToWallet(PayTo(own_pkh, amount, 5), confirmed));
+        BOOST_CHECK(WalletHoldsLegacyStakableCoin(*wallet));
+    }
+    auto pk_wallet = CreateSyncedWallet(*m_node.chain,
+        WITH_LOCK(Assert(m_node.chainman)->GetMutex(), return m_node.chainman->ActiveChain()), own_key);
+    {
+        LOCK2(::cs_main, pk_wallet->cs_wallet);
+        BOOST_REQUIRE(pk_wallet->AddToWallet(PayTo(foreign_pkh, amount, 6), confirmed));
+        BOOST_CHECK(!WalletHoldsLegacyStakableCoin(*pk_wallet));
+        BOOST_REQUIRE(pk_wallet->AddToWallet(PayTo(own_pk, amount, 7), confirmed));
+        BOOST_CHECK(WalletHoldsLegacyStakableCoin(*pk_wallet));
+    }
+
+    // Watch-only: the wallet knows the public key of the output's script but holds no private key for it.
+    auto watch = CreateWatchOnlyKeyWallet(*m_node.chain,
+        WITH_LOCK(Assert(m_node.chainman)->GetMutex(), return m_node.chainman->ActiveChain()), own_key.GetPubKey());
+    {
+        LOCK2(::cs_main, watch->cs_wallet);
+        BOOST_REQUIRE(watch->AddToWallet(PayTo(own_pkh, amount, 8), confirmed));
+        BOOST_CHECK(!watch->GetLiveUnspentStakeCandidateOutpoints().empty());
+        BOOST_CHECK(!WalletHoldsLegacyStakableCoin(*watch));
+    }
 }
 
 BOOST_AUTO_TEST_SUITE_END()

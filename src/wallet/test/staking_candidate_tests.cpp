@@ -1390,6 +1390,76 @@ BOOST_FIXTURE_TEST_CASE(a_new_key_whose_backup_fails_stays_pending_and_is_retrie
     BOOST_CHECK(!WITH_LOCK(without_key.cs_wallet, return without_key.m_quantum_return_pending.has_value()));
 }
 
+// A key made for the return address whose backup failed carries the PoS label and sits in the address book. No
+// automatic payout choice may take it (Gold Rush PoS signals, the PoW claim binding), configured or labelled or cached.
+BOOST_FIXTURE_TEST_CASE(a_pending_return_key_is_never_chosen_as_a_gold_rush_payout_address, LegacyStakeWindowSetup)
+{
+    using Outcome = QuantumStakeReturnPreparation::Outcome;
+    ScopedArgsRestore restore_args;
+    ScopedQuantumBackupDir backups{m_path_root / "qkb-payout"};
+    auto wallet = CreateSyncedWallet(*m_node.chain,
+        WITH_LOCK(Assert(m_node.chainman)->GetMutex(), return m_node.chainman->ActiveChain()), coinbaseKey);
+    // The mock database writes no file: the backup fails, the new key stays pending.
+    const QuantumStakeReturnPreparation prep = PrepareQuantumStakeReturn(*wallet, QuantumStakeReturnTrigger::EXPLICIT, /*allow_new_key=*/true);
+    BOOST_REQUIRE(prep.outcome == Outcome::PENDING_BACKUP);
+    const CTxDestination pending = DecodeDestination(prep.address);
+    BOOST_REQUIRE(IsValidDestination(pending));
+    BOOST_CHECK(WITH_LOCK(wallet->cs_wallet, return wallet->IsQuantumStakeReturnPendingKey(pending)));
+    {
+        // The pending key sits in the address book under the label the PoS signal looks for.
+        bool labelled{false};
+        LOCK(wallet->cs_wallet);
+        wallet->ForEachAddrBookEntry([&](const CTxDestination& dest, const std::string& label, bool, const std::optional<AddressPurpose>&) {
+            if (dest == pending && label == "PoS - Quantum Stake Address") labelled = true;
+        });
+        BOOST_CHECK(labelled);
+    }
+
+    CScript script;
+    std::string address;
+    bilingual_str error;
+    bool created{false};
+    // The labelled reuse path: without consent to make a key the PoS signal has no payout, rather than this one.
+    gArgs.ForceSetArg("-qqallowautokeycreation", "0");
+    BOOST_CHECK(!wallet->EnsureShadowSignalPayoutAddress(script, address, error, &created));
+    BOOST_CHECK(address.empty());
+    BOOST_CHECK(script.empty());
+    BOOST_CHECK(!created);
+    BOOST_CHECK_MESSAGE(error.original.find("no existing payout key") != std::string::npos, error.original);
+    // With consent a different key is made; the pending one is left alone.
+    gArgs.ForceSetArg("-qqallowautokeycreation", "1");
+    BOOST_REQUIRE_MESSAGE(wallet->EnsureShadowSignalPayoutAddress(script, address, error, &created), error.original);
+    BOOST_CHECK(created);
+    BOOST_CHECK(address != prep.address);
+    BOOST_CHECK(WITH_LOCK(wallet->cs_wallet, return wallet->IsQuantumStakeReturnPendingKey(pending)));
+    gArgs.ForceSetArg("-qqallowautokeycreation", "0");
+
+    // A configured payout address: the shared validation refuses it, for the PoS signal and the PoW claim alike.
+    {
+        ScopedArgsRestore configured_pos;
+        gArgs.ForceSetArg("-qqpospayoutaddress", prep.address);
+        BOOST_CHECK(!wallet->EnsureShadowSignalPayoutAddress(script, address, error, &created));
+        BOOST_CHECK_MESSAGE(error.original.find("waiting for its first verified wallet backup") != std::string::npos, error.original);
+    }
+    {
+        ScopedArgsRestore configured_pow;
+        gArgs.ForceSetArg("-qqpowpayoutaddress", prep.address);
+        BOOST_CHECK(!wallet->EnsurePowPayoutAddress(error, &created));
+        BOOST_CHECK_MESSAGE(error.original.find("waiting for its first verified wallet backup") != std::string::npos, error.original);
+        BOOST_CHECK(WITH_LOCK(wallet->cs_wallet, return wallet->m_pow_payout_quantum.empty()));
+    }
+
+    // A cached binding to the pending key is refused as well, and so is a pending key under the PoW label.
+    WITH_LOCK(wallet->cs_wallet, wallet->m_pow_payout_quantum = prep.address);
+    BOOST_CHECK(!wallet->EnsurePowPayoutAddress(error, &created));
+    BOOST_CHECK_MESSAGE(error.original.find("waiting for its first verified wallet backup") != std::string::npos, error.original);
+    BOOST_CHECK(WITH_LOCK(wallet->cs_wallet, return !IsValidDestination(wallet->GetRecordedPowPayoutKey())));
+    WITH_LOCK(wallet->cs_wallet, wallet->m_pow_payout_quantum.clear());
+    BOOST_REQUIRE(wallet->SetAddressBook(pending, "PoW - Quantum Claim Address", AddressPurpose::RECEIVE));
+    BOOST_CHECK(!wallet->EnsurePowPayoutAddress(error, &created));
+    BOOST_CHECK(WITH_LOCK(wallet->cs_wallet, return wallet->m_pow_payout_quantum.empty()));
+}
+
 // The same on a real database: the backup is made, verified and recorded, and only then the address is active.
 BOOST_FIXTURE_TEST_CASE(a_new_key_becomes_the_return_address_after_a_verified_backup_and_a_failed_one_is_retried, LegacyStakeWindowSetup)
 {

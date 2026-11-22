@@ -14587,6 +14587,14 @@ QuantumAddressBindingResult CWallet::ResolveConfiguredQuantumAddress(
                 option, purpose));
             return QuantumAddressBindingResult::INVALID;
         }
+        // A key made for the quantum stake return address is not usable for anything until its first verified
+        // wallet backup succeeded.
+        if (IsQuantumStakeReturnPendingKey(candidate)) {
+            error = Untranslated(strprintf(
+                "%s for %s is a new quantum key still waiting for its first verified wallet backup.",
+                option, purpose));
+            return QuantumAddressBindingResult::INVALID;
+        }
     }
 
     destination = candidate;
@@ -14661,6 +14669,10 @@ bool CWallet::EnsurePowPayoutAddress(bilingual_str& error, bool* created, bool a
                 IsDirectQuantumMigrationScript(
                     GetScriptForDestination(existing)) &&
                 key_info && key_info->durably_stored) {
+                if (IsQuantumStakeReturnPendingKey(existing)) {
+                    error = _("Stored Gold Rush PoW payout address is a new quantum key still waiting for its first verified wallet backup.");
+                    return false;
+                }
                 return true;
             }
             if (IsValidDestination(existing) &&
@@ -14685,6 +14697,7 @@ bool CWallet::EnsurePowPayoutAddress(bilingual_str& error, bool* created, bool a
             }
             const auto key_info = GetQuantumKeyInfo(dest);
             if (!key_info || !key_info->durably_stored) continue;
+            if (IsQuantumStakeReturnPendingKey(dest)) continue;
             const int label_priority =
                 label == POW_PAYOUT_LABEL ? 2 :
                 label == OLD_POW_PAYOUT_LABEL ? 1 : 0;
@@ -14753,7 +14766,7 @@ CTxDestination CWallet::GetRecordedPowPayoutKey() const
             return false;
         }
         const auto info = GetQuantumKeyInfo(dest);
-        return info && info->durably_stored;
+        return info && info->durably_stored && !IsQuantumStakeReturnPendingKey(dest);
     };
     // 1. The payout key the claim miner is bound to (configured, restored or created).
     if (!m_pow_payout_quantum.empty()) {
@@ -14859,6 +14872,8 @@ bool CWallet::EnsureShadowSignalPayoutAddress(
             }
             const auto key_info = GetQuantumKeyInfo(dest);
             if (!key_info || !key_info->durably_stored) continue;
+            // The return key waiting for its backup carries this very label; it is not reused.
+            if (IsQuantumStakeReturnPendingKey(dest)) continue;
             const int label_priority =
                 label == SHADOW_SIGNAL_PAYOUT_LABEL ? 2 :
                 label == OLD_SHADOW_SIGNAL_PAYOUT_LABEL ? 1 : 0;

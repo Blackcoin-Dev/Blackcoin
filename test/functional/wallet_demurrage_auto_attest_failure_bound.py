@@ -14,10 +14,12 @@ the keys the earlier passes did not reach, going round the four keys before the 
 Phase 2, the realistic trigger: the mempool accepts attestations. The four keys are attested in one pass
 (some fee inputs are targets of attestations already pending, which the mempool refuses, and the next fee
 input is used), and their change is paid to one more key (F). F has one older confirmed output that has just
-become due and, since the pass before, four trusted unconfirmed outputs (the change) that all sort before it.
+become due and trusted unconfirmed outputs: the change of the four attestations and one more output that the
+test makes on purpose, by grinding the amount of a plain payment until its outpoint sorts before the
+confirmed output's (the ordering the constructor's old lowest-outpoint choice needed, set up explicitly and
+checked against the real outpoint order, not left to the ids of the change transactions).
 The pass for F attests the confirmed output with one attempt: no failed attempt, no retry through the fee
-inputs. (The confirmed output sorts after the change because its funding transaction is chosen among
-candidates for an id that sorts high.)
+inputs.
 
 Every output is created before the demurrage activation, so all of them are due at the same height; F's output
 is kept out of the wallet's candidate scan (locked) until the pass that is meant to attest it.
@@ -44,10 +46,9 @@ FEE_INPUTS = 20
 MAX_FAILED = 16
 
 
-def sorts_high(txid):
-    """True when an outpoint of this transaction sorts after nearly any other transaction's (the first byte of
-    the internal, reversed, id is what the outpoint order compares first)."""
-    return int(txid[-2:], 16) >= 0xFC
+def outpoint_key(txid, vout):
+    """The order outpoints sort in: the hash bytes in internal (reversed) order, then the output index."""
+    return (bytes.fromhex(txid)[::-1], vout)
 
 
 class DemurrageAutoAttestFailureBoundTest(BitcoinTestFramework):
@@ -146,16 +147,18 @@ class DemurrageAutoAttestFailureBoundTest(BitcoinTestFramework):
         self.generate(COINBASE_MATURITY + 2, funder)
         for address in keys:
             pay(address, Decimal("1"))
-        self.log.info("F's older output, from a funding transaction whose id sorts after the ids of its change")
+        self.log.info("F's older output: one confirmed output of a funding transaction whose id does not sort first")
+        # Not an ordering of the change (that is set up explicitly in phase 2): only room below it, so that an
+        # output sorting before it can be made. A first id byte of 0x80 or more has half the range below it.
         f_txid = None
         for attempt in range(200):
             txid = fund.sendtoaddress(change_key, Decimal("1") + attempt * Decimal("0.00000001"))
-            if sorts_high(txid):
+            if bytes.fromhex(txid)[::-1][0] >= 0x80:
                 node.sendrawtransaction(fund.gettransaction(txid)["hex"])
                 f_txid = txid
                 break
             fund.abandontransaction(txid)  # never broadcast: its input is free again
-        assert f_txid is not None, "no funding transaction with a high id"
+        assert f_txid is not None, "no funding transaction with an id that leaves room below it"
         for _ in range(FEE_INPUTS):
             pay(fee_key, Decimal("0.05"))
         self.generate(1, funder)
@@ -222,13 +225,33 @@ class DemurrageAutoAttestFailureBoundTest(BitcoinTestFramework):
         assert_equal(set(node.getrawmempool()), first_round)
         change = [u for u in auto.listunspent(0, 0) if u["address"] == change_key]
         assert_equal(len(change), due_keys)  # trusted, unconfirmed
-        assert all(not sorts_high(u["txid"]) for u in change), "the change must sort before F's older output"
+
+        self.log.info("A trusted unconfirmed output of F's key that sorts before F's confirmed output, made on purpose")
+        f_key = outpoint_key(f_txid, f_outpoint[0]["vout"])
+        # Paid from one of the change outputs (not due, so a plain payment may spend it), to the same key.
+        source = change[0]
+        grind = None
+        for attempt in range(200):
+            raw = node.createrawtransaction(
+                [{"txid": source["txid"], "vout": source["vout"]}],
+                [{change_key: source["amount"] - Decimal("0.002") - attempt * Decimal("0.00000001")}])
+            signed = auto.signrawtransactionwithwallet(raw)
+            assert signed["complete"]
+            decoded = node.decoderawtransaction(signed["hex"])
+            if outpoint_key(decoded["txid"], 0) < f_key:
+                grind = node.sendrawtransaction(signed["hex"])
+                break
+        assert grind is not None, "no payment with an outpoint that sorts before F's confirmed output"
+        ground = [u for u in auto.listunspent(0, 0, [change_key]) if u["txid"] == grind]
+        assert_equal(len(ground), 1)
+        assert ground[0]["safe"], "the output must be trusted"
+        assert outpoint_key(grind, ground[0]["vout"]) < f_key
 
         # A block that does not include them: they stay pending, and F's output is offered to the scan.
         self.set_mt(self.mt + 16)
         self.generateblock(node, mining, [], sync_fun=self.no_op)
         self.set_mt(self.mt + 16)
-        assert_equal(set(node.getrawmempool()), first_round)
+        assert_equal(set(node.getrawmempool()), first_round | {grind})
         auto.lockunspent(True, f_outpoint)
         assert_equal(len(due_rows(auto, [change_key])), 1)  # F's confirmed output; the change is not due
         stats = self.run_pass(auto, expected_passes=passes + 2)
@@ -241,7 +264,7 @@ class DemurrageAutoAttestFailureBoundTest(BitcoinTestFramework):
         assert f_attestation in node.getrawmempool()
         # The pending ones were kept, with their inputs.
         assert_equal(self.automatic(auto) & first_round, first_round)
-        assert_equal(set(node.getrawmempool()), first_round | {f_attestation})
+        assert_equal(set(node.getrawmempool()), first_round | {f_attestation, grind})
         self.generate(1, mining)
         assert_equal(auto.gettransaction(f_attestation)["confirmations"], 1)
         row = [r for r in auto.getdemurragewalletinfo()["outputs"] if r["txid"] == f_txid]

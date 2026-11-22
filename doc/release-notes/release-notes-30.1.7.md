@@ -301,6 +301,30 @@ operator can see before the last Gold Rush block (height 6,192,999), in plain la
   cannot pay. `send` does not: a wallet funded only with legacy coins gets `Insufficient funds`
   from it while a migration transaction is permitted. Use `migratetoquantum`, `sendtoaddress`, or
   select the inputs explicitly. This is unchanged from 30.1.6.
+- **Automatic demurrage attestation in a very large wallet can slow other loaded wallets.** This
+  applies only after Final, and only to a node started with `-qqautodemurrageattest=1` (it is off
+  by default) that has an unlocked wallet with staking on. In a very large wallet (tens of
+  thousands of outputs with many keys due) a pass of the automatic attestation can delay RPC calls
+  to the other loaded wallets, and some node calls that need the same locks, for several seconds.
+  It happens roughly once a minute while due work remains, and the first pass after the node
+  starts can take longer. Each wait is the sum of repeated short holds of the wallet and chain
+  locks, so the longest single hold is not a limit on how long a call can wait. Leave the option
+  off and attest with `senddemurrageattestation` if the delay matters.
+- **A pass of the automatic attestation is bounded.** One pass makes at most 16 submissions and
+  at most 16 failed attempts, so at most 32 attempts, however many keys are due and however many
+  fee inputs the wallet holds. A key that fails for a reason another fee input cannot cure (the
+  target is unconfirmed or locked, the state is stale, the attestation is too early, or the target
+  conflicts with a transaction that is not the fee input) is not retried through its other fee
+  inputs in that pass. Keys the pass did not reach come first in the next pass, so a few keys that
+  keep failing cannot starve the others. The wallet file is not changed by this.
+- **Attestations choose a confirmed output.** The attestation of a key names an output of that key
+  that is in the confirmed chain: the output that made the key due when the automatic path asks,
+  otherwise the lowest-sorting confirmed output that is not locked. A trusted but unconfirmed
+  output of the same key (change, for example) is never chosen, because the mempool refuses an
+  attestation whose target is unconfirmed. The manual `senddemurrageattestation` follows the same
+  rule: for a key that has only unconfirmed outputs it fails at once with the existing message
+  "Demurrage attestation requires a live wallet UTXO controlled by this quantum key" instead of
+  building a transaction the mempool refuses.
 - **Downgrade.** A wallet written by 30.1.7 opens in 30.1.6 with the same balances, unspent outputs
   and transactions, and 30.1.7 finds its quantum stake return record again. 30.1.6 does not know the
   late-Migration policy: do not use 30.1.6 to stake legacy coins in the last Migration window (from

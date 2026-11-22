@@ -145,6 +145,44 @@ Release qualification is pending.
   `-finalstakereserve=0` turns it off. A wallet with a single output withholds it for the 500
   candidate heights and stakes it again from the first Final block. Winning the first Final block
   stays a matter of chance. Wallet policy only; no consensus rule changes.
+- **A new quantum stake return key is backed up before it becomes the return address.**
+  Quantum keys are random, so a wallet backup made before a key existed cannot recover coins paid
+  to it. A key made for the legacy-stake return address is now written to the wallet together
+  with a pending record (one database transaction, so a crash leaves both or neither), and
+  `CWallet::BackupWallet` with key verification (every key reopened and challenged) runs into the
+  wallet's backup directory before the key is saved as the return address; the address and the
+  removal of the pending record are one atomic write. If the backup fails (an unwritable
+  directory, a full disk), the key stays in the wallet as pending, the previous return address
+  stays in use, the error is reported, and the same key is retried, by the next
+  `setquantumstakereturn`, by the wallet's own maintenance, and after a restart. A pending key
+  cannot be used as the return address in the meantime, including through `existing_address`.
+  Concurrent callers produce one key, and no backup work is done while the chain or staking lock
+  is held. `getstakinginfo`, `getmigrationstatus`, `getquantumstakereadiness`, the Staking page
+  notice and the log report the pending key (`legacy_stake_return_pending`, `..._pending_address`,
+  `..._pending_error`; `stake_return.pending` and friends) apart from the readiness of the
+  active address. A wallet that holds a pending record opens in v30.1.6, which ignores the
+  record, and in this version again with the pending state intact. A reused key whose
+  verified-backup flag is unset keeps the existing "make a fresh backup" prompt.
+- **`-quantumkeybackupdir`.** Where those backups go. The default is
+  `<network datadir>/quantum-key-backups/<wallet>/`; with the option, `<dir>/<wallet>/`. The wallet
+  name becomes one safe path component (`default` for the unnamed wallet; anything else is `n_`
+  and its lower case letters, digits and `-`, every other byte escaped, so no two names share a
+  folder, even on a file system that ignores case; a very long name is shortened with a hash of
+  the whole name). A file is named `quantum-wallet-<UTC time>-h<height>-<random>.dat` with a
+  manifest of the keys it holds next to it, keeps the wallet's encryption, and is private:
+  directory 0700 and files 0600 on POSIX. The three newest verified backups are kept, plus any
+  older one that is the only backup of a key the wallet still holds. Pruning happens after the
+  new return address is durable, never touches a file this feature did not write and never counts
+  a failed attempt as a backup.
+- **A better order for choosing the return address.** With no address saved, the wallet takes, in
+  this order: the one `-qqpospayoutaddress`, the wallet's recorded Gold Rush claim payout key (the
+  key the claim miner is bound to, the configured `-qqpowpayoutaddress`, or the key its confirmed
+  Gold Rush payouts were paid to; an address-book label alone does not identify it), another
+  quantum receive address of the wallet (the existing label ranking, then the oldest, then the
+  address), and only then a new key, with the existing consent (`allow_new_quantum_key`, or
+  `-qqallowautokeycreation`). A key that is already in every old backup is therefore reused before
+  one is made. A wallet unlocked for staking only still cannot choose or create a key, and can
+  still bind an existing one with `existing_address`.
 
 ## Staking readiness for the first Final block
 

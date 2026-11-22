@@ -358,7 +358,7 @@ BOOST_AUTO_TEST_CASE(an_unusable_pending_attestation_never_hides_a_usable_one_fo
         const std::vector<const PendingWalletAttestation*> order = unusable_first
             ? std::vector<const PendingWalletAttestation*>{bad, good}
             : std::vector<const PendingWalletAttestation*>{good, bad};
-        const KeyPendingDecision decision = DecidePendingAttestationsForKey(*fx.wallet, view, consensus, height, time, order, std::nullopt);
+        const KeyPendingDecision decision = DecidePendingAttestationsForKey(*fx.wallet, view, consensus, height, time, fx.f.key_script, order);
         BOOST_CHECK(decision.suppress_construction);
         BOOST_REQUIRE(decision.reported != nullptr);
         BOOST_CHECK(decision.reported->txid == usable_outside_mempool);
@@ -370,7 +370,7 @@ BOOST_AUTO_TEST_CASE(an_unusable_pending_attestation_never_hides_a_usable_one_fo
 
     // Only the unusable one: construction is not suppressed, and a manual transaction is still not cleaned up.
     {
-        const KeyPendingDecision decision = DecidePendingAttestationsForKey(*fx.wallet, view, consensus, height, time, {bad}, std::nullopt);
+        const KeyPendingDecision decision = DecidePendingAttestationsForKey(*fx.wallet, view, consensus, height, time, fx.f.key_script, {bad});
         BOOST_CHECK(!decision.suppress_construction);
         BOOST_CHECK(decision.reported == nullptr);
         BOOST_CHECK(decision.to_resubmit.empty());
@@ -379,7 +379,7 @@ BOOST_AUTO_TEST_CASE(an_unusable_pending_attestation_never_hides_a_usable_one_fo
     // Usable but temporarily unavailable (broadcasting off) still suppresses, and is kept, not offered.
     fx.wallet->SetBroadcastTransactions(false);
     {
-        const KeyPendingDecision decision = DecidePendingAttestationsForKey(*fx.wallet, view, consensus, height, time, {bad, good}, std::nullopt);
+        const KeyPendingDecision decision = DecidePendingAttestationsForKey(*fx.wallet, view, consensus, height, time, fx.f.key_script, {bad, good});
         BOOST_CHECK(decision.suppress_construction);
         BOOST_CHECK(decision.reported_use == PendingAttestationUse::TEMPORARILY_UNAVAILABLE);
         BOOST_CHECK(decision.to_resubmit.empty());
@@ -409,18 +409,85 @@ BOOST_AUTO_TEST_CASE(unusable_automatic_attestations_are_cleaned_up_separately_a
     BOOST_CHECK(bad->automatic && !bad->in_mempool);
 
     // Alongside a usable entry the unusable automatic one is cleaned up, and construction is suppressed.
-    KeyPendingDecision decision = DecidePendingAttestationsForKey(*fx.wallet, view, consensus, height, time, {bad, good}, std::nullopt);
+    KeyPendingDecision decision = DecidePendingAttestationsForKey(*fx.wallet, view, consensus, height, time, fx.f.key_script, {bad, good});
     BOOST_CHECK(decision.suppress_construction);
     BOOST_REQUIRE_EQUAL(decision.to_abandon.size(), size_t{1});
     BOOST_CHECK(decision.to_abandon.front() == automatic_unusable);
     // Alone, it is cleaned up and construction proceeds.
-    decision = DecidePendingAttestationsForKey(*fx.wallet, view, consensus, height, time, {bad}, std::nullopt);
+    decision = DecidePendingAttestationsForKey(*fx.wallet, view, consensus, height, time, fx.f.key_script, {bad});
     BOOST_CHECK(!decision.suppress_construction);
     BOOST_REQUIRE_EQUAL(decision.to_abandon.size(), size_t{1});
     // With a usable child that spends it, it is kept.
-    decision = DecidePendingAttestationsForKey(*fx.wallet, view, consensus, height, time, {bad, kid}, std::nullopt);
+    decision = DecidePendingAttestationsForKey(*fx.wallet, view, consensus, height, time, fx.f.key_script, {bad, kid});
     BOOST_CHECK(decision.suppress_construction);
     BOOST_CHECK(decision.to_abandon.empty());
+}
+
+BOOST_AUTO_TEST_CASE(a_malformed_local_attestation_state_is_not_an_absent_record_and_abandons_nothing)
+{
+    KeyDecisionFixture fx(*this);
+    const Consensus::Params& consensus = Params().GetConsensus();
+    const int height = 150;
+    const int64_t time = 1700000000;
+    // An automatic attestation, not in the mempool, that references an existing record of the key.
+    const Consensus::DemurrageAttestationRecord referenced = Record(uint256S("aa"), uint256S("1a"), 0);
+    const COutPoint fee_input = fx.FeeInput(*this);
+    const uint256 automatic = fx.AddPending(fee_input, fx.live_target, /*automatic=*/true, referenced);
+    const COutPoint latest_marker = Consensus::DemurrageLatestAttestationOutpoint(fx.f.key_hash);
+
+    LOCK(cs_main);
+    LOCK(fx.wallet->cs_wallet);
+    CCoinsViewCache& view = m_node.chainman->ActiveChainstate().CoinsTip();
+    const std::vector<PendingWalletAttestation> pending = PendingWalletDemurrageAttestations(*fx.wallet);
+    const PendingWalletAttestation* entry = Entry(pending, automatic);
+    BOOST_REQUIRE(entry != nullptr);
+    BOOST_CHECK(entry->automatic && !entry->in_mempool);
+
+    // Authenticated absence: the chain has no record for the key, the entry references a state the key does
+    // not have, so it can never confirm and is cleaned up.
+    BOOST_CHECK(Consensus::IsDemurrageStateSaneForScript(view, fx.f.key_script));
+    KeyPendingDecision decision = DecidePendingAttestationsForKey(*fx.wallet, view, consensus, height, time, fx.f.key_script, {entry});
+    BOOST_CHECK(!decision.local_state_invalid);
+    BOOST_REQUIRE_EQUAL(decision.to_abandon.size(), size_t{1});
+    BOOST_CHECK(decision.to_abandon.front() == automatic);
+
+    // A malformed marker coin where the key's latest record belongs: the reader says "no record" for it too,
+    // but it is a local state error. Nothing is abandoned or offered, construction is suppressed, and the
+    // problem is flagged for the caller to report.
+    view.AddCoin(latest_marker, Coin{CTxOut{0, CScript{} << OP_TRUE}, 10, /*fCoinBaseIn=*/true, false, 0}, /*possible_overwrite=*/false);
+    BOOST_CHECK(!Consensus::IsDemurrageStateSaneForScript(view, fx.f.key_script));
+    BOOST_CHECK(!Consensus::LatestDemurrageAttestationRecord(view, fx.f.key_hash).has_value());
+    decision = DecidePendingAttestationsForKey(*fx.wallet, view, consensus, height, time, fx.f.key_script, {entry});
+    BOOST_CHECK(decision.local_state_invalid);
+    BOOST_CHECK(decision.suppress_construction);
+    BOOST_CHECK(decision.to_abandon.empty());
+    BOOST_CHECK(decision.to_resubmit.empty());
+    // The reservation: the transaction is still pending and its input is still counted as spent by it.
+    const auto wtx_it = fx.wallet->mapWallet.find(automatic);
+    BOOST_REQUIRE(wtx_it != fx.wallet->mapWallet.end());
+    BOOST_CHECK(!wtx_it->second.isAbandoned());
+    BOOST_CHECK(fx.wallet->IsSpent(fee_input));
+    // Even a manual or reusable entry is only preserved: nothing is resubmitted from a malformed state.
+    const uint256 manual = [&] {
+        const COutPoint input = fx.FeeInput(*this);
+        return fx.AddPending(input, fx.live_target, /*automatic=*/false, std::nullopt);
+    }();
+    const std::vector<PendingWalletAttestation> both = PendingWalletDemurrageAttestations(*fx.wallet);
+    const PendingWalletAttestation* manual_entry = Entry(both, manual);
+    const PendingWalletAttestation* auto_entry = Entry(both, automatic);
+    BOOST_REQUIRE(manual_entry && auto_entry);
+    decision = DecidePendingAttestationsForKey(*fx.wallet, view, consensus, height, time, fx.f.key_script, {manual_entry, auto_entry});
+    BOOST_CHECK(decision.local_state_invalid);
+    BOOST_CHECK(decision.to_abandon.empty());
+    BOOST_CHECK(decision.to_resubmit.empty());
+
+    // Repaired (the malformed coin is gone): the decision is made from the authenticated absence again.
+    BOOST_REQUIRE(view.SpendCoin(latest_marker));
+    decision = DecidePendingAttestationsForKey(*fx.wallet, view, consensus, height, time, fx.f.key_script, {manual_entry, auto_entry});
+    BOOST_CHECK(!decision.local_state_invalid);
+    BOOST_CHECK(decision.suppress_construction); // the manual entry references the (absent) state and is usable
+    BOOST_REQUIRE_EQUAL(decision.to_abandon.size(), size_t{1});
+    BOOST_CHECK(decision.to_abandon.front() == automatic);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

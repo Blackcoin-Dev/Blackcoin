@@ -969,12 +969,22 @@ PendingAttestationUse ClassifyPendingAttestation(const CWallet& wallet, const CC
 
 KeyPendingDecision DecidePendingAttestationsForKey(const CWallet& wallet, const CCoinsViewCache& view,
                                                    const Consensus::Params& consensus, int evaluation_height,
-                                                   int64_t evaluation_time,
-                                                   const std::vector<const PendingWalletAttestation*>& key_pending,
-                                                   const std::optional<Consensus::DemurrageAttestationRecord>& record)
+                                                   int64_t evaluation_time, const CScript& key_script,
+                                                   const std::vector<const PendingWalletAttestation*>& key_pending)
 {
     AssertLockHeld(wallet.cs_wallet);
     KeyPendingDecision decision;
+    // LatestDemurrageAttestationRecord answers "none" for a missing record and for a malformed one alike.
+    // Only an authenticated absence may be matched against; on a malformed local state nothing is decided
+    // from it, so nothing is abandoned and no reservation is released.
+    const std::optional<uint256> key_hash = Consensus::DemurrageControllingKeyHashForScript(key_script);
+    if (!key_hash || !Consensus::IsDemurrageStateSaneForScript(view, key_script)) {
+        decision.local_state_invalid = true;
+        decision.suppress_construction = true;
+        return decision;
+    }
+    const std::optional<Consensus::DemurrageAttestationRecord> record =
+        Consensus::LatestDemurrageAttestationRecord(view, *key_hash);
     std::vector<const PendingWalletAttestation*> unusable_automatic;
     std::set<uint256> usable_parents; // transactions that a usable entry spends from
     const PendingWalletAttestation* resubmit{nullptr};
@@ -1643,17 +1653,22 @@ int MaybeAutoDemurrageAttest(CWallet& wallet)
             if (decision_it == key_decisions.end()) {
                 // The key-level decision, once per scan: every pending entry for the key is examined, and any
                 // usable one suppresses a new attestation.
-                const std::optional<Consensus::DemurrageAttestationRecord> latest_record =
-                    Consensus::LatestDemurrageAttestationRecord(view, *key_hash);
                 const auto key_pending_it = pending_by_key.find(*key_hash);
                 const std::vector<const PendingWalletAttestation*> no_pending;
                 decision_it = key_decisions.emplace(*key_hash, DecidePendingAttestationsForKey(
-                    wallet, view, consensus, evaluation_height, evaluation_time,
-                    key_pending_it == pending_by_key.end() ? no_pending : key_pending_it->second, latest_record)).first;
+                    wallet, view, consensus, evaluation_height, evaluation_time, out.txout.scriptPubKey,
+                    key_pending_it == pending_by_key.end() ? no_pending : key_pending_it->second)).first;
                 to_resubmit.insert(decision_it->second.to_resubmit.begin(), decision_it->second.to_resubmit.end());
                 to_abandon.insert(decision_it->second.to_abandon.begin(), decision_it->second.to_abandon.end());
             }
             const KeyPendingDecision& key_decision = decision_it->second;
+            if (key_decision.local_state_invalid) {
+                if (suppressed_keys.insert(*key_hash).second) {
+                    wallet.WalletLogPrintf("Demurrage auto-attest suppressed for key %s: its local attestation state is invalid (not merely absent); pending attestations and their inputs are kept untouched until it is repaired\n",
+                                           key_hash->ToString());
+                }
+                continue;
+            }
             if (key_decision.suppress_construction) {
                 if (suppressed_keys.insert(*key_hash).second) {
                     const PendingWalletAttestation& pending = *key_decision.reported;

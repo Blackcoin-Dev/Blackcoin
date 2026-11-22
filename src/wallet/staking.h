@@ -519,6 +519,10 @@ struct KeyPendingDecision {
     //! A usable attestation for the key's current state is already pending (in the mempool, offered again,
     //! or kept because it cannot be offered now): no new one is constructed.
     bool suppress_construction{false};
+    //! The key's local attestation state (the marker coin in the chain state) is malformed, which is not the
+    //! same as an authenticated absence of a record. Nothing is matched, resubmitted or abandoned: the pending
+    //! transactions and their reservations are kept, construction is suppressed, and the caller reports it.
+    bool local_state_invalid{false};
     //! The usable entry the log line names (null when none is usable).
     const PendingWalletAttestation* reported{nullptr};
     PendingAttestationUse reported_use{PendingAttestationUse::UNUSABLE};
@@ -531,12 +535,13 @@ struct KeyPendingDecision {
 /** Examines every pending entry for one key (given in the order they are to be considered): any usable
  *  entry whose referenced state is the key's current record, whether or not the mempool holds it,
  *  suppresses construction, and unusable entries never hide a usable one. Unusable automatic entries are
- *  listed for cleanup separately; one that a usable entry spends from is kept. */
+ *  listed for cleanup separately; one that a usable entry spends from is kept. The key's current record is
+ *  read here from the chain state of `key_script`: a malformed local state is told apart from a missing
+ *  record (IsDemurrageStateSaneForScript) before anything is matched, and then nothing is changed. */
 KeyPendingDecision DecidePendingAttestationsForKey(const CWallet& wallet, const CCoinsViewCache& view,
                                                    const Consensus::Params& consensus, int evaluation_height,
-                                                   int64_t evaluation_time,
-                                                   const std::vector<const PendingWalletAttestation*>& key_pending,
-                                                   const std::optional<Consensus::DemurrageAttestationRecord>& record)
+                                                   int64_t evaluation_time, const CScript& key_script,
+                                                   const std::vector<const PendingWalletAttestation*>& key_pending)
     EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet);
 int MaybeAutoShadowSignal(CWallet& wallet);
 int MaybeAutoRedelegateQuantumColdStake(CWallet& wallet);

@@ -3,6 +3,7 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <addresstype.h>
+#include <arith_uint256.h>
 #include <coins.h>
 #include <consensus/amount.h>
 #include <consensus/demurrage.h>
@@ -17,6 +18,7 @@
 #include <key_io.h>
 #include <policy/feerate.h>
 #include <policy/policy.h>
+#include <pos.h>
 #include <primitives/transaction.h>
 #include <script/interpreter.h>
 #include <script/script.h>
@@ -200,6 +202,67 @@ BOOST_AUTO_TEST_CASE(mainnet_lifecycle_is_height_coherent_and_demurrage_is_autom
         pre_final_coin, consensus, migration_end + 1, active_mtp);
     BOOST_CHECK(first_final.active);
     BOOST_CHECK_EQUAL(first_final.inactive_blocks, 0);
+}
+
+BOOST_AUTO_TEST_CASE(mainnet_migration_start_quarters_ordinary_legacy_stake_weight)
+{
+    // What the code does at the first Migration block, asserted as it is (nothing here changes consensus):
+    // from block G+1 (G = 6,192,999, the last Gold Rush block) the stake weight of every kernel is its
+    // value times the liquid multiplier 2,500/10,000, and the kernel product is compared in full width.
+    // That includes an ordinary legacy self-stake. The difficulty target changes only from produced blocks
+    // (pow.cpp), so with the same stakers the first blocks after G are expected to take about four times
+    // as long.
+    SetShadowTestSchedule(/*whitelist_height=*/1, /*reward_start_height=*/2, /*gold_rush_blocks=*/10);
+    const auto main_params = CreateChainParams(ArgsManager{}, ChainType::MAIN);
+    SetShadowTestSchedule(MAINNET_SHADOW_WHITELIST_HEIGHT,
+                          MAINNET_SHADOW_REWARD_START_HEIGHT,
+                          MAINNET_SHADOW_GOLD_RUSH_BLOCKS);
+    const Consensus::Params& consensus = main_params->GetConsensus();
+    const int G = consensus.nGoldRushEndHeight;
+    BOOST_REQUIRE_EQUAL(G, 6192999);
+    const int64_t mtp = consensus.nQuantumMigrationDeadlineTime + 1;
+
+    // An ordinary legacy self-stake: a pay-to-pubkey-hash output.
+    const CScript legacy_script = GetScriptForDestination(PKHash{uint160{}});
+
+    // The kernel at height h is checked with the tier flag of its candidate height h.
+    const bool tiers_at_G = IsQuantumStakeTiersActive(consensus, mtp, G);
+    const bool tiers_at_G1 = IsQuantumStakeTiersActive(consensus, mtp, G + 1);
+    BOOST_CHECK(!tiers_at_G);
+    BOOST_CHECK(tiers_at_G1);
+    const StakeWeightContext at_G = GetStakeWeightContext(legacy_script, /*stake_input=*/nullptr, G, tiers_at_G);
+    const StakeWeightContext at_G1 = GetStakeWeightContext(legacy_script, /*stake_input=*/nullptr, G + 1, tiers_at_G1);
+    BOOST_CHECK(!at_G.stake_tiers_active);
+    BOOST_CHECK_EQUAL(at_G.multiplier_ppm10k, 10000);
+    BOOST_CHECK_EQUAL(at_G.pool_ppm10k, 10000);
+    BOOST_CHECK(at_G1.stake_tiers_active);
+    BOOST_CHECK_EQUAL(at_G1.multiplier_ppm10k, 2500);
+    BOOST_CHECK_EQUAL(at_G1.pool_ppm10k, 10000);
+    BOOST_CHECK_EQUAL(at_G1.effective_unbonding_blocks, 0);
+
+    // Effective weight: the full value at G, a quarter (rounded down) from G+1.
+    for (const CAmount value : {CAmount{1000} * COIN, CAmount{1}, CAmount{3}, CAmount{12345678901}, CAmount{1} << 52}) {
+        BOOST_CHECK(EffectiveStakeWeight(value, at_G.multiplier_ppm10k, at_G.pool_ppm10k) == arith_uint256(static_cast<uint64_t>(value)));
+        BOOST_CHECK(EffectiveStakeWeight(value, at_G1.multiplier_ppm10k, at_G1.pool_ppm10k) == arith_uint256(static_cast<uint64_t>(value) / 4));
+    }
+    // The arithmetic switches with the same height: wraparound 256-bit product through G, full width from G+1.
+    BOOST_CHECK(!IsQuantumWitnessSpendActive(consensus, mtp, G));
+    BOOST_CHECK(IsQuantumWitnessSpendActive(consensus, mtp, G + 1));
+    // A target so large that target * weight crosses 2^256: the wraparound product is tiny and the largest
+    // hash fails it, while the full-width product accepts the hash.
+    arith_uint256 target = arith_uint256{1} << 230;
+    const arith_uint256 weight_G = EffectiveStakeWeight(1000 * COIN, at_G.multiplier_ppm10k, at_G.pool_ppm10k);
+    arith_uint256 wrapped = target;
+    wrapped *= weight_G;
+    const uint256 largest_hash = ArithToUint256(~arith_uint256{});
+    BOOST_REQUIRE(UintToArith256(largest_hash) > wrapped);
+    BOOST_CHECK(KernelProductLE(target, weight_G, largest_hash));
+    // At a target that does not cross 2^256 both rules agree.
+    arith_uint256 small_target = arith_uint256{1} << 100;
+    arith_uint256 small_product = small_target;
+    small_product *= weight_G;
+    BOOST_CHECK(KernelProductLE(small_target, weight_G, ArithToUint256(small_product)));
+    BOOST_CHECK(!KernelProductLE(small_target, weight_G, ArithToUint256(small_product + 1)));
 }
 
 BOOST_AUTO_TEST_CASE(mainnet_gold_rush_v2_missing_time_is_deterministic)

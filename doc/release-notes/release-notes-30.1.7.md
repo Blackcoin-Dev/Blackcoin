@@ -347,6 +347,16 @@ outputs the wallet stakes, what it reports, and what it tells the user to do.
   height, so a competing block at the same height is scanned too. Retry state
   recorded on a disconnected block is dropped. The wallet file stays readable by
   30.1.6 and earlier; an older record without a block hash means scan again.
+- **Operator note: staking power drops at the first Migration block, and blocks can be slower for a
+  while.** This describes the consensus rules as they have always been; 30.1.7 does not change
+  them. The last Gold Rush block is 6,192,999 (G). From block G+1 the stake weight of a kernel is
+  its value times the liquid multiplier of 2,500 out of 10,000, so liquid legacy stake, including an
+  ordinary legacy self-stake, counts at a quarter of its value, and the kernel product is compared
+  in full width instead of the wraparound arithmetic used through G. The difficulty target is
+  adjusted only from blocks that were produced, and waiting alone does not lower it. If the
+  same stakers are online, the first blocks after G can therefore take about four times longer than
+  before until the target has followed. Wallets that stake in that window are not at fault and need
+  no action; keep them online and unlocked for staking.
 
 ## Behaviour that changes before the end of Gold Rush
 

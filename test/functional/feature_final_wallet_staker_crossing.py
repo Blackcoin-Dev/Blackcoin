@@ -64,19 +64,32 @@ class FinalWalletStakerCrossingTest(TransitionTFinalTestBase, BitcoinTestFramewo
         info = self.wallet_of(index).getquantumstakereadiness()["final_stake_reserve"]
         return info, {(o["txid"], o["vout"]) for o in info["reserved_outpoints"]}
 
+    def allowed_outputs(self, index):
+        """The outputs of producer `index` its staker may use now: mature for the next block (the wallet stakes an
+        output from the block it matures in, `confirmations >= MATURITY`) and not in the final stake reserve."""
+        wallet = self.wallet_of(index)
+        _, reserved = self.reserve_keys(index)
+        return reserved, [{"txid": u["txid"], "vout": u["vout"]} for u in wallet.listunspent(1, 9999999)
+                          if u["spendable"] and u["amount"] > 0 and u["confirmations"] >= MATURITY and key(u) not in reserved]
+
     def producer_blocks(self, group):
-        """The producers of `group` take turns by height: one block each time, made by the wallet's own staker."""
+        """The producers of `group` take turns by height: one block each time, made by the wallet's own staker. The
+        reserve is chosen by transaction hash, so which outputs a producer may use varies from run to run: when the
+        producer whose turn it is has no output it may use (all its mature outputs are reserved), the next one in the
+        rotation makes the block. Every block is still made by a wallet staker."""
         height = self.nodes[group[0]].getblockcount() + 1
-        return group[height % len(group)]
+        for offset in range(len(group)):
+            index = group[(height + offset) % len(group)]
+            if self.allowed_outputs(index)[1]:
+                return index
+        raise AssertionError("no producer of the group has an output it may stake")
 
     def stake_next(self, index, group):
         """The staker of producer `index` makes the next block from an output it is allowed to use now. Returns the
         block hash; the group's nodes are synced."""
         node = self.nodes[index]
         wallet = self.wallet_of(index)
-        _, reserved = self.reserve_keys(index)
-        allowed = [{"txid": u["txid"], "vout": u["vout"]} for u in wallet.listunspent(1, 9999999)
-                   if u["spendable"] and u["amount"] > 0 and u["confirmations"] > MATURITY and key(u) not in reserved]
+        reserved, allowed = self.allowed_outputs(index)
         assert allowed, "producer %d has no output it may stake" % index
         before = node.getblockcount()
         for _ in range(60000):

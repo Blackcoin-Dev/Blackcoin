@@ -75,12 +75,6 @@ class OldBackupRecoveryTest(TransitionTFinalTestBase, BitcoinTestFramework):
         os.makedirs(backup_dir, exist_ok=True)
 
         variants = VARIANTS
-        if not self.options.descriptors:
-            # NOT COVERED: an encrypted legacy (BDB) wallet. The node's own staker finds no stakable output in it
-            # in this test ("0 live wallet outputs indexed for staking"), which has nothing to do with the return
-            # key, so only the unencrypted legacy wallet is exercised here.
-            variants = [v for v in VARIANTS if v[1] is None]
-            self.log.info("Legacy wallet run: only the unencrypted wallet is exercised")
         records = []  # one dict per variant
         self.log.info("Two wallets, each with one legacy coinbase to stake in the window")
         for index, (kind, passphrase) in enumerate(variants):
@@ -95,6 +89,15 @@ class OldBackupRecoveryTest(TransitionTFinalTestBase, BitcoinTestFramework):
             legacy_addr = wallet.getnewaddress("", "legacy")
             self.generatetoaddress(n0, 1, legacy_addr, sync_fun=self.sync_all)
             self.bump()
+            if passphrase and not self.options.descriptors:
+                # A legacy (BDB) wallet created with a passphrase never connects its key-time notifier to the wallet's
+                # birth time (CWallet::ConnectScriptPubKeyManNotifiers runs before the key manager exists), so the
+                # birth time stays unknown, every block counts as older than the wallet and nothing is added to it
+                # ("0 live wallet outputs indexed for staking"). v30.1.6 does the same. A rescan reads the block it
+                # missed; the key manager is connected after the next restart.
+                n0.syncwithvalidationinterfacequeue()
+                wallet.rescanblockchain()
+                assert_equal(wallet.getwalletinfo()["txcount"], 1)
             coinbase = n0.getblock(n0.getblockhash(index + 1), 2)["tx"][0]
             records.append({"name": name, "kind": kind, "passphrase": passphrase,
                             "kernel": {"txid": coinbase["txid"], "vout": 0}, "coinbase_value": coinbase["vout"][0]["value"]})

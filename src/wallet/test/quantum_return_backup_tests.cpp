@@ -115,7 +115,7 @@ BOOST_AUTO_TEST_CASE(retention_keeps_three_and_every_sole_protector)
         BOOST_CHECK_EQUAL(doomed.size(), count > 3 ? count - 3 : 0);
         for (const std::string& name : doomed) {
             // only the oldest are removed
-            BOOST_CHECK(std::stoul(name.substr(1)) < count - 3);
+            BOOST_CHECK(ToIntegral<size_t>(name.substr(1)).value_or(count) < count - 3);
         }
     }
 

@@ -10,6 +10,7 @@
 
 #include <consensus/demurrage.h>
 #include <pos.h>
+#include <wallet/final_stake_reserve.h> // FinalStakeReserveEnforcedOutpoints
 #include <wallet/spend.h>
 #include <wallet/wallet.h>
 
@@ -339,11 +340,6 @@ std::set<COutPoint> FinalStakeReserveConsumedSources(const CWallet& wallet, int6
  *  ignore_lock_of, when given, names outputs whose coin lock does not take them out of the scan (see
  *  CoinFilterParams::staking_scan_ignores_lock_of). */
 FinalStakeReserve ComputeFinalStakeReserve(const CWallet& wallet, const std::set<COutPoint>* ignore_lock_of = nullptr)
-    EXCLUSIVE_LOCKS_REQUIRED(::cs_main, wallet.cs_wallet);
-
-/** The outputs automatic spending must not select: the reserve while the guard is active, otherwise empty. Always
- *  computed fresh (a spend never reads a cached reserve). Cheap when the guard is off. */
-std::set<COutPoint> FinalStakeReserveEnforcedOutpoints(const CWallet& wallet, const std::set<COutPoint>* ignore_lock_of = nullptr)
     EXCLUSIVE_LOCKS_REQUIRED(::cs_main, wallet.cs_wallet);
 
 /** The recheck before an automatic spend is committed: true when any input of tx is in the enforced reserve. Takes

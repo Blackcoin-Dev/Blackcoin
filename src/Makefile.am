@@ -369,6 +369,7 @@ BITCOIN_CORE_H = \
   wallet/dump.h \
   wallet/external_signer_scriptpubkeyman.h \
   wallet/fees.h \
+  wallet/final_stake_reserve.h \
   wallet/load.h \
   wallet/pow_miner_tip_signal.h \
   wallet/pow_mining_duty_cycle.h \

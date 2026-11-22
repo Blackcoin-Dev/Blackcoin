@@ -32,9 +32,9 @@
 #include <util/trace.h>
 #include <wallet/coincontrol.h>
 #include <wallet/fees.h>
+#include <wallet/final_stake_reserve.h>
 #include <wallet/receive.h>
 #include <wallet/spend.h>
-#include <wallet/staking.h>
 #include <wallet/transaction.h>
 #include <wallet/wallet.h>
 #include <validation.h>

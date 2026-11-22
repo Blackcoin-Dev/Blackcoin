@@ -145,7 +145,14 @@ function Invoke-Teardown {
     }
     if (Test-Path $Root) {
         & $removeRoot
-        $leftovers = if ($KeepResults) { @(Get-ChildItem -LiteralPath $Root -Force -ErrorAction SilentlyContinue | Where-Object { $_.FullName -ne $keptResults }) } else { @(if (Test-Path $Root) { $Root }) }
+        $leftovers = @(
+            if ($KeepResults) {
+                Get-ChildItem -LiteralPath $Root -Force -ErrorAction SilentlyContinue |
+                    Where-Object { $_.FullName -ne $keptResults }
+            } elseif (Test-Path $Root) {
+                $Root
+            }
+        )
         if ($leftovers.Count -gt 0) {
             Start-Sleep -Seconds 5
             & $removeRoot

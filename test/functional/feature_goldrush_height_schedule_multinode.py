@@ -393,32 +393,36 @@ class GoldRushHeightScheduleMultiNodeTest(BitcoinTestFramework):
         valued = [o for o in coinstake["vout"] if o["value"] > 0]
         assert_equal(len(valued), 1)
         assert_equal(valued[0]["scriptPubKey"]["type"], "witness_unknown")
-        # The window blocks from the one after the address is ready up to M - 1 (block M is produced and checked
-        # after this loop), not only the first: a legacy kernel is paid back in
-        # full (principal plus the scheduled reward, plus fees when the block carries transactions) to ONE
-        # output, the return address; a quantum kernel keeps paying quantum outputs.
-        legacy_returns = 0
-        for height in range(return_height, MIGRATION_END_HEIGHT):
+        # Every window block from the one after the address is ready through M itself (M is produced after the
+        # loop over the earlier ones and checked the same way): a legacy kernel is paid back in full (principal
+        # plus the scheduled reward plus the exact fees of the block's transactions) to ONE output, the return
+        # address; a quantum kernel keeps paying quantum outputs.
+        legacy_returns = [0]
+
+        def check_window_block(height):
             block = node.getblock(node.getblockhash(height), 2)
             if "proof-of-stake" not in block["flags"]:
-                continue
+                return
             coinstake = block["tx"][1]
             prev = node.getrawtransaction(coinstake["vin"][0]["txid"], True)["vout"][coinstake["vin"][0]["vout"]]
             valued = [o for o in coinstake["vout"] if o["value"] > 0]
             assert all(o["scriptPubKey"]["type"] == "witness_unknown" for o in valued), (height, valued)
             if prev["scriptPubKey"]["type"] != "witness_unknown":  # a legacy kernel
-                legacy_returns += 1
+                legacy_returns[0] += 1
                 assert_equal(len(valued), 1)
                 assert_equal(valued[0]["scriptPubKey"]["hex"], return_script)
-                paid = valued[0]["value"]
-                if len(block["tx"]) == 2:  # no transaction fees in this block
-                    assert_equal(paid, prev["value"] + Decimal("1.5"))
-                else:
-                    assert paid > prev["value"] + Decimal("1.5"), (height, paid)
-        assert legacy_returns > 0, "no legacy kernel was staked inside the window after the address was ready"
+                fees = sum((tx["fee"] for tx in block["tx"][2:]), Decimal(0))  # the block's transactions after the coinstake
+                assert_equal(valued[0]["value"], prev["value"] + Decimal("1.5") + fees)
+                if len(block["tx"]) > 2:
+                    assert fees > 0, (height, fees)
+
+        for height in range(return_height, MIGRATION_END_HEIGHT):
+            check_window_block(height)
+        assert legacy_returns[0] > 0, "no legacy kernel was staked inside the window after the address was ready"
         self._mine_pos_block(node, staker_a)  # the final Migration block
         self._sync_started()
         assert_equal(node.getblockcount(), MIGRATION_END_HEIGHT)
+        check_window_block(MIGRATION_END_HEIGHT)  # the last Migration block itself
         self._assert_phase_everywhere("final_lockout")
         self.log.info("All 5 nodes flipped to Final Lockout at exactly boundary height %d", MIGRATION_END_HEIGHT)
 

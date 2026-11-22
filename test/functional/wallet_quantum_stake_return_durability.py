@@ -97,22 +97,22 @@ class QuantumStakeReturnDurabilityTest(TransitionTFinalTestBase, BitcoinTestFram
         self.pow_blocks(n0, LAST_LEGACY_STAKE_HEIGHT - n0.getblockcount(), pow_addr, sync=True)
         assert_equal(n0.getblockcount(), LAST_LEGACY_STAKE_HEIGHT)
 
-        self.log.info("Setting the return address creates a durable key and prompts for a backup")
-        with n0.assert_debug_log(["is not in a verified wallet backup yet"]):
+        self.log.info("Setting the return address creates a durable key and backs it up before it is active")
+        with n0.assert_debug_log(["after a verified wallet backup"]):
             result = ret.setquantumstakereturn({"allow_new_quantum_key": True})
         assert_equal(result["created"], True)
-        assert_equal(result["backup_verified"], False)
-        assert "fresh wallet backup" in result["backup_action"]
+        assert_equal(result["backup_verified"], True)
+        assert "backup_action" not in result
         address = result["address"]
         info = ret.getstakinginfo()
         assert_equal(info["legacy_stake_return_ready"], True)
-        assert_equal(info["legacy_stake_return_backup_verified"], False)
-        assert "fresh wallet backup" in info["legacy_stake_return_backup_action"]
-        assert "fresh wallet backup" in info["legacy_staking_notice"]
-        assert_equal(ret.getmigrationstatus()["legacy_stake_return_backup_verified"], False)
+        assert_equal(info["legacy_stake_return_backup_verified"], True)
+        assert "legacy_stake_return_backup_action" not in info
+        assert "fresh wallet backup" not in info["legacy_staking_notice"]
+        assert_equal(ret.getmigrationstatus()["legacy_stake_return_backup_verified"], True)
         readiness = ret.getquantumstakereadiness()
-        assert_equal(readiness["stake_return"]["backup_verified"], False)
-        assert "backup_action" in readiness["stake_return"]
+        assert_equal(readiness["stake_return"]["backup_verified"], True)
+        assert "backup_action" not in readiness["stake_return"]
 
         self.log.info("The key and the address survive a restart (they were durably written)")
         self.restart_node(0, extra_args=self.extra_args[0] + ["-mocktime=%d" % self.mt])
@@ -125,15 +125,13 @@ class QuantumStakeReturnDurabilityTest(TransitionTFinalTestBase, BitcoinTestFram
         info = ret.getstakinginfo()
         assert_equal(info["legacy_stake_return_ready"], True)
         assert_equal(info["legacy_stake_return_address"], address)
-        assert_equal(info["legacy_stake_return_backup_verified"], False)
+        assert_equal(info["legacy_stake_return_backup_verified"], True)
 
-        self.log.info("backupwallet after the key was set clears the prompt")
+        self.log.info("A backup made after the key was set (the one restored below)")
         ret.backupwallet(after_key)
         info = ret.getstakinginfo()
         assert_equal(info["legacy_stake_return_backup_verified"], True)
         assert "legacy_stake_return_backup_action" not in info
-        assert "fresh wallet backup" not in info["legacy_staking_notice"]
-        assert_equal(ret.getquantumstakereadiness()["stake_return"]["backup_verified"], True)
 
         self.log.info("The wallet stakes its legacy kernel to the return address (block 81)")
         block_hash = self.stake_outpoint(ret, n0, kernel)

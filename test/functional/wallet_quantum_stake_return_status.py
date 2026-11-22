@@ -67,7 +67,9 @@ class QuantumStakeReturnStatusTest(TransitionTFinalTestBase, BitcoinTestFramewor
         result = wallet.setquantumstakereturn()
         assert_equal(result["created"], True)
         assert_equal(result["ready"], True)
-        assert "backup_action" in result  # a key that no backup holds yet
+        # the new key was backed up and verified before it became the address
+        assert_equal(result["backup_verified"], True)
+        assert "backup_action" not in result
         address = result["address"]
         again = wallet.setquantumstakereturn()
         assert_equal(again["address"], address)
@@ -77,6 +79,9 @@ class QuantumStakeReturnStatusTest(TransitionTFinalTestBase, BitcoinTestFramewor
         explicit = wallet.setquantumstakereturn({"existing_address": other})
         assert_equal(explicit["created"], False)
         assert_equal(explicit["address"], other)
+        # a reused key that no verified backup holds keeps the prompt (and is no way round the pending-key rule)
+        assert_equal(explicit["backup_verified"], False)
+        assert "fresh wallet backup" in explicit["backup_action"]
 
         self.log.info("N1: wording")
         helptext = node.help("setquantumstakereturn")

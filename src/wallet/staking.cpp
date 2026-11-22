@@ -3533,6 +3533,35 @@ bool SpendsFinalStakeReserve(CWallet& wallet, const CTransaction& tx)
     return std::any_of(tx.vin.begin(), tx.vin.end(), [&reserve](const CTxIn& txin) { return reserve.count(txin.prevout) > 0; });
 }
 
+FinalStakeReserveSpendReport DescribeFinalStakeReserveSpend(CWallet& wallet, const CTransaction& tx)
+{
+    LOCK2(::cs_main, wallet.cs_wallet);
+    FinalStakeReserveSpendReport report;
+    const CBlockIndex* tip = wallet.chain().getTip();
+    if (!tip || !gArgs.GetBoolArg("-finalstakereserve", DEFAULT_FINAL_STAKE_RESERVE) ||
+        !IsFinalStakeReserveGuardActive(Params().GetConsensus(), tip->nHeight + 1)) {
+        return report;
+    }
+    const FinalStakeReserve reserve = ComputeFinalStakeReserve(wallet);
+    if (!reserve.active) return report;
+    report.reserved_before = static_cast<int64_t>(reserve.reserved.size());
+    report.eligible_before = reserve.eligible_count;
+    report.eligible_weight_before = reserve.eligible_weight;
+    for (const FinalStakeReserveSource& source : reserve.reserved) {
+        if (std::any_of(tx.vin.begin(), tx.vin.end(), [&](const CTxIn& txin) { return txin.prevout == source.outpoint; })) {
+            report.spent.push_back(source);
+            report.spent_effective_value += source.effective_value;
+        }
+    }
+    return report;
+}
+
+FinalStakeReserve SnapshotFinalStakeReserve(CWallet& wallet)
+{
+    LOCK2(::cs_main, wallet.cs_wallet);
+    return ComputeFinalStakeReserve(wallet);
+}
+
 bool FinalStakeReserveCommitRecheckNeeded(const CWallet& wallet)
 {
     if (!gArgs.GetBoolArg("-finalstakereserve", DEFAULT_FINAL_STAKE_RESERVE) || !wallet.HaveChain()) return false;

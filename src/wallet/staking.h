@@ -351,6 +351,25 @@ std::set<COutPoint> FinalStakeReserveEnforcedOutpoints(const CWallet& wallet, co
 bool SpendsFinalStakeReserve(CWallet& wallet, const CTransaction& tx)
     LOCKS_EXCLUDED(::cs_main, wallet.cs_wallet);
 
+/** What a deliberate spend of the final stake reserve takes: the reserved outputs a transaction spends, with the
+ *  reserve and the eligibility at the first Final block as they stand before it. Empty `spent` when the guard is not
+ *  on or no input is reserved. Takes cs_main and cs_wallet itself; call with neither held. */
+struct FinalStakeReserveSpendReport
+{
+    std::vector<FinalStakeReserveSource> spent;
+    CAmount spent_effective_value{0};
+    int64_t reserved_before{0};
+    int64_t eligible_before{0};
+    CAmount eligible_weight_before{0};
+};
+FinalStakeReserveSpendReport DescribeFinalStakeReserveSpend(CWallet& wallet, const CTransaction& tx)
+    LOCKS_EXCLUDED(::cs_main, wallet.cs_wallet);
+
+/** The reserve as it stands now (after a transaction was committed): for the reduction a deliberate spend caused.
+ *  Takes cs_main and cs_wallet itself; call with neither held. */
+FinalStakeReserve SnapshotFinalStakeReserve(CWallet& wallet)
+    LOCKS_EXCLUDED(::cs_main, wallet.cs_wallet);
+
 /** Whether CWallet::CommitTransaction has to take cs_main to derive the reserve again: the option is on, the height
  *  schedule is known and the tip is at most a safety margin of blocks from the guard (or inside it), and not past it.
  *  The margin covers the blocks that could connect between this reading and the lock. Reads the tip height itself;

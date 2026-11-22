@@ -274,6 +274,27 @@ UniValue SendMoneyToScript(CWallet& wallet, const CScript scriptPubKey, CAmount 
     return tx->GetHash().GetHex();
 }
 
+static RPCResult FinalStakeReserveSpentDoc()
+{
+    return RPCResult{RPCResult::Type::OBJ, "final_stake_reserve_spent", /*optional=*/true,
+        "present when explicitly selected inputs spent outputs the final stake reserve holds back: what was consumed and what it took from the readiness for the first Final block", {
+            {RPCResult::Type::ARR, "outpoints", "the reserved outputs the transaction spends", {
+                {RPCResult::Type::OBJ, "", "", {
+                    {RPCResult::Type::STR_HEX, "txid", "transaction id"},
+                    {RPCResult::Type::NUM, "vout", "output index"},
+                    {RPCResult::Type::STR_AMOUNT, "effective_value", "kernel value at the first Final block"},
+                }},
+            }},
+            {RPCResult::Type::STR_AMOUNT, "effective_value", "their total kernel value at the first Final block"},
+            {RPCResult::Type::NUM, "reserved_before", "outputs held back before the transaction"},
+            {RPCResult::Type::NUM, "reserved_after", "outputs held back after it"},
+            {RPCResult::Type::NUM, "eligible_before", "unspent outputs able to stake at the first Final block, before"},
+            {RPCResult::Type::NUM, "eligible_after", "the same, after"},
+            {RPCResult::Type::STR_AMOUNT, "eligible_weight_before", "their effective kernel value at the first Final block, before"},
+            {RPCResult::Type::STR_AMOUNT, "eligible_weight_after", "the same, after"},
+        }};
+}
+
 static UniValue FinishTransaction(
     const std::shared_ptr<CWallet> pwallet,
     const UniValue& options,
@@ -327,6 +348,10 @@ static UniValue FinishTransaction(
         CTransactionRef tx(MakeTransactionRef(std::move(mtx)));
         result.pushKV("txid", tx->GetHash().GetHex());
         if (add_to_wallet && !psbt_opt_in) {
+            // A deliberate spend of the final stake reserve (explicit inputs) is reported: which reserved outputs it
+            // consumed and what that took from the readiness for the first Final block.
+            FinalStakeReserveSpendReport reserve_spend;
+            if (!explicit_inputs.empty()) reserve_spend = DescribeFinalStakeReserveSpend(*pwallet, *tx);
             try {
                 CommitWalletTransactionOrThrow(
                     *pwallet, tx, {}, "Blackcoin wallet transaction",
@@ -340,6 +365,27 @@ static UniValue FinishTransaction(
                     for (const CTxIn& txin : tx->vin) pwallet->UnlockCoin(txin.prevout);
                 }
                 throw;
+            }
+            if (!reserve_spend.spent.empty()) {
+                const FinalStakeReserve after = SnapshotFinalStakeReserve(*pwallet);
+                UniValue spent(UniValue::VOBJ);
+                UniValue outpoints(UniValue::VARR);
+                for (const FinalStakeReserveSource& source : reserve_spend.spent) {
+                    UniValue entry(UniValue::VOBJ);
+                    entry.pushKV("txid", source.outpoint.hash.GetHex());
+                    entry.pushKV("vout", static_cast<int64_t>(source.outpoint.n));
+                    entry.pushKV("effective_value", ValueFromAmount(source.effective_value));
+                    outpoints.push_back(std::move(entry));
+                }
+                spent.pushKV("outpoints", std::move(outpoints));
+                spent.pushKV("effective_value", ValueFromAmount(reserve_spend.spent_effective_value));
+                spent.pushKV("reserved_before", reserve_spend.reserved_before);
+                spent.pushKV("reserved_after", static_cast<int64_t>(after.reserved.size()));
+                spent.pushKV("eligible_before", reserve_spend.eligible_before);
+                spent.pushKV("eligible_after", after.eligible_count);
+                spent.pushKV("eligible_weight_before", ValueFromAmount(reserve_spend.eligible_weight_before));
+                spent.pushKV("eligible_weight_after", ValueFromAmount(after.eligible_weight));
+                result.pushKV("final_stake_reserve_spent", std::move(spent));
             }
         } else {
             result.pushKV("hex", hex);
@@ -1485,7 +1531,8 @@ RPCHelpMan send()
                     {RPCResult::Type::STR_HEX, "txid", /*optional=*/true, "The transaction id for the send. Only 1 transaction is created regardless of the number of addresses."},
                     {RPCResult::Type::STR_HEX, "hex", /*optional=*/true, "If add_to_wallet is false, the hex-encoded raw transaction with signature(s)"},
                     {RPCResult::Type::STR, "psbt", /*optional=*/true, "If more signatures are needed, or if add_to_wallet is false, the base64-encoded (partially) signed transaction"},
-                    {RPCResult::Type::STR, "warning", /*optional=*/true, "Backup reminder when quantum change-key creation was authorized"}
+                    {RPCResult::Type::STR, "warning", /*optional=*/true, "Backup reminder when quantum change-key creation was authorized"},
+                    FinalStakeReserveSpentDoc(),
                 }
         },
         RPCExamples{""
@@ -1595,7 +1642,8 @@ RPCHelpMan sendall()
                     {RPCResult::Type::BOOL, "complete", "If the transaction has a complete set of signatures"},
                     {RPCResult::Type::STR_HEX, "txid", /*optional=*/true, "The transaction id for the send. Only 1 transaction is created regardless of the number of addresses."},
                     {RPCResult::Type::STR_HEX, "hex", /*optional=*/true, "If add_to_wallet is false, the hex-encoded raw transaction with signature(s)"},
-                    {RPCResult::Type::STR, "psbt", /*optional=*/true, "If more signatures are needed, or if add_to_wallet is false, the base64-encoded (partially) signed transaction"}
+                    {RPCResult::Type::STR, "psbt", /*optional=*/true, "If more signatures are needed, or if add_to_wallet is false, the base64-encoded (partially) signed transaction"},
+                    FinalStakeReserveSpentDoc(),
                 }
         },
         RPCExamples{""

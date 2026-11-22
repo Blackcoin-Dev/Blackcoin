@@ -299,7 +299,9 @@ class FinalStakeReserveTest(TransitionTFinalTestBase, BitcoinTestFramework):
         sent = wallet.send(outputs=[{destination: free_value / 2}], options={"change_address": destination})
         spent = {(i["txid"], i["vout"]) for i in node.decoderawtransaction(wallet.gettransaction(sent["txid"])["hex"])["vin"]}
         assert_equal(spent, {free_key})
-        # Explicit coin control may spend the reserve; the readiness report then shows the reduction.
+        # Explicit coin control may spend the reserve; the result reports what it consumed and the readiness report
+        # then shows the reduction.
+        before_explicit = self.reserve(wallet)
         explicit = wallet.send(outputs=[{destination: reserved_value / 2}],
                                options={"inputs": [{"txid": reserved_key[0], "vout": reserved_key[1]}], "add_inputs": False,
                                         "change_address": destination})
@@ -307,6 +309,20 @@ class FinalStakeReserveTest(TransitionTFinalTestBase, BitcoinTestFramework):
         spent = {(i["txid"], i["vout"]) for i in node.decoderawtransaction(wallet.gettransaction(explicit["txid"])["hex"])["vin"]}
         assert_equal(spent, {reserved_key})
         after = self.reserve(wallet)
+        report = explicit["final_stake_reserve_spent"]
+        assert_equal([(o["txid"], o["vout"]) for o in report["outpoints"]], [reserved_key])
+        assert_equal(report["outpoints"][0]["effective_value"], report["effective_value"])
+        assert report["effective_value"] > 0
+        assert_equal(report["reserved_before"], before_explicit["reserved_count"])
+        assert_equal(report["reserved_after"], after["reserved_count"])
+        assert_equal(report["eligible_before"], before_explicit["eligible_count"])
+        assert_equal(report["eligible_after"], after["eligible_count"])
+        assert_equal(report["eligible_weight_before"], before_explicit["eligible_weight"])
+        assert_equal(report["eligible_weight_after"], after["eligible_weight"])
+        assert report["eligible_after"] < report["eligible_before"]
+        assert report["eligible_weight_after"] < report["eligible_weight_before"]
+        # A payment that spends no reserved output reports nothing of the kind.
+        assert "final_stake_reserve_spent" not in sent
         # Both outputs are now spent by unconfirmed transactions: nothing qualifying is left until they confirm.
         assert_equal(after["reserved_count"], 0)
         assert reserved_key not in self.reserved_keys(wallet)

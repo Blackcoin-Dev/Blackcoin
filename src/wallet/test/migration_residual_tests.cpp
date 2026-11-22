@@ -35,14 +35,10 @@ BOOST_AUTO_TEST_CASE(a_wallet_without_private_keys_reports_its_legacy_outputs_as
     }
     wallet->LoadWallet();
     const CPubKey pubkey = coinbaseKey.GetPubKey();
-    uint256 block_hash;
-    int height;
-    {
-        LOCK(::cs_main);
-        height = m_node.chainman->ActiveChain().Height();
-        block_hash = m_node.chainman->ActiveChain()[1]->GetBlockHash();
-    }
-    LOCK(wallet->cs_wallet);
+    // The report reads the chainstate, so (as its callers do) take the chain lock before the wallet lock.
+    LOCK2(::cs_main, wallet->cs_wallet);
+    const int height = m_node.chainman->ActiveChain().Height();
+    const uint256 block_hash = m_node.chainman->ActiveChain()[1]->GetBlockHash();
     wallet->SetWalletFlag(WALLET_FLAG_DESCRIPTORS);
     wallet->SetWalletFlag(WALLET_FLAG_DISABLE_PRIVATE_KEYS);
     FlatSigningProvider provider;

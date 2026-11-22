@@ -1,6 +1,35 @@
 # Blackcoin Core release process
 
-## Current v30.1.6 signed release
+## Current v30.1.7rc1 DEVELOPMENT candidate
+
+This is an unpublished development candidate. `configure.ac` records major 30,
+minor 1, build 7, revision 0, RC1, and `CLIENT_VERSION_IS_RELEASE=false`.
+The numeric `CLIENT_VERSION` is `300107`; macOS short version is `30.1.7`,
+bundle version is `30.1.700`, and `BlackcoinFullVersion` is `30.1.7`. The
+runtime and configured package version are `30.1.7rc1`. The canonical
+development notes are `doc/release-notes/release-notes-30.1.7.md`.
+
+This source line follows the published v30.1.6 release.
+
+Manual candidate packages use an explicit `30.1.7-alpha1` or
+`30.1.7-beta1` label bound to the exact source SHA. Such builds do not publish
+a release. The future `v30.1.7` production path remains blocked until RC0,
+release=true, final canonical notes, the complete exact-source safety gate,
+a Blackcoin-Dev SSH-signed source commit and annotated tag, and protected
+`V30.1.7` acknowledgement are present. Retain the signed immutable-configuration
+receipt, authenticated release inventory and numeric release-ID checks,
+two isolated builders with byte comparison, attestations, and immutable
+publication verification. A version transition is not evidence of those results.
+
+Qualify the final exact source and artifacts across the native platform matrix,
+pinned Berkeley DB legacy-wallet support, sanitizers and fuzzing, mixed-version
+compatibility, restart and long-running resource behavior. Record actual test
+results and the selected artifact digests. Source changes, focused fixtures, and
+template-only measurements do not replace those checks.
+
+The sections below preserve historical release controls and evidence boundaries.
+
+## v30.1.6 signed release (historical)
 
 This runbook's current source line is `30.1.6`.
 `configure.ac` records major 30, minor 1, build 6, revision 0, RC0, and

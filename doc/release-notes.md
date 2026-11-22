@@ -1,3 +1,17 @@
+30.1.7rc1 DEVELOPMENT Candidate Notes
+===================================
+
+This development candidate is an efficiency and cleanup release on top of the
+published 30.1.6, with clearer behaviour around the migration to quantum outputs,
+the Final phase and the end of Gold Rush. Consensus and storage formats are
+unchanged.
+
+The source is RC1 with `CLIENT_VERSION_IS_RELEASE=false`; final release
+qualification is pending. See `doc/release-notes/release-notes-30.1.7.md` for
+the changes, the compatibility notes and the known limitations.
+
+The following sections preserve prior release history.
+
 30.1.6 Release Notes
 ====================
 

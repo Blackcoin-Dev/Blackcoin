@@ -1,6 +1,8 @@
-# Blackcoin Core 30.1.7
+# Blackcoin Core 30.1.7rc1 (DEVELOPMENT, unreleased candidate)
 
-Blackcoin Core 30.1.7 follows 30.1.6. It is an efficiency and cleanup release on
+RELEASE_NOTES_NOT_FINAL
+
+Blackcoin Core 30.1.7rc1 follows 30.1.6. It is an efficiency and cleanup release on
 the wallet and node side, with clearer behaviour around the migration to quantum
 outputs, the Final phase and the end of Gold Rush.
 
@@ -8,6 +10,9 @@ Consensus and reward rules, activation heights, the wire protocol and the wallet
 file format are unchanged. None of the changes below alters which blocks or
 transactions are valid. A wallet file written by 30.1.7 stays readable by 30.1.6
 and earlier.
+
+This candidate has `CLIENT_VERSION_IS_RELEASE=false`.
+Release qualification is pending.
 
 ## Wallet load and cleanup
 
@@ -332,3 +337,11 @@ operator can see before the last Gold Rush block (height 6,192,999), in plain la
   block, so it has only that one block (the margin) to be spent before Final; a return created from
   6,921,500 on matures too late and can never be spent. Switch legacy staking off from height
   6,921,499, or stay on 30.1.7.
+
+## Version identity
+
+The source is configured as `30.1.7rc1`: major 30, minor 1, build 7, revision 0, RC1. The
+numeric `CLIENT_VERSION` is
+`300107`. macOS uses short version `30.1.7` and bundle version `30.1.700`, and
+`BlackcoinFullVersion` is `30.1.7`. The steps to a signed release are in the
+[release process](../release-process.md).

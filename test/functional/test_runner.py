@@ -98,8 +98,8 @@ EXTENDED_SCRIPTS = [
     'feature_quantum_integration_soak.py',
     'feature_quantum_demurrage_soak.py',
     'feature_dbcrash.py',
-    # Requires an explicit independently built 30.1.5.2 baseline daemon.
-    'feature_3016_upgrade.py --descriptors',
+    # Requires the unmodified published 30.1.6 baseline daemon (BLACKCOIN_V30_1_6_BINARY).
+    'feature_3017_upgrade.py --descriptors',
     # Diagnostic observations; no precise OS CPU duty pass threshold.
     'feature_pow_cpu_budget.py --descriptors',
     # Renew natural jobs and qualify completed duty periods across restart.

@@ -1,5 +1,11 @@
 # Changelog
 
+## v30.1.7rc1 (DEVELOPMENT, unreleased candidate)
+
+- Identify the source as 30.1.7. It follows the published v30.1.6; the numeric
+  client version becomes 300107. The changes are listed in
+  `doc/release-notes/release-notes-30.1.7.md`.
+
 ## v30.1.6
 
 - Final release of the source line developed as 30.1.5.3rc1 through

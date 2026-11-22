@@ -207,11 +207,13 @@ BOOST_AUTO_TEST_CASE(mainnet_lifecycle_is_height_coherent_and_demurrage_is_autom
 BOOST_AUTO_TEST_CASE(mainnet_migration_start_quarters_ordinary_legacy_stake_weight)
 {
     // What the code does at the first Migration block, asserted as it is (nothing here changes consensus):
-    // from block G+1 (G = 6,192,999, the last Gold Rush block) the stake weight of every kernel is its
-    // value times the liquid multiplier 2,500/10,000, and the kernel product is compared in full width.
-    // That includes an ordinary legacy self-stake. The difficulty target changes only from produced blocks
-    // (pow.cpp), so with the same stakers the first blocks after G are expected to take about four times
-    // as long.
+    // from block G+1 (G = 6,192,999, the last Gold Rush block) the stake weight of a kernel is its value times the
+    // liquid multiplier 2,500/10,000, and the kernel product is compared in full width. That is the weight of an
+    // ordinary liquid legacy stake, including an ordinary legacy self-stake; a tiered program overrides the
+    // multiplier (GetStakeWeightContext in pos.cpp), so a tiered stake can weigh more, up to its full value. The
+    // difficulty target changes only from produced blocks (pow.cpp), so with an unchanged target and unchanged
+    // participating liquid stake the first expected wait is about four times the usual one; that is the initial
+    // expectation only, not a multiplier for later blocks.
     SetShadowTestSchedule(/*whitelist_height=*/1, /*reward_start_height=*/2, /*gold_rush_blocks=*/10);
     const auto main_params = CreateChainParams(ArgsManager{}, ChainType::MAIN);
     SetShadowTestSchedule(MAINNET_SHADOW_WHITELIST_HEIGHT,

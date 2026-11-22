@@ -400,7 +400,7 @@ class QuantumReturnBackupTest(TransitionTFinalTestBase, BitcoinTestFramework):
 
         self.log.info("The choice order: a label does not make the claim payout key, the configured one does")
         wo = self.make_wallet("wclaim")
-        older = wo.getnewquantumaddress("some older key")["address"]
+        wo.getnewquantumaddress("some older key")
         claim = wo.getnewquantumaddress("PoW - Quantum Claim Address")["address"]
         newest_pos = wo.getnewquantumaddress(LABEL)["address"]
         # the label ranking (as before) puts the PoS-labelled key first when nothing else identifies a claim key
@@ -408,7 +408,7 @@ class QuantumReturnBackupTest(TransitionTFinalTestBase, BitcoinTestFramework):
         assert_equal(result["address"], newest_pos)
         assert_equal(result["created"], False)
         wp = self.make_wallet("wclaimtwo")
-        older = wp.getnewquantumaddress("some older key")["address"]
+        wp.getnewquantumaddress("some older key")
         claim = wp.getnewquantumaddress("PoW - Quantum Claim Address")["address"]
         self.restart_node(0, extra_args=self.base_args + ["-qqpowpayoutaddress=" + claim])
         wp = node.get_wallet_rpc("wclaimtwo")

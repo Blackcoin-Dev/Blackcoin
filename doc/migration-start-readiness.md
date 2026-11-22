@@ -14,13 +14,16 @@ The last Gold Rush block is height 6,192,999 (G, `nGoldRushEndHeight`, set from
 | What | Before G+1 | From G+1 | Where |
 |---|---|---|---|
 | Stake weight of an ordinary liquid legacy stake (including a legacy self-stake) | full value | value times 2,500 out of 10,000, rounded down | `src/pos.cpp` 127 to 134, `EffectiveStakeWeight` |
-| Stake weight of a tiered quantum stake | not applicable | between 2,500 and 10,000 out of 10,000 of its value, from its program's unbonding period | `src/pos.cpp` 140 to 142 |
+| Stake weight of a tiered quantum stake | not applicable | its value times a tier multiplier between 2,500 and 10,000 out of 10,000 (from its program's unbonding period), and then times the pool factor: 10,000 out of 10,000 for an owner stake, 8,000 out of 10,000 for a cold stake (so a tiered cold stake weighs 20% to 80% of its value before rounding) | `src/pos.cpp` 130 to 142 and 45 to 57, `src/test/data/staking_mr_table.h` 15 |
 | Kernel product (target times weight) | 256-bit wraparound | full width (512-bit) comparison | `src/pos.cpp` 277 to 290 |
 | Quantum witness spends and the stake tiers | not active | active | `src/shadow_schedule.cpp` 47 to 66, `src/validation.cpp` 3998 to 4008 |
 
-The effect on timing comes from the first two rows. A node that stakes an ordinary legacy output has a
-quarter of the chance per second after G+1 that it had before, if the difficulty target is unchanged.
-The target is changed only by the blocks that are produced (`src/pow.cpp` 56 to 94), so the network
+The effect on timing comes from the first two rows and from the arithmetic switch in the third. A node
+that stakes an ordinary legacy output has a quarter of the chance per second after G+1 that it had
+before, but only while the model conditions in the assumptions below hold: the difficulty target is
+unchanged, the legacy wraparound before the switch was negligible, the full-width comparison does not
+saturate after it (every hash accepted), and weight rounding is negligible. Where one of those fails the
+table below does not apply. The target is changed only by the blocks that are produced (`src/pow.cpp` 56 to 94), so the network
 cannot react before the first slow blocks exist.
 
 ## Expected first interval
@@ -31,22 +34,28 @@ Assumptions (all of them):
    (`src/kernel/chainparams.cpp` 109 to 111).
 2. The target in force at G+1 is the one that produced normal 64 second blocks from the pre-switch
    stake. The chance per second of finding a block is proportional to target times effective weight, so
-   the expected spacing scales as one over the effective weight.
+   the expected spacing scales as one over the effective weight. This holds only if the legacy
+   wraparound before the switch was negligible, the full-width comparison after the switch does not
+   saturate (accept every hash), and weight rounding is negligible. Where one of these fails, the
+   proportional scaling and the tables below do not apply.
 3. Nobody adds or removes stake except as stated. Stake on nodes that are not running a
    consensus-compatible release, or that are offline, produces no valid blocks and counts as gone.
-4. The 4-fold figure is an initial expectation. It holds while the target is unchanged and the
-   participating liquid stake is unchanged, and it is not a multiplier for later blocks: each block
-   moves the target.
+4. The 4-fold figure is an initial expectation. It holds while the target is unchanged, the
+   participating stake weight is unchanged and assumption 2 holds, and it is not a multiplier for later
+   blocks: each block moves the target.
 5. The numbers below are expected values from a mean-field recurrence (the next expected spacing is
    this one divided by the factor the target just grew by). Real spacings are random and the first
-   blocks can be much longer or shorter than the mean. Compact rounding of the target and the limit
-   `posLimitV2` are not significant at these sizes and are ignored. Block times are whole seconds.
+   blocks can be much longer or shorter than the mean. Compact rounding of the target is ignored, and
+   the target is assumed to have ample headroom below the limit `posLimitV2`, so the limit never caps
+   the rise (the unit test starts from a synthetic target, so it does not show this for mainnet; check
+   it before relying on the table). Block times are whole seconds.
 
 Let `u` be the share of the pre-switch staking weight that is on upgraded nodes that are online at G+1,
-and `w` the average weight factor of that stake after the switch: 0.25 if all of it is ordinary liquid
-legacy stake, up to 1.0 if all of it is tiered at full strength. The expected first interval is
-`64 / (u * w)` seconds. For ordinary legacy stake on every producer (`u = 1`, `w = 0.25`) that is
-256 seconds, the four-fold expectation.
+and `w` the value-weighted average effective weight factor of that stake after the switch, including
+the pool factor: 0.25 if all of it is ordinary liquid legacy stake, up to 1.0 for direct (owner) stake
+tiered at full strength, and at most 0.8 for a tiered cold stake. The expected first interval is
+`64 / (u * w)` seconds. For ordinary legacy stake that is all of the participating weight (`u = 1`,
+`w = 0.25`) that is 256 seconds, the four-fold expectation.
 
 ### The retarget rule, as the code implements it
 
@@ -64,24 +73,26 @@ of 64 seconds, and the time those blocks take in total. The recurrence is run by
 `migration_start_expected_interval_follows_the_retarget_rule` (`src/test/blackcoin_tests.cpp`), which
 calls the real `CalculateNextTargetRequired`, so every cell is asserted by code.
 
-| Upgraded and online (`u`) | All ordinary liquid legacy (`w` = 0.25) | Average weight factor 0.5 | Average weight factor 1.0 |
+| Participating stake-weight share, upgraded and online (`u`) | All ordinary liquid legacy (`w` = 0.25) | Average weight factor 0.5 | Average weight factor 1.0 |
 |---|---|---|---|
 | 100% | 256 s; 16 blocks; 29 min | 128 s; 13 blocks; 19 min | 64 s; no easing needed |
 | 75% | 341 s; 17 blocks; 33 min | 171 s; 15 blocks; 24 min | 85 s; 8 blocks; 10 min |
 | 50% | 512 s; 17 blocks; 38 min | 256 s; 16 blocks; 29 min | 128 s; 13 blocks; 19 min |
 | 25% | 1,024 s; 18 blocks; 55 min | 512 s; 17 blocks; 38 min | 256 s; 16 blocks; 29 min |
 
-How to read it: with every producer upgraded and all stake ordinary liquid legacy, the expected first
-block takes about four minutes, and the expected spacing has come back to within 10% of normal after
-about 16 blocks and half an hour. Each producer that is missing at G+1 lengthens the first interval in
-proportion (half the producers means twice as long) and adds one or two blocks to the recovery. Below
+How to read it: with all participating weight upgraded and online and all of it ordinary liquid legacy
+stake, the expected first block takes about four minutes, and the expected spacing has come back to
+within 10% of normal after about 16 blocks and half an hour. Each share of participating stake weight
+that is missing at G+1 lengthens the first interval in proportion (half the weight means twice as
+long); the table gives the effect on the number of recovery blocks, which differs by cell. Losing half
+the nodes does not necessarily lose half the weight. Below
 about a quarter of the pre-switch weight the first interval is over fifteen minutes, one interval can
 be a good deal longer than the mean, and the spacing cap of ten target spacings (640 seconds) limits
 how fast the target can ease from a single very long block.
 
-### What loss of producers does
+### What loss of stake weight does
 
-A producer that is not running at G+1 does not slow the chain by itself; the effect is the same as the
+A node that is not running at G+1 does not slow the chain by itself; the effect is the same as the
 share `u` being lower. If it comes back during the recovery, the chain speeds up, and the target,
 which was raised for fewer producers, then lowers again over the following blocks. While any stake that
 satisfies the rules is online and staking, blocks keep being produced, only more slowly the less there
@@ -92,23 +103,26 @@ is; the recurrence above shows how quickly the target follows.
 - The node runs a release that implements the Migration rules (30.1.6 or later) and shows the expected
   version in `getnetworkinfo`.
 - It is fully synced: `getblockchaininfo` reports `initialblockdownload` false and the tip is recent.
-- Staking is enabled and the worker runs: `getstakinginfo` shows `enabled`, `worker_running`, and
-  `staking_state` other than `disabled`, `locked` or `error`.
+- Staking is enabled, the worker runs and the data is current: `getstakinginfo` shows `staking` true
+  (the node reports it only when `enabled`, `worker_running` and `eligible` are true and
+  `staking_state` is `searching`) and `staking_snapshot_current` true. A state of `syncing` or
+  `starting`, or a stale snapshot, does not count even if `eligible` is true from cached data.
 - An encrypted wallet is unlocked for staking only (`walletpassphrase <passphrase> <seconds> true`),
   with a timeout that outlasts the window you intend to watch, or the wallet is not locked.
 - It has peers in both directions: `getnetworkinfo` and `getpeerinfo` show several connections, and at
   least one is outbound.
 - There are coins that can stake: `getstakinginfo` shows a positive `weight` and `eligible` true.
-- The system clock is correct; Proof of Stake block times must not be in the future.
+- The system clock is correct; Proof of Stake block times must be within the permitted future drift
+  (`FutureDrift`, checked in `src/validation.cpp`).
 
 ## Watch after G+1, and when to act
 
 - `getblockchaininfo` and `getstakinginfo` (`blocks`, `difficulty`, `expectedtime`, `netstakeweight`):
-  the tip should keep moving, slowly at first, and `difficulty` should fall block by block as the
-  target rises.
+  the tip should keep moving, slowly at first, and in the model `difficulty` trends down as the target
+  rises (single blocks vary, and a block after a short gap can lower the target).
 - Expect the first intervals in the table above and treat a single long gap as normal. Act only if the
-  tip has not moved for much longer than the table's first interval for your situation (for example
-  more than 45 minutes with most producers upgraded), or if your node's tip differs from other nodes you
+  tip has not moved for much longer than the table's first interval for your situation (for example,
+  under the model assumptions above, more than 45 minutes with most participating weight upgraded), or if your node's tip differs from other nodes you
   trust.
 - What to do then: confirm the node is synced and has peers, that staking is enabled and the wallet is
   unlocked for staking, restart the wallet or node only if one of those is wrong, and do not reduce your

@@ -213,9 +213,11 @@ BOOST_AUTO_TEST_CASE(mainnet_migration_start_quarters_ordinary_legacy_stake_weig
     // from block G+1 (G = 6,192,999, the last Gold Rush block) the stake weight of a kernel is its value times the
     // liquid multiplier 2,500/10,000, and the kernel product is compared in full width. That is the weight of an
     // ordinary liquid legacy stake, including an ordinary legacy self-stake; a tiered program overrides the
-    // multiplier (GetStakeWeightContext in pos.cpp), so a tiered stake can weigh more, up to its full value. The
-    // difficulty target changes only from produced blocks (pow.cpp), so with an unchanged target and unchanged
-    // participating liquid stake the first expected wait is about four times the usual one; that is the initial
+    // tier multiplier (GetStakeWeightContext in pos.cpp), so a tiered stake can weigh more, and a cold stake is
+    // further multiplied by the pool factor 8,000/10,000. The difficulty target changes only from produced blocks
+    // (pow.cpp), so with an unchanged target and unchanged participating stake weight, and only if the legacy
+    // wraparound before the switch is negligible, the full-width comparison does not saturate and weight rounding
+    // is negligible, the first expected wait is about four times the usual one; that is the initial
     // expectation only, not a multiplier for later blocks (see migration_start_expected_interval_follows_the_retarget_rule).
     SetShadowTestSchedule(/*whitelist_height=*/1, /*reward_start_height=*/2, /*gold_rush_blocks=*/10);
     const auto main_params = CreateChainParams(ArgsManager{}, ChainType::MAIN);

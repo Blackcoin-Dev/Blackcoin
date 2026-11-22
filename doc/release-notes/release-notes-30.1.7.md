@@ -355,18 +355,21 @@ outputs the wallet stakes, what it reports, and what it tells the user to do.
   them. The last Gold Rush block is 6,192,999 (G). From block G+1 the stake weight of an ordinary
   liquid legacy stake, including an ordinary legacy self-stake, is its value times the liquid
   multiplier of 2,500 out of 10,000, a quarter of its value (a tiered quantum program sets its own
-  multiplier, between 2,500 and 10,000 out of 10,000), and the kernel product is compared in full
+  tier multiplier, between 2,500 and 10,000 out of 10,000, and a cold stake is then further multiplied
+  by the pool factor of 8,000 out of 10,000), and the kernel product is compared in full
   width instead of the wraparound arithmetic used through G. The difficulty target is adjusted only
-  from blocks that were produced, and waiting alone does not lower it. With an unchanged target and
-  the same ordinary liquid legacy stake online, the first expected block interval after G is about
-  four times the usual one. That is the initial expectation, not a multiplier for later blocks: with
+  from blocks that were produced, and waiting alone does not lower it. In a model that assumes an unchanged
+  target, the same ordinary liquid legacy stake weight online, negligible legacy wraparound before the
+  switch, no saturation of the full-width comparison after it and negligible weight rounding, the first
+  expected block interval after G is about four times the usual one; where those conditions fail the
+  model does not apply. That is the initial expectation, not a multiplier for later blocks: with
   the retarget interval of 15, a block that follows four target spacings raises the target by about
   22/16, so the expected spacing falls block by block (in the model of
   `doc/migration-start-readiness.md`, to within 10% of normal in about 16 blocks, roughly half an
-  hour, if every producer is online). Fewer producers online lengthen the first interval in
-  proportion. Wallets that stake in that window are not at fault and need no action; keep them online
+  hour, if all the participating weight is online, and with ample target headroom). A smaller share of
+  participating stake weight online lengthens the first interval in proportion. Wallets that stake in that window are not at fault and need no action; keep them online
   and unlocked for staking. `doc/migration-start-readiness.md` has the calculation, a table for 100%,
-  75%, 50% and 25% of producers upgraded and online, and the checks to make before and after the
+  75%, 50% and 25% of participating stake weight upgraded and online, and the checks to make before and after the
   height.
 
 ## Behaviour that changes before the end of Gold Rush

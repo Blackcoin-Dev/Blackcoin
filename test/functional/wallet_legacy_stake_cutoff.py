@@ -98,8 +98,13 @@ class LegacyStakeCutoffTest(TransitionTFinalTestBase, BitcoinTestFramework):
         # Mature legacy kernels exist (the wallet simply refuses to use them).
         assert len(self.stake_inputs(wallet, [stake_addr])) > 0
         wallet.staking(True)
-        self.wait_until(lambda: wallet.getstakinginfo()["staking_state"] == "no_eligible_coins", timeout=60)
+        # The worker sets "searching" at the top of every iteration and "no_eligible_coins" only while a search
+        # slot of that iteration runs, so with a mock clock that does not move the second state is visible for
+        # one short moment: do not poll for it. The snapshot being current at this tip is the stable sign that
+        # the worker has looked at the wallet.
+        self.wait_until(lambda: wallet.getstakinginfo()["staking_snapshot_current"], timeout=60)
         info = wallet.getstakinginfo()
+        assert info["staking_state"] in ("searching", "no_eligible_coins"), info["staking_state"]
         assert_equal(info["eligible"], False)
         assert_equal(info["weight"], 0)
         for _ in range(12):

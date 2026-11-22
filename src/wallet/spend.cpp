@@ -3051,7 +3051,12 @@ util::Result<CreatedTransactionResult> CreateUTXOOptimizationTransaction(CWallet
 
     CAmount available_coins = 0;
     if (from_address) {
-        for (const COutput& out : AvailableCoins(wallet, &coin_control).All()) {
+        // The inputs are chosen here by the wallet, not by the user: naming an address is not an explicit
+        // authorization to spend an output the final stake reserve holds back, so the scan leaves them out and
+        // the amount to split comes from what is left.
+        CoinFilterParams from_params;
+        from_params.avoid_final_stake_reserve = true;
+        for (const COutput& out : AvailableCoins(wallet, &coin_control, /*feerate=*/std::nullopt, from_params).All()) {
             CTxDestination out_dest;
             if (ExtractDestination(out.txout.scriptPubKey, out_dest) && out_dest == *from_address) {
                 coin_control.Select(out.outpoint);
@@ -3061,6 +3066,13 @@ util::Result<CreatedTransactionResult> CreateUTXOOptimizationTransaction(CWallet
         coin_control.m_allow_other_inputs = false;
     } else {
         available_coins = GetBalance(wallet).m_mine_trusted;
+        // The transaction below selects automatically and leaves the reserve alone, so it cannot split that value.
+        if (const std::set<COutPoint> reserve = FinalStakeReserveEnforcedOutpoints(wallet); !reserve.empty()) {
+            for (const COutput& out : AvailableCoins(wallet, &coin_control).All()) {
+                if (reserve.count(out.outpoint)) available_coins -= out.txout.nValue;
+            }
+            available_coins = std::max<CAmount>(available_coins, 0);
+        }
     }
 
     if (available_coins == 0) {

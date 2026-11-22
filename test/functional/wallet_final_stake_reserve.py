@@ -285,6 +285,16 @@ class FinalStakeReserveTest(TransitionTFinalTestBase, BitcoinTestFramework):
         swept = wallet.sendall(recipients=[destination], options={"add_to_wallet": False})
         spent = {(i["txid"], i["vout"]) for i in node.decoderawtransaction(swept["hex"])["vin"]}
         assert_equal(spent, {free_key})
+        # The UTXO optimiser chooses its inputs itself: naming the reserved output's address is no authorization to
+        # spend it, and nothing is split from there. The same call for the free output's address, and for the whole
+        # wallet, uses the unreserved output only.
+        split = free_value / 4
+        assert_raises_rpc_error(-6, "No available coins to optimize", wallet.optimizeutxoset, destination, split, False, outputs[reserved_key]["address"])
+        for from_address in (outputs[free_key]["address"], None):
+            args = [destination, split, False] + ([from_address] if from_address else [])
+            optimized = wallet.optimizeutxoset(*args)
+            spent = {(i["txid"], i["vout"]) for i in node.decoderawtransaction(optimized["tx"])["vin"]}
+            assert_equal(spent, {free_key})
         # A payment that one output covers is funded from the unreserved one.
         sent = wallet.send(outputs=[{destination: free_value / 2}], options={"change_address": destination})
         spent = {(i["txid"], i["vout"]) for i in node.decoderawtransaction(wallet.gettransaction(sent["txid"])["hex"])["vin"]}

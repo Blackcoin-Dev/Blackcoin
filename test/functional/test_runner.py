@@ -191,7 +191,7 @@ BASE_SCRIPTS = [
     'feature_goldrush_height_schedule_multinode.py',
     'feature_goldrush_legacy_compat.py',
     'feature_goldrush_local_mining_policy.py',
-    'feature_goldrush_mixed_version.py',
+    'feature_goldrush_mixed_version.py --legacy-wallet',
     'feature_goldrush_v3014_wallet_upgrade.py --descriptors',
     'feature_goldrush_v3014_qqp2_upgrade.py --descriptors',
     'feature_goldrush_v3014_same_anchor_mixed.py --descriptors',

@@ -215,7 +215,8 @@ BOOST_AUTO_TEST_CASE(mainnet_migration_start_quarters_ordinary_legacy_stake_weig
     // ordinary liquid legacy stake, including an ordinary legacy self-stake; a tiered program overrides the
     // tier multiplier (GetStakeWeightContext in pos.cpp), so a tiered stake can weigh more, and a cold stake is
     // further multiplied by the pool factor 8,000/10,000. The difficulty target changes only from produced blocks
-    // (pow.cpp), so with an unchanged target and unchanged participating stake weight, and only if the legacy
+    // (pow.cpp), so with an unchanged target and the same ordinary liquid legacy outputs online and eligible with unchanged
+    // principal, and only if the legacy
     // wraparound before the switch is negligible, the full-width comparison does not saturate and weight rounding
     // is negligible, the first expected wait is about four times the usual one; that is the initial
     // expectation only, not a multiplier for later blocks (see migration_start_expected_interval_follows_the_retarget_rule).

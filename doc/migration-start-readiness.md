@@ -40,9 +40,9 @@ Assumptions (all of them):
    proportional scaling and the tables below do not apply.
 3. Nobody adds or removes stake except as stated. Stake on nodes that are not running a
    consensus-compatible release, or that are offline, produces no valid blocks and counts as gone.
-4. The 4-fold figure is an initial expectation. It holds while the target is unchanged, the
-   participating stake weight is unchanged and assumption 2 holds, and it is not a multiplier for later
-   blocks: each block moves the target.
+4. The 4-fold figure is an initial expectation. It holds while the target is unchanged, the same
+   ordinary liquid legacy outputs remain online and eligible, with unchanged principal, and assumption 2
+   holds, and it is not a multiplier for later blocks: each block moves the target.
 5. The numbers below are expected values from a mean-field recurrence (the next expected spacing is
    this one divided by the factor the target just grew by). Real spacings are random and the first
    blocks can be much longer or shorter than the mean. Compact rounding of the target is ignored, and
@@ -64,7 +64,7 @@ between the last two Proof of Stake blocks, counted as at most ten target spacin
 to 94; with interval 15 the rule is `((interval - 1) * spacing + 2 * A) / ((interval + 1) * spacing)`).
 A block after exactly 64 seconds leaves the target alone; a block after 256 seconds (four spacings)
 raises it by 22/16, about 1.375; a block after 640 seconds or more raises it by at most 34/16, 2.125.
-Waiting without a block changes nothing.
+Waiting without a block changes nothing. Negative gaps are treated as 64 seconds.
 
 ### Table
 
@@ -85,18 +85,16 @@ stake, the expected first block takes about four minutes, and the expected spaci
 within 10% of normal after about 16 blocks and half an hour. Each share of participating stake weight
 that is missing at G+1 lengthens the first interval in proportion (half the weight means twice as
 long); the table gives the effect on the number of recovery blocks, which differs by cell. Losing half
-the nodes does not necessarily lose half the weight. Below
-about a quarter of the pre-switch weight the first interval is over fifteen minutes, one interval can
-be a good deal longer than the mean, and the spacing cap of ten target spacings (640 seconds) limits
-how fast the target can ease from a single very long block.
+the nodes does not necessarily lose half the weight. Under the model, the first expected interval
+exceeds fifteen minutes when `u * w < 64/900`. A single interval can be much longer than its mean; the
+640-second retarget input cap limits adjustment after a long gap.
 
 ### What loss of stake weight does
 
-A node that is not running at G+1 does not slow the chain by itself; the effect is the same as the
-share `u` being lower. If it comes back during the recovery, the chain speeds up, and the target,
-which was raised for fewer producers, then lowers again over the following blocks. While any stake that
-satisfies the rules is online and staking, blocks keep being produced, only more slowly the less there
-is; the recurrence above shows how quickly the target follows.
+Offline stake reduces `u`. Returning eligible stake shortens the model's expected interval at the
+current target. Subsequent target adjustments depend on observed PoS timestamp gaps: below 64 seconds
+lowers the target, above 64 raises it, and exactly 64 leaves it unchanged, subject to rounding and
+limits. Negative gaps are treated as 64 seconds.
 
 ## Check on every staking node before G+1
 
@@ -109,8 +107,9 @@ is; the recurrence above shows how quickly the target follows.
   `starting`, or a stale snapshot, does not count even if `eligible` is true from cached data.
 - An encrypted wallet is unlocked for staking only (`walletpassphrase <passphrase> <seconds> true`),
   with a timeout that outlasts the window you intend to watch, or the wallet is not locked.
-- It has peers in both directions: `getnetworkinfo` and `getpeerinfo` show several connections, and at
-  least one is outbound.
+- Check peer connectivity with `getnetworkinfo` (`connections`, `connections_in`, `connections_out`)
+  and `getpeerinfo` (`inbound`). Maintain several peers, including outbound connections; inbound
+  connections are not required for staking.
 - There are coins that can stake: `getstakinginfo` shows a positive `weight` and `eligible` true.
 - The system clock is correct; Proof of Stake block times must be within the permitted future drift
   (`FutureDrift`, checked in `src/validation.cpp`).
@@ -120,16 +119,20 @@ is; the recurrence above shows how quickly the target follows.
 - `getblockchaininfo` and `getstakinginfo` (`blocks`, `difficulty`, `expectedtime`, `netstakeweight`):
   the tip should keep moving, slowly at first, and in the model `difficulty` trends down as the target
   rises (single blocks vary, and a block after a short gap can lower the target).
-- Expect the first intervals in the table above and treat a single long gap as normal. Act only if the
+- Use `getblockchaininfo.blocks` for active-tip progress. `getstakinginfo.blocks` can describe an older
+  snapshot. `expectedtime` estimates this wallet's reward wait, not the network's next-block interval;
+  `netstakeweight` is a historical estimate.
+- Expect the first intervals in the table above and treat a single long gap as normal. Investigate unhealthy
+  staking or connectivity immediately. Investigate a network-wide stall if the
   tip has not moved for much longer than the table's first interval for your situation (for example,
   under the model assumptions above, more than 45 minutes with most participating weight upgraded), or if your node's tip differs from other nodes you
   trust.
 - What to do then: confirm the node is synced and has peers, that staking is enabled and the wallet is
   unlocked for staking, restart the wallet or node only if one of those is wrong, and do not reduce your
   own stake or move coins in a hurry. A wallet that stakes in this window is not at fault.
-- Legacy stake that should keep earning can be moved to tiered quantum stake after G+1; that raises its
-  weight above the liquid quarter, but it is a separate decision with its own lock period and is not
-  required for the chain to continue.
+- Moving to a tiered quantum stake changes weight according to its effective unbonding period and pool
+  factor. It does not always raise weight above 25%. Review the lock period and resulting weight before
+  moving coins; tiering is not required for chain continuation.
 
 ## Tests
 

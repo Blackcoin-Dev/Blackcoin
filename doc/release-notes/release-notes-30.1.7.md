@@ -359,7 +359,7 @@ outputs the wallet stakes, what it reports, and what it tells the user to do.
   by the pool factor of 8,000 out of 10,000), and the kernel product is compared in full
   width instead of the wraparound arithmetic used through G. The difficulty target is adjusted only
   from blocks that were produced, and waiting alone does not lower it. In a model that assumes an unchanged
-  target, the same ordinary liquid legacy stake weight online, negligible legacy wraparound before the
+  target, the same ordinary liquid legacy outputs remaining online and eligible with unchanged principal, negligible legacy wraparound before the
   switch, no saturation of the full-width comparison after it and negligible weight rounding, the first
   expected block interval after G is about four times the usual one; where those conditions fail the
   model does not apply. That is the initial expectation, not a multiplier for later blocks: with

@@ -837,6 +837,24 @@ struct QuantumColdStakeDelegationRecord
     }
 };
 
+/** A quantum key made for the legacy-stake return address whose backup has not succeeded yet (wallet record
+ *  "quantumreturnpending", skipped by older versions). It is written in the same database transaction as the
+ *  key, names the key, says what consent created it, and exists until the destination is activated. */
+struct QuantumStakeReturnPendingRecord
+{
+    uint32_t version{1};
+    std::vector<unsigned char> witness_program;
+    //! Which consent made the key: "explicit" (setquantumstakereturn with allow_new_quantum_key) or "automatic"
+    //! (-qqallowautokeycreation).
+    std::string consent;
+    int64_t creation_time{0};
+
+    SERIALIZE_METHODS(QuantumStakeReturnPendingRecord, obj)
+    {
+        READWRITE(obj.version, obj.witness_program, obj.consent, obj.creation_time);
+    }
+};
+
 struct QuantumColdStakeDelegationInfo
 {
     CTxDestination destination;
@@ -1385,7 +1403,9 @@ private:
     bool WriteAddressBookWithDB(WalletBatch& batch, const CTxDestination& address, const std::string& name, const std::optional<AddressPurpose>& purpose) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     bool SetAddressBookLocked(const CTxDestination& address, const std::string& name, const std::optional<AddressPurpose>& purpose, AddressBookNotification& notification) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
 
-    util::Result<CTxDestination> AddQuantumKeyInternal(const std::vector<unsigned char>& public_key, const CKeyingMaterial& private_key, const std::string& label, int64_t creation_time, bool record_as_receive, const std::optional<CTxDestination>& receive_destination);
+    //! stake_return_consent, when not null, also writes the pending-return record for the new key in the same
+    //! database transaction and publishes it with the key (see QuantumStakeReturnPendingRecord).
+    util::Result<CTxDestination> AddQuantumKeyInternal(const std::vector<unsigned char>& public_key, const CKeyingMaterial& private_key, const std::string& label, int64_t creation_time, bool record_as_receive, const std::optional<CTxDestination>& receive_destination, const std::string* stake_return_consent = nullptr);
 
     //! Unsets a wallet flag and saves it to disk
     void UnsetWalletFlagWithDB(WalletBatch& batch, uint64_t flag);
@@ -2253,6 +2273,18 @@ public:
     //! Quantum address that receives the principal and reward of a legacy stake made in the last
     //! blocks of Migration (record "quantumstakereturn", skipped by older versions); empty when unset.
     std::string m_quantum_stake_return GUARDED_BY(cs_wallet);
+    //! The key made for the return address that is not yet in a verified backup, while it is not the active
+    //! destination (record "quantumreturnpending"). Set with the key, cleared with the activation.
+    std::optional<QuantumStakeReturnPendingRecord> m_quantum_return_pending GUARDED_BY(cs_wallet);
+    //! The last backup error of that pending key, for status output. Not persisted.
+    std::string m_quantum_return_pending_error GUARDED_BY(cs_wallet);
+    //! Serializes every preparation of the return destination of this wallet (choice, creation, backup and
+    //! activation), so concurrent callers produce one key. Taken before cs_wallet and never with cs_main held.
+    Mutex m_quantum_return_prepare_mutex;
+    //! The wallet's own (automatic) retry of a failed backup waits until this steady-clock time, so a backup
+    //! that keeps failing is not attempted on every pass of the maintenance and staking threads. Explicit calls
+    //! ignore it. Not persisted.
+    SteadyClock::time_point m_quantum_return_retry_at GUARDED_BY(m_quantum_return_prepare_mutex){};
     std::map<std::vector<unsigned char>, int> m_redelegation_last_auto_attempt_height GUARDED_BY(cs_wallet);
     std::map<std::vector<unsigned char>, int> m_redelegation_last_auto_success_height GUARDED_BY(cs_wallet);
     std::map<std::vector<unsigned char>, int> m_redelegation_last_win_height GUARDED_BY(cs_wallet);
@@ -2563,6 +2595,21 @@ public:
     util::Result<CTxDestination> GetNewDestination(const OutputType type, const std::string label, bool* reserved = nullptr);
     util::Result<CTxDestination> GetNewChangeDestination(const OutputType type);
     util::Result<CTxDestination> GetNewQuantumDestination(const std::string label);
+    /** A new quantum key for the legacy-stake return address with its pending-return record, both in one
+     *  database transaction. consent is "explicit" or "automatic". */
+    util::Result<CTxDestination> AddQuantumStakeReturnKey(const std::string& label, const std::string& consent);
+    /** The witness program of every quantum key the wallet holds. */
+    std::set<std::vector<unsigned char>> GetQuantumKeyPrograms() const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    /** Whether dest is the key made for the return address that is still waiting for its backup. */
+    bool IsQuantumStakeReturnPendingKey(const CTxDestination& dest) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    /** Load the pending-return record. Refused (false) when it names no key of this wallet. */
+    bool LoadQuantumStakeReturnPending(const QuantumStakeReturnPendingRecord& record) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    /** The quantum key the wallet records as its Gold Rush claim payout key, or an invalid destination:
+     *  the payout key bound for the claim miner (configured, restored or created), else the configured
+     *  -qqpowpayoutaddress, else the one key that confirmed synthetic Gold Rush payouts in this wallet were
+     *  paid to (the oldest if several). An address-book label alone never identifies it. Only an ordinary
+     *  direct quantum key with a durably stored key of this wallet qualifies. */
+    CTxDestination GetRecordedPowPayoutKey() const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     util::Result<CTxDestination> GetNewTieredQuantumDestination(const std::string label, uint16_t unbonding_blocks);
     util::Result<CTxDestination> GetNewQuantumChangeDestination();
     util::Result<CTxDestination> AddQuantumKey(const std::vector<unsigned char>& public_key, const CKeyingMaterial& private_key, const std::string& label, int64_t creation_time, bool record_as_receive = true);

@@ -17,6 +17,7 @@
 #include <wallet/coincontrol.h>
 #include <wallet/fees.h>
 #include <wallet/migration_batch.h>
+#include <wallet/quantum_return_backup.h>
 #include <wallet/receive.h>
 #include <wallet/redelegation.h>
 #include <wallet/staking.h>
@@ -39,6 +40,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstdlib>
 #include <limits>
 #include <map>
 #include <set>
@@ -2461,6 +2463,13 @@ std::string QuantumStakeReturnBackupAction()
            "random and are not derived from a seed, so a backup made before this key was created cannot recover coins paid to it.";
 }
 
+std::string QuantumStakeReturnPendingAction()
+{
+    return "Wait for the wallet's own retry, or call setquantumstakereturn again after fixing the backup directory "
+           "(-quantumkeybackupdir). The key stays in the wallet and is retried as it is; it becomes the return address only "
+           "after a verified wallet backup. The previous return address, if any, stays in use.";
+}
+
 std::string LegacyStakingNotice(const Consensus::Params& consensus, int next_height,
                                 const LegacyStakeQuantumReturn& quantum_return)
 {
@@ -2498,6 +2507,16 @@ std::string LegacyStakingNotice(const Consensus::Params& consensus, int next_hei
     } else {
         ready = strprintf("Return address NOT READY: %s Until it is, this wallet will not stake legacy coins from height %d.",
                           quantum_return.reason, first_quantum);
+    }
+    // A key made for the return address that is not in a verified backup yet: said apart from the readiness of
+    // the active destination above.
+    if (quantum_return.pending) {
+        ready += quantum_return.pending_error.empty()
+            ? strprintf(" A new return key (%s) is waiting for its first verified wallet backup before it becomes the "
+                        "return address.", quantum_return.pending_address)
+            : strprintf(" A new return key (%s) is NOT active: its wallet backup failed (%s). It stays pending and the "
+                        "backup is retried with the same key; fix the backup directory (-quantumkeybackupdir) or run "
+                        "setquantumstakereturn again.", quantum_return.pending_address, quantum_return.pending_error);
     }
     // The opportunistic window opens earlier: with a ready return address a legacy stake is already paid as
     // quantum coins; without one it stakes as before, and the return address is the action to take.
@@ -2549,6 +2568,17 @@ std::optional<CTxDestination> ChooseLegacyStakeQuantumReturn(const std::vector<Q
     return best;
 }
 
+QuantumReturnChoice ChooseQuantumStakeReturn(const CTxDestination& saved, const CTxDestination& configured,
+                                             const CTxDestination& claim_key,
+                                             const std::vector<QuantumReturnCandidate>& candidates)
+{
+    if (IsValidDestination(saved)) return {QuantumReturnSource::SAVED, saved};
+    if (IsValidDestination(configured)) return {QuantumReturnSource::CONFIGURED, configured};
+    if (IsValidDestination(claim_key)) return {QuantumReturnSource::CLAIM_KEY, claim_key};
+    if (const auto pick = ChooseLegacyStakeQuantumReturn(candidates)) return {QuantumReturnSource::RANKED, *pick};
+    return {};
+}
+
 namespace {
 //! Why dest cannot be the quantum stake return address; empty when it can.
 std::string QuantumStakeReturnProblem(const CWallet& wallet, const CTxDestination& dest)
@@ -2561,6 +2591,8 @@ std::string QuantumStakeReturnProblem(const CWallet& wallet, const CTxDestinatio
     const auto info = wallet.GetQuantumKeyInfo(dest);
     if (!info) return "it is not backed by a quantum key of this wallet.";
     if (!info->durably_stored) return "its quantum key is not durably stored yet.";
+    // A key made for the return address stays out of every use as the destination until its backup succeeded.
+    if (wallet.IsQuantumStakeReturnPendingKey(dest)) return "it is a new key still waiting for its first verified wallet backup.";
     return "";
 }
 } // namespace
@@ -2569,6 +2601,11 @@ LegacyStakeQuantumReturn ResolveLegacyStakeQuantumReturn(const CWallet& wallet)
 {
     AssertLockHeld(wallet.cs_wallet);
     LegacyStakeQuantumReturn result;
+    if (wallet.m_quantum_return_pending) {
+        result.pending = true;
+        result.pending_address = EncodeDestination(WitnessUnknown{QUANTUM_MIGRATION_WITNESS_VERSION, wallet.m_quantum_return_pending->witness_program});
+        result.pending_error = wallet.m_quantum_return_pending_error;
+    }
     if (wallet.IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS)) {
         result.reason = "this wallet has no private keys.";
         return result;
@@ -2646,7 +2683,136 @@ bool WalletHoldsLegacyStakableCoin(const CWallet& wallet)
     return false;
 }
 
-QuantumStakeReturnPreparation PrepareQuantumStakeReturn(CWallet& wallet, QuantumStakeReturnTrigger trigger)
+namespace {
+//! How long the wallet's own retry waits after a failed backup of the pending key.
+constexpr std::chrono::seconds QUANTUM_RETURN_AUTOMATIC_RETRY_INTERVAL{60};
+
+//! A crash point for functional tests: on a test chain, with -quantumreturncrashpoint=<point>, the process
+//! ends here without any cleanup, as a power loss would. Never reachable on a production chain.
+void QuantumReturnCrashPoint(const CWallet& wallet, const char* point)
+{
+    if (!Params().IsTestChain()) return;
+    if (gArgs.GetArg("-quantumreturncrashpoint", "") != point) return;
+    wallet.WalletLogPrintf("Quantum stake return test crash point %s reached; exiting without cleanup.\n", point);
+    std::_Exit(7);
+}
+
+/** Back the wallet up, with every quantum key reopened and challenged, into the wallet's backup directory and
+ *  record the generation next to it. No wallet or chain lock is held: this is file system work. */
+bool BackupQuantumReturnKey(CWallet& wallet, std::string& error)
+{
+    AssertLockNotHeld(::cs_main);
+    AssertLockNotHeld(wallet.cs_wallet);
+    const fs::path directory = QuantumKeyBackupDirectory(wallet.GetName());
+    if (!EnsureQuantumKeyBackupDirectory(directory, error)) return false;
+    const QuantumKeyBackupKeySet keys = WITH_LOCK(wallet.cs_wallet, return wallet.GetQuantumKeyPrograms());
+    const std::optional<int> height = wallet.HaveChain() ? wallet.chain().getHeight() : std::nullopt;
+    const std::string file_name = QuantumKeyBackupFileName(GetTime(), height.value_or(0), NewQuantumKeyBackupSuffix());
+    const uint64_t sequence = NextQuantumKeyBackupSequence(directory);
+    bilingual_str backup_error;
+    if (!wallet.BackupWallet(fs::PathToString(directory / fs::PathFromString(file_name)), &backup_error, /*verify_quantum_keys=*/true)) {
+        error = backup_error.original.empty() ? "the wallet backup failed" : backup_error.original;
+        return false;
+    }
+    QuantumReturnCrashPoint(wallet, "after_backup_install");
+    return WriteQuantumKeyBackupManifest(directory, file_name, sequence, keys, error);
+}
+
+/** Make the pending key the destination (unless a valid destination was saved meanwhile) and clear the pending
+ *  record, in one durable database transaction. Memory follows only after the commit. */
+bool ActivatePendingQuantumStakeReturn(CWallet& wallet, const CTxDestination& dest, bool& became_destination, bilingual_str& error)
+{
+    LOCK(wallet.cs_wallet);
+    became_destination = false;
+    if (!wallet.m_quantum_return_pending) return true;
+    const bool set_destination = !ResolveLegacyStakeQuantumReturn(wallet).available;
+    const std::string encoded = EncodeDestination(dest);
+    WalletBatch batch(wallet.GetDatabase());
+    if (!batch.TxnBegin(/*durable=*/true)) {
+        error = _("Failed to begin the database transaction that activates the quantum stake return address.");
+        return false;
+    }
+    if (set_destination && !batch.WriteQuantumStakeReturn(encoded)) {
+        batch.TxnAbort();
+        error = _("Failed to write the quantum stake return address to the wallet database.");
+        return false;
+    }
+    if (!batch.EraseQuantumStakeReturnPending()) {
+        batch.TxnAbort();
+        error = _("Failed to clear the pending quantum stake return record.");
+        return false;
+    }
+    if (!batch.TxnCommit()) {
+        batch.TxnAbort();
+        error = _("Failed to commit the activation of the quantum stake return address.");
+        return false;
+    }
+    if (set_destination) wallet.m_quantum_stake_return = encoded;
+    wallet.m_quantum_return_pending.reset();
+    wallet.m_quantum_return_pending_error.clear();
+    // The candidate set depends on it inside the window; never serve a stale selection.
+    DropStakeSlotCache(wallet);
+    became_destination = set_destination;
+    return true;
+}
+
+/** The pending key: back it up, then activate it. prep carries what the caller knows already. Holds the
+ *  wallet's preparation mutex (the caller), no other lock. */
+QuantumStakeReturnPreparation FinishPendingQuantumStakeReturn(CWallet& wallet, QuantumStakeReturnPreparation prep)
+    EXCLUSIVE_LOCKS_REQUIRED(wallet.m_quantum_return_prepare_mutex)
+{
+    using Outcome = QuantumStakeReturnPreparation::Outcome;
+    CTxDestination dest;
+    {
+        LOCK(wallet.cs_wallet);
+        if (!wallet.m_quantum_return_pending) {
+            prep.detail = "no key is waiting for its backup";
+            return prep;
+        }
+        dest = WitnessUnknown{QUANTUM_MIGRATION_WITNESS_VERSION, wallet.m_quantum_return_pending->witness_program};
+    }
+    prep.address = EncodeDestination(dest);
+    prep.key_created = true;
+    const auto still_pending = [&](const std::string& why) {
+        {
+            LOCK(wallet.cs_wallet);
+            wallet.m_quantum_return_pending_error = why;
+        }
+        wallet.WalletLogPrintf("The new quantum stake return key %s is not active yet: %s. The key stays in the wallet and the previous return address stays in use; the backup is retried with the same key.\n",
+                               prep.address, why);
+        wallet.m_quantum_return_retry_at = SteadyClock::now() + QUANTUM_RETURN_AUTOMATIC_RETRY_INTERVAL;
+        prep.outcome = Outcome::PENDING_BACKUP;
+        prep.detail = why;
+        return prep;
+    };
+    std::string backup_error;
+    if (!BackupQuantumReturnKey(wallet, backup_error)) return still_pending(backup_error);
+    QuantumReturnCrashPoint(wallet, "before_activation");
+    bool became_destination{false};
+    bilingual_str activation_error;
+    if (!ActivatePendingQuantumStakeReturn(wallet, dest, became_destination, activation_error)) {
+        return still_pending(activation_error.original);
+    }
+    QuantumReturnCrashPoint(wallet, "after_activation");
+    wallet.m_quantum_return_retry_at = {};
+    // Only after the activation is durable: keep the newest generations and the sole protectors of any key.
+    {
+        const QuantumKeyBackupKeySet live = WITH_LOCK(wallet.cs_wallet, return wallet.GetQuantumKeyPrograms());
+        PruneQuantumKeyBackups(QuantumKeyBackupDirectory(wallet.GetName()), live, QUANTUM_KEY_BACKUP_KEEP_GENERATIONS);
+    }
+    if (!became_destination) {
+        prep.outcome = Outcome::NO_ACTION;
+        prep.detail = "the new key is in a verified backup; the return address saved meanwhile stays";
+        return prep;
+    }
+    wallet.WalletLogPrintf("Quantum stake return address set to %s after a verified wallet backup: legacy stakes in the last %d blocks of Migration are paid there.\n",
+                           prep.address, Params().GetConsensus().nCoinbaseMaturity + LEGACY_STAKE_MIGRATION_MARGIN_BLOCKS);
+    prep.outcome = Outcome::CREATED_ADDRESS;
+    return prep;
+}
+} // namespace
+
+QuantumStakeReturnPreparation PrepareQuantumStakeReturn(CWallet& wallet, QuantumStakeReturnTrigger trigger, bool allow_new_key)
 {
     using Outcome = QuantumStakeReturnPreparation::Outcome;
     QuantumStakeReturnPreparation prep;
@@ -2666,9 +2832,24 @@ QuantumStakeReturnPreparation PrepareQuantumStakeReturn(CWallet& wallet, Quantum
         prep.detail = "the chain has no tip yet";
         return prep;
     }
-    if (int64_t{*tip_height} + 1 > int64_t{consensus.nQuantumMigrationEndHeight}) {
+    if (int64_t{*tip_height} + 1 > int64_t{consensus.nQuantumMigrationEndHeight} && trigger == QuantumStakeReturnTrigger::AUTOMATIC) {
         prep.detail = "the window has passed";
         return prep;
+    }
+    // One preparation at a time per wallet, so concurrent callers produce one key. The mutex is taken before
+    // any wallet lock, and the backup below runs with no wallet and no chain lock held.
+    AssertLockNotHeld(::cs_main);
+    AssertLockNotHeld(wallet.cs_wallet);
+    LOCK(wallet.m_quantum_return_prepare_mutex);
+    // A key made earlier whose backup did not finish is completed first, whoever asks and whatever the other
+    // conditions of an automatic preparation are: it already has its consent. Retrying here is also what a
+    // restart does, since the record is loaded with the wallet.
+    if (WITH_LOCK(wallet.cs_wallet, return wallet.m_quantum_return_pending.has_value())) {
+        if (trigger == QuantumStakeReturnTrigger::AUTOMATIC && SteadyClock::now() < wallet.m_quantum_return_retry_at) {
+            prep.detail = "the last backup of the pending key failed a moment ago; it is retried soon";
+            return prep;
+        }
+        return FinishPendingQuantumStakeReturn(wallet, prep);
     }
     if (trigger == QuantumStakeReturnTrigger::AUTOMATIC) {
         // Not before Gold Rush has ended, and only for a wallet with legacy coins to return: a pre-end chain
@@ -2682,7 +2863,7 @@ QuantumStakeReturnPreparation PrepareQuantumStakeReturn(CWallet& wallet, Quantum
             return prep;
         }
     }
-    CTxDestination chosen;
+    QuantumReturnChoice choice;
     {
         LOCK(wallet.cs_wallet);
         const LegacyStakeQuantumReturn current = ResolveLegacyStakeQuantumReturn(wallet);
@@ -2691,13 +2872,19 @@ QuantumStakeReturnPreparation PrepareQuantumStakeReturn(CWallet& wallet, Quantum
             prep.detail = "a quantum stake return address is already saved";
             return prep;
         }
+        CTxDestination configured_dest;
         const std::vector<std::string> configured = gArgs.GetArgs("-qqpospayoutaddress");
         if (configured.size() == 1) {
             const CTxDestination dest = DecodeDestination(configured.front());
-            if (QuantumStakeReturnProblem(wallet, dest).empty()) chosen = dest;
+            if (QuantumStakeReturnProblem(wallet, dest).empty()) configured_dest = dest;
         }
-        if (!IsValidDestination(chosen)) {
-            std::vector<QuantumReturnCandidate> candidates;
+        CTxDestination claim_dest;
+        if (!IsValidDestination(configured_dest)) {
+            const CTxDestination dest = wallet.GetRecordedPowPayoutKey();
+            if (QuantumStakeReturnProblem(wallet, dest).empty()) claim_dest = dest;
+        }
+        std::vector<QuantumReturnCandidate> candidates;
+        if (!IsValidDestination(configured_dest) && !IsValidDestination(claim_dest)) {
             wallet.ForEachAddrBookEntry([&](const CTxDestination& dest, const std::string& label, bool is_change,
                                             const std::optional<AddressPurpose> purpose) {
                 if (is_change || !purpose || *purpose != AddressPurpose::RECEIVE) return;
@@ -2705,47 +2892,44 @@ QuantumStakeReturnPreparation PrepareQuantumStakeReturn(CWallet& wallet, Quantum
                 const auto info = wallet.GetQuantumKeyInfo(dest);
                 candidates.push_back({dest, label, is_change, info ? info->creation_time : 0});
             });
-            if (const auto pick = ChooseLegacyStakeQuantumReturn(candidates)) chosen = *pick;
         }
+        choice = ChooseQuantumStakeReturn(CTxDestination{}, configured_dest, claim_dest, candidates);
     }
     // The wallet lock is not held from here: key generation and the database writes below take
     // the locks they need themselves.
-    bool created_key{false};
-    if (!IsValidDestination(chosen)) {
+    if (choice.source == QuantumReturnSource::NONE) {
         // The existing key-creation policy decides whether a new key may exist.
-        if (!gArgs.GetBoolArg("-qqallowautokeycreation", DEFAULT_ALLOW_AUTO_QUANTUM_KEY_CREATION)) {
+        const bool automatic_consent = gArgs.GetBoolArg("-qqallowautokeycreation", DEFAULT_ALLOW_AUTO_QUANTUM_KEY_CREATION);
+        if (!allow_new_key && !automatic_consent) {
             prep.detail = "no quantum address to reuse and automatic key creation is not allowed";
             return prep;
         }
-        CScript script;
-        std::string address;
-        bilingual_str error;
-        bool created{false};
-        if (!wallet.EnsureShadowSignalPayoutAddress(script, address, error, &created)) {
-            wallet.WalletLogPrintf("Quantum stake return address not created: %s\n", error.original);
+        const auto key = wallet.AddQuantumStakeReturnKey("PoS - Quantum Stake Address", allow_new_key ? "explicit" : "automatic");
+        if (!key) {
+            wallet.WalletLogPrintf("Quantum stake return address not created: %s\n", util::ErrorString(key).original);
             prep.outcome = Outcome::FAILED;
-            prep.detail = error.original;
+            prep.detail = util::ErrorString(key).original;
             return prep;
         }
-        created_key = created;
-        prep.key_created = created;
-        if (created) {
-            wallet.WalletLogPrintf("Created quantum stake address %s for legacy stakes paid as quantum coins. Back up the wallet.\n", address);
-        }
-        chosen = DecodeDestination(address);
+        wallet.WalletLogPrintf("Created quantum stake address %s for legacy stakes paid as quantum coins. It becomes the return address after a verified wallet backup.\n",
+                               EncodeDestination(*key));
+        prep.address = EncodeDestination(*key);
+        prep.key_created = true;
+        QuantumReturnCrashPoint(wallet, "after_key_insertion");
+        return FinishPendingQuantumStakeReturn(wallet, prep);
     }
     bilingual_str error;
-    if (!SetQuantumStakeReturn(wallet, chosen, error)) {
+    if (!SetQuantumStakeReturn(wallet, choice.destination, error)) {
         wallet.WalletLogPrintf("Quantum stake return address not set: %s\n", error.original);
         prep.outcome = Outcome::FAILED;
-        prep.address = EncodeDestination(chosen);
+        prep.address = EncodeDestination(choice.destination);
         prep.detail = error.original;
         return prep;
     }
     wallet.WalletLogPrintf("Quantum stake return address set to %s: legacy stakes in the last %d blocks of Migration are paid there.\n",
-                           EncodeDestination(chosen), consensus.nCoinbaseMaturity + LEGACY_STAKE_MIGRATION_MARGIN_BLOCKS);
-    prep.outcome = created_key ? Outcome::CREATED_ADDRESS : Outcome::REUSED_ADDRESS;
-    prep.address = EncodeDestination(chosen);
+                           EncodeDestination(choice.destination), consensus.nCoinbaseMaturity + LEGACY_STAKE_MIGRATION_MARGIN_BLOCKS);
+    prep.outcome = Outcome::REUSED_ADDRESS;
+    prep.address = EncodeDestination(choice.destination);
     return prep;
 }
 

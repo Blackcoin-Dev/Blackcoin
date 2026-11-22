@@ -39,6 +39,7 @@ struct RGBOwnedAssignmentRecord;
 struct RGBTransitionProofRecord;
 struct RGBTransitionRecord;
 struct QuantumColdStakeDelegationRecord;
+struct QuantumStakeReturnPendingRecord;
 struct WalletContext;
 
 /**
@@ -109,6 +110,7 @@ extern const std::string QUANTUM_KEY;
 extern const std::string QUANTUM_REDELEGATION_AUTO_SCAN;
 extern const std::string QUANTUM_REDELEGATION_AUTO_SCAN_TIP;
 extern const std::string QUANTUM_STAKE_RETURN;
+extern const std::string QUANTUM_STAKE_RETURN_PENDING;
 extern const std::string QUANTUM_REDELEGATION_LAST_ATTEMPT;
 extern const std::string QUANTUM_REDELEGATION_LAST_SUCCESS;
 extern const std::string QUANTUM_REDELEGATION_LAST_WIN;
@@ -341,6 +343,8 @@ public:
      *  loader detects by its height and treats as "scan again". */
     bool WriteQuantumRedelegationAutoScanTip(int height, const uint256& tip);
     bool WriteQuantumStakeReturn(const std::string& address);
+    bool WriteQuantumStakeReturnPending(const QuantumStakeReturnPendingRecord& record);
+    bool EraseQuantumStakeReturnPending();
     bool WriteQuantumRedelegationLastAttemptHeight(const std::vector<unsigned char>& witness_program, int height);
     bool WriteQuantumRedelegationLastSuccessHeight(const std::vector<unsigned char>& witness_program, int height);
     bool WriteQuantumRedelegationLastWinHeight(const std::vector<unsigned char>& witness_program, int height);

@@ -373,6 +373,7 @@ BITCOIN_CORE_H = \
   wallet/pow_miner_tip_signal.h \
   wallet/pow_mining_duty_cycle.h \
   wallet/migration_batch.h \
+  wallet/quantum_return_backup.h \
   wallet/quantum_stake_ops.h \
   wallet/qq_development_donation.h \
   wallet/receive.h \
@@ -558,6 +559,7 @@ libbitcoin_wallet_a_SOURCES = \
   wallet/interfaces.cpp \
   wallet/load.cpp \
   wallet/migration_batch.cpp \
+  wallet/quantum_return_backup.cpp \
   wallet/receive.cpp \
   wallet/redelegation.cpp \
   wallet/rpc/addresses.cpp \

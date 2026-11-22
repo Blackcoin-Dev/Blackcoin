@@ -8945,13 +8945,53 @@ util::Result<CTxDestination> CWallet::GetNewQuantumChangeDestination()
     return AddQuantumKey(std::vector<unsigned char>(public_key.begin(), public_key.end()), private_key, "", GetTime(), /*record_as_receive=*/false);
 }
 
+util::Result<CTxDestination> CWallet::AddQuantumStakeReturnKey(const std::string& label, const std::string& consent)
+{
+    std::vector<uint8_t> public_key;
+    std::vector<uint8_t> generated_private_key;
+    if (!ML_DSA::KeyGen(public_key, generated_private_key)) {
+        return util::Error{_("Error: ML-DSA key generation failed")};
+    }
+    CKeyingMaterial private_key(generated_private_key.begin(), generated_private_key.end());
+    CleanseVector(generated_private_key);
+    return AddQuantumKeyInternal(std::vector<unsigned char>(public_key.begin(), public_key.end()), private_key, label,
+                                 GetTime(), /*record_as_receive=*/true, std::nullopt, &consent);
+}
+
+std::set<std::vector<unsigned char>> CWallet::GetQuantumKeyPrograms() const
+{
+    AssertLockHeld(cs_wallet);
+    std::set<std::vector<unsigned char>> programs;
+    for (const auto& [program, record] : m_quantum_keys) programs.insert(program);
+    return programs;
+}
+
+bool CWallet::IsQuantumStakeReturnPendingKey(const CTxDestination& dest) const
+{
+    AssertLockHeld(cs_wallet);
+    if (!m_quantum_return_pending) return false;
+    const auto info = GetQuantumKeyInfo(dest);
+    if (!info) return false;
+    const auto pending_key = m_quantum_keys.find(m_quantum_return_pending->witness_program);
+    return pending_key != m_quantum_keys.end() && pending_key->second.public_key == info->public_key;
+}
+
+bool CWallet::LoadQuantumStakeReturnPending(const QuantumStakeReturnPendingRecord& record)
+{
+    AssertLockHeld(cs_wallet);
+    const auto key = m_quantum_keys.find(record.witness_program);
+    if (record.version != 1 || key == m_quantum_keys.end() || !key->second.durably_stored) return false;
+    m_quantum_return_pending = record;
+    return true;
+}
+
 util::Result<CTxDestination> CWallet::AddQuantumKey(const std::vector<unsigned char>& public_key, const CKeyingMaterial& private_key, const std::string& label, int64_t creation_time, bool record_as_receive)
 {
     return AddQuantumKeyInternal(public_key, private_key, label, creation_time,
                                  record_as_receive, std::nullopt);
 }
 
-util::Result<CTxDestination> CWallet::AddQuantumKeyInternal(const std::vector<unsigned char>& public_key, const CKeyingMaterial& private_key, const std::string& label, int64_t creation_time, bool record_as_receive, const std::optional<CTxDestination>& receive_destination)
+util::Result<CTxDestination> CWallet::AddQuantumKeyInternal(const std::vector<unsigned char>& public_key, const CKeyingMaterial& private_key, const std::string& label, int64_t creation_time, bool record_as_receive, const std::optional<CTxDestination>& receive_destination, const std::string* stake_return_consent)
 {
     CTxDestination dest;
     CTxDestination address_book_dest;
@@ -8976,6 +9016,9 @@ util::Result<CTxDestination> CWallet::AddQuantumKeyInternal(const std::vector<un
         }
         if (m_wallet_unlock_staking_only) {
             return util::Error{_("Error: Wallet is unlocked for staking only.")};
+        }
+        if (stake_return_consent && m_quantum_return_pending) {
+            return util::Error{_("Error: A quantum key for the stake return address is already waiting for its backup.")};
         }
         if (!QuantumWalletPrivateKeyMatches(public_key, private_key)) {
             return util::Error{_("Error: ML-DSA key failed integrity check")};
@@ -9059,6 +9102,18 @@ util::Result<CTxDestination> CWallet::AddQuantumKeyInternal(const std::vector<un
                     return abort_with_error(_("Error: Failed to write address book entry"));
                 }
             }
+            // The pending-return record goes into the same transaction as the key, so a crash leaves
+            // either neither or both: a key made for the return address is never without its record.
+            std::optional<QuantumStakeReturnPendingRecord> pending_record;
+            if (stake_return_consent) {
+                pending_record.emplace();
+                pending_record->witness_program = witness_program;
+                pending_record->consent = *stake_return_consent;
+                pending_record->creation_time = key_time;
+                if (!batch.WriteQuantumStakeReturnPending(*pending_record)) {
+                    return abort_with_error(_("Error: Failed to write the pending stake return record"));
+                }
+            }
 
             if (!batch.TxnCommit()) {
                 mark_ambiguous();
@@ -9073,6 +9128,10 @@ util::Result<CTxDestination> CWallet::AddQuantumKeyInternal(const std::vector<un
             record.backup_verified = false;
             m_wallet_flags = new_flags;
             m_quantum_keys.emplace(witness_program, std::move(record));
+            if (pending_record) {
+                m_quantum_return_pending = std::move(pending_record);
+                m_quantum_return_pending_error.clear();
+            }
             NotifyOwnershipChanged();
             InvalidateShadowPowClaimImplicitOwnershipLocked();
             MaybeUpdateBirthTime(key_time);
@@ -14683,6 +14742,50 @@ bool CWallet::EnsurePowPayoutAddress(bilingual_str& error, bool* created, bool a
     }
     WalletLogPrintf("Gold Rush PoW miner created payout address %s. Back up the wallet.\n", encoded);
     return true;
+}
+
+CTxDestination CWallet::GetRecordedPowPayoutKey() const
+{
+    AssertLockHeld(cs_wallet);
+    const auto usable = [&](const CTxDestination& dest) {
+        if (!IsValidDestination(dest) || !IsQuantumMigrationDestination(dest) ||
+            !IsDirectQuantumMigrationScript(GetScriptForDestination(dest))) {
+            return false;
+        }
+        const auto info = GetQuantumKeyInfo(dest);
+        return info && info->durably_stored;
+    };
+    // 1. The payout key the claim miner is bound to (configured, restored or created).
+    if (!m_pow_payout_quantum.empty()) {
+        const CTxDestination bound = DecodeDestination(m_pow_payout_quantum);
+        if (usable(bound)) return bound;
+    }
+    // 2. The configured payout key.
+    const std::vector<std::string> configured = gArgs.GetArgs("-qqpowpayoutaddress");
+    if (configured.size() == 1) {
+        const CTxDestination dest = DecodeDestination(configured.front());
+        if (usable(dest)) return dest;
+    }
+    // 3. The key this wallet's confirmed synthetic Gold Rush payouts were paid to.
+    CTxDestination best;
+    int64_t best_time{0};
+    std::string best_encoded;
+    for (const auto& [txid, block_hash] : m_confirmed_synthetic_payout_block_by_txid) {
+        const auto it = mapWallet.find(txid);
+        if (it == mapWallet.end() || !it->second.tx) continue;
+        for (const CTxOut& out : it->second.tx->vout) {
+            CTxDestination dest;
+            if (!ExtractDestination(out.scriptPubKey, dest) || !usable(dest)) continue;
+            const int64_t created = GetQuantumKeyInfo(dest)->creation_time;
+            const std::string encoded = EncodeDestination(dest);
+            if (!IsValidDestination(best) || created < best_time || (created == best_time && encoded < best_encoded)) {
+                best = dest;
+                best_time = created;
+                best_encoded = encoded;
+            }
+        }
+    }
+    return best;
 }
 
 bool CWallet::EnsureShadowSignalPayoutAddress(

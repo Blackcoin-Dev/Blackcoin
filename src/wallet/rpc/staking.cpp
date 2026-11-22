@@ -769,6 +769,14 @@ void AddLegacyStakeReturnStatus(UniValue& obj, const CWallet& wallet, const Cons
     } else {
         obj.pushKV("legacy_stake_return_action", quantum_return.reason);
     }
+    // A new key made for the return address and not yet in a verified backup: reported apart from the
+    // readiness of the active destination above.
+    obj.pushKV("legacy_stake_return_pending", quantum_return.pending);
+    if (quantum_return.pending) {
+        obj.pushKV("legacy_stake_return_pending_address", quantum_return.pending_address);
+        if (!quantum_return.pending_error.empty()) obj.pushKV("legacy_stake_return_pending_error", quantum_return.pending_error);
+        obj.pushKV("legacy_stake_return_pending_action", QuantumStakeReturnPendingAction());
+    }
     // Stopped in the window without a ready return address, and always once Final has started.
     obj.pushKV("legacy_staking_stopped", final_started || (in_window && !quantum_return.available));
     const std::string notice = LegacyStakingNotice(consensus, static_cast<int>(next_height), quantum_return);
@@ -786,12 +794,19 @@ static RPCHelpMan setquantumstakereturn()
         "The address must already be an ordinary quantum address of this wallet, or be created here with\n"
         "allow_new_quantum_key (needs a normal unlock). A wallet unlocked for staking only cannot create a key,\n"
         "so set the address before the window starts. With no address and no key creation, an existing quantum\n"
-        "address of this wallet is chosen.\n",
+        "address of this wallet is chosen, in this order: the saved address, the one -qqpospayoutaddress, the wallet's\n"
+        "Gold Rush claim payout key, then another quantum receive address of the wallet (label, oldest, address).\n"
+        "A NEW key is saved as the return address only after a wallet backup into -quantumkeybackupdir (default\n"
+        "<datadir>/quantum-key-backups/<wallet>/) verified it: the key is stored with a pending record, the backup\n"
+        "reopens it and signs with it, and then the address becomes active. If the backup fails this call fails,\n"
+        "the key stays pending (it cannot be used as the return address, with existing_address either), the\n"
+        "previous address stays active, and the next call, the wallet's own retry or a restart retries the same key.\n"
+        "The three newest verified backups are kept, and an older one only while it is the only backup of a key.\n",
         {
             {"options", RPCArg::Type::OBJ_NAMED_PARAMS, RPCArg::Optional::OMITTED, "",
                 {
                     {"existing_address", RPCArg::Type::STR, RPCArg::Default{""}, "Use this already-owned quantum address."},
-                    {"allow_new_quantum_key", RPCArg::Type::BOOL, RPCArg::Default{false}, "When no address exists, create one new non-HD ML-DSA key. Back up the wallet afterwards."},
+                    {"allow_new_quantum_key", RPCArg::Type::BOOL, RPCArg::Default{false}, "When no address exists, create one new non-HD ML-DSA key; it becomes the address once its verified wallet backup succeeded. Keep the backup."},
                 },
                 RPCArgOptions{.oneline_description = "options"}},
         },
@@ -818,10 +833,18 @@ static RPCHelpMan setquantumstakereturn()
     if (!existing.empty()) {
         dest = DecodeDestination(existing);
     } else {
-        const QuantumStakeReturnPreparation prep = PrepareQuantumStakeReturn(*pwallet, QuantumStakeReturnTrigger::EXPLICIT);
-        // A key the automatic path made counts as created, even when it did not finish: it needs a backup.
+        const QuantumStakeReturnPreparation prep = PrepareQuantumStakeReturn(*pwallet, QuantumStakeReturnTrigger::EXPLICIT, allow_new);
+        // A key the preparation made counts as created, even when it did not become the address: it needs a backup.
         if (prep.key_created) created = true;
-        if (prep.key_created && !prep.Saved()) {
+        if (prep.outcome == QuantumStakeReturnPreparation::Outcome::PENDING_BACKUP) {
+            throw JSONRPCError(RPC_WALLET_ERROR, strprintf(
+                "A new ML-DSA key (%s) was created for the stake return address but its wallet backup failed: %s. "
+                "The key stays in the wallet as PENDING and is not the return address; the previous return address "
+                "(if any) stays in use. Fix the backup directory (-quantumkeybackupdir) and call setquantumstakereturn "
+                "again: the same key is retried. It also retries automatically and after a restart.",
+                prep.address, prep.detail));
+        }
+        if (prep.key_created && !prep.Saved() && prep.outcome == QuantumStakeReturnPreparation::Outcome::FAILED) {
             throw JSONRPCError(RPC_WALLET_ERROR, strprintf(
                 "A new ML-DSA key was created for the stake return address (%s) but the address could not be saved: %s. "
                 "The key stays in the wallet database: back up the wallet now, then retry with existing_address set to it.",
@@ -831,19 +854,23 @@ static RPCHelpMan setquantumstakereturn()
             LOCK(pwallet->cs_wallet);
             dest = DecodeDestination(pwallet->m_quantum_stake_return);
         } else {
+            LegacyStakeQuantumReturn current;
             {
                 LOCK(pwallet->cs_wallet);
-                const LegacyStakeQuantumReturn current = ResolveLegacyStakeQuantumReturn(*pwallet);
+                current = ResolveLegacyStakeQuantumReturn(*pwallet);
                 if (current.available) dest = DecodeDestination(current.address);
             }
             if (!IsValidDestination(dest)) {
+                if (current.pending) {
+                    throw JSONRPCError(RPC_WALLET_ERROR, strprintf(
+                        "The new ML-DSA key %s is waiting for its wallet backup and cannot be made the return address yet: %s. "
+                        "The backup needs the wallet unlocked normally (not locked, not for staking only).",
+                        current.pending_address, prep.detail));
+                }
                 if (!allow_new) {
                     throw JSONRPCError(RPC_WALLET_ERROR, "This wallet has no quantum address to use. Retry with {\"allow_new_quantum_key\":true} after authorizing key creation (needs a normal unlock; back up the wallet afterwards), or pass existing_address.");
                 }
-                auto result = pwallet->GetNewQuantumDestination("PoS - Quantum Stake Address");
-                if (!result) throw JSONRPCError(RPC_WALLET_ERROR, util::ErrorString(result).original);
-                dest = *result;
-                created = true;
+                throw JSONRPCError(RPC_WALLET_ERROR, strprintf("The quantum stake return address was not set: %s.", prep.detail));
             }
         }
     }
@@ -1040,6 +1067,10 @@ static RPCHelpMan getquantumstakereadiness()
                 {RPCResult::Type::STR, "action", /*optional=*/true, "what to do when it is not ready"},
                 {RPCResult::Type::BOOL, "backup_verified", "whether a verified backup was made after its key was created"},
                 {RPCResult::Type::STR, "backup_action", /*optional=*/true, "present while no verified backup holds the key"},
+                {RPCResult::Type::BOOL, "pending", "whether a new key made for the return address is waiting for its verified wallet backup; it is not the address yet, and ready, address and backup_verified describe only the active address"},
+                {RPCResult::Type::STR, "pending_address", /*optional=*/true, "the pending key's address, while pending is true"},
+                {RPCResult::Type::STR, "pending_error", /*optional=*/true, "the last backup error of the pending key, once an attempt has failed"},
+                {RPCResult::Type::STR, "pending_action", /*optional=*/true, "what to do about the pending key"},
             }},
             {RPCResult::Type::BOOL, "wallet_locked", "fully locked: no signer is available and staking waits"},
             {RPCResult::Type::BOOL, "staking_only_unlock", "unlocked for staking only"},
@@ -1079,6 +1110,12 @@ static RPCHelpMan getquantumstakereadiness()
     }
     stake_return.pushKV("backup_verified", readiness.stake_return.available && readiness.stake_return.backup_verified);
     if (!readiness.stake_return.backup_verified) stake_return.pushKV("backup_action", QuantumStakeReturnBackupAction());
+    stake_return.pushKV("pending", readiness.stake_return.pending);
+    if (readiness.stake_return.pending) {
+        stake_return.pushKV("pending_address", readiness.stake_return.pending_address);
+        if (!readiness.stake_return.pending_error.empty()) stake_return.pushKV("pending_error", readiness.stake_return.pending_error);
+        stake_return.pushKV("pending_action", QuantumStakeReturnPendingAction());
+    }
     result.pushKV("stake_return", std::move(stake_return));
     result.pushKV("wallet_locked", readiness.wallet_locked);
     result.pushKV("staking_only_unlock", readiness.staking_only_unlock);
@@ -1143,6 +1180,10 @@ static RPCHelpMan getstakinginfo()
                         {RPCResult::Type::STR, "legacy_stake_return_action", /*optional=*/true, "What to do before the window starts, when the return address is not ready"},
                         {RPCResult::Type::BOOL, "legacy_stake_return_backup_verified", /*optional=*/true, "Whether a verified wallet backup (backupwallet) was made after the return address key was created, when the address is ready"},
                         {RPCResult::Type::STR, "legacy_stake_return_backup_action", /*optional=*/true, "Make a fresh wallet backup now: a backup made before the return key existed cannot recover coins paid to it"},
+                        {RPCResult::Type::BOOL, "legacy_stake_return_pending", /*optional=*/true, "Whether a new key made for the return address is waiting for its verified wallet backup. It is not the return address yet; this is separate from legacy_stake_return_ready, which describes the active address"},
+                        {RPCResult::Type::STR, "legacy_stake_return_pending_address", /*optional=*/true, "The pending key's address, while legacy_stake_return_pending is true"},
+                        {RPCResult::Type::STR, "legacy_stake_return_pending_error", /*optional=*/true, "The last backup error of the pending key, once an attempt has failed"},
+                        {RPCResult::Type::STR, "legacy_stake_return_pending_action", /*optional=*/true, "What to do about the pending key"},
                         {RPCResult::Type::STR, "warnings", "Current network and wallet warnings"},
                     }
                 },

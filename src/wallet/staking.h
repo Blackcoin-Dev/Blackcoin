@@ -90,6 +90,12 @@ struct LegacyStakeQuantumReturn
     //! after this address's key was created. While false, a wallet backup made
     //! before the key existed cannot recover coins paid to it.
     bool backup_verified{false};
+    //! A new key made for the return address is waiting for its verified wallet backup. It is NOT the
+    //! destination: available and address above describe the active destination only.
+    bool pending{false};
+    std::string pending_address;
+    //! The last backup error of the pending key; empty before the first attempt has failed.
+    std::string pending_error;
 };
 
 /** The independent guard CreateCoinStake runs on a legacy kernel in the quantum return window: empty when the
@@ -102,6 +108,9 @@ std::string LegacyReturnWindowCoinstakeProblem(const CMutableTransaction& coinst
 
 /** What to tell the user when a quantum stake return key is not yet in a verified backup. */
 std::string QuantumStakeReturnBackupAction();
+
+/** What to tell the user while a new return key waits for its wallet backup. */
+std::string QuantumStakeReturnPendingAction();
 
 /** Plain-language notice for status output: the height from which legacy
  *  stakes are paid to a quantum address, which address, whether the wallet is
@@ -125,6 +134,29 @@ struct QuantumReturnCandidate
 };
 std::optional<CTxDestination> ChooseLegacyStakeQuantumReturn(const std::vector<QuantumReturnCandidate>& candidates);
 
+/** Where the automatic choice of the return address came from, best first. */
+enum class QuantumReturnSource {
+    NONE,       //!< nothing usable: a new key is needed (and only with consent)
+    SAVED,      //!< the saved return destination
+    CONFIGURED, //!< the one -qqpospayoutaddress
+    CLAIM_KEY,  //!< the wallet's recorded Gold Rush claim payout key
+    RANKED,     //!< another owned quantum receive address, by label, then oldest, then address
+};
+
+struct QuantumReturnChoice
+{
+    QuantumReturnSource source{QuantumReturnSource::NONE};
+    CTxDestination destination;
+};
+
+/** The order in which a return destination is taken: a saved valid destination, exactly one configured valid
+ *  owned destination, the recorded Gold Rush claim payout key, then the existing ranking of the candidates
+ *  (ChooseLegacyStakeQuantumReturn). The first three are passed only when valid and owned (an invalid
+ *  destination means absent). Pure. */
+QuantumReturnChoice ChooseQuantumStakeReturn(const CTxDestination& saved, const CTxDestination& configured,
+                                             const CTxDestination& claim_key,
+                                             const std::vector<QuantumReturnCandidate>& candidates);
+
 /** The persisted quantum stake return address, checked: wallet-owned ordinary
  *  direct quantum address with a durably stored key. Read-only, never creates a
  *  key, so it is safe on the staking path and under a staking-only unlock. */
@@ -132,7 +164,8 @@ LegacyStakeQuantumReturn ResolveLegacyStakeQuantumReturn(const CWallet& wallet)
     EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet);
 
 /** Persist dest as the quantum stake return address (record "quantumstakereturn";
- *  older versions skip it). The address must pass the same checks as above. */
+ *  older versions skip it). The address must pass the same checks as above, and must not be a key still
+ *  waiting for its first verified backup. */
 bool SetQuantumStakeReturn(CWallet& wallet, const CTxDestination& dest, bilingual_str& error);
 
 /** What an automatic preparation of the quantum stake return address did. */
@@ -143,6 +176,7 @@ struct QuantumStakeReturnPreparation
         REUSED_ADDRESS,  //!< an address the wallet already had was chosen and saved
         CREATED_ADDRESS, //!< a new quantum key was created and its address saved
         FAILED,          //!< an attempt was made and did not complete
+        PENDING_BACKUP,  //!< a new key exists but its backup failed: it is not the destination, the previous one stays
     };
     Outcome outcome{Outcome::NO_ACTION};
     //! The address saved (REUSED_ADDRESS, CREATED_ADDRESS) or the one already saved (NO_ACTION because it was set).
@@ -150,7 +184,7 @@ struct QuantumStakeReturnPreparation
     //! A new quantum key was generated and persisted by this call, whatever happened afterwards (a FAILED
     //! preparation can still leave a key behind that needs a backup).
     bool key_created{false};
-    //! Why NO_ACTION or FAILED, when known.
+    //! Why NO_ACTION, FAILED or PENDING_BACKUP, when known (for PENDING_BACKUP the backup error).
     std::string detail;
     bool Saved() const { return outcome == Outcome::REUSED_ADDRESS || outcome == Outcome::CREATED_ADDRESS; }
 };
@@ -166,12 +200,17 @@ enum class QuantumStakeReturnTrigger {
 };
 
 /** When the wallet is fully unlocked (or unencrypted), has no valid return
- *  address and a height schedule exists: set one. An existing wallet-owned
- *  quantum address is reused (-qqpospayoutaddress first); a key is created only
- *  when the existing policy allows it (-qqallowautokeycreation). Never creates
- *  a key otherwise. Call outside cs_main and cs_wallet. The result tells reuse,
- *  creation, no action and failure apart. */
-QuantumStakeReturnPreparation PrepareQuantumStakeReturn(CWallet& wallet, QuantumStakeReturnTrigger trigger);
+ *  address and a height schedule exists: set one, in this order: the saved valid destination, the one
+ *  configured -qqpospayoutaddress, the recorded Gold Rush claim payout key, another owned quantum receive
+ *  address (label ranking, oldest, then address), and last a new key, only with consent (allow_new_key, the
+ *  explicit option, or -qqallowautokeycreation). A new key is written with a pending-return record, backed
+ *  up with CWallet::BackupWallet(..., verify_quantum_keys=true) into the wallet's -quantumkeybackupdir
+ *  directory, and only then becomes the destination; if the backup fails the key stays pending, the previous
+ *  destination stays, and the next call (or restart) retries the same key. Preparations are serialized per
+ *  wallet. Call outside cs_main and cs_wallet. The result tells reuse, creation, no action, failure and a
+ *  pending backup apart. */
+QuantumStakeReturnPreparation PrepareQuantumStakeReturn(CWallet& wallet, QuantumStakeReturnTrigger trigger,
+                                                        bool allow_new_key = false);
 /** PrepareQuantumStakeReturn(wallet, AUTOMATIC).Saved(). */
 bool MaybeAutoSetQuantumStakeReturn(CWallet& wallet);
 

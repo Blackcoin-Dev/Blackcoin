@@ -25,6 +25,7 @@ saved as the return address. This test checks, on regtest, with no blocks needed
  * the choice order: a label alone does not make the claim payout key, the configured one does.
 """
 import os
+import signal
 import stat
 from threading import Barrier, Thread
 from urllib.parse import quote
@@ -39,7 +40,9 @@ from test_framework.util import (
 from transition_t_final_util import LIFECYCLE_ARGS, TransitionTFinalTestBase
 
 LABEL = "PoS - Quantum Stake Address"
-CRASH_EXIT = 7
+# The test-only crash point ends the process with SIGKILL on POSIX (the exit status is the negated signal)
+# and with TerminateProcess(7) on Windows.
+CRASH_EXIT = 7 if os.name == "nt" else -signal.SIGKILL
 
 
 def component(name):

@@ -47,6 +47,13 @@
 #include <string_view>
 #include <thread>
 
+#ifndef WIN32
+#include <csignal>
+#include <unistd.h>
+#else
+#include <windows.h>
+#endif
+
 namespace wallet {
 
 static int64_t GetStakeCombineThreshold() { return 500 * COIN; }
@@ -2687,6 +2694,19 @@ namespace {
 //! How long the wallet's own retry waits after a failed backup of the pending key.
 constexpr std::chrono::seconds QUANTUM_RETURN_AUTOMATIC_RETRY_INTERVAL{60};
 
+//! Test-only abrupt termination: the kernel ends the process, so no exit handler, sanitizer finalizer or
+//! stream flush runs (a plain _Exit still enters the sanitizers' exit interceptors, which can block).
+[[noreturn]] void TerminateProcessAbruptly()
+{
+#ifndef WIN32
+    kill(getpid(), SIGKILL);
+    for (;;) pause(); // unreachable: SIGKILL cannot be caught or ignored
+#else
+    TerminateProcess(GetCurrentProcess(), 7);
+    for (;;) Sleep(INFINITE); // unreachable
+#endif
+}
+
 //! A crash point for functional tests: on a test chain, with -quantumreturncrashpoint=<point>, the process
 //! ends here without any cleanup, as a power loss would. Never reachable on a production chain.
 void QuantumReturnCrashPoint(const CWallet& wallet, const char* point)
@@ -2694,7 +2714,7 @@ void QuantumReturnCrashPoint(const CWallet& wallet, const char* point)
     if (!Params().IsTestChain()) return;
     if (gArgs.GetArg("-quantumreturncrashpoint", "") != point) return;
     wallet.WalletLogPrintf("Quantum stake return test crash point %s reached; exiting without cleanup.\n", point);
-    std::_Exit(7);
+    TerminateProcessAbruptly();
 }
 
 /** Back the wallet up, with every quantum key reopened and challenged, into the wallet's backup directory and

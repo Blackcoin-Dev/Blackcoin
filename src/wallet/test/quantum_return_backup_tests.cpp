@@ -7,6 +7,7 @@
 #include <test/util/setup_common.h>
 #include <util/fs.h>
 #include <util/getuniquepath.h>
+#include <util/strencodings.h>
 #include <util/string.h>
 #include <wallet/quantum_return_backup.h>
 
@@ -255,6 +256,36 @@ BOOST_AUTO_TEST_CASE(created_backup_directories_are_private_whatever_the_umask)
     }
 }
 #endif
+
+BOOST_AUTO_TEST_CASE(windows_volume_classification_accepts_only_local_ntfs)
+{
+    // The pure function the Windows directory flush asks before it trusts a flush (it runs on every platform).
+    for (const unsigned drive : {QUANTUM_BACKUP_DRIVE_FIXED, QUANTUM_BACKUP_DRIVE_REMOVABLE}) {
+        BOOST_CHECK(!QuantumBackupVolumeRejection("NTFS", drive));
+        BOOST_CHECK(!QuantumBackupVolumeRejection("ntfs", drive));
+        BOOST_CHECK(!QuantumBackupVolumeRejection("Ntfs", drive));
+    }
+    // Another file system on a local disk: refused, and the message names it.
+    for (const std::string file_system : {"ReFS", "FAT32", "exFAT", "FAT", "CDFS", "UDF"}) {
+        const auto rejection = QuantumBackupVolumeRejection(file_system, QUANTUM_BACKUP_DRIVE_FIXED);
+        BOOST_REQUIRE_MESSAGE(rejection, file_system);
+        BOOST_CHECK_MESSAGE(rejection->find(ToLower(file_system)) != std::string::npos, *rejection);
+        BOOST_CHECK(rejection->find("local NTFS") != std::string::npos);
+    }
+    // A network share is refused even when the server says NTFS.
+    const auto remote = QuantumBackupVolumeRejection("NTFS", QUANTUM_BACKUP_DRIVE_REMOTE);
+    BOOST_REQUIRE(remote);
+    BOOST_CHECK(remote->find("network share") != std::string::npos);
+    BOOST_CHECK(QuantumBackupVolumeRejection("SMB", QUANTUM_BACKUP_DRIVE_REMOTE));
+    // NTFS on anything that is not a local disk, and an unidentified volume, are refused.
+    for (const unsigned drive : {QUANTUM_BACKUP_DRIVE_UNKNOWN, QUANTUM_BACKUP_DRIVE_NO_ROOT_DIR, QUANTUM_BACKUP_DRIVE_CDROM,
+                                 QUANTUM_BACKUP_DRIVE_RAMDISK, 99U}) {
+        BOOST_CHECK(QuantumBackupVolumeRejection("NTFS", drive));
+    }
+    const auto unknown = QuantumBackupVolumeRejection("", QUANTUM_BACKUP_DRIVE_FIXED);
+    BOOST_REQUIRE(unknown);
+    BOOST_CHECK(unknown->find("unknown") != std::string::npos);
+}
 
 BOOST_AUTO_TEST_CASE(a_failed_commit_of_a_new_backup_directory_or_its_parent_entry_fails_the_preparation)
 {

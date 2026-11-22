@@ -10,8 +10,10 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <optional>
 #include <set>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace wallet {
@@ -35,8 +37,25 @@ fs::path QuantumKeyBackupDirectory(const std::string& wallet_name);
  *  directory, or the file system root for a directory outside it) are committed to disk, so a name made by an
  *  earlier, interrupted attempt is committed too. Returns false with the reason in error; a directory that cannot be
  *  committed is a failure (the key it protects stays pending). On Windows the directories are flushed through a
- *  directory handle (FlushFileBuffers); that code is compiled for the Windows target only and has not been run. */
+ *  directory handle (FlushFileBuffers), and only on a local NTFS volume (see QuantumBackupVolumeRejection); that
+ *  code is compiled for the Windows target only and has not been run. */
 bool EnsureQuantumKeyBackupDirectory(const fs::path& directory, std::string& error);
+
+/** GetDriveTypeW's results, kept here so the classification below is the same function on every platform. */
+constexpr unsigned QUANTUM_BACKUP_DRIVE_UNKNOWN{0};
+constexpr unsigned QUANTUM_BACKUP_DRIVE_NO_ROOT_DIR{1};
+constexpr unsigned QUANTUM_BACKUP_DRIVE_REMOVABLE{2};
+constexpr unsigned QUANTUM_BACKUP_DRIVE_FIXED{3};
+constexpr unsigned QUANTUM_BACKUP_DRIVE_REMOTE{4};
+constexpr unsigned QUANTUM_BACKUP_DRIVE_CDROM{5};
+constexpr unsigned QUANTUM_BACKUP_DRIVE_RAMDISK{6};
+
+/** Whether a Windows volume may vouch for a directory flush. Flushing a directory handle makes the directory's
+ *  entries durable only on a local NTFS volume; on another file system, or through a network share, the call can
+ *  succeed without doing it. Takes the volume's file system name (as GetVolumeInformationByHandleW reports it,
+ *  compared without regard to case) and its GetDriveTypeW value. Returns nullopt when the volume is accepted
+ *  (local NTFS, on a fixed or removable drive) and otherwise the reason it is not, naming the file system. */
+std::optional<std::string> QuantumBackupVolumeRejection(std::string_view file_system, unsigned drive_type);
 
 /** Tests only: replace the commit of a directory (an empty function restores the real one). */
 void SetQuantumKeyBackupDirectoryCommitForTest(std::function<bool(const fs::path&)> hook);

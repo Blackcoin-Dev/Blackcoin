@@ -58,36 +58,72 @@ bool IsLowerHex(std::string_view s)
 //! Test seam: replaces the commit of a directory (see SetQuantumKeyBackupDirectoryCommitForTest).
 std::function<bool(const fs::path&)> g_directory_commit_hook;
 
+std::string DriveTypeName(unsigned drive_type)
+{
+    switch (drive_type) {
+    case QUANTUM_BACKUP_DRIVE_NO_ROOT_DIR: return "no volume root";
+    case QUANTUM_BACKUP_DRIVE_REMOVABLE: return "a removable drive";
+    case QUANTUM_BACKUP_DRIVE_FIXED: return "a fixed drive";
+    case QUANTUM_BACKUP_DRIVE_REMOTE: return "a network share";
+    case QUANTUM_BACKUP_DRIVE_CDROM: return "an optical drive";
+    case QUANTUM_BACKUP_DRIVE_RAMDISK: return "a RAM disk";
+    default: return "an unknown kind of drive";
+    }
+}
+
 #ifdef WIN32
-/** Flush a directory on Windows: open it as a directory (FILE_FLAG_BACKUP_SEMANTICS) with write access and flush the
- *  handle. DirectoryCommit() in util/fs_helpers.cpp returns success without flushing on this platform and is left as
- *  it is for its other callers; the backup must not take that for a commit, so an error here is a failed commit. */
-bool FlushDirectoryWindows(const fs::path& directory)
+/** Flush a directory on Windows: open it as a directory (FILE_FLAG_BACKUP_SEMANTICS) with write access, check through
+ *  the open handle that its volume is a local NTFS volume (QuantumBackupVolumeRejection), and flush the handle.
+ *  DirectoryCommit() in util/fs_helpers.cpp returns success without flushing on this platform and is left as it is
+ *  for its other callers; the backup must not take that for a commit, so an error here is a failed commit, and a
+ *  file system that cannot vouch for the flush is refused before it is trusted. `reason` says why it failed. */
+bool FlushDirectoryWindows(const fs::path& directory, std::string& reason)
 {
     const HANDLE handle = ::CreateFileW(directory.wstring().c_str(), GENERIC_WRITE,
                                         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
                                         FILE_FLAG_BACKUP_SEMANTICS, nullptr);
     if (handle == INVALID_HANDLE_VALUE) {
-        LogPrintf("Unable to open directory %s for durable commit: %s\n", fs::PathToString(directory), Win32ErrorString(static_cast<int>(::GetLastError())));
+        reason = strprintf("it cannot be opened for writing: %s", Win32ErrorString(static_cast<int>(::GetLastError())));
+        LogPrintf("Unable to open directory %s for durable commit: %s\n", fs::PathToString(directory), reason);
         return false;
     }
     bool committed = true;
-    if (!::FlushFileBuffers(handle)) {
-        LogPrintf("Unable to durably commit directory %s: %s\n", fs::PathToString(directory), Win32ErrorString(static_cast<int>(::GetLastError())));
+    // The volume is classified through the handle that is flushed, not through the path that was asked for.
+    wchar_t file_system[MAX_PATH + 1] = {};
+    wchar_t volume_root[MAX_PATH + 1] = {};
+    std::string narrow_file_system;
+    unsigned drive_type{QUANTUM_BACKUP_DRIVE_UNKNOWN};
+    if (!::GetVolumeInformationByHandleW(handle, nullptr, 0, nullptr, nullptr, nullptr, file_system, MAX_PATH + 1)) {
+        reason = strprintf("its file system cannot be identified: %s", Win32ErrorString(static_cast<int>(::GetLastError())));
+        committed = false;
+    } else {
+        for (const wchar_t* c = file_system; *c != L'\0'; ++c) narrow_file_system.push_back(*c < 0x80 ? static_cast<char>(*c) : '?');
+        if (::GetVolumePathNameW(directory.wstring().c_str(), volume_root, MAX_PATH + 1)) {
+            drive_type = ::GetDriveTypeW(volume_root);
+        }
+        if (const std::optional<std::string> rejection = QuantumBackupVolumeRejection(narrow_file_system, drive_type)) {
+            reason = *rejection;
+            committed = false;
+        }
+    }
+    if (committed && !::FlushFileBuffers(handle)) {
+        reason = strprintf("flushing it failed: %s", Win32ErrorString(static_cast<int>(::GetLastError())));
         committed = false;
     }
+    if (!committed) LogPrintf("Unable to durably commit directory %s: %s\n", fs::PathToString(directory), reason);
     if (!::CloseHandle(handle)) committed = false;
     return committed;
 }
 #endif
 
 /** Make the entries of one directory durable: what has been created in it and what has been renamed into it. */
-bool CommitDirectory(const fs::path& directory)
+bool CommitDirectory(const fs::path& directory, std::string& reason)
 {
     if (g_directory_commit_hook) return g_directory_commit_hook(directory);
 #ifdef WIN32
-    return FlushDirectoryWindows(directory);
+    return FlushDirectoryWindows(directory, reason);
 #else
+    (void)reason;
     return DirectoryCommit(directory);
 #endif
 }
@@ -186,6 +222,21 @@ fs::path QuantumKeyBackupDirectory(const std::string& wallet_name)
     return QuantumKeyBackupBaseDirectory() / fs::PathFromString(QuantumKeyBackupWalletComponent(wallet_name));
 }
 
+std::optional<std::string> QuantumBackupVolumeRejection(std::string_view file_system, unsigned drive_type)
+{
+    const std::string name = file_system.empty() ? std::string{"unknown"} : ToLower(std::string{file_system});
+    if (drive_type == QUANTUM_BACKUP_DRIVE_REMOTE) {
+        return strprintf("the backup directory is on a network share (file system %s), where a flush does not prove that the directory entries are on disk; use a folder on a local NTFS volume", name);
+    }
+    if (name != "ntfs") {
+        return strprintf("the backup directory is on a volume with file system %s, where a flush does not prove that the directory entries are on disk; use a folder on a local NTFS volume", name);
+    }
+    if (drive_type != QUANTUM_BACKUP_DRIVE_FIXED && drive_type != QUANTUM_BACKUP_DRIVE_REMOVABLE) {
+        return strprintf("the backup directory is on an NTFS volume on %s, which is not a local disk; use a folder on a local NTFS volume", DriveTypeName(drive_type));
+    }
+    return std::nullopt;
+}
+
 void SetQuantumKeyBackupDirectoryCommitForTest(std::function<bool(const fs::path&)> hook)
 {
     g_directory_commit_hook = std::move(hook);
@@ -240,8 +291,10 @@ bool EnsureQuantumKeyBackupDirectory(const fs::path& directory, std::string& err
         // found by this walk like any other: nothing here depends on what an earlier attempt managed to undo.
         const fs::path datadir = gArgs.GetDataDirNet();
         for (fs::path path = directory;; path = path.parent_path()) {
-            if (!CommitDirectory(path)) {
+            std::string reason;
+            if (!CommitDirectory(path, reason)) {
                 error = strprintf("cannot make the backup directory %s durable", fs::PathToString(path));
+                if (!reason.empty()) error += ": " + reason;
                 return false;
             }
             const fs::path parent = path.parent_path();

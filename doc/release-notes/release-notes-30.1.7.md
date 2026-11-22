@@ -197,6 +197,17 @@ Release qualification is pending.
   older one that is the only backup of a key the wallet still holds. Pruning happens after the
   new return address is durable, never touches a file this feature did not write and never counts
   a failed attempt as a backup.
+- **Windows: the backup folder must be on a local NTFS volume.** A new return key becomes active
+  only after the backup folder, and every folder above it up to the data directory (or the volume
+  root for a folder outside it), has been flushed to disk, and Windows vouches for that flush only
+  on a local NTFS volume. The wallet checks the volume of every folder it flushes, and it needs
+  permission to open each of them for writing. On a network share, ReFS, FAT32, exFAT or any
+  other file system, or when a folder cannot be opened for writing, the key stays pending: the
+  Staking page notice, the log and `legacy_stake_return_pending_error` name the folder and the
+  reason (for example "the backup directory is on a volume with file system exfat ... use a
+  folder on a local NTFS volume"), and nothing is pruned. Point `-quantumkeybackupdir` at a folder on a
+  local NTFS disk and run `setquantumstakereturn` again. This Windows code was written without a
+  Windows build or test machine and has not been run.
 - **A better order for choosing the return address.** With no address saved, the wallet takes, in
   this order: the one `-qqpospayoutaddress`, the wallet's recorded Gold Rush claim payout key (the
   key the claim miner is bound to, the configured `-qqpowpayoutaddress`, or the key its confirmed

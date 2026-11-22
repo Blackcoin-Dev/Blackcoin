@@ -136,7 +136,10 @@ static void CommitWalletTransactionOrThrow(
     const std::optional<CTxDestination>& created_destination = std::nullopt,
     const std::optional<ShadowPowClaimCommitAuthority>&
         shadow_pow_authority = std::nullopt)
+    LOCKS_EXCLUDED(wallet.cs_wallet)
 {
+    // CommitTransaction takes cs_main and then cs_wallet itself.
+    AssertLockNotHeld(wallet.cs_wallet);
     std::string broadcast_error;
     bool committed{false};
     try {
@@ -6221,232 +6224,236 @@ static RPCHelpMan sweepdemurragedecay()
             "sweepdemurragedecay without destination_address creates a new non-HD ML-DSA key that an older wallet backup cannot recover. Retry with {\"allow_new_quantum_key\":true}, or supply an existing wallet-owned direct quantum destination_address. Back up the wallet after key creation. No key, transaction, or wallet metadata was created.");
     }
 
-    LOCK2(cs_main, pwallet->cs_wallet);
-    if (!dry_run) {
-        EnsureWalletIsUnlocked(*pwallet);
-        if (pwallet->m_wallet_unlock_staking_only) {
-            throw JSONRPCError(RPC_WALLET_ERROR, "Wallet unlocked for staking only, unable to sweep demurrage outputs");
-        }
-        if (pwallet->IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS)) {
-            throw JSONRPCError(RPC_WALLET_ERROR, "Error: Private keys are disabled for this wallet");
-        }
-    }
-
-    const Consensus::Params& consensus = Params().GetConsensus();
-    const CBlockIndex* tip = pwallet->chain().getTip();
-    const int tip_height = tip ? tip->nHeight : -1;
-    const int evaluation_height = tip_height >= 0 ? tip_height + 1 : 0;
-    const int64_t evaluation_time = tip ? tip->GetMedianTimePast() : 0;
-    if (!consensus.IsDemurrageActive(evaluation_height, evaluation_time)) {
-        throw JSONRPCError(RPC_WALLET_ERROR, "demurrage is not active for the next block");
-    }
-
-    std::optional<CScript> source_script;
-    if (!source_address.empty()) {
-        std::string error_msg;
-        const CTxDestination source_dest = DecodeDestination(source_address, error_msg);
-        const auto* witness = std::get_if<WitnessUnknown>(&source_dest);
-        if (!IsValidDestination(source_dest) || !witness ||
-            !IsQuantumMigrationWitnessProgram(witness->GetWitnessVersion(), witness->GetWitnessProgram())) {
-            throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, error_msg.empty() ? "source_address is not a Blackcoin migration address" : error_msg);
-        }
-        if (!pwallet->GetQuantumKeyInfo(source_dest).has_value()) {
-            throw JSONRPCError(RPC_WALLET_ERROR, "source_address is not wallet-backed");
-        }
-        source_script = GetScriptForDestination(source_dest);
-    }
-
-    CTxDestination dest;
+    // The construction needs cs_main and cs_wallet. The commit takes them itself and must find neither held, so the
+    // transaction and the reply are made inside this block and both locks are released before the commit.
+    CTransactionRef tx;
+    std::optional<CTxDestination> created_destination;
     bool newly_generated{false};
-    if (!destination_address.empty()) {
-        std::string error_msg;
-        dest = DecodeDestination(destination_address, error_msg);
-        const auto* witness = std::get_if<WitnessUnknown>(&dest);
-        if (!IsValidDestination(dest) || !witness ||
-            !IsQuantumMigrationWitnessProgram(witness->GetWitnessVersion(), witness->GetWitnessProgram())) {
-            throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, error_msg.empty() ? "destination_address is not a Blackcoin migration address" : error_msg);
-        }
-        if (!pwallet->GetQuantumKeyInfo(dest).has_value()) {
-            throw JSONRPCError(RPC_WALLET_ERROR, "destination_address is not wallet-backed");
-        }
-    } else {
-        auto op_dest = pwallet->GetNewQuantumDestination(label);
-        if (!op_dest) throw JSONRPCError(RPC_WALLET_ERROR, util::ErrorString(op_dest).original);
-        dest = *op_dest;
-        newly_generated = true;
-    }
-    const std::optional<CTxDestination> created_destination = newly_generated
-        ? std::optional<CTxDestination>{dest}
-        : std::nullopt;
-    if (!pwallet->GetQuantumKeyInfo(dest).has_value()) {
-        ThrowQuantumActionError(
-            RPC_WALLET_ERROR,
-            "Demurrage sweep",
-            "Refusing to sweep: destination ML-DSA key is not confirmed stored in the wallet",
-            created_destination);
-    }
-
-    CCoinControl coin_control;
-    coin_control.m_allow_other_inputs = false;
-    coin_control.m_include_unsafe_inputs = include_unsafe;
-    coin_control.destChange = dest;
-    if (requested_fee_rate) {
-        coin_control.m_feerate = *requested_fee_rate;
-        coin_control.fOverrideFeeRate = true;
-    }
-
-    CoinFilterParams filter;
-    filter.only_spendable = true;
-    filter.skip_locked = true;
-    filter.include_immature_coinbase = false;
-    // The sweep picks its inputs itself: it leaves the final stake reserve alone, as the commit would refuse it.
-    filter.avoid_final_stake_reserve = true;
-
-    CoinsResult available = AvailableCoins(*pwallet, &coin_control, std::nullopt, filter);
-    std::map<COutPoint, Coin> chain_coins;
-    std::vector<COutput> candidates;
-    for (const COutput& out : available.All()) {
-        if (!IsQuantumMigrationScript(out.txout.scriptPubKey)) continue;
-        if (source_script && out.txout.scriptPubKey != *source_script) continue;
-        CTxDestination out_dest;
-        if (!ExtractDestination(out.txout.scriptPubKey, out_dest) || !pwallet->GetQuantumKeyInfo(out_dest).has_value()) continue;
-        chain_coins.emplace(out.outpoint, Coin{});
-        candidates.push_back(out);
-    }
-    pwallet->chain().findCoins(chain_coins);
-
-    CAmount nominal_amount{0};
-    CAmount effective_amount{0};
-    CAmount burned_amount{0};
-    CAmount skipped_locked_amount{0};
-    int selected_inputs{0};
-    int skipped_locked_outputs{0};
-    std::vector<COutPoint> selected_outpoints;
-    const CCoinsViewCache& view = pwallet->chain().getCoinsTip();
-    for (const COutput& out : candidates) {
-        const auto coin_it = chain_coins.find(out.outpoint);
-        if (coin_it == chain_coins.end() || coin_it->second.IsSpent()) continue;
-        const std::optional<Consensus::DemurrageAttestationState> latest_attestation =
-            Consensus::LatestDemurrageAttestationStateForScript(view, out.txout.scriptPubKey);
-        const Consensus::DemurrageEvaluation eval = Consensus::EvaluateDemurrage(
-            coin_it->second, consensus, evaluation_height, evaluation_time,
-            latest_attestation ? std::optional<int>{latest_attestation->height} : std::nullopt,
-            latest_attestation ? std::optional<int>{static_cast<int>(latest_attestation->coverage_start_height)} : std::nullopt);
-        if (eval.locked) {
-            ++skipped_locked_outputs;
-            skipped_locked_amount += eval.nominal_value;
-            continue;
-        }
-        if (eval.burned_value <= 0) continue;
-        selected_outpoints.push_back(out.outpoint);
-        nominal_amount += eval.nominal_value;
-        effective_amount += eval.effective_value;
-        burned_amount += eval.burned_value;
-        ++selected_inputs;
-    }
-    if (selected_inputs == 0) {
-        ThrowQuantumActionError(
-            RPC_WALLET_INSUFFICIENT_FUNDS,
-            "Demurrage sweep",
-            "No spendable wallet-owned quantum outputs are currently decaying",
-            created_destination);
-    }
-    if (effective_amount <= 0) {
-        ThrowQuantumActionError(
-            RPC_WALLET_INSUFFICIENT_FUNDS,
-            "Demurrage sweep",
-            "Selected decaying outputs have no spendable effective value",
-            created_destination);
-    }
-
-    const int64_t current_time = GetAdjustedTimeSeconds();
-    const CFeeRate fee_rate = GetMinimumFeeRate(*pwallet, coin_control, current_time);
-    if (coin_control.m_feerate && fee_rate > *coin_control.m_feerate) {
-        ThrowQuantumActionError(
-            RPC_INVALID_PARAMETER,
-            "Demurrage sweep",
-            strprintf("Fee rate (%s) is lower than the minimum fee rate setting (%s)", coin_control.m_feerate->ToString(FeeEstimateMode::SAT_VB), fee_rate.ToString(FeeEstimateMode::SAT_VB)),
-            created_destination);
-    }
-
-    CMutableTransaction sweep_tx;
-    sweep_tx.nVersion = CTransaction::CURRENT_VERSION;
-    sweep_tx.nTime = current_time;
-    static constexpr uint32_t MAX_SEQUENCE_NONFINAL = 0xfffffffe;
-    for (const COutPoint& outpoint : selected_outpoints) {
-        sweep_tx.vin.emplace_back(outpoint, CScript(), MAX_SEQUENCE_NONFINAL);
-    }
-    sweep_tx.vout.emplace_back(effective_amount, GetScriptForDestination(dest));
-
-    const TxSize tx_size = CalculateMaximumSignedTxSize(CTransaction(sweep_tx), pwallet.get(), &coin_control);
-    if (tx_size.vsize <= 0) {
-        ThrowQuantumActionError(
-            RPC_WALLET_ERROR,
-            "Demurrage sweep",
-            "Unable to estimate demurrage sweep transaction size",
-            created_destination);
-    }
-    const CAmount fee = std::max(GetMinFee(static_cast<size_t>(tx_size.vsize), static_cast<uint32_t>(current_time)), fee_rate.GetFee(static_cast<uint32_t>(tx_size.vsize)));
-    if (fee > pwallet->m_default_max_tx_fee) {
-        ThrowQuantumActionError(
-            RPC_WALLET_ERROR,
-            "Demurrage sweep",
-            strprintf("Fee exceeds wallet max transaction fee (%s)", FormatMoney(pwallet->m_default_max_tx_fee)),
-            created_destination);
-    }
-    const CAmount output_amount = effective_amount - fee;
-    if (!MoneyRange(output_amount) || output_amount <= 0) {
-        ThrowQuantumActionError(
-            RPC_WALLET_INSUFFICIENT_FUNDS,
-            "Demurrage sweep",
-            "Selected decaying outputs cannot pay the sweep fee",
-            created_destination);
-    }
-    sweep_tx.vout[0].nValue = output_amount;
-
-    if (IsDust(sweep_tx.vout[0], pwallet->chain().relayDustFee())) {
-        ThrowQuantumActionError(
-            RPC_WALLET_INSUFFICIENT_FUNDS,
-            "Demurrage sweep",
-            "Demurrage sweep would strand the effective value below dust after fees",
-            created_destination);
-    }
-    if (!dry_run) {
-        std::map<int, bilingual_str> input_errors;
-        if (!pwallet->SignTransaction(sweep_tx, input_errors)) {
-            if (!input_errors.empty()) {
-                ThrowQuantumActionError(
-                    RPC_WALLET_ERROR,
-                    "Demurrage sweep",
-                    strprintf("Signing demurrage sweep failed: %s", input_errors.begin()->second.original),
-                    created_destination);
+    UniValue obj(UniValue::VOBJ);
+    {
+        LOCK2(cs_main, pwallet->cs_wallet);
+        if (!dry_run) {
+            EnsureWalletIsUnlocked(*pwallet);
+            if (pwallet->m_wallet_unlock_staking_only) {
+                throw JSONRPCError(RPC_WALLET_ERROR, "Wallet unlocked for staking only, unable to sweep demurrage outputs");
             }
+            if (pwallet->IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS)) {
+                throw JSONRPCError(RPC_WALLET_ERROR, "Error: Private keys are disabled for this wallet");
+            }
+        }
+
+        const Consensus::Params& consensus = Params().GetConsensus();
+        const CBlockIndex* tip = pwallet->chain().getTip();
+        const int tip_height = tip ? tip->nHeight : -1;
+        const int evaluation_height = tip_height >= 0 ? tip_height + 1 : 0;
+        const int64_t evaluation_time = tip ? tip->GetMedianTimePast() : 0;
+        if (!consensus.IsDemurrageActive(evaluation_height, evaluation_time)) {
+            throw JSONRPCError(RPC_WALLET_ERROR, "demurrage is not active for the next block");
+        }
+
+        std::optional<CScript> source_script;
+        if (!source_address.empty()) {
+            std::string error_msg;
+            const CTxDestination source_dest = DecodeDestination(source_address, error_msg);
+            const auto* witness = std::get_if<WitnessUnknown>(&source_dest);
+            if (!IsValidDestination(source_dest) || !witness ||
+                !IsQuantumMigrationWitnessProgram(witness->GetWitnessVersion(), witness->GetWitnessProgram())) {
+                throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, error_msg.empty() ? "source_address is not a Blackcoin migration address" : error_msg);
+            }
+            if (!pwallet->GetQuantumKeyInfo(source_dest).has_value()) {
+                throw JSONRPCError(RPC_WALLET_ERROR, "source_address is not wallet-backed");
+            }
+            source_script = GetScriptForDestination(source_dest);
+        }
+
+        CTxDestination dest;
+        if (!destination_address.empty()) {
+            std::string error_msg;
+            dest = DecodeDestination(destination_address, error_msg);
+            const auto* witness = std::get_if<WitnessUnknown>(&dest);
+            if (!IsValidDestination(dest) || !witness ||
+                !IsQuantumMigrationWitnessProgram(witness->GetWitnessVersion(), witness->GetWitnessProgram())) {
+                throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, error_msg.empty() ? "destination_address is not a Blackcoin migration address" : error_msg);
+            }
+            if (!pwallet->GetQuantumKeyInfo(dest).has_value()) {
+                throw JSONRPCError(RPC_WALLET_ERROR, "destination_address is not wallet-backed");
+            }
+        } else {
+            auto op_dest = pwallet->GetNewQuantumDestination(label);
+            if (!op_dest) throw JSONRPCError(RPC_WALLET_ERROR, util::ErrorString(op_dest).original);
+            dest = *op_dest;
+            newly_generated = true;
+        }
+        if (newly_generated) created_destination = dest;
+        if (!pwallet->GetQuantumKeyInfo(dest).has_value()) {
             ThrowQuantumActionError(
                 RPC_WALLET_ERROR,
                 "Demurrage sweep",
-                "Signing demurrage sweep failed",
+                "Refusing to sweep: destination ML-DSA key is not confirmed stored in the wallet",
                 created_destination);
         }
-    }
-    CTransactionRef tx = MakeTransactionRef(std::move(sweep_tx));
-    const int result_vsize = dry_run ? static_cast<int>(tx_size.vsize) : static_cast<int>(GetVirtualTransactionSize(*tx, 0, 0));
 
-    UniValue obj(UniValue::VOBJ);
-    obj.pushKV("dry_run", dry_run);
-    obj.pushKV("evaluation_height", evaluation_height);
-    obj.pushKV("evaluation_time", evaluation_time);
-    obj.pushKV("selected_inputs", selected_inputs);
-    obj.pushKV("skipped_locked_outputs", skipped_locked_outputs);
-    obj.pushKV("nominal_amount", ValueFromAmount(nominal_amount));
-    obj.pushKV("effective_amount", ValueFromAmount(effective_amount));
-    obj.pushKV("burned_amount", ValueFromAmount(burned_amount));
-    obj.pushKV("skipped_locked_amount", ValueFromAmount(skipped_locked_amount));
-    obj.pushKV("destination", EncodeDestination(dest));
-    obj.pushKV("newly_generated", newly_generated);
-    obj.pushKV("amount", ValueFromAmount(tx->vout[0].nValue));
-    obj.pushKV("fee", ValueFromAmount(fee));
-    obj.pushKV("vsize", result_vsize);
-    obj.pushKV("hex", EncodeHexTx(*tx));
+        CCoinControl coin_control;
+        coin_control.m_allow_other_inputs = false;
+        coin_control.m_include_unsafe_inputs = include_unsafe;
+        coin_control.destChange = dest;
+        if (requested_fee_rate) {
+            coin_control.m_feerate = *requested_fee_rate;
+            coin_control.fOverrideFeeRate = true;
+        }
+
+        CoinFilterParams filter;
+        filter.only_spendable = true;
+        filter.skip_locked = true;
+        filter.include_immature_coinbase = false;
+        // The sweep picks its inputs itself: it leaves the final stake reserve alone, as the commit would refuse it.
+        filter.avoid_final_stake_reserve = true;
+
+        CoinsResult available = AvailableCoins(*pwallet, &coin_control, std::nullopt, filter);
+        std::map<COutPoint, Coin> chain_coins;
+        std::vector<COutput> candidates;
+        for (const COutput& out : available.All()) {
+            if (!IsQuantumMigrationScript(out.txout.scriptPubKey)) continue;
+            if (source_script && out.txout.scriptPubKey != *source_script) continue;
+            CTxDestination out_dest;
+            if (!ExtractDestination(out.txout.scriptPubKey, out_dest) || !pwallet->GetQuantumKeyInfo(out_dest).has_value()) continue;
+            chain_coins.emplace(out.outpoint, Coin{});
+            candidates.push_back(out);
+        }
+        pwallet->chain().findCoins(chain_coins);
+
+        CAmount nominal_amount{0};
+        CAmount effective_amount{0};
+        CAmount burned_amount{0};
+        CAmount skipped_locked_amount{0};
+        int selected_inputs{0};
+        int skipped_locked_outputs{0};
+        std::vector<COutPoint> selected_outpoints;
+        const CCoinsViewCache& view = pwallet->chain().getCoinsTip();
+        for (const COutput& out : candidates) {
+            const auto coin_it = chain_coins.find(out.outpoint);
+            if (coin_it == chain_coins.end() || coin_it->second.IsSpent()) continue;
+            const std::optional<Consensus::DemurrageAttestationState> latest_attestation =
+                Consensus::LatestDemurrageAttestationStateForScript(view, out.txout.scriptPubKey);
+            const Consensus::DemurrageEvaluation eval = Consensus::EvaluateDemurrage(
+                coin_it->second, consensus, evaluation_height, evaluation_time,
+                latest_attestation ? std::optional<int>{latest_attestation->height} : std::nullopt,
+                latest_attestation ? std::optional<int>{static_cast<int>(latest_attestation->coverage_start_height)} : std::nullopt);
+            if (eval.locked) {
+                ++skipped_locked_outputs;
+                skipped_locked_amount += eval.nominal_value;
+                continue;
+            }
+            if (eval.burned_value <= 0) continue;
+            selected_outpoints.push_back(out.outpoint);
+            nominal_amount += eval.nominal_value;
+            effective_amount += eval.effective_value;
+            burned_amount += eval.burned_value;
+            ++selected_inputs;
+        }
+        if (selected_inputs == 0) {
+            ThrowQuantumActionError(
+                RPC_WALLET_INSUFFICIENT_FUNDS,
+                "Demurrage sweep",
+                "No spendable wallet-owned quantum outputs are currently decaying",
+                created_destination);
+        }
+        if (effective_amount <= 0) {
+            ThrowQuantumActionError(
+                RPC_WALLET_INSUFFICIENT_FUNDS,
+                "Demurrage sweep",
+                "Selected decaying outputs have no spendable effective value",
+                created_destination);
+        }
+
+        const int64_t current_time = GetAdjustedTimeSeconds();
+        const CFeeRate fee_rate = GetMinimumFeeRate(*pwallet, coin_control, current_time);
+        if (coin_control.m_feerate && fee_rate > *coin_control.m_feerate) {
+            ThrowQuantumActionError(
+                RPC_INVALID_PARAMETER,
+                "Demurrage sweep",
+                strprintf("Fee rate (%s) is lower than the minimum fee rate setting (%s)", coin_control.m_feerate->ToString(FeeEstimateMode::SAT_VB), fee_rate.ToString(FeeEstimateMode::SAT_VB)),
+                created_destination);
+        }
+
+        CMutableTransaction sweep_tx;
+        sweep_tx.nVersion = CTransaction::CURRENT_VERSION;
+        sweep_tx.nTime = current_time;
+        static constexpr uint32_t MAX_SEQUENCE_NONFINAL = 0xfffffffe;
+        for (const COutPoint& outpoint : selected_outpoints) {
+            sweep_tx.vin.emplace_back(outpoint, CScript(), MAX_SEQUENCE_NONFINAL);
+        }
+        sweep_tx.vout.emplace_back(effective_amount, GetScriptForDestination(dest));
+
+        const TxSize tx_size = CalculateMaximumSignedTxSize(CTransaction(sweep_tx), pwallet.get(), &coin_control);
+        if (tx_size.vsize <= 0) {
+            ThrowQuantumActionError(
+                RPC_WALLET_ERROR,
+                "Demurrage sweep",
+                "Unable to estimate demurrage sweep transaction size",
+                created_destination);
+        }
+        const CAmount fee = std::max(GetMinFee(static_cast<size_t>(tx_size.vsize), static_cast<uint32_t>(current_time)), fee_rate.GetFee(static_cast<uint32_t>(tx_size.vsize)));
+        if (fee > pwallet->m_default_max_tx_fee) {
+            ThrowQuantumActionError(
+                RPC_WALLET_ERROR,
+                "Demurrage sweep",
+                strprintf("Fee exceeds wallet max transaction fee (%s)", FormatMoney(pwallet->m_default_max_tx_fee)),
+                created_destination);
+        }
+        const CAmount output_amount = effective_amount - fee;
+        if (!MoneyRange(output_amount) || output_amount <= 0) {
+            ThrowQuantumActionError(
+                RPC_WALLET_INSUFFICIENT_FUNDS,
+                "Demurrage sweep",
+                "Selected decaying outputs cannot pay the sweep fee",
+                created_destination);
+        }
+        sweep_tx.vout[0].nValue = output_amount;
+
+        if (IsDust(sweep_tx.vout[0], pwallet->chain().relayDustFee())) {
+            ThrowQuantumActionError(
+                RPC_WALLET_INSUFFICIENT_FUNDS,
+                "Demurrage sweep",
+                "Demurrage sweep would strand the effective value below dust after fees",
+                created_destination);
+        }
+        if (!dry_run) {
+            std::map<int, bilingual_str> input_errors;
+            if (!pwallet->SignTransaction(sweep_tx, input_errors)) {
+                if (!input_errors.empty()) {
+                    ThrowQuantumActionError(
+                        RPC_WALLET_ERROR,
+                        "Demurrage sweep",
+                        strprintf("Signing demurrage sweep failed: %s", input_errors.begin()->second.original),
+                        created_destination);
+                }
+                ThrowQuantumActionError(
+                    RPC_WALLET_ERROR,
+                    "Demurrage sweep",
+                    "Signing demurrage sweep failed",
+                    created_destination);
+            }
+        }
+        tx = MakeTransactionRef(std::move(sweep_tx));
+        const int result_vsize = dry_run ? static_cast<int>(tx_size.vsize) : static_cast<int>(GetVirtualTransactionSize(*tx, 0, 0));
+
+        obj.pushKV("dry_run", dry_run);
+        obj.pushKV("evaluation_height", evaluation_height);
+        obj.pushKV("evaluation_time", evaluation_time);
+        obj.pushKV("selected_inputs", selected_inputs);
+        obj.pushKV("skipped_locked_outputs", skipped_locked_outputs);
+        obj.pushKV("nominal_amount", ValueFromAmount(nominal_amount));
+        obj.pushKV("effective_amount", ValueFromAmount(effective_amount));
+        obj.pushKV("burned_amount", ValueFromAmount(burned_amount));
+        obj.pushKV("skipped_locked_amount", ValueFromAmount(skipped_locked_amount));
+        obj.pushKV("destination", EncodeDestination(dest));
+        obj.pushKV("newly_generated", newly_generated);
+        obj.pushKV("amount", ValueFromAmount(tx->vout[0].nValue));
+        obj.pushKV("fee", ValueFromAmount(fee));
+        obj.pushKV("vsize", result_vsize);
+        obj.pushKV("hex", EncodeHexTx(*tx));
+    }
     if (!dry_run) {
         mapValue_t map_value;
         map_value["comment"] = "Blackcoin demurrage sweep";

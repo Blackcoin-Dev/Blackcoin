@@ -157,7 +157,10 @@ static void CommitWalletTransactionOrThrow(
     const std::optional<CTxDestination>& created_destination = std::nullopt,
     const CommitSpendProvenance& provenance = {},
     FinalStakeReserveSpendReport* reserve_report = nullptr)
+    LOCKS_EXCLUDED(wallet.cs_wallet)
 {
+    // CommitTransaction takes cs_main and then cs_wallet itself, so the caller holds neither wallet lock.
+    AssertLockNotHeld(wallet.cs_wallet);
     std::string broadcast_error;
     WalletCommitStatus status;
     bool committed{false};
@@ -2164,201 +2167,205 @@ RPCHelpMan migratetoquantum()
                 "migratetoquantum without existing_address creates a new non-HD ML-DSA key that an older wallet backup cannot recover. Retry with {\"allow_new_quantum_key\":true}, or supply an existing wallet-owned direct quantum existing_address. Back up the wallet after key creation. No key, transaction, or wallet metadata was created.");
         }
 
-        LOCK2(cs_main, pwallet->cs_wallet);
-        if (!dry_run) {
-            EnsureWalletIsUnlocked(*pwallet);
-            if (pwallet->IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS)) {
-                throw JSONRPCError(RPC_WALLET_ERROR, "Error: Private keys are disabled for this wallet");
-            }
-        }
-
-        const Consensus::Params& consensus = Params().GetConsensus();
-        int64_t mtp = 0;
-        int next_height = 0;
-        if (const CBlockIndex* tip = pwallet->chain().chainman().ActiveChain().Tip()) {
-            mtp = tip->GetMedianTimePast();
-            next_height = tip->nHeight + 1;
-        }
-        if (consensus.IsQuantumFinalLockout(mtp, next_height)) {
-            throw JSONRPCError(RPC_WALLET_ERROR,
-                "The migration deadline has passed; legacy coins are no longer spendable and cannot be migrated.");
-        }
-        const std::string phase = QQPhaseName(consensus.GetQuantumQuasarPhase(mtp, next_height));
-        if (!dry_run && !IsQuantumWitnessSpendActive(consensus, mtp, next_height)) {
-            throw JSONRPCError(RPC_WALLET_ERROR,
-                "Quantum funding is disabled during Gold Rush. Use dry_run with an existing wallet-backed address for planning, then migrate after Gold Rush ends.");
-        }
-
-        CTxDestination dest;
-        bool newly_generated = false;
-        if (!existing.empty()) {
-            std::string err;
-            dest = DecodeDestination(existing, err);
-            const auto* w = std::get_if<WitnessUnknown>(&dest);
-            if (!IsValidDestination(dest) || !w ||
-                !IsQuantumMigrationWitnessProgram(w->GetWitnessVersion(), w->GetWitnessProgram())) {
-                throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "existing_address is not a Blackcoin migration address");
-            }
-            if (!pwallet->GetQuantumKeyInfo(dest).has_value()) {
-                throw JSONRPCError(RPC_WALLET_ERROR, "existing_address is not wallet-backed (no ML-DSA private key in this wallet)");
-            }
-        } else {
-            auto op_dest = pwallet->GetNewQuantumDestination(label);
-            if (!op_dest) throw JSONRPCError(RPC_WALLET_ERROR, util::ErrorString(op_dest).original);
-            dest = *op_dest;
-            newly_generated = true;
-        }
-        const std::optional<CTxDestination> created_destination = newly_generated
-            ? std::optional<CTxDestination>{dest}
-            : std::nullopt;
-        if (!pwallet->GetQuantumKeyInfo(dest).has_value()) {
-            ThrowQuantumActionError(
-                RPC_WALLET_ERROR,
-                "Quantum migration",
-                "Refusing to migrate: destination ML-DSA key is not confirmed stored in the wallet.",
-                created_destination);
-        }
-
-        CCoinControl coin_control;
-        coin_control.m_allow_other_inputs = false;
-        coin_control.m_include_unsafe_inputs = include_unsafe;
-        coin_control.destChange = dest;
-        if (requested_fee_rate) {
-            coin_control.m_feerate = *requested_fee_rate;
-            coin_control.fOverrideFeeRate = true;
-        }
-        CoinFilterParams filter;
-        filter.only_spendable = true;
-        filter.skip_locked = true;
-        filter.include_immature_coinbase = false;
-        // A coinbase or coinstake output that matures in the very next block is
-        // valid to spend in that block. Without this, an output maturing exactly
-        // in the last Migration block could not be moved.
-        filter.include_next_block_mature_coinbase = true;
-        // The wallet's own choice of inputs leaves the final stake reserve alone.
-        filter.avoid_final_stake_reserve = true;
-
-        const bool anchor_required_early = IsQuantumWitnessSpendActive(consensus, mtp, next_height);
-        CAmount eligible_amount = 0;
-        unsigned int eligible_inputs = 0;
-        unsigned int migration_anchor_inputs = 0;
-        unsigned int migration_auxiliary_inputs = 0;
-        std::vector<MigrationBatchInput> batch_candidates;
-        const CCoinsViewCache& migration_view = pwallet->chain().chainman().ActiveChainstate().CoinsTip();
-        for (const COutput& out : AvailableCoins(*pwallet, &coin_control, std::nullopt, filter).All()) {
-            const CScript& spk = out.txout.scriptPubKey;
-            if (IsQuantumMigrationScript(spk)) {
-                // A confirmed quantum output of the wallet can anchor and fund a later batch.
-                const Coin& quantum_coin = migration_view.AccessCoin(out.outpoint);
-                if (out.spendable && anchor_required_early &&
-                    IsMigrationAuxiliaryOutput(*pwallet, out.outpoint, out.txout, quantum_coin, consensus, mtp, next_height)) {
-                    const int quantum_vsize = CalculateMaximumSignedInputSize(out.txout, pwallet.get(), &coin_control);
-                    batch_candidates.push_back({out.outpoint, out.txout.nValue, out.txout.nValue,
-                                                quantum_vsize > 0 ? int64_t{quantum_vsize} * WITNESS_SCALE_FACTOR : int64_t{4000},
-                                                /*anchor=*/true, /*auxiliary=*/true});
-                    ++migration_auxiliary_inputs;
-                }
-                continue;
-            }
-            if (IsQuantumColdStakeScript(spk)) continue;
-            if (IsEUTXOScript(spk)) continue;
-            if (!out.spendable) continue;
-            const Coin& coin = migration_view.AccessCoin(out.outpoint);
-            const bool is_anchor = !coin.IsSpent() && IsWalletProtectedLineageInput(
-                    *pwallet, out.outpoint, coin, consensus, mtp, next_height);
-            if (is_anchor) ++migration_anchor_inputs;
-            const int input_vsize = CalculateMaximumSignedInputSize(out.txout, pwallet.get(), &coin_control);
-            batch_candidates.push_back({out.outpoint, out.txout.nValue, out.txout.nValue,
-                                        input_vsize > 0 ? int64_t{input_vsize} * WITNESS_SCALE_FACTOR : int64_t{600},
-                                        is_anchor});
-            eligible_amount += out.txout.nValue;
-            ++eligible_inputs;
-        }
-        if (eligible_inputs == 0) {
-            ThrowQuantumActionError(
-                RPC_WALLET_INSUFFICIENT_FUNDS,
-                "Quantum migration",
-                "No spendable legacy coins to migrate.",
-                created_destination);
-        }
-        const bool anchor_required = IsQuantumWitnessSpendActive(consensus, mtp, next_height);
-        if (anchor_required && migration_anchor_inputs == 0 && migration_auxiliary_inputs == 0) {
-            ThrowQuantumActionError(
-                RPC_WALLET_ERROR,
-                "Quantum migration",
-                "This wallet's spendable legacy coins are witness-only and cannot create a fork-unique migration transaction, and it has no confirmed quantum output to anchor them. If an earlier migration batch is still unconfirmed, wait for it to confirm. Otherwise add a small P2PKH or non-witness P2SH wallet UTXO as a migration anchor. During Gold Rush, prepare that anchor before quantum spending activates.",
-                created_destination);
-        }
-
-        auto batch = BuildMigrationBatch(*pwallet, coin_control, dest, batch_candidates, batch_limit, anchor_required, /*sign=*/!dry_run,
-                                         FinalStakeReserveEnforcedOutpoints(*pwallet));
-        if (!batch) {
-            ThrowQuantumActionError(
-                RPC_WALLET_ERROR,
-                "Quantum migration",
-                util::ErrorString(batch).original,
-                created_destination);
-        }
-
-        const CTransactionRef& tx = batch->tx;
-        if (tx->vout.size() != 1 || IsDust(tx->vout[0], pwallet->chain().relayDustFee())) {
-            ThrowQuantumActionError(
-                RPC_WALLET_INSUFFICIENT_FUNDS,
-                "Quantum migration",
-                "Migration would strand funds: swept value is below the dust threshold after fees.",
-                created_destination);
-        }
-
+        // The construction needs cs_main and cs_wallet. The commit takes them itself and must find neither held,
+        // so the transaction and the reply are made inside this block and both locks are released before the commit.
+        CTransactionRef tx;
+        std::optional<CTxDestination> created_destination;
+        bool newly_generated{false};
         UniValue result(UniValue::VOBJ);
-        result.pushKV("phase", phase);
-        result.pushKV("deadline_mtp", consensus.nQuantumMigrationDeadlineTime);
-        result.pushKV("eligible_inputs", (int)batch->selected.size());
-        result.pushKV("eligible_amount", ValueFromAmount(batch->selected_value));
-        result.pushKV("total_eligible_inputs", (int)eligible_inputs);
-        result.pushKV("total_eligible_amount", ValueFromAmount(eligible_amount));
-        result.pushKV("remaining_inputs", (int)batch->remaining_inputs);
-        result.pushKV("remaining_amount", ValueFromAmount(batch->remaining_value));
-        result.pushKV("more_batches", batch->remaining_inputs > 0);
         {
-            std::set<COutPoint> considered;
-            for (const MigrationBatchInput& c : batch_candidates) considered.insert(c.outpoint);
-            const ExcludedLegacyOutputs excluded = FindExcludedLegacyOutputs(*pwallet, considered, consensus, next_height);
-            result.pushKV("excluded_legacy_outputs", (int)excluded.count);
-            result.pushKV("excluded_legacy_amount", ValueFromAmount(excluded.amount));
-            if (excluded.next_maturity_height > 0) result.pushKV("next_maturity_height", excluded.next_maturity_height);
-            UniValue reasons(UniValue::VOBJ);
-            auto add_reason = [&reasons](const char* name, const ResidualCategory& c) {
-                UniValue entry(UniValue::VOBJ);
-                entry.pushKV("count", (int)c.count);
-                entry.pushKV("amount", ValueFromAmount(c.amount));
-                reasons.pushKV(name, std::move(entry));
-            };
-            add_reason("protected_asset", excluded.protected_asset);
-            add_reason("locked", excluded.locked);
-            add_reason("immature", excluded.immature);
-            add_reason("unconfirmed", excluded.unconfirmed);
-            add_reason("signer_unavailable", excluded.signer_unavailable);
-            add_reason("other", excluded.other);
-            result.pushKV("excluded_legacy_by_reason", std::move(reasons));
+            LOCK2(cs_main, pwallet->cs_wallet);
+            if (!dry_run) {
+                EnsureWalletIsUnlocked(*pwallet);
+                if (pwallet->IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS)) {
+                    throw JSONRPCError(RPC_WALLET_ERROR, "Error: Private keys are disabled for this wallet");
+                }
+            }
+
+            const Consensus::Params& consensus = Params().GetConsensus();
+            int64_t mtp = 0;
+            int next_height = 0;
+            if (const CBlockIndex* tip = pwallet->chain().chainman().ActiveChain().Tip()) {
+                mtp = tip->GetMedianTimePast();
+                next_height = tip->nHeight + 1;
+            }
+            if (consensus.IsQuantumFinalLockout(mtp, next_height)) {
+                throw JSONRPCError(RPC_WALLET_ERROR,
+                    "The migration deadline has passed; legacy coins are no longer spendable and cannot be migrated.");
+            }
+            const std::string phase = QQPhaseName(consensus.GetQuantumQuasarPhase(mtp, next_height));
+            if (!dry_run && !IsQuantumWitnessSpendActive(consensus, mtp, next_height)) {
+                throw JSONRPCError(RPC_WALLET_ERROR,
+                    "Quantum funding is disabled during Gold Rush. Use dry_run with an existing wallet-backed address for planning, then migrate after Gold Rush ends.");
+            }
+
+            CTxDestination dest;
+            if (!existing.empty()) {
+                std::string err;
+                dest = DecodeDestination(existing, err);
+                const auto* w = std::get_if<WitnessUnknown>(&dest);
+                if (!IsValidDestination(dest) || !w ||
+                    !IsQuantumMigrationWitnessProgram(w->GetWitnessVersion(), w->GetWitnessProgram())) {
+                    throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "existing_address is not a Blackcoin migration address");
+                }
+                if (!pwallet->GetQuantumKeyInfo(dest).has_value()) {
+                    throw JSONRPCError(RPC_WALLET_ERROR, "existing_address is not wallet-backed (no ML-DSA private key in this wallet)");
+                }
+            } else {
+                auto op_dest = pwallet->GetNewQuantumDestination(label);
+                if (!op_dest) throw JSONRPCError(RPC_WALLET_ERROR, util::ErrorString(op_dest).original);
+                dest = *op_dest;
+                newly_generated = true;
+            }
+            if (newly_generated) created_destination = dest;
+            if (!pwallet->GetQuantumKeyInfo(dest).has_value()) {
+                ThrowQuantumActionError(
+                    RPC_WALLET_ERROR,
+                    "Quantum migration",
+                    "Refusing to migrate: destination ML-DSA key is not confirmed stored in the wallet.",
+                    created_destination);
+            }
+
+            CCoinControl coin_control;
+            coin_control.m_allow_other_inputs = false;
+            coin_control.m_include_unsafe_inputs = include_unsafe;
+            coin_control.destChange = dest;
+            if (requested_fee_rate) {
+                coin_control.m_feerate = *requested_fee_rate;
+                coin_control.fOverrideFeeRate = true;
+            }
+            CoinFilterParams filter;
+            filter.only_spendable = true;
+            filter.skip_locked = true;
+            filter.include_immature_coinbase = false;
+            // A coinbase or coinstake output that matures in the very next block is
+            // valid to spend in that block. Without this, an output maturing exactly
+            // in the last Migration block could not be moved.
+            filter.include_next_block_mature_coinbase = true;
+            // The wallet's own choice of inputs leaves the final stake reserve alone.
+            filter.avoid_final_stake_reserve = true;
+
+            const bool anchor_required_early = IsQuantumWitnessSpendActive(consensus, mtp, next_height);
+            CAmount eligible_amount = 0;
+            unsigned int eligible_inputs = 0;
+            unsigned int migration_anchor_inputs = 0;
+            unsigned int migration_auxiliary_inputs = 0;
+            std::vector<MigrationBatchInput> batch_candidates;
+            const CCoinsViewCache& migration_view = pwallet->chain().chainman().ActiveChainstate().CoinsTip();
+            for (const COutput& out : AvailableCoins(*pwallet, &coin_control, std::nullopt, filter).All()) {
+                const CScript& spk = out.txout.scriptPubKey;
+                if (IsQuantumMigrationScript(spk)) {
+                    // A confirmed quantum output of the wallet can anchor and fund a later batch.
+                    const Coin& quantum_coin = migration_view.AccessCoin(out.outpoint);
+                    if (out.spendable && anchor_required_early &&
+                        IsMigrationAuxiliaryOutput(*pwallet, out.outpoint, out.txout, quantum_coin, consensus, mtp, next_height)) {
+                        const int quantum_vsize = CalculateMaximumSignedInputSize(out.txout, pwallet.get(), &coin_control);
+                        batch_candidates.push_back({out.outpoint, out.txout.nValue, out.txout.nValue,
+                                                    quantum_vsize > 0 ? int64_t{quantum_vsize} * WITNESS_SCALE_FACTOR : int64_t{4000},
+                                                    /*anchor=*/true, /*auxiliary=*/true});
+                        ++migration_auxiliary_inputs;
+                    }
+                    continue;
+                }
+                if (IsQuantumColdStakeScript(spk)) continue;
+                if (IsEUTXOScript(spk)) continue;
+                if (!out.spendable) continue;
+                const Coin& coin = migration_view.AccessCoin(out.outpoint);
+                const bool is_anchor = !coin.IsSpent() && IsWalletProtectedLineageInput(
+                        *pwallet, out.outpoint, coin, consensus, mtp, next_height);
+                if (is_anchor) ++migration_anchor_inputs;
+                const int input_vsize = CalculateMaximumSignedInputSize(out.txout, pwallet.get(), &coin_control);
+                batch_candidates.push_back({out.outpoint, out.txout.nValue, out.txout.nValue,
+                                            input_vsize > 0 ? int64_t{input_vsize} * WITNESS_SCALE_FACTOR : int64_t{600},
+                                            is_anchor});
+                eligible_amount += out.txout.nValue;
+                ++eligible_inputs;
+            }
+            if (eligible_inputs == 0) {
+                ThrowQuantumActionError(
+                    RPC_WALLET_INSUFFICIENT_FUNDS,
+                    "Quantum migration",
+                    "No spendable legacy coins to migrate.",
+                    created_destination);
+            }
+            const bool anchor_required = IsQuantumWitnessSpendActive(consensus, mtp, next_height);
+            if (anchor_required && migration_anchor_inputs == 0 && migration_auxiliary_inputs == 0) {
+                ThrowQuantumActionError(
+                    RPC_WALLET_ERROR,
+                    "Quantum migration",
+                    "This wallet's spendable legacy coins are witness-only and cannot create a fork-unique migration transaction, and it has no confirmed quantum output to anchor them. If an earlier migration batch is still unconfirmed, wait for it to confirm. Otherwise add a small P2PKH or non-witness P2SH wallet UTXO as a migration anchor. During Gold Rush, prepare that anchor before quantum spending activates.",
+                    created_destination);
+            }
+
+            auto batch = BuildMigrationBatch(*pwallet, coin_control, dest, batch_candidates, batch_limit, anchor_required, /*sign=*/!dry_run,
+                                             FinalStakeReserveEnforcedOutpoints(*pwallet));
+            if (!batch) {
+                ThrowQuantumActionError(
+                    RPC_WALLET_ERROR,
+                    "Quantum migration",
+                    util::ErrorString(batch).original,
+                    created_destination);
+            }
+
+        tx = batch->tx;
+            if (tx->vout.size() != 1 || IsDust(tx->vout[0], pwallet->chain().relayDustFee())) {
+                ThrowQuantumActionError(
+                    RPC_WALLET_INSUFFICIENT_FUNDS,
+                    "Quantum migration",
+                    "Migration would strand funds: swept value is below the dust threshold after fees.",
+                    created_destination);
+            }
+
+            result.pushKV("phase", phase);
+            result.pushKV("deadline_mtp", consensus.nQuantumMigrationDeadlineTime);
+            result.pushKV("eligible_inputs", (int)batch->selected.size());
+            result.pushKV("eligible_amount", ValueFromAmount(batch->selected_value));
+            result.pushKV("total_eligible_inputs", (int)eligible_inputs);
+            result.pushKV("total_eligible_amount", ValueFromAmount(eligible_amount));
+            result.pushKV("remaining_inputs", (int)batch->remaining_inputs);
+            result.pushKV("remaining_amount", ValueFromAmount(batch->remaining_value));
+            result.pushKV("more_batches", batch->remaining_inputs > 0);
+            {
+                std::set<COutPoint> considered;
+                for (const MigrationBatchInput& c : batch_candidates) considered.insert(c.outpoint);
+                const ExcludedLegacyOutputs excluded = FindExcludedLegacyOutputs(*pwallet, considered, consensus, next_height);
+                result.pushKV("excluded_legacy_outputs", (int)excluded.count);
+                result.pushKV("excluded_legacy_amount", ValueFromAmount(excluded.amount));
+                if (excluded.next_maturity_height > 0) result.pushKV("next_maturity_height", excluded.next_maturity_height);
+                UniValue reasons(UniValue::VOBJ);
+                auto add_reason = [&reasons](const char* name, const ResidualCategory& c) {
+                    UniValue entry(UniValue::VOBJ);
+                    entry.pushKV("count", (int)c.count);
+                    entry.pushKV("amount", ValueFromAmount(c.amount));
+                    reasons.pushKV(name, std::move(entry));
+                };
+                add_reason("protected_asset", excluded.protected_asset);
+                add_reason("locked", excluded.locked);
+                add_reason("immature", excluded.immature);
+                add_reason("unconfirmed", excluded.unconfirmed);
+                add_reason("signer_unavailable", excluded.signer_unavailable);
+                add_reason("other", excluded.other);
+                result.pushKV("excluded_legacy_by_reason", std::move(reasons));
+            }
+            result.pushKV("continuation_batches", (int)batch->continuation_batches);
+            result.pushKV("continuation_fees", ValueFromAmount(batch->continuation_fees));
+            result.pushKV("minimum_blocks_to_finish", (int)batch->continuation_min_blocks);
+            if (batch->remaining_inputs > 0 && consensus.IsMigrationEndScheduled() &&
+                next_height + static_cast<int64_t>(batch->continuation_min_blocks) - 1 > consensus.nQuantumMigrationEndHeight) {
+                result.pushKV("completion_warning",
+                    "Even with every later batch confirmed in the next block, the migration cannot finish by the last Migration block; "
+                    "move what you can now, with a larger max_inputs if the wallet allows it.");
+            }
+            result.pushKV("auxiliary_inputs", (int)batch->auxiliary.size());
+            result.pushKV("auxiliary_amount", ValueFromAmount(batch->auxiliary_value));
+            result.pushKV("max_inputs", (int)batch_limit);
+            result.pushKV("destination", EncodeDestination(dest));
+            result.pushKV("newly_generated", newly_generated);
+            result.pushKV("stored_in_wallet", true);
+            result.pushKV("amount", ValueFromAmount(tx->vout[0].nValue));
+            result.pushKV("fee", ValueFromAmount(batch->fee));
+            result.pushKV("vsize", dry_run ? (int)batch->estimated_vsize : (int)GetVirtualTransactionSize(*tx, 0, 0));
         }
-        result.pushKV("continuation_batches", (int)batch->continuation_batches);
-        result.pushKV("continuation_fees", ValueFromAmount(batch->continuation_fees));
-        result.pushKV("minimum_blocks_to_finish", (int)batch->continuation_min_blocks);
-        if (batch->remaining_inputs > 0 && consensus.IsMigrationEndScheduled() &&
-            next_height + static_cast<int64_t>(batch->continuation_min_blocks) - 1 > consensus.nQuantumMigrationEndHeight) {
-            result.pushKV("completion_warning",
-                "Even with every later batch confirmed in the next block, the migration cannot finish by the last Migration block; "
-                "move what you can now, with a larger max_inputs if the wallet allows it.");
-        }
-        result.pushKV("auxiliary_inputs", (int)batch->auxiliary.size());
-        result.pushKV("auxiliary_amount", ValueFromAmount(batch->auxiliary_value));
-        result.pushKV("max_inputs", (int)batch_limit);
-        result.pushKV("destination", EncodeDestination(dest));
-        result.pushKV("newly_generated", newly_generated);
-        result.pushKV("stored_in_wallet", true);
-        result.pushKV("amount", ValueFromAmount(tx->vout[0].nValue));
-        result.pushKV("fee", ValueFromAmount(batch->fee));
-        result.pushKV("vsize", dry_run ? (int)batch->estimated_vsize : (int)GetVirtualTransactionSize(*tx, 0, 0));
         if (!dry_run) {
             CommitWalletTransactionOrThrow(*pwallet, tx, {}, "Quantum migration", created_destination);
             result.pushKV("txid", tx->GetHash().GetHex());
@@ -2455,152 +2462,156 @@ RPCHelpMan migrategoldrushrewards()
                 "migrategoldrushrewards without existing_address creates a new non-HD ML-DSA key that an older wallet backup cannot recover. Retry with {\"allow_new_quantum_key\":true}, or supply an existing wallet-owned direct quantum existing_address. Back up the wallet after key creation. No key, transaction, or wallet metadata was created.");
         }
 
-        LOCK2(cs_main, pwallet->cs_wallet);
-        if (!dry_run) {
-            EnsureWalletIsUnlocked(*pwallet);
-            if (pwallet->IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS)) {
-                throw JSONRPCError(RPC_WALLET_ERROR, "Error: Private keys are disabled for this wallet");
-            }
-        }
-
-        const Consensus::Params& consensus = Params().GetConsensus();
-        int64_t mtp = 0;
-        int next_height = 0;
-        if (const CBlockIndex* tip = pwallet->chain().getTip()) {
-            mtp = tip->GetMedianTimePast();
-            next_height = tip->nHeight + 1;
-        }
-        const bool goldrush_move_active = IsQuantumWitnessSpendActive(consensus, mtp, next_height);
-        if (!goldrush_move_active) {
-            throw JSONRPCError(RPC_WALLET_ERROR,
-                "Gold Rush reward outputs remain locked until quantum witness spends activate after the Gold Rush.");
-        }
-        const std::string phase = QQPhaseName(consensus.GetQuantumQuasarPhase(mtp, next_height));
-
-        CTxDestination dest;
-        bool newly_generated = false;
-        if (!existing.empty()) {
-            std::string err;
-            dest = DecodeDestination(existing, err);
-            const auto* w = std::get_if<WitnessUnknown>(&dest);
-            if (!IsValidDestination(dest) || !w ||
-                !IsQuantumMigrationWitnessProgram(w->GetWitnessVersion(), w->GetWitnessProgram())) {
-                throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "existing_address is not a Blackcoin migration address");
-            }
-            if (!pwallet->GetQuantumKeyInfo(dest).has_value()) {
-                throw JSONRPCError(RPC_WALLET_ERROR, "existing_address is not wallet-backed (no ML-DSA private key in this wallet)");
-            }
-        } else {
-            auto op_dest = pwallet->GetNewQuantumDestination(label);
-            if (!op_dest) throw JSONRPCError(RPC_WALLET_ERROR, util::ErrorString(op_dest).original);
-            dest = *op_dest;
-            newly_generated = true;
-        }
-        const std::optional<CTxDestination> created_destination = newly_generated
-            ? std::optional<CTxDestination>{dest}
-            : std::nullopt;
-        if (!pwallet->GetQuantumKeyInfo(dest).has_value()) {
-            ThrowQuantumActionError(
-                RPC_WALLET_ERROR,
-                "Gold Rush reward consolidation",
-                "Refusing to move Gold Rush reward outputs: destination ML-DSA key is not confirmed stored in the wallet.",
-                created_destination);
-        }
-        const CScript destination_script = GetScriptForDestination(dest);
-
-        CCoinControl coin_control;
-        coin_control.m_allow_other_inputs = false;
-        coin_control.m_include_unsafe_inputs = include_unsafe;
-        coin_control.destChange = dest;
-        coin_control.m_include_generated_quantum_inputs = true;
-        if (requested_fee_rate) {
-            coin_control.m_feerate = *requested_fee_rate;
-            coin_control.fOverrideFeeRate = true;
-        }
-        CoinFilterParams filter;
-        filter.only_spendable = true;
-        filter.skip_locked = true;
-        filter.include_immature_coinbase = false;
-        filter.include_generated_quantum_inputs = true;
-        filter.avoid_final_stake_reserve = true;
-
-        ChainstateManager& chainman = pwallet->chain().chainman();
-        const CCoinsViewCache& view = chainman.ActiveChainstate().CoinsTip();
-        CAmount eligible_amount = 0;
-        unsigned int eligible_inputs = 0;
-        std::vector<MigrationBatchInput> batch_candidates;
-        std::map<COutPoint, CAmount> candidate_burn;
-        for (const COutput& out : AvailableCoins(*pwallet, &coin_control, std::nullopt, filter).All()) {
-            const CScript& spk = out.txout.scriptPubKey;
-            if (!IsQuantumMigrationScript(spk) || spk == destination_script) continue;
-            CScript marker_script;
-            if (!IsGoldRushDirectPayoutOutput(view, out.outpoint, &marker_script) || marker_script != spk) continue;
-            const Coin& coin = view.AccessCoin(out.outpoint);
-            if (coin.IsSpent()) continue;
-            const std::optional<Consensus::DemurrageAttestationState> latest_attestation =
-                Consensus::LatestDemurrageAttestationStateForScript(view, spk);
-            const Consensus::DemurrageEvaluation eval = Consensus::EvaluateDemurrage(
-                coin, consensus, next_height, mtp,
-                latest_attestation ? std::optional<int>{latest_attestation->height} : std::nullopt,
-                latest_attestation ? std::optional<int>{static_cast<int>(latest_attestation->coverage_start_height)} : std::nullopt);
-            if (eval.locked || eval.effective_value <= 0) continue;
-            const int input_vsize = CalculateMaximumSignedInputSize(out.txout, pwallet.get(), &coin_control);
-            batch_candidates.push_back({out.outpoint, out.txout.nValue, eval.effective_value,
-                                        input_vsize > 0 ? int64_t{input_vsize} * WITNESS_SCALE_FACTOR : int64_t{4000},
-                                        /*anchor=*/false});
-            candidate_burn.emplace(out.outpoint, eval.burned_value);
-            eligible_amount += out.txout.nValue;
-            ++eligible_inputs;
-        }
-        if (eligible_inputs == 0) {
-            ThrowQuantumActionError(
-                RPC_WALLET_INSUFFICIENT_FUNDS,
-                "Gold Rush reward consolidation",
-                "No mature wallet-owned Gold Rush reward outputs are available to consolidate.",
-                created_destination);
-        }
-
-        auto batch = BuildMigrationBatch(*pwallet, coin_control, dest, batch_candidates, batch_limit, /*require_anchor=*/false, /*sign=*/!dry_run,
-                                         FinalStakeReserveEnforcedOutpoints(*pwallet));
-        if (!batch) {
-            ThrowQuantumActionError(
-                RPC_WALLET_ERROR,
-                "Gold Rush reward consolidation",
-                util::ErrorString(batch).original,
-                created_destination);
-        }
-        CAmount burned_amount = 0;
-        for (const COutPoint& selected : batch->selected) burned_amount += candidate_burn.at(selected);
-        const CAmount effective_eligible_amount = batch->selected_effective_value;
-
-        const CTransactionRef& tx = batch->tx;
-        if (tx->vout.size() != 1 || IsDust(tx->vout[0], pwallet->chain().relayDustFee())) {
-            ThrowQuantumActionError(
-                RPC_WALLET_INSUFFICIENT_FUNDS,
-                "Gold Rush reward consolidation",
-                "Gold Rush reward consolidation would strand funds: selected value is below the dust threshold after fees.",
-                created_destination);
-        }
-
+        // The construction needs cs_main and cs_wallet. The commit takes them itself and must find neither held,
+        // so the transaction and the reply are made inside this block and both locks are released before the commit.
+        CTransactionRef tx;
+        std::optional<CTxDestination> created_destination;
+        bool newly_generated{false};
         UniValue result(UniValue::VOBJ);
-        result.pushKV("phase", phase);
-        result.pushKV("deadline_mtp", consensus.nQuantumMigrationDeadlineTime);
-        result.pushKV("eligible_inputs", (int)batch->selected.size());
-        result.pushKV("eligible_amount", ValueFromAmount(batch->selected_value));
-        result.pushKV("effective_eligible_amount", ValueFromAmount(effective_eligible_amount));
-        result.pushKV("burned_amount", ValueFromAmount(burned_amount));
-        result.pushKV("total_eligible_inputs", (int)eligible_inputs);
-        result.pushKV("total_eligible_amount", ValueFromAmount(eligible_amount));
-        result.pushKV("remaining_inputs", (int)batch->remaining_inputs);
-        result.pushKV("remaining_amount", ValueFromAmount(batch->remaining_value));
-        result.pushKV("more_batches", batch->remaining_inputs > 0);
-        result.pushKV("max_inputs", (int)batch_limit);
-        result.pushKV("destination", EncodeDestination(dest));
-        result.pushKV("newly_generated", newly_generated);
-        result.pushKV("stored_in_wallet", true);
-        result.pushKV("amount", ValueFromAmount(tx->vout[0].nValue));
-        result.pushKV("fee", ValueFromAmount(batch->fee));
-        result.pushKV("vsize", dry_run ? (int)batch->estimated_vsize : (int)GetVirtualTransactionSize(*tx, 0, 0));
+        {
+            LOCK2(cs_main, pwallet->cs_wallet);
+            if (!dry_run) {
+                EnsureWalletIsUnlocked(*pwallet);
+                if (pwallet->IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS)) {
+                    throw JSONRPCError(RPC_WALLET_ERROR, "Error: Private keys are disabled for this wallet");
+                }
+            }
+
+            const Consensus::Params& consensus = Params().GetConsensus();
+            int64_t mtp = 0;
+            int next_height = 0;
+            if (const CBlockIndex* tip = pwallet->chain().getTip()) {
+                mtp = tip->GetMedianTimePast();
+                next_height = tip->nHeight + 1;
+            }
+            const bool goldrush_move_active = IsQuantumWitnessSpendActive(consensus, mtp, next_height);
+            if (!goldrush_move_active) {
+                throw JSONRPCError(RPC_WALLET_ERROR,
+                    "Gold Rush reward outputs remain locked until quantum witness spends activate after the Gold Rush.");
+            }
+            const std::string phase = QQPhaseName(consensus.GetQuantumQuasarPhase(mtp, next_height));
+
+            CTxDestination dest;
+            if (!existing.empty()) {
+                std::string err;
+                dest = DecodeDestination(existing, err);
+                const auto* w = std::get_if<WitnessUnknown>(&dest);
+                if (!IsValidDestination(dest) || !w ||
+                    !IsQuantumMigrationWitnessProgram(w->GetWitnessVersion(), w->GetWitnessProgram())) {
+                    throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "existing_address is not a Blackcoin migration address");
+                }
+                if (!pwallet->GetQuantumKeyInfo(dest).has_value()) {
+                    throw JSONRPCError(RPC_WALLET_ERROR, "existing_address is not wallet-backed (no ML-DSA private key in this wallet)");
+                }
+            } else {
+                auto op_dest = pwallet->GetNewQuantumDestination(label);
+                if (!op_dest) throw JSONRPCError(RPC_WALLET_ERROR, util::ErrorString(op_dest).original);
+                dest = *op_dest;
+                newly_generated = true;
+            }
+            if (newly_generated) created_destination = dest;
+            if (!pwallet->GetQuantumKeyInfo(dest).has_value()) {
+                ThrowQuantumActionError(
+                    RPC_WALLET_ERROR,
+                    "Gold Rush reward consolidation",
+                    "Refusing to move Gold Rush reward outputs: destination ML-DSA key is not confirmed stored in the wallet.",
+                    created_destination);
+            }
+            const CScript destination_script = GetScriptForDestination(dest);
+
+            CCoinControl coin_control;
+            coin_control.m_allow_other_inputs = false;
+            coin_control.m_include_unsafe_inputs = include_unsafe;
+            coin_control.destChange = dest;
+            coin_control.m_include_generated_quantum_inputs = true;
+            if (requested_fee_rate) {
+                coin_control.m_feerate = *requested_fee_rate;
+                coin_control.fOverrideFeeRate = true;
+            }
+            CoinFilterParams filter;
+            filter.only_spendable = true;
+            filter.skip_locked = true;
+            filter.include_immature_coinbase = false;
+            filter.include_generated_quantum_inputs = true;
+            filter.avoid_final_stake_reserve = true;
+
+            ChainstateManager& chainman = pwallet->chain().chainman();
+            const CCoinsViewCache& view = chainman.ActiveChainstate().CoinsTip();
+            CAmount eligible_amount = 0;
+            unsigned int eligible_inputs = 0;
+            std::vector<MigrationBatchInput> batch_candidates;
+            std::map<COutPoint, CAmount> candidate_burn;
+            for (const COutput& out : AvailableCoins(*pwallet, &coin_control, std::nullopt, filter).All()) {
+                const CScript& spk = out.txout.scriptPubKey;
+                if (!IsQuantumMigrationScript(spk) || spk == destination_script) continue;
+                CScript marker_script;
+                if (!IsGoldRushDirectPayoutOutput(view, out.outpoint, &marker_script) || marker_script != spk) continue;
+                const Coin& coin = view.AccessCoin(out.outpoint);
+                if (coin.IsSpent()) continue;
+                const std::optional<Consensus::DemurrageAttestationState> latest_attestation =
+                    Consensus::LatestDemurrageAttestationStateForScript(view, spk);
+                const Consensus::DemurrageEvaluation eval = Consensus::EvaluateDemurrage(
+                    coin, consensus, next_height, mtp,
+                    latest_attestation ? std::optional<int>{latest_attestation->height} : std::nullopt,
+                    latest_attestation ? std::optional<int>{static_cast<int>(latest_attestation->coverage_start_height)} : std::nullopt);
+                if (eval.locked || eval.effective_value <= 0) continue;
+                const int input_vsize = CalculateMaximumSignedInputSize(out.txout, pwallet.get(), &coin_control);
+                batch_candidates.push_back({out.outpoint, out.txout.nValue, eval.effective_value,
+                                            input_vsize > 0 ? int64_t{input_vsize} * WITNESS_SCALE_FACTOR : int64_t{4000},
+                                            /*anchor=*/false});
+                candidate_burn.emplace(out.outpoint, eval.burned_value);
+                eligible_amount += out.txout.nValue;
+                ++eligible_inputs;
+            }
+            if (eligible_inputs == 0) {
+                ThrowQuantumActionError(
+                    RPC_WALLET_INSUFFICIENT_FUNDS,
+                    "Gold Rush reward consolidation",
+                    "No mature wallet-owned Gold Rush reward outputs are available to consolidate.",
+                    created_destination);
+            }
+
+            auto batch = BuildMigrationBatch(*pwallet, coin_control, dest, batch_candidates, batch_limit, /*require_anchor=*/false, /*sign=*/!dry_run,
+                                             FinalStakeReserveEnforcedOutpoints(*pwallet));
+            if (!batch) {
+                ThrowQuantumActionError(
+                    RPC_WALLET_ERROR,
+                    "Gold Rush reward consolidation",
+                    util::ErrorString(batch).original,
+                    created_destination);
+            }
+            CAmount burned_amount = 0;
+            for (const COutPoint& selected : batch->selected) burned_amount += candidate_burn.at(selected);
+            const CAmount effective_eligible_amount = batch->selected_effective_value;
+
+        tx = batch->tx;
+            if (tx->vout.size() != 1 || IsDust(tx->vout[0], pwallet->chain().relayDustFee())) {
+                ThrowQuantumActionError(
+                    RPC_WALLET_INSUFFICIENT_FUNDS,
+                    "Gold Rush reward consolidation",
+                    "Gold Rush reward consolidation would strand funds: selected value is below the dust threshold after fees.",
+                    created_destination);
+            }
+
+            result.pushKV("phase", phase);
+            result.pushKV("deadline_mtp", consensus.nQuantumMigrationDeadlineTime);
+            result.pushKV("eligible_inputs", (int)batch->selected.size());
+            result.pushKV("eligible_amount", ValueFromAmount(batch->selected_value));
+            result.pushKV("effective_eligible_amount", ValueFromAmount(effective_eligible_amount));
+            result.pushKV("burned_amount", ValueFromAmount(burned_amount));
+            result.pushKV("total_eligible_inputs", (int)eligible_inputs);
+            result.pushKV("total_eligible_amount", ValueFromAmount(eligible_amount));
+            result.pushKV("remaining_inputs", (int)batch->remaining_inputs);
+            result.pushKV("remaining_amount", ValueFromAmount(batch->remaining_value));
+            result.pushKV("more_batches", batch->remaining_inputs > 0);
+            result.pushKV("max_inputs", (int)batch_limit);
+            result.pushKV("destination", EncodeDestination(dest));
+            result.pushKV("newly_generated", newly_generated);
+            result.pushKV("stored_in_wallet", true);
+            result.pushKV("amount", ValueFromAmount(tx->vout[0].nValue));
+            result.pushKV("fee", ValueFromAmount(batch->fee));
+            result.pushKV("vsize", dry_run ? (int)batch->estimated_vsize : (int)GetVirtualTransactionSize(*tx, 0, 0));
+        }
         if (!dry_run) {
             CommitWalletTransactionOrThrow(*pwallet, tx, {}, "Gold Rush reward consolidation", created_destination);
             result.pushKV("txid", tx->GetHash().GetHex());

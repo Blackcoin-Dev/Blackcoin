@@ -650,9 +650,9 @@ bool CreateQuantumColdStakeRedelegationTransaction(
     const std::vector<unsigned char>& target_staking_pubkey,
     const QuantumColdStakeRedelegationOptions& options,
     QuantumColdStakeRedelegationResult& result,
-    bilingual_str& error);
+    bilingual_str& error) LOCKS_EXCLUDED(wallet.cs_wallet);
 
-int MaybeAutoDemurrageAttest(CWallet& wallet);
+int MaybeAutoDemurrageAttest(CWallet& wallet) LOCKS_EXCLUDED(wallet.cs_wallet);
 
 //! At most this many failed attempts (a construction that fails, or a commit the mempool refuses) in one
 //! automatic pass, next to the existing cap of MAX_DEMURRAGE_ATTESTATIONS_PER_BLOCK successful submissions:
@@ -716,7 +716,7 @@ AutoDemurrageAttestPassStats RunAutoDemurrageAttestAttempts(CWallet& wallet,
                                                             const std::vector<COutPoint>& fee_outpoints,
                                                             std::set<COutPoint> pending_targets,
                                                             int evaluation_height,
-                                                            const AutoDemurrageAttestAttemptFn& attempt);
+                                                            const AutoDemurrageAttestAttemptFn& attempt) LOCKS_EXCLUDED(wallet.cs_wallet);
 
 /** Whether the wallet owns, and can sign for, a live legacy output the staker could stake. */
 bool WalletHoldsLegacyStakableCoin(const CWallet& wallet) EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet);
@@ -799,8 +799,8 @@ KeyPendingDecision DecidePendingAttestationsForKey(const CWallet& wallet, const 
  *  not abandoned descendant anywhere in the wallet (any key, direct or indirect), since abandonment is
  *  recursive. Decided under the wallet lock right before each abandonment. Returns how many were abandoned. */
 size_t AbandonStaleAutomaticAttestations(CWallet& wallet, const std::set<uint256>& candidates);
-int MaybeAutoShadowSignal(CWallet& wallet);
-int MaybeAutoRedelegateQuantumColdStake(CWallet& wallet);
+int MaybeAutoShadowSignal(CWallet& wallet) LOCKS_EXCLUDED(wallet.cs_wallet);
+int MaybeAutoRedelegateQuantumColdStake(CWallet& wallet) LOCKS_EXCLUDED(wallet.cs_wallet);
 
 /** Result of comparing a candidate tip with the last tip an automatic scan ran on. */
 enum class AutoScanVerdict {

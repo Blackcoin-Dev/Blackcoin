@@ -98,7 +98,10 @@ function Remove-Vhd([string]$Path, [System.Collections.ArrayList]$Steps, [System
 
 # Idempotent clean-up. Returns what it did and what it could not do; the caller puts that into the final receipt.
 function Invoke-Teardown {
-    Write-Host '--- teardown'
+    # -KeepResults is used only after a failed copy of the results: everything but $Root\results is removed, so the
+    # workflow's upload of C:\q\results can still recover the evidence; the workflow's last step removes the rest
+    param([switch]$KeepResults)
+    Write-Host "--- teardown (keep results: $KeepResults)"
     $steps = New-Object System.Collections.ArrayList
     $failures = New-Object System.Collections.ArrayList
     try {
@@ -130,23 +133,36 @@ function Invoke-Teardown {
     } catch {
         $null = $failures.Add("removing the user profile: $($_.Exception.Message)")
     }
-    if (Test-Path $Root) {
-        Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $Root
-        if (Test-Path $Root) {
-            Start-Sleep -Seconds 5
+    $keptResults = Join-Path $Root 'results'
+    $removeRoot = {
+        if ($KeepResults) {
+            Get-ChildItem -LiteralPath $Root -Force -ErrorAction SilentlyContinue |
+                Where-Object { $_.FullName -ne $keptResults } |
+                Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+        } else {
             Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $Root
         }
     }
-    $rootPresent = [bool](Test-Path $Root)
+    if (Test-Path $Root) {
+        & $removeRoot
+        $leftovers = if ($KeepResults) { @(Get-ChildItem -LiteralPath $Root -Force -ErrorAction SilentlyContinue | Where-Object { $_.FullName -ne $keptResults }) } else { @(if (Test-Path $Root) { $Root }) }
+        if ($leftovers.Count -gt 0) {
+            Start-Sleep -Seconds 5
+            & $removeRoot
+        }
+    }
+    $rootPresent = if ($KeepResults) {
+        @(Get-ChildItem -LiteralPath $Root -Force -ErrorAction SilentlyContinue | Where-Object { $_.FullName -ne $keptResults }).Count -gt 0
+    } else { [bool](Test-Path $Root) }
     $userPresent = [bool](Get-LocalUser -Name $UserName -ErrorAction SilentlyContinue)
     $sharePresent = [bool](Get-SmbShare -Name $ShareName -ErrorAction SilentlyContinue)
-    if ($rootPresent) { $null = $failures.Add("$Root is still present") }
+    if ($rootPresent) { $null = $failures.Add("$Root is still present (apart from the preserved results)") }
     if ($userPresent) { $null = $failures.Add("the local user $UserName is still present") }
     if ($sharePresent) { $null = $failures.Add("the share $ShareName is still present") }
     Write-Host ("teardown: root present = {0}, user present = {1}, share present = {2}, failures = {3}" -f $rootPresent, $userPresent, $sharePresent, $failures.Count)
     foreach ($failure in $failures) { Write-Host "::error::teardown: $failure" }
     return [pscustomobject]@{
-        root_present = $rootPresent; user_present = $userPresent; share_present = $sharePresent
+        root_present = $rootPresent; results_preserved = [bool]$KeepResults; user_present = $userPresent; share_present = $sharePresent
         failures = @($failures); steps = @($steps)
     }
 }
@@ -354,7 +370,12 @@ try {
         $p.WaitForExit()       # lets the redirected streams and the exit code settle
     }
     $childCode = $null
-    try { $childCode = [int]$p.ExitCode } catch { Write-Host "the child's exit code is not readable: $($_.Exception.Message)" }
+    $rawExitCode = $p.ExitCode      # read it as is: a cast of $null to [int] would silently become 0
+    if ($null -ne $rawExitCode) {
+        try { $childCode = [int]$rawExitCode } catch { Write-Host "the child's exit code is not readable: $($_.Exception.Message)" }
+    } else {
+        Write-Host "the child's exit code is not readable: it is null"
+    }
     Write-Host "child exit code: $childCode (timed out: $timedOut)"
     $childRun = [ordered]@{
         started = $childStarted.ToUniversalTime().ToString('o'); finished = (Get-Date).ToUniversalTime().ToString('o')
@@ -409,7 +430,8 @@ try {
         $exitCode = 1
     }
     try {
-        $teardownOutcome = Invoke-Teardown
+        # a failed copy keeps C:\q\results for the workflow's upload; the workflow's last step deletes it
+        $teardownOutcome = if ($copyProblem) { Invoke-Teardown -KeepResults } else { Invoke-Teardown }
         if (@($teardownOutcome.failures).Count -gt 0) { $exitCode = 1 }
     } catch {
         Write-Host "::error::teardown threw: $($_.Exception.Message)"

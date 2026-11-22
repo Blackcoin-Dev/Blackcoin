@@ -499,14 +499,33 @@ class Env:
     def node(self, datadir, extra_args=(), label=None):
         return Node(self, datadir, extra_args, label or "node%d" % (len(self.nodes) + 1))
 
-    def finish_case(self):
-        """Stop every node (a forced kill is recorded, not raised), then run the cleanups; return what failed."""
+    def stop_nodes(self):
+        """Stop every node (a forced kill is recorded, not raised); return what failed."""
         problems = []
         for node in self.nodes:
             try:
                 node.stop(clean=False)
             except Exception as error:  # pylint: disable=broad-except
                 problems.append("stopping %s: %s" % (node.label, error))
+        return problems
+
+    def collect_logs(self, case_name):
+        """Copy the whole debug.log of every node that was started. This runs after the nodes stopped and BEFORE the
+        cleanups remove a substituted drive or any other path the log lives under. Returns (excerpt lines, file names,
+        problems); a log that cannot be copied is a problem and fails the case."""
+        lines, copied, problems = [], [], []
+        for index, node in enumerate(self.nodes, 1):
+            lines.extend("[%s] %s" % (node.label, line) for line in node.log_excerpt())
+            destination = os.path.join(self.logs, "%s-%d-%s-debug.log" % (safe_name(case_name), index, safe_name(node.label)))
+            if node.save_full_log(destination):
+                copied.append(os.path.basename(destination))
+            else:
+                problems.append("the full debug.log of %s (%s) could not be copied" % (node.label, node.log_file))
+        return lines, copied, problems
+
+    def run_cleanups(self):
+        """Run the cleanups (newest first); return what failed."""
+        problems = []
         for cleanup in reversed(self.cleanups):
             try:
                 outcome = cleanup()
@@ -517,8 +536,11 @@ class Env:
         self.cleanups = []
         return problems
 
+    def finish_case(self):
+        """Stop the nodes, then run the cleanups (run_case collects the logs between the two)."""
+        return self.stop_nodes() + self.run_cleanups()
 
-# ----- wallet steps shared by the cases -----
+
 def make_wallet(node, name, passphrase=None):
     arguments = {"wallet_name": name, "load_on_startup": True}
     if passphrase:
@@ -555,16 +577,59 @@ def key_dump(wallet, address):
     return {"private_key": info["private_key"], "public_key": info["public_key"]}
 
 
+def summarize_key_inventory(raw):
+    """The pure part of the key inventory: reduce a getquantumkeyinventory result to the total, the sorted stable key
+    identities and the backup flags per identity. The identity is the witness program with a hash of the public key
+    (src/wallet/rpc/addresses.cpp, getquantumkeyinventory: result fields `total`, `keys[].witness_program`,
+    `keys[].public_key`, `keys[].backup_verified`, `keys[].stored_in_wallet`). Raises CheckFailed on an answer that does
+    not hold together (a count that disagrees with the list, a repeated key, a missing field)."""
+    try:
+        entries = list(raw["keys"])
+        identities = []
+        flags = {}
+        durable = True
+        for entry in entries:
+            identity = "%s:%s" % (entry["witness_program"], hashlib.sha256(bytes.fromhex(entry["public_key"])).hexdigest())
+            identities.append(identity)
+            flags[identity] = bool(entry["backup_verified"])
+            durable = durable and bool(entry["stored_in_wallet"])
+        total = int(raw["total"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise CheckFailed("getquantumkeyinventory returned an unusable answer (%s: %s)" % (type(error).__name__, error))
+    check(len(set(identities)) == len(identities), "getquantumkeyinventory lists a key twice: %s" % sorted(identities))
+    check(total == len(identities), "getquantumkeyinventory total %s disagrees with its %d listed keys" % (total, len(identities)))
+    return {"total": total, "identities": sorted(identities), "backup_flags": {k: flags[k] for k in sorted(flags)},
+            "verified": sum(1 for value in flags.values() if value), "all_durably_stored": durable}
+
+
+def check_same_keys(before, after, label):
+    """The wallet holds exactly the same keys: the same total and the same sorted identities (the backup flags are
+    allowed to differ here and are compared by flag_changes)."""
+    check(before["keys"]["total"] == after["keys"]["total"],
+          "%s: the key total changed from %d to %d" % (label, before["keys"]["total"], after["keys"]["total"]))
+    check(before["keys"]["identities"] == after["keys"]["identities"],
+          "%s: the key identities changed: %s -> %s" % (label, before["keys"]["identities"], after["keys"]["identities"]))
+
+
+def flag_changes(before, after):
+    """The keys whose backup flag differs between two inventories (identity -> [before, after])."""
+    first, second = before["keys"]["backup_flags"], after["keys"]["backup_flags"]
+    return {k: [first.get(k), second.get(k)] for k in sorted(set(first) | set(second)) if first.get(k) != second.get(k)}
+
+
+def check_key_count(inventory, expected, label):
+    check(inventory["keys"]["total"] == expected,
+          "%s: expected %d keys in the wallet, getquantumkeyinventory lists %d" % (label, expected, inventory["keys"]["total"]))
+
+
 def wallet_inventory(wallet):
-    """Every address of the wallet's address book by label (the quantum return keys are all there), and the readiness
-    of the stake return: the state compared before a failure, after a restart and after the recovery. A key that is
-    missing, or an extra one, shows here and not in a check of the pending address alone."""
-    book = {}
-    for label in wallet.listlabels():
-        book[label] = sorted(wallet.getaddressesbylabel(label).keys())
+    """The real key inventory (getquantumkeyinventory: total, sorted key identities, backup flags) and the readiness of
+    the stake return. Compared before a failure, after it, after a restart and after the recovery, so a key that is
+    missing or extra shows here, which the address book cannot prove."""
+    keys = summarize_key_inventory(wallet.getquantumkeyinventory())
     state = stake_state(wallet)
     keep = ("ready", "address", "pending", "pending_address", "backup_verified")
-    return {"address_book": book, "stake_return": {key: state.get(key) for key in keep}}
+    return {"keys": keys, "stake_return": {key: state.get(key) for key in keep}}
 
 
 def restore_and_compare(node, backup_file, new_name, address, original_dump, passphrase, also=None):
@@ -765,11 +830,23 @@ def case_subst(env, rec):
         rec["observed"][name] = outcome
 
 
-def pending_checks(wallet, address=None):
-    state = stake_state(wallet)
-    check(state["ready"] is False and state["pending"] is True and state.get("pending_error"),
-          "the key is not pending with an error: %s" % state)
+def check_pending_state(state, with_error=True):
+    """A pending key with no active address. After a real backup refusal the readiness RPC carries a non-empty
+    pending_error; right after the after_key_insertion crash no backup attempt has failed, key insertion clears the
+    error (src/wallet/wallet.cpp about 9189) and the RPC omits an empty one (src/wallet/rpc/staking.cpp about 1123), so
+    there the error must be absent."""
+    check(state.get("ready") is False and state.get("pending") is True, "the key is not pending: %s" % state)
+    if with_error:
+        check(state.get("pending_error"), "the key is not pending with an error: %s" % state)
+    else:
+        check("pending_error" not in state or not state["pending_error"],
+              "a pending error exists although no backup attempt has failed: %s" % state)
     check("address" not in state, "an active return address exists while the key is pending: %s" % state)
+
+
+def pending_checks(wallet, address=None, with_error=True):
+    state = stake_state(wallet)
+    check_pending_state(state, with_error)
     if address:
         check(state["pending_address"] == address, "the pending key changed")
     return state
@@ -791,6 +868,8 @@ def refused_and_recovered(env, rec, node, wallet_name, passphrase, error_checks,
           "%s: the pending key is not in the wallet" % label)
     check(len(wallet.getaddressesbylabel("PoS - Quantum Stake Address")) == 1, "%s: more than one key was made" % label)
     inventory_before = wallet_inventory(wallet)
+    check_key_count(inventory_before, 1, label)
+    check(inventory_before["keys"]["verified"] == 0, "%s: a key is marked backed up although the backup was refused" % label)
     if guarded_directory is not None:
         check(snapshot(guarded_directory) == directory_files_before,
               "%s: existing generations in %s changed" % (label, guarded_directory))
@@ -799,6 +878,8 @@ def refused_and_recovered(env, rec, node, wallet_name, passphrase, error_checks,
     node.start(extra_args=[])  # the default path beneath the datadir
     wallet = node.wait_wallet(wallet_name)
     unlock(wallet, passphrase)
+    inventory_restart = wallet_inventory(wallet)
+    check_same_keys(inventory_before, inventory_restart, "%s: after the restart" % label)
     result = wallet.setquantumstakereturn()  # no new consent: the key that exists is completed
     check(result["address"] == pending_address and result["ready"] is True and result["backup_verified"] is True,
           "%s: the same key did not activate after switching to the default path: %s" % (label, result))
@@ -806,8 +887,10 @@ def refused_and_recovered(env, rec, node, wallet_name, passphrase, error_checks,
     check(state["pending"] is False and state["ready"] is True and state["address"] == pending_address
           and state["backup_verified"] is True, "%s: the state after recovery is wrong: %s" % (label, state))
     inventory_after = wallet_inventory(wallet)
-    check(inventory_after["address_book"] == inventory_before["address_book"],
-          "%s: the key inventory changed across the recovery: %s -> %s" % (label, inventory_before, inventory_after))
+    check_same_keys(inventory_before, inventory_after, "%s: across the recovery" % label)
+    check(inventory_after["keys"]["verified"] == inventory_after["keys"]["total"],
+          "%s: a key is not marked backed up after the recovery: %s" % (label, inventory_after["keys"]["backup_flags"]))
+    rec["observed"][label + "_backup_flag_changes"] = flag_changes(inventory_before, inventory_after)
     directory = os.path.join(default_backup_root(datadir), component(wallet_name))
     found = generations(directory)
     check(len(found) == 1, "%s: expected one generation in the default directory, found %s" % (label, found))
@@ -923,6 +1006,7 @@ def case_denied_ancestor(env, rec):
     state = pending_checks(wallet)
     pending_address = state["pending_address"]
     inventory_before = wallet_inventory(wallet)
+    check_key_count(inventory_before, 1, "denied ancestor")
     check(not wallet_files(leaf), "a backup file was written although the ancestor was denied")
     node.stop()
     code, output = run_command(["icacls", blocked, "/remove:d", user])
@@ -931,6 +1015,7 @@ def case_denied_ancestor(env, rec):
     denial["active"] = False
     node.start(extra_args=["-quantumkeybackupdir=blocked\\sub"])  # retry after a restart
     wallet = node.wait_wallet("wblk")
+    check_same_keys(inventory_before, wallet_inventory(wallet), "denied ancestor: after the restart")
     result = wallet.setquantumstakereturn()
     check(result["address"] == pending_address and result["ready"] is True and result["backup_verified"] is True,
           "the same key did not activate after the denial was removed: %s" % result)
@@ -938,7 +1023,9 @@ def case_denied_ancestor(env, rec):
     check(state["pending"] is False and state["backup_verified"] is True and state["address"] == pending_address,
           "the state after the recovery is wrong: %s" % state)
     inventory_after = wallet_inventory(wallet)
-    check(inventory_after["address_book"] == inventory_before["address_book"], "the key inventory changed across the recovery")
+    check_same_keys(inventory_before, inventory_after, "denied ancestor: across the recovery")
+    check(inventory_after["keys"]["verified"] == inventory_after["keys"]["total"], "a key is not marked backed up after the recovery")
+    rec["observed"]["backup_flag_changes"] = flag_changes(inventory_before, inventory_after)
     check(len(generations(leaf)) == 1, "no verified generation in the leaf after the retry")
     rec["observed"]["recovery_restore"] = restore_and_compare(
         node, os.path.join(leaf, generations(leaf)[0]), "wblk-restored", pending_address, key_dump(wallet, pending_address), None)
@@ -998,9 +1085,10 @@ def case_affected_wallet(env, rec):
     node.restart(extra_args=arguments)
     wallet = node.wait_wallet(name)
     unlock(wallet, passphrase)
-    state = pending_checks(wallet)
+    state = pending_checks(wallet, with_error=False)  # no backup attempt has failed yet, so there is no error
     pending_address = state["pending_address"]
     check(not wallet_files(leaf), "a backup exists before any backup was made")
+    check_key_count(wallet_inventory(wallet), 1, "after the after_key_insertion crash")
 
     # 2. an existing quantum address of the wallet becomes the active return address while that key is pending
     active_address = wallet.getnewquantumaddress("affected-destination")["address"]
@@ -1009,6 +1097,9 @@ def case_affected_wallet(env, rec):
     state = stake_state(wallet)
     check(state["ready"] is True and state["address"] == active_address and state["pending"] is True
           and state["pending_address"] == pending_address, "the wallet is not in the pending-plus-active state: %s" % state)
+    inventory_two = wallet_inventory(wallet)
+    check_key_count(inventory_two, 2, "before any backup was generated")
+    check(inventory_two["keys"]["verified"] == 0, "a key is marked backed up before any backup was generated: %s" % inventory_two["keys"])
     dumps = {active_address: key_dump(wallet, active_address), pending_address: key_dump(wallet, pending_address)}
 
     # 3. four genuine generations written by the daemon, the key staying pending and the active address staying active
@@ -1027,6 +1118,7 @@ def case_affected_wallet(env, rec):
     key_lists = {tuple(sorted(m["keys"])) for m in manifests.values()}
     check(len(key_lists) == 1 and len(next(iter(key_lists))) >= 2, "the generations do not hold the same two or more keys: %s" % manifests)
     inventory_start = wallet_inventory(wallet)
+    check_same_keys(inventory_two, inventory_start, "after the four crash cycles")
     check(inventory_start["stake_return"]["pending"] is True and inventory_start["stake_return"]["address"] == active_address,
           "the state before the failure is wrong: %s" % inventory_start)
     snapshot_start = snapshot(leaf)
@@ -1058,7 +1150,11 @@ def case_affected_wallet(env, rec):
     check(after_failure["stake_return"]["pending"] is True and after_failure["stake_return"]["pending_address"] == pending_address
           and after_failure["stake_return"]["address"] == active_address and after_failure["stake_return"]["ready"] is True,
           "the active address or the pending key changed after the failed retry: %s" % after_failure)
-    check(after_failure["address_book"] == inventory_start["address_book"], "the key inventory changed after the failed retry")
+    check_same_keys(inventory_start, after_failure, "after the failed retry")
+    check(flag_changes(inventory_start, after_failure) == {}, "a backup flag changed during the failed retry: %s" % flag_changes(inventory_start, after_failure))
+    refused = stake_state(wallet)
+    check(refused.get("pending") is True and refused.get("pending_error"),
+          "a real backup refusal left no pending error: %s" % refused)
     check(snapshot(leaf) == snapshot_start, "the generations of the failing path changed during the failed retry")
     node.restart(extra_args=arguments)  # still denied
     wallet = node.wait_wallet(name)
@@ -1084,7 +1180,8 @@ def case_affected_wallet(env, rec):
     after_recovery = wallet_inventory(wallet)
     check(after_recovery["stake_return"]["pending"] is False and after_recovery["stake_return"]["backup_verified"] is True
           and after_recovery["stake_return"]["address"] == active_address, "the state after the recovery is wrong: %s" % after_recovery)
-    check(after_recovery["address_book"] == inventory_start["address_book"], "the key inventory changed across the recovery")
+    check_same_keys(inventory_start, after_recovery, "across the recovery")
+    rec["observed"]["backup_flag_changes"] = flag_changes(inventory_start, after_recovery)
     rec["observed"]["inventory_after_recovery"] = after_recovery
     survivors = generations(leaf)
     all_sequences = dict(sequences)
@@ -1153,6 +1250,7 @@ def case_failcommit(env, rec):
         wallet = node.wait_wallet(name)
         unlock(wallet, passphrase)
         inventory_before = wallet_inventory(wallet)
+        check_key_count(inventory_before, 1, name)
         result = wallet.setquantumstakereturn()
         check(result["address"] == pending[name] and result["ready"] is True and result["backup_verified"] is True,
               "%s: the same key did not activate on retry: %s" % (name, result))
@@ -1160,7 +1258,9 @@ def case_failcommit(env, rec):
         check(state["pending"] is False and state["backup_verified"] is True and state["address"] == pending[name],
               "%s: the state after the retry is wrong: %s" % (name, state))
         inventory_after = wallet_inventory(wallet)
-        check(inventory_after["address_book"] == inventory_before["address_book"], "%s: the key inventory changed" % name)
+        check_same_keys(inventory_before, inventory_after, "%s: across the recovery" % name)
+        check(inventory_after["keys"]["verified"] == inventory_after["keys"]["total"], "%s: a key is not marked backed up" % name)
+        rec["observed"][name + "_backup_flag_changes"] = flag_changes(inventory_before, inventory_after)
         directory = os.path.join(default_backup_root(datadir), component(name))
         found = generations(directory)
         check(len(found) == 1, "no generation")
@@ -1280,17 +1380,23 @@ def run_case(env, name, expected, function):
     except Exception:  # pylint: disable=broad-except
         rec["failure"] = traceback.format_exc()
     finally:
+        # order matters: stop the nodes, copy the full logs, and only then remove drive mappings and other paths
         problems = []
         try:
-            problems = env.finish_case()
+            problems = env.stop_nodes()
         except Exception as error:  # pylint: disable=broad-except
-            problems = ["finishing the case raised %s: %s" % (type(error).__name__, error)]
+            problems = ["stopping the nodes raised %s: %s" % (type(error).__name__, error)]
         rec["full_logs"] = []
-        for index, node in enumerate(env.nodes, 1):
-            rec["log_lines"].extend("[%s] %s" % (node.label, line) for line in node.log_excerpt())
-            destination = os.path.join(env.logs, "%s-%d-%s-debug.log" % (safe_name(name), index, safe_name(node.label)))
-            if node.save_full_log(destination):
-                rec["full_logs"].append(os.path.basename(destination))
+        try:
+            lines, rec["full_logs"], log_problems = env.collect_logs(name)
+            rec["log_lines"].extend(lines)
+            problems.extend(log_problems)
+        except Exception as error:  # pylint: disable=broad-except
+            problems.append("collecting the logs raised %s: %s" % (type(error).__name__, error))
+        try:
+            problems.extend(env.run_cleanups())
+        except Exception as error:  # pylint: disable=broad-except
+            problems.append("finishing the case raised %s: %s" % (type(error).__name__, error))
         rec["forced_kills"] = list(env.forced_kills)
         rec["cleanup_problems"] = problems
         if problems:
@@ -1487,6 +1593,65 @@ def selftest():
         problems = env.finish_case()
         assert any("exited with 3" in problem for problem in problems) and len(problems) == 1
         assert env.cleanups == []
+        # logs are copied from where they are; a missing required log is a problem
+        os.makedirs(env.logs, exist_ok=True)
+        os.makedirs(os.path.dirname(node.log_file), exist_ok=True)
+        with open(node.log_file, "w", encoding="utf-8") as handle:
+            handle.write("2026 wallet backup line\n")
+        lines, copied, log_problems = env.collect_logs("case one")
+        assert copied == ["case_one-1-fake-debug.log"] and not log_problems
+        assert os.path.isfile(os.path.join(env.logs, copied[0]))
+        os.remove(node.log_file)
+        lines, copied, log_problems = env.collect_logs("case one")
+        assert copied == [] and len(log_problems) == 1 and "could not be copied" in log_problems[0]
+    # the real key inventory: identities, flags, counts and the pending-error rule
+
+    def fake_inventory(*pairs):
+        return {"total": len(pairs), "keys": [
+            {"witness_program": "%02x" % number, "public_key": "%02x" % (number + 100), "backup_verified": flag,
+             "stored_in_wallet": True} for number, flag in pairs]}
+    first = {"keys": summarize_key_inventory(fake_inventory((2, False), (1, False)))}
+    assert first["keys"]["total"] == 2 and first["keys"]["verified"] == 0 and first["keys"]["all_durably_stored"]
+    assert first["keys"]["identities"] == sorted(first["keys"]["identities"])
+    swapped = {"keys": summarize_key_inventory(fake_inventory((1, True), (2, False)))}
+    check_same_keys(first, swapped, "order and flags do not matter")
+    assert list(flag_changes(first, swapped).values()) == [[False, True]]
+    check_key_count(first, 2, "two")
+    try:
+        check_key_count({"keys": summarize_key_inventory(fake_inventory((1, False)))}, 2, "x")
+        raise AssertionError("a wrong count must fail")
+    except CheckFailed:
+        pass
+    for broken in ({"total": 3, "keys": fake_inventory((1, False))["keys"]}, {"total": 2, "keys": fake_inventory((1, False), (1, False))["keys"]},
+                   {"keys": []}, {"total": 1, "keys": [{"witness_program": "01"}]}, {"total": 1, "keys": [
+                       {"witness_program": "01", "public_key": "zz", "backup_verified": False, "stored_in_wallet": True}]}):
+        try:
+            summarize_key_inventory(broken)
+            raise AssertionError("accepted %r" % broken)
+        except CheckFailed:
+            pass
+    try:
+        check_same_keys(first, {"keys": summarize_key_inventory(fake_inventory((1, False), (3, False)))}, "x")
+        raise AssertionError("a different key must fail")
+    except CheckFailed:
+        pass
+    try:
+        check_same_keys(first, {"keys": summarize_key_inventory(fake_inventory((1, False)))}, "x")
+        raise AssertionError("a missing key must fail")
+    except CheckFailed:
+        pass
+    check_pending_state({"ready": False, "pending": True, "pending_address": "a"}, with_error=False)
+    check_pending_state({"ready": False, "pending": True, "pending_error": "refused"}, with_error=True)
+    for state, with_error in (({"ready": False, "pending": True, "pending_address": "a"}, True),
+                              ({"ready": False, "pending": True, "pending_error": "refused"}, False),
+                              ({"ready": False, "pending": True, "pending_error": ""}, True),
+                              ({"ready": True, "pending": True, "address": "x"}, False),
+                              ({"ready": False, "pending": False}, False)):
+        try:
+            check_pending_state(state, with_error)
+            raise AssertionError("accepted %r" % state)
+        except CheckFailed:
+            pass
     assert {name for name, _, _ in CASES} >= {"flush-probe", "default-path", "crash-points", "fat32"}
     print("harness self-test passed")
     return 0

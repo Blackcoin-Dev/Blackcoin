@@ -6898,6 +6898,11 @@ bool CWallet::CommitTransaction(CTransactionRef tx, mapValue_t mapValue, std::ve
             wtx = nullptr;
         }
         commit_writes.reset();
+        // Test chains only: the storage failure above, on request, so a test sees what a caller does with it.
+        if (wtx && Params().IsTestChain() && gArgs.GetBoolArg("-qqcommitwritefailure", false)) {
+            WalletLogPrintf("Injecting a wallet commit write failure for %s\n", tx->GetHash().ToString());
+            wtx = nullptr;
+        }
 
         // wtx can only be null if the db write failed.
         if (!wtx) {

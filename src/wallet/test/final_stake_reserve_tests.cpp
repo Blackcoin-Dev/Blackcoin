@@ -7,11 +7,13 @@
 #include <chainparams.h>
 #include <common/args.h>
 #include <consensus/params.h>
+#include <interfaces/wallet.h>
 #include <primitives/transaction.h>
 #include <script/script.h>
 #include <test/util/setup_common.h>
 #include <validation.h>
 #include <wallet/coincontrol.h>
+#include <wallet/context.h>
 #include <wallet/spend.h>
 #include <wallet/staking.h>
 #include <wallet/test/util.h>
@@ -22,6 +24,8 @@
 #include <util/time.h>
 
 #include <set>
+#include <memory>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -603,6 +607,151 @@ BOOST_FIXTURE_TEST_CASE(a_mixed_transaction_is_refused_when_its_automatic_input_
     BOOST_REQUIRE_MESSAGE(rw.wallet->CommitTransaction(tx, {}, {}, &error, nullptr, std::nullopt, &provenance, &report), error);
     BOOST_CHECK(Recorded(rw, tx));
     BOOST_CHECK_EQUAL(report.spent.size(), 1U);
+}
+
+
+namespace {
+//! The wallet of ReserveWallet behind the interface the GUI commits through.
+struct ReserveInterface
+{
+    std::shared_ptr<CWallet> wallet;
+    WalletContext context;
+    std::unique_ptr<interfaces::Wallet> iface;
+    ReserveInterface(TestChain100Setup& setup, ReserveWallet& rw)
+        : wallet{rw.wallet.release()}
+    {
+        context.chain = setup.m_node.chain.get();
+        iface = interfaces::MakeWallet(context, wallet);
+    }
+    //! A transaction of the interface, built while the guard is off, spending `big` by choice.
+    CTransactionRef Prepare(const ReserveWallet& rw, CAmount amount, bool explicit_big)
+    {
+        gArgs.ForceSetArg("-finalstakereserve", "0");
+        CCoinControl coin_control;
+        if (explicit_big) {
+            coin_control.Select(rw.big);
+            coin_control.m_allow_other_inputs = false;
+        }
+        coin_control.destChange = rw.dest_small;
+        int change_pos{1};
+        CAmount fee{0};
+        auto created = iface->createTransaction({CRecipient{rw.recipient, amount, false}}, coin_control, /*sign=*/true, change_pos, fee);
+        BOOST_REQUIRE_MESSAGE(created, util::ErrorString(created).original);
+        return *created;
+    }
+};
+bool IsRejection(const std::exception& e) { return dynamic_cast<const interfaces::WalletCommitRejected*>(&e) != nullptr; }
+} // namespace
+
+// The wallet stored the transaction and could not relay it yet: that is a commit, and the reserve it consumed is
+// reported like any other spend of it. (Review: the warning was dropped for this disposition.)
+BOOST_FIXTURE_TEST_CASE(a_stored_but_unrelayed_commit_still_reports_the_reserve_it_consumed, CandidateAtGuardStart)
+{
+    ReserveWallet rw = MakeReserveWallet(*this, coinbaseKey);
+    ReserveInterface gui{*this, rw};
+    gui.wallet->SetBroadcastTransactions(true);
+    // The mempool already holds a transaction that spends the same output, so the relay of ours is refused for a
+    // reason that is not terminal.
+    const CTransactionRef tx = gui.Prepare(rw, 15 * COIN, /*explicit_big=*/true);
+    BOOST_REQUIRE_EQUAL(tx->vin.size(), 1U);
+    gArgs.ForceSetArg("-finalstakereserve", "1");
+    std::string warning;
+    BOOST_CHECK_NO_THROW(warning = gui.iface->commitTransaction(tx, {}, {}));
+    BOOST_CHECK(WITH_LOCK(gui.wallet->cs_wallet, return gui.wallet->mapWallet.count(tx->GetHash()) > 0));
+    BOOST_CHECK_MESSAGE(warning.find("final stake reserve") != std::string::npos, "warning: " + warning);
+}
+
+// The reserve refusal is the typed, recoverable rejection: nothing was stored.
+BOOST_FIXTURE_TEST_CASE(a_reserve_refusal_through_the_interface_is_the_typed_rejection, CandidateAtGuardStart)
+{
+    ReserveWallet rw = MakeReserveWallet(*this, coinbaseKey);
+    ReserveInterface gui{*this, rw};
+    const CTransactionRef tx = gui.Prepare(rw, 25 * COIN, /*explicit_big=*/false);
+    BOOST_REQUIRE_EQUAL(tx->vin.size(), 2U);
+    gArgs.ForceSetArg("-finalstakereserve", "1");
+    BOOST_CHECK_EXCEPTION(gui.iface->commitTransaction(tx, {}, {}), interfaces::WalletCommitRejected,
+        [](const interfaces::WalletCommitRejected& e) { return std::string{e.what()} == FINAL_STAKE_RESERVE_COMMIT_ERROR; });
+    BOOST_CHECK(!WITH_LOCK(gui.wallet->cs_wallet, return gui.wallet->mapWallet.count(tx->GetHash()) > 0));
+}
+
+// A storage failure in the commit is not a rejection a caller may recover from: the wallet can hold a record the
+// disk does not. It reaches the caller as an ordinary exception (the Send dialog does not catch that type), never as
+// the typed rejection.
+BOOST_FIXTURE_TEST_CASE(a_storage_failure_in_the_commit_is_not_a_recoverable_rejection, CandidateAtGuardStart)
+{
+    ReserveWallet rw = MakeReserveWallet(*this, coinbaseKey);
+    ReserveInterface gui{*this, rw};
+    const CTransactionRef tx = gui.Prepare(rw, 25 * COIN, /*explicit_big=*/false);
+    gArgs.ForceSetArg("-finalstakereserve", "0");
+    gArgs.ForceSetArg("-qqcommitwritefailure", "1");
+    bool thrown{false};
+    try {
+        gui.iface->commitTransaction(tx, {}, {});
+    } catch (const std::exception& e) {
+        thrown = true;
+        BOOST_CHECK_MESSAGE(!IsRejection(e), "a storage failure was reported as a recoverable rejection");
+        BOOST_CHECK_MESSAGE(std::string{e.what()}.find("Wallet db error") != std::string::npos, e.what());
+    }
+    gArgs.ForceSetArg("-qqcommitwritefailure", "0");
+    BOOST_CHECK(thrown);
+}
+
+
+namespace {
+//! Chain height 100, Final begins at 101 and demurrage with it; a month is one block, so an output untouched since
+//! before 101 has been inactive for more than the grace of 6 blocks from the block 108 on, and is not yet locked (24).
+class DemurrageSweepSetup : public TestChain100Setup
+{
+public:
+    DemurrageSweepSetup()
+        : TestChain100Setup{ChainType::REGTEST, {
+              "-shadowwhitelistheight=20",
+              "-shadowgoldrushstartheight=30",
+              "-shadowgoldrushendheight=60",
+              "-qqgoldrushendheight=60",
+              "-qqmigrationendheight=100",
+              "-qqdemurrageblockspermonth=1",
+          }}
+    {
+    }
+};
+} // namespace
+
+// The sweep of the GUI makes its transaction under cs_main and cs_wallet and commits it with neither held (the commit
+// takes both itself). A funded, committed sweep; in a lock-order build a lock held at the commit aborts it.
+BOOST_FIXTURE_TEST_CASE(a_funded_gui_sweep_commits_without_holding_the_wallet_locks, DemurrageSweepSetup)
+{
+    // Final blocks pay quantum outputs only: the coinbase of the blocks that age the chain goes to a quantum address.
+    CKey miner_key;
+    miner_key.MakeNewKey(/*fCompressed=*/true);
+    std::shared_ptr<CWallet> wallet;
+    {
+        std::unique_ptr<CWallet> aging = CreateSyncedWallet(*m_node.chain, WITH_LOCK(Assert(m_node.chainman)->GetMutex(), return m_node.chainman->ActiveChain()), miner_key);
+        const auto miner_dest = aging->GetNewQuantumDestination("miner");
+        BOOST_REQUIRE(miner_dest);
+        for (int i = 0; i < 8; ++i) CreateAndProcessBlock({}, GetScriptForDestination(*miner_dest));
+    }
+    wallet.reset(CreateSyncedWallet(*m_node.chain, WITH_LOCK(Assert(m_node.chainman)->GetMutex(), return m_node.chainman->ActiveChain()), miner_key).release());
+    wallet->SetBroadcastTransactions(false);
+    const auto source_dest = wallet->GetNewQuantumDestination("decaying");
+    BOOST_REQUIRE(source_dest);
+    const COutPoint source = AddQuantumStakeSource(*this, *wallet, *source_dest, 20 * COIN, 30, 1);
+    WalletContext context;
+    context.chain = m_node.chain.get();
+    const auto iface = interfaces::MakeWallet(context, wallet);
+
+    const auto swept = iface->sweepDemurrageDecay(/*allow_new_quantum_key=*/true);
+    BOOST_REQUIRE_MESSAGE(swept, util::ErrorString(swept).original);
+    BOOST_CHECK_EQUAL(swept->selected_inputs, 1U);
+    BOOST_CHECK_EQUAL(swept->selected_amount, 20 * COIN);
+    BOOST_CHECK_GT(swept->amount, 0);
+    BOOST_CHECK_LT(swept->amount, 20 * COIN);
+    const uint256 txid{uint256S(swept->txid)};
+    LOCK(wallet->cs_wallet);
+    const CWalletTx* wtx = wallet->GetWalletTx(txid);
+    BOOST_REQUIRE(wtx);
+    BOOST_REQUIRE_EQUAL(wtx->tx->vin.size(), 1U);
+    BOOST_CHECK(wtx->tx->vin[0].prevout == source);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

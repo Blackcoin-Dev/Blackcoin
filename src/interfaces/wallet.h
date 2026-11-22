@@ -25,6 +25,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <tuple>
 #include <type_traits>
@@ -49,6 +50,15 @@ using isminefilter = std::underlying_type<isminetype>::type;
 } // namespace wallet
 
 namespace interfaces {
+
+//! Thrown by Wallet::commitTransaction when the wallet refused the transaction and left nothing of it behind (no
+//! record, no coin lock of the operation), so the caller may report the refusal and carry on. A storage failure or any
+//! other error is not this type: it stays a plain exception and is not to be treated as recoverable.
+class WalletCommitRejected : public std::runtime_error
+{
+public:
+    using std::runtime_error::runtime_error;
+};
 
 class Handler;
 struct WalletAddress;
@@ -219,7 +229,9 @@ public:
         CAmount& fee) = 0;
 
     //! Commit transaction. Returns a warning to show the user (empty when there is none), e.g. that the
-    //! transaction spent outputs the final stake reserve holds back.
+    //! transaction spent outputs the final stake reserve holds back, or that it was stored but could not be relayed
+    //! yet. Throws WalletCommitRejected when the wallet refused it and kept nothing; any other exception (a storage
+    //! failure, for one) means the wallet state cannot be trusted and is not to be recovered from.
     virtual std::string commitTransaction(CTransactionRef tx,
         WalletValueMap value_map,
         WalletOrderForm order_form) = 0;

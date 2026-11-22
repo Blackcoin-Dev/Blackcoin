@@ -7228,6 +7228,39 @@ void WalletTests::finalStakeReservePreparedTransactions()
         QVERIFY(model_messages.first().at(1).toString().contains(QStringLiteral("final stake reserve")));
         QCOMPARE(static_cast<int>(model_messages.first().at(2).toUInt()), static_cast<int>(CClientUIInterface::MSG_WARNING));
     }
+    // 7. A storage failure in the commit is not a refusal the dialog may present and recover from: the wallet can hold
+    //    a record the disk does not. The failure leaves the dialog as an exception (the application treats it as fatal),
+    //    the user is not told that nothing happened, and nothing is reported as sent.
+    {
+        guard_off();
+        const COutPoint fresh = AddReserveSource(test, *wallet, *dest_small, 10 * COIN, 72, 3);
+        dialog.getCoinControl()->UnSelectAll();
+        dialog.getCoinControl()->Select(fresh);
+        dialog.getCoinControl()->m_allow_other_inputs = false;
+        dialog.getCoinControl()->destChange = *payee;
+        QVBoxLayout* entries = dialog.findChild<QVBoxLayout*>("entries");
+        SendCoinsEntry* entry = qobject_cast<SendCoinsEntry*>(entries->itemAt(0)->widget());
+        entry->findChild<QValidatedLineEdit*>("payTo")->setText(QString::fromStdString(EncodeDestination(*payee)));
+        entry->findChild<BitcoinAmountField*>("payAmount")->setValue(5 * COIN);
+        QSignalSpy messages(&dialog, &SendCoinsDialog::message);
+        int sent_count{0};
+        const QMetaObject::Connection sent_connection = QObject::connect(&dialog, &SendCoinsDialog::coinsSent, &dialog, [&sent_count](const uint256&) { ++sent_count; });
+        gArgs.ForceSetArg("-qqcommitwritefailure", "1");
+        auto clear_injection = interfaces::MakeCleanupHandler([] { gArgs.ForceSetArg("-qqcommitwritefailure", "0"); });
+        ConfirmSendAfter([] {});
+        bool escaped{false};
+        try {
+            QMetaObject::invokeMethod(&dialog, "sendButtonClicked", Q_ARG(bool, false));
+        } catch (const interfaces::WalletCommitRejected&) {
+            QFAIL("a storage failure was reported as a recoverable rejection");
+        } catch (const std::runtime_error& e) {
+            escaped = QString::fromStdString(e.what()).contains(QStringLiteral("Wallet db error"));
+        }
+        QObject::disconnect(sent_connection);
+        QVERIFY2(escaped, "the storage failure did not leave the dialog");
+        QCOMPARE(sent_count, 0);
+        QCOMPARE(messages.count(), 0);
+    }
 }
 
 void WalletTests::historyScaleBenchmark_data()

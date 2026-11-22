@@ -61,6 +61,10 @@ class FinalStakeReserveTest(TransitionTFinalTestBase, BitcoinTestFramework):
     def skip_test_if_missing_module(self):
         self.skip_if_no_wallet()
 
+    def setup_network(self):
+        # Two independent chains: the nodes are never connected.
+        self.setup_nodes()
+
     def reserve(self, wallet):
         return wallet.getquantumstakereadiness()["final_stake_reserve"]
 
@@ -74,7 +78,7 @@ class FinalStakeReserveTest(TransitionTFinalTestBase, BitcoinTestFramework):
         wallet = node.get_wallet_rpc(name)
         wallet.staking(False)
         for _ in range(count):
-            self.generatetoaddress(node, 1, wallet.getnewaddress("", "legacy"))
+            self.generatetoaddress(node, 1, wallet.getnewaddress("", "legacy"), sync_fun=self.no_op)
             self.bump()
         return wallet
 
@@ -143,6 +147,8 @@ class FinalStakeReserveTest(TransitionTFinalTestBase, BitcoinTestFramework):
         self.set_initial_mt()
         pow0 = default0.getnewaddress("", "legacy")
         pow1 = default1.getnewaddress("", "legacy")
+        quantum_miner0 = default0.getnewquantumaddress()["address"]
+        quantum_miner1 = default1.getnewquantumaddress()["address"]
 
         self.log.info("Node 0: wallets with %d, %d, %d and %d quantum outputs", K_MAIN, K_SINGLE, K_LOCKED, K_SPEND)
         wq = self.build_wallet(n0, pow0, "wq", K_MAIN)
@@ -167,15 +173,15 @@ class FinalStakeReserveTest(TransitionTFinalTestBase, BitcoinTestFramework):
             assert_equal(node.getblockcount(), GUARD_START)
             assert_equal(node.getquantumquasarinfo()["phase"], "migration")
 
-        self.test_negative(n1, wn, q_neg, pow1)
+        self.test_negative(n1, wn, q_neg, pow1, quantum_miner1)
         self.test_readiness_fields(wq, q_main)
         self.test_locked(wl, q_locked)
         self.test_spending(n0, ws, q_spend)
         main = self.test_main_window(n0, wq, w1, q_main, q_single, pow0)
-        self.test_final_block_and_reorgs(n0, wq, w1, q_single, pow0, main)
+        self.test_final_block_and_reorgs(n0, q_single, quantum_miner0, main)
 
     # The E2 experiment, with the reserve off: it exhausts the wallet, asserted.
-    def test_negative(self, node, wallet, addresses, pow_addr):
+    def test_negative(self, node, wallet, addresses, pow_addr, quantum_miner):
         self.log.info("Reserve off: the wallet stakes every output at 83..88 and nothing is left for F")
         info = self.reserve(wallet)
         assert_equal(info["enabled"], False)
@@ -206,7 +212,7 @@ class FinalStakeReserveTest(TransitionTFinalTestBase, BitcoinTestFramework):
             wallet.staking(False)
         assert_equal(node.getblockcount(), M)
         assert_equal(wallet.getstakinginfo()["eligible"], False)
-        self.pow_blocks(node, 1, pow_addr)  # proof of work has to make F
+        self.pow_blocks(node, 1, quantum_miner)  # proof of work has to make F (a Final block pays a quantum address)
         assert_equal(node.getblockcount(), F)
 
     def test_readiness_fields(self, wallet, addresses):
@@ -280,12 +286,13 @@ class FinalStakeReserveTest(TransitionTFinalTestBase, BitcoinTestFramework):
         spent = {(i["txid"], i["vout"]) for i in node.decoderawtransaction(swept["hex"])["vin"]}
         assert_equal(spent, {free_key})
         # A payment that one output covers is funded from the unreserved one.
-        txid = wallet.sendtoaddress(destination, free_value / 2)
-        spent = {(i["txid"], i["vout"]) for i in node.decoderawtransaction(wallet.gettransaction(txid)["hex"])["vin"]}
+        sent = wallet.send(outputs=[{destination: free_value / 2}], options={"change_address": destination})
+        spent = {(i["txid"], i["vout"]) for i in node.decoderawtransaction(wallet.gettransaction(sent["txid"])["hex"])["vin"]}
         assert_equal(spent, {free_key})
         # Explicit coin control may spend the reserve; the readiness report then shows the reduction.
         explicit = wallet.send(outputs=[{destination: reserved_value / 2}],
-                               options={"inputs": [{"txid": reserved_key[0], "vout": reserved_key[1]}], "add_inputs": False})
+                               options={"inputs": [{"txid": reserved_key[0], "vout": reserved_key[1]}], "add_inputs": False,
+                                        "change_address": destination})
         assert explicit["complete"]
         spent = {(i["txid"], i["vout"]) for i in node.decoderawtransaction(wallet.gettransaction(explicit["txid"])["hex"])["vin"]}
         assert_equal(spent, {reserved_key})
@@ -362,7 +369,10 @@ class FinalStakeReserveTest(TransitionTFinalTestBase, BitcoinTestFramework):
         assert_equal(node.getblockcount(), M)
         return {"wallet": wallet, "single": single, "reserved": reserved_list, "stake_hashes": stake_hashes}
 
-    def test_final_block_and_reorgs(self, node, wallet, single, q_single, pow_addr, main):
+    def test_final_block_and_reorgs(self, node, q_single, quantum_miner, main):
+        # The node was restarted: the wallet handles of the restarted node.
+        wallet = main["wallet"]
+        single = main["single"]
         reserved = main["reserved"]
         self.log.info("At the tip M the guard is released for candidate F")
         released = self.reserve(wallet)
@@ -380,13 +390,13 @@ class FinalStakeReserveTest(TransitionTFinalTestBase, BitcoinTestFramework):
         first = key(block["tx"][1]["vin"][0])
         assert first in reserved
 
-        self.log.info("A reorganisation across F: the wallet makes F again from another reserved output")
+        self.log.info("A reorganisation across F: the wallet makes F again from a reserved output")
         node.invalidateblock(f_hash)
         assert_equal(node.getblockcount(), M)
         self.bump()
-        f2_hash = self.stake_from(wallet, node, set(reserved) - {first})
+        f2_hash = self.stake_from(wallet, node, set(reserved))
         assert f2_hash != f_hash
-        assert key(node.getblock(f2_hash, 2)["tx"][1]["vin"][0]) != first
+        assert key(node.getblock(f2_hash, 2)["tx"][1]["vin"][0]) in reserved
         assert_equal(self.reserve(wallet)["active"], False)
 
         self.log.info("N = 1: the withheld output stakes at F + 1")
@@ -398,6 +408,7 @@ class FinalStakeReserveTest(TransitionTFinalTestBase, BitcoinTestFramework):
         coinstake_85 = main["stake_hashes"][2]
         node.invalidateblock(coinstake_85)
         assert_equal(node.getblockcount(), 84)
+        node.syncwithvalidationinterfacequeue()
         window = self.reserve(wallet)
         assert_equal(window["active"], True)
         assert_equal(window["consumed_count"], 2)  # the stake at 85 is no longer on the chain
@@ -406,6 +417,8 @@ class FinalStakeReserveTest(TransitionTFinalTestBase, BitcoinTestFramework):
         assert_equal([(o["txid"], o["vout"]) for o in window["reserved_outpoints"]], reserved)
         node.reconsiderblock(coinstake_85)
         assert_equal(node.getblockcount(), F + 1)
+        node.syncwithvalidationinterfacequeue()
+        assert_equal(self.reserve(wallet)["consumed_count"], 0)  # the guard is over: the reserve is released
         assert_equal(self.reserve(wallet)["active"], False)
 
 

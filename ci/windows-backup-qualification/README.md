@@ -19,6 +19,7 @@ wallets:
 | `outside-denied` | an outside path whose ancestors reach `C:\` is refused with an accurate pending error naming `C:\`; the earlier destination is untouched; the same key activates on the default path; a writable test-volume root works |
 | `unc-share` / `mapped-drive` | ordinary file creation works first; the backup is refused as unsupported; the key stays pending; existing generations are untouched; the same key activates on the default path |
 | `denied-ancestor` | `icacls /deny` on an ancestor gives an ancestor-specific refusal; after the denial is removed and the node restarted the same key activates |
+| `affected-wallet` | the AFFECTED wallet has an active return address and a second key pending; four real generations (written by the daemon, using the `before_activation` crash point) sit in the path that then fails (denied ancestor); the repeated call, a restart and the recovery leave the active address, the full key inventory and every file of the failing path unchanged; only the success prunes, to exactly the newest three |
 | `fat32` | FAT32 mounted volume: refused naming the file system although ordinary writes succeed |
 | `failcommit` | `-quantumreturnfailcommit=<directory-name>`: the key stays pending, a restart without it activates the same key |
 | `crash-points` | the four `-quantumreturncrashpoint` values end the daemon with exit code 7 (`TerminateProcess`); after a restart the pending or active state is the expected one and the key is recoverable from a backup |
@@ -28,13 +29,29 @@ Each case writes `case-<name>.json` (name, expected, observed, status, `daemon_e
 A case whose infrastructure could not be set up (VHD, share, `subst`, `net use`) is `unresolved`; `unresolved` fails
 the job exactly as `fail` does. `summary.json` must show every listed case passed.
 
-"Restores and signs" is checked as: the restored wallet owns the address and `dumpquantumkey` returns the same
-ML-DSA private key as the wallet that was backed up. No spend is signed (no funded chain is used).
+"Restores and signs" is checked as: the restored wallet owns the address, `dumpquantumkey` returns the same ML-DSA
+private key as the wallet that was backed up (key equality, an additional check), and, after unlocking, `backupwallet`
+on the restored wallet succeeds. That call runs the daemon's own backup verifier: it stages a copy, reopens it, and with
+every quantum key signs and verifies a fresh random ML-DSA challenge before it installs the file. This proves the restored
+wallet holds working private key material that signs and verifies. It does NOT show that a transaction is built, accepted
+or relayed: no spend is made and no funded chain is used. The same restore and challenge is done after the recoveries of the
+refused-path and commit-failure cases, together with `pending == false`, `backup_verified == true` and an unchanged key
+inventory.
+
+How the `affected-wallet` state is reached (read from the source): `PrepareQuantumStakeReturn` makes a new key only when no
+usable return address is saved, so `allow_new_quantum_key` cannot create a second pending key beside an active address
+(`src/wallet/staking.cpp`, the "already saved" return). The state is reached in the other order: a key becomes pending
+(crash point `after_key_insertion`), then an existing quantum address is saved with `existing_address`;
+`ActivatePendingQuantumStakeReturn` keeps that address when the pending key completes. Each crash at `before_activation`
+leaves one genuine, manifested generation and the key still pending.
 
 ## What it does not prove
 
 - No power-loss, storage-controller or write-cache claim. A process can be killed and restarted here; a machine
   cannot. Only tested Windows API success, fail-closed behaviour and process-crash recovery are claimed.
+- That the MinGW compile and link of the probe works. This stays unresolved until the `flush-probe` job succeeds on the
+  runner: a successful link of the probe on a POSIX host (`PROBE_TARGET=native`) establishes nothing about MinGW.
+- Acceptance of a transaction signed by a restored key (see above).
 - Only the file systems and path kinds above. NTFS on a VHD is not proof about every physical disk.
 - It tests the build artifact of one commit; a different commit needs a new run.
 - The hosted runner is an administrator with UAC disabled; the standard user is a separate local account created for
@@ -48,21 +65,32 @@ ML-DSA private key as the wallet that was backed up. No spend is signed (no fund
 2. Dispatch `windows-backup-qualification.yml` from a branch that holds this directory:
    `gh workflow run windows-backup-qualification.yml --ref <branch> -f target_sha=<40 hex> -f build_run_id=<id> -f artifact_name=<name>`.
 3. The `flush-probe` job builds `flush_probe.exe` from the sources of `target_sha`. The `windows-backup` job verifies
-   that the build run's head is `target_sha`, that the artifact is exactly the three files `build.yml` uploads, that
-   their SHA-256 match the unsigned canary manifest and checksum list of the same run, the payload and the daemon's
-   embedded identity (`verify_windows_payload.py`), `blackcoind.exe --version`, and the probe's hash; then it creates
-   the standard user, VHDs, share and ACLs, runs the child harness as that user, and always uploads the results and
-   always cleans up.
+   that the build run is run `build_run_id` of this repository, belongs to the workflow file
+   `.github/workflows/build.yml` (the run's `path` and the id of that workflow), was a successful dispatch with head
+   `target_sha`, that the artifact is exactly the three files `build.yml` uploads, that their SHA-256 and the manifest's
+   own SHA-256 match the unsigned canary manifest and checksum list of the same run (duplicate entries are rejected),
+   the payload and the daemon's embedded identity (`verify_windows_payload.py`), `blackcoind.exe --version`, and the
+   probe's hash; then it creates the standard user, VHDs, share and ACLs, runs the child harness as that user within a
+   30 minute budget (the process tree is terminated on a timeout), and always uploads the results (plus the live results
+   directory as a fallback) and always cleans up. A failed copy of the results, a timeout, a child exit code that cannot
+   be read, or a clean-up failure fails the job.
 
 Results: the workflow artifact `windows-backup-qualification-results-<target_sha>-<run id>` (case files,
-`summary.json`, `child-identity.json`, `child-whoami-all.txt`, `admin-evidence/`, `artifact-verification.json`,
-`daemon-version.txt`, the probe's provenance, `logs/` with each daemon's console output).
+`summary.json`, `child-identity.json`, `child-profile.json`, `child-whoami-all.txt`, `final-receipt.json` with the
+clean-up outcome, `admin-evidence/` with the runner facts, `child-run.json`, partition access paths, volume and ACL
+details and `sha256-harness-probe-payload.txt`, `diskpart/` with every diskpart script and its output,
+`artifact-verification.json`, `build-run-verification.json`, `build-artifacts.json` (the build artifacts' expiry),
+`daemon-version.txt`, the probe's provenance, `tested/` with the exact probe and portable payload that ran and their
+SHA-256, `logs/` with each daemon's console output and its full `debug.log`). A daemon that had to be killed after a stop
+timeout is recorded in its case file and fails the case.
 
 ## Files
 
 - `qualify-admin.ps1`: administrator side (user, VHDs through `diskpart /s`, share, ACLs, launch, verdict, teardown).
-- `qualify-child.ps1`: runs as the standard user; records `whoami /all`, fails if administrator, elevated, or if
-  `SeBackupPrivilege`/`SeRestorePrivilege` is enabled; runs the harness.
+- `qualify-child.ps1`: runs as the standard user; records `whoami /all`, fails if the token holds the administrators SID in
+  any form (deny-only included), is elevated, or has `SeBackupPrivilege`/`SeRestorePrivilege` enabled; sets its profile and
+  temporary folders from its own identity, checks them against the profile registered for its SID and proves a temporary
+  file can be created; runs the harness.
 - `harness.py`: standard library only; `--selftest` tests its pure helpers on any platform, `--list` lists the cases.
 - `flush_probe.cpp`, `build-probe.sh`: the probe and its build (`PROBE_TARGET=native` is a link check on a POSIX host).
 - `verify_inputs.py`: fail-closed checks of the run, the artifact names and the hashes (`selftest` included).

@@ -29,7 +29,10 @@ $NtfsLabel = 'QNTFS'
 $FatLabel = 'QFAT'
 $NtfsVhd = Join-Path $Root 'ntfs.vhd'
 $FatVhd = Join-Path $Root 'fat32.vhd'
-$ChildTimeoutMinutes = 35
+# The hosted job allows 60 minutes and the qualifying step 45: the child gets 30, which leaves time for the collection of
+# the results, the clean-up and the always-run upload steps even when the child has to be killed.
+$ChildTimeoutMinutes = 30
+$script:DiskpartLogDir = $null
 
 function Write-Utf8NoBom([string]$Path, [string]$Text) {
     [System.IO.File]::WriteAllText($Path, $Text, (New-Object System.Text.UTF8Encoding($false)))
@@ -48,12 +51,25 @@ function Invoke-Native([string]$File, [string[]]$Arguments) {
     return [pscustomobject]@{ Code = $code; Output = $output.Trim() }
 }
 
+# A native command that must succeed: its exit code is checked here and a failure ends the step with the output.
+function Invoke-Checked([string]$What, [string]$File, [string[]]$Arguments) {
+    $result = Invoke-Native $File $Arguments
+    if ($result.Code -ne 0) { throw "$What failed with exit code $($result.Code): $($result.Output)" }
+    return $result
+}
+
+# The script and the output (with the exit code) of every diskpart run are kept with the results.
 function Invoke-Diskpart([string]$Name, [string[]]$Lines) {
     $script = Join-Path $Root ($Name + '.txt')
-    Write-Utf8NoBom $script (($Lines -join "`r`n") + "`r`n")
+    $text = ($Lines -join "`r`n") + "`r`n"
+    Write-Utf8NoBom $script $text
     $result = Invoke-Native 'diskpart.exe' @('/s', $script)
     Write-Host "diskpart $Name exit code $($result.Code)"
     Write-Host $result.Output
+    if ($script:DiskpartLogDir -and (Test-Path $script:DiskpartLogDir)) {
+        Write-Utf8NoBom (Join-Path $script:DiskpartLogDir ($Name + '.script.txt')) $text
+        Write-Utf8NoBom (Join-Path $script:DiskpartLogDir ($Name + '.output.txt')) ("exit code $($result.Code)`r`n" + $result.Output + "`r`n")
+    }
     return $result
 }
 
@@ -65,28 +81,55 @@ function Get-FreeLetter([string[]]$Preferred, [string[]]$Taken) {
     throw "no free drive letter among $($Preferred -join ',')"
 }
 
-function Remove-Vhd([string]$Path) {
+# Detach and delete a VHD. The diskpart exit code is recorded; the outcome (the file is gone) decides.
+function Remove-Vhd([string]$Path, [System.Collections.ArrayList]$Steps, [System.Collections.ArrayList]$Failures) {
     if (Test-Path $Path) {
         $name = 'detach-' + [System.IO.Path]::GetFileNameWithoutExtension($Path)
-        $null = Invoke-Diskpart $name @("select vdisk file=`"$Path`"", 'detach vdisk')
+        $r = Invoke-Diskpart $name @("select vdisk file=`"$Path`"", 'detach vdisk')
+        $null = $Steps.Add([ordered]@{ step = $name; exit_code = $r.Code; output = $r.Output })
         Remove-Item -Force -ErrorAction SilentlyContinue $Path
+        if (Test-Path $Path) {
+            Start-Sleep -Seconds 3
+            Remove-Item -Force -ErrorAction SilentlyContinue $Path
+        }
+        if (Test-Path $Path) { $null = $Failures.Add("$Path could not be removed after detach (diskpart exit code $($r.Code))") }
     }
 }
 
+# Idempotent clean-up. Returns what it did and what it could not do; the caller puts that into the final receipt.
 function Invoke-Teardown {
     Write-Host '--- teardown'
-    Get-Process -Name blackcoind -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    $steps = New-Object System.Collections.ArrayList
+    $failures = New-Object System.Collections.ArrayList
+    try {
+        $running = @(Get-Process -Name blackcoind -ErrorAction SilentlyContinue)
+        foreach ($process in $running) { Stop-Process -Id $process.Id -Force -ErrorAction Stop }
+        $null = $steps.Add([ordered]@{ step = 'stop-blackcoind'; stopped = $running.Count })
+    } catch {
+        $null = $failures.Add("stopping blackcoind: $($_.Exception.Message)")
+    }
     if (Test-Path $Root) {
-        Remove-Vhd $NtfsVhd
-        Remove-Vhd $FatVhd
+        Remove-Vhd $NtfsVhd $steps $failures
+        Remove-Vhd $FatVhd $steps $failures
     }
-    $null = Invoke-Native 'net.exe' @('share', $ShareName, '/delete', '/y')
-    if (Get-LocalUser -Name $UserName -ErrorAction SilentlyContinue) {
-        Remove-LocalUser -Name $UserName -ErrorAction SilentlyContinue
+    $share = Invoke-Native 'net.exe' @('share', $ShareName, '/delete', '/y')
+    $null = $steps.Add([ordered]@{ step = 'net-share-delete'; exit_code = $share.Code; output = $share.Output })
+    # exit code 2 with message 2310 means the share did not exist, which is the clean state
+    if ($share.Code -ne 0 -and $share.Output -notmatch '2310') {
+        $null = $failures.Add("net share delete exited with $($share.Code): $($share.Output)")
     }
-    Get-CimInstance Win32_UserProfile -ErrorAction SilentlyContinue |
-        Where-Object { $_.LocalPath -like "*\$UserName" } |
-        ForEach-Object { Remove-CimInstance $_ -ErrorAction SilentlyContinue }
+    try {
+        if (Get-LocalUser -Name $UserName -ErrorAction SilentlyContinue) { Remove-LocalUser -Name $UserName -ErrorAction Stop }
+    } catch {
+        $null = $failures.Add("removing the local user: $($_.Exception.Message)")
+    }
+    try {
+        Get-CimInstance Win32_UserProfile -ErrorAction Stop |
+            Where-Object { $_.LocalPath -like "*\$UserName" } |
+            ForEach-Object { Remove-CimInstance $_ -ErrorAction Stop }
+    } catch {
+        $null = $failures.Add("removing the user profile: $($_.Exception.Message)")
+    }
     if (Test-Path $Root) {
         Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $Root
         if (Test-Path $Root) {
@@ -94,12 +137,23 @@ function Invoke-Teardown {
             Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $Root
         }
     }
-    Write-Host ("teardown: root present = {0}, user present = {1}" -f (Test-Path $Root),
-        [bool](Get-LocalUser -Name $UserName -ErrorAction SilentlyContinue))
+    $rootPresent = [bool](Test-Path $Root)
+    $userPresent = [bool](Get-LocalUser -Name $UserName -ErrorAction SilentlyContinue)
+    $sharePresent = [bool](Get-SmbShare -Name $ShareName -ErrorAction SilentlyContinue)
+    if ($rootPresent) { $null = $failures.Add("$Root is still present") }
+    if ($userPresent) { $null = $failures.Add("the local user $UserName is still present") }
+    if ($sharePresent) { $null = $failures.Add("the share $ShareName is still present") }
+    Write-Host ("teardown: root present = {0}, user present = {1}, share present = {2}, failures = {3}" -f $rootPresent, $userPresent, $sharePresent, $failures.Count)
+    foreach ($failure in $failures) { Write-Host "::error::teardown: $failure" }
+    return [pscustomobject]@{
+        root_present = $rootPresent; user_present = $userPresent; share_present = $sharePresent
+        failures = @($failures); steps = @($steps)
+    }
 }
 
 if ($Action -eq 'Teardown') {
-    Invoke-Teardown
+    $outcome = Invoke-Teardown
+    if (@($outcome.failures).Count -gt 0) { exit 1 }
     exit 0
 }
 
@@ -107,9 +161,13 @@ foreach ($required in @($PayloadDir, $ProbeExe, $HarnessDir, $PythonExe, $Result
     if (-not $required) { throw 'Run needs -PayloadDir -ProbeExe -HarnessDir -PythonExe -ResultsOut' }
 }
 $exitCode = 1
+$timedOut = $false
+$teardownOutcome = $null
+$copyProblem = ''
 try {
     # ----- layout on disk -----
-    Invoke-Teardown            # a clean start, whatever an earlier run left
+    $start = Invoke-Teardown            # a clean start, whatever an earlier run left
+    if (@($start.failures).Count -gt 0) { throw "the clean start failed: $(@($start.failures) -join '; ')" }
     $Bin = Join-Path $Root 'bin'
     $Harness = Join-Path $Root 'harness'
     $ResultsDir = Join-Path $Root 'results'
@@ -122,12 +180,36 @@ try {
     foreach ($directory in @($Root, $Bin, $Harness, $ResultsDir, $Cases, $ShareDir, $NtfsMount, $FatMount)) {
         New-Item -ItemType Directory -Force -Path $directory | Out-Null
     }
+    $evidence = Join-Path $ResultsDir 'admin-evidence'
+    New-Item -ItemType Directory -Force -Path $evidence | Out-Null
+    $script:DiskpartLogDir = Join-Path $ResultsDir 'diskpart'
+    New-Item -ItemType Directory -Force -Path $script:DiskpartLogDir | Out-Null
+    $setupLog = New-Object System.Collections.ArrayList
     Copy-Item -Path (Join-Path $PayloadDir '*') -Destination $Bin -Recurse -Force
     Copy-Item -Path $ProbeExe -Destination (Join-Path $Bin 'flush_probe.exe') -Force
     Copy-Item -Path (Join-Path $HarnessDir 'harness.py') -Destination $Harness -Force
     Copy-Item -Path (Join-Path $HarnessDir 'qualify-child.ps1') -Destination $Harness -Force
     $Daemon = Join-Path $Bin 'blackcoind.exe'
     if (-not (Test-Path $Daemon)) { throw "blackcoind.exe is not in $Bin" }
+
+    # ----- hashes of what is being run: the harness files, the probe, every payload file -----
+    $hashLines = New-Object System.Collections.ArrayList
+    foreach ($name in @('harness.py', 'qualify-child.ps1', 'qualify-admin.ps1', 'verify_inputs.py', 'build-probe.sh', 'flush_probe.cpp', 'README.md')) {
+        $file = Join-Path $HarnessDir $name
+        if (Test-Path $file) { $null = $hashLines.Add(('{0}  harness/{1}' -f (Get-FileHash -Algorithm SHA256 -LiteralPath $file).Hash.ToLower(), $name)) }
+    }
+    # the copies the child actually runs must be the ones hashed above
+    foreach ($name in @('harness.py', 'qualify-child.ps1')) {
+        $source = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $HarnessDir $name)).Hash
+        $copy = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $Harness $name)).Hash
+        if ($source -ne $copy) { throw "the staged $name differs from the qualifying branch's file" }
+    }
+    $null = $hashLines.Add(('{0}  probe/flush_probe.exe' -f (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $Bin 'flush_probe.exe')).Hash.ToLower()))
+    foreach ($file in (Get-ChildItem -LiteralPath $Bin -Recurse -File | Sort-Object FullName)) {
+        $relative = $file.FullName.Substring($Bin.Length).TrimStart('\')
+        $null = $hashLines.Add(('{0}  payload/{1}' -f (Get-FileHash -Algorithm SHA256 -LiteralPath $file.FullName).Hash.ToLower(), $relative))
+    }
+    Write-Utf8NoBom (Join-Path $evidence 'sha256-harness-probe-payload.txt') (($hashLines -join "`r`n") + "`r`n")
 
     # ----- the separate standard user (the plan's PowerShell) -----
     $plain = 'Qq1!' + [guid]::NewGuid()
@@ -139,12 +221,26 @@ try {
     $cred = New-Object System.Management.Automation.PSCredential($user, $pw)
 
     # The user may write to the root (cases, results, share); the binaries and scripts are readable, not writable.
-    $null = Invoke-Native 'icacls.exe' @($Root, '/grant', "${user}:(OI)(CI)M")
+    $null = Invoke-Checked "icacls grant on $Root" 'icacls.exe' @($Root, '/grant', "${user}:(OI)(CI)M")
     foreach ($locked in @($Bin, $Harness)) {
-        $r = Invoke-Native 'icacls.exe' @($locked, '/inheritance:r', '/grant:r', '*S-1-5-32-544:(OI)(CI)F', '*S-1-5-18:(OI)(CI)F', "${user}:(OI)(CI)RX")
-        if ($r.Code -ne 0) { throw "icacls on $locked failed: $($r.Output)" }
+        $null = Invoke-Checked "icacls lock-down of $locked" 'icacls.exe' @($locked, '/inheritance:r', '/grant:r', '*S-1-5-32-544:(OI)(CI)F', '*S-1-5-18:(OI)(CI)F', "${user}:(OI)(CI)RX")
     }
-    try { Start-Service seclogon } catch { Write-Host "seclogon: $($_.Exception.Message)" }
+
+    # Secondary Logon must be running for Start-Process -Credential: enable it when disabled, start it, verify it.
+    $seclogon = Get-CimInstance Win32_Service -Filter "Name='seclogon'"
+    if (-not $seclogon) { throw 'the Secondary Logon service (seclogon) does not exist on this runner' }
+    $null = $setupLog.Add("seclogon before: start mode $($seclogon.StartMode), state $($seclogon.State)")
+    if ($seclogon.StartMode -eq 'Disabled') {
+        Set-Service -Name seclogon -StartupType Manual
+        $null = $setupLog.Add('seclogon: start mode changed from Disabled to Manual')
+    }
+    $service = Get-Service -Name seclogon
+    if ($service.Status -ne 'Running') { Start-Service -Name seclogon }
+    $service.WaitForStatus('Running', [TimeSpan]::FromSeconds(30))
+    $service.Refresh()
+    if ($service.Status -ne 'Running') { throw "the Secondary Logon service is $($service.Status), not Running" }
+    $null = $setupLog.Add("seclogon after: state $($service.Status)")
+    Write-Host ($setupLog -join '; ')
 
     # ----- letters and infrastructure -----
     $NtfsLetter = Get-FreeLetter @('V', 'W', 'X', 'Y') @()
@@ -167,7 +263,7 @@ try {
         }
         $access = (Get-Partition -DriveLetter $NtfsLetter).AccessPaths
         if (@($access | Where-Object { $_ -like "$NtfsMount*" }).Count -eq 0) { throw "the mount path is not an access path: $access" }
-        $null = Invoke-Native 'icacls.exe' @("${NtfsLetter}:\", '/grant', "${user}:(OI)(CI)M")
+        $null = Invoke-Checked "icacls grant on ${NtfsLetter}:\" 'icacls.exe' @("${NtfsLetter}:\", '/grant', "${user}:(OI)(CI)M")
         $infra.ntfs_vhd = $true
     } catch {
         $infra.ntfs_vhd_error = $_.Exception.Message
@@ -188,8 +284,7 @@ try {
         Write-Host "::warning::FAT32 VHD setup failed: $($infra.fat32_vhd_error)"
     }
     try {
-        $r = Invoke-Native 'net.exe' @('share', "$ShareName=$ShareDir", "/grant:$UserName,FULL")
-        if ($r.Code -ne 0) { throw "net share failed: $($r.Output)" }
+        $null = Invoke-Checked 'net share' 'net.exe' @('share', "$ShareName=$ShareDir", "/grant:$UserName,FULL")
         $infra.share = $true
     } catch {
         $infra.share_error = $_.Exception.Message
@@ -206,64 +301,131 @@ try {
     }
     $LayoutPath = Join-Path $Harness 'layout.json'
     Write-Utf8NoBom $LayoutPath ($layout | ConvertTo-Json -Depth 5)
-    $null = Invoke-Native 'icacls.exe' @($LayoutPath, '/grant', "${user}:R")
+    $null = Invoke-Checked "icacls read grant on $LayoutPath" 'icacls.exe' @($LayoutPath, '/grant', "${user}:R")
 
-    # ----- evidence recorded as the administrator -----
-    $evidence = Join-Path $ResultsDir 'admin-evidence'
-    New-Item -ItemType Directory -Force -Path $evidence | Out-Null
+    # ----- evidence recorded as the administrator (every command's exit code is checked) -----
     $os = Get-CimInstance Win32_OperatingSystem
     $info = [ordered]@{
         image_os = $env:ImageOS; image_version = $env:ImageVersion; os_caption = $os.Caption; os_build = $os.BuildNumber
         computer = $env:COMPUTERNAME; runner_user = $env:USERNAME; ntfs_letter = $NtfsLetter; subst_letter = $SubstLetter; mapped_letter = $MappedLetter; infra = $infra
+        setup_log = @($setupLog); child_timeout_minutes = $ChildTimeoutMinutes
         started = (Get-Date).ToUniversalTime().ToString('o')
     }
     Write-Utf8NoBom (Join-Path $evidence 'runner-info.json') ($info | ConvertTo-Json -Depth 5)
-    Write-Utf8NoBom (Join-Path $evidence 'runner-whoami-all.txt') ((Invoke-Native 'whoami.exe' @('/all')).Output)
-    Write-Utf8NoBom (Join-Path $evidence 'volumes.txt') ((Get-Volume | Format-Table -AutoSize | Out-String))
-    Write-Utf8NoBom (Join-Path $evidence 'icacls-root.txt') ((Invoke-Native 'icacls.exe' @($Root)).Output + "`r`n" + (Invoke-Native 'icacls.exe' @("$env:SystemDrive\")).Output)
-    Write-Utf8NoBom (Join-Path $evidence 'daemon-version.txt') ((Invoke-Native $Daemon @('--version')).Output)
+    Write-Utf8NoBom (Join-Path $evidence 'runner-whoami-all.txt') ((Invoke-Checked 'whoami /all' 'whoami.exe' @('/all')).Output)
+    Write-Utf8NoBom (Join-Path $evidence 'volumes.txt') ((Get-Volume | Format-List * | Out-String))
+    Write-Utf8NoBom (Join-Path $evidence 'partitions.json') (@(Get-Partition | Select-Object DiskNumber, PartitionNumber, DriveLetter, Type, Size, GptType, AccessPaths) | ConvertTo-Json -Depth 4)
+    $aclText = New-Object System.Collections.ArrayList
+    foreach ($target in @($Root, "$env:SystemDrive\", $Bin, $Harness, $NtfsMountDatadir, $NtfsMount, $ShareDir)) {   # FAT32 has no ACLs, so it is not listed
+        if (Test-Path -LiteralPath $target) {
+            $acl = Invoke-Checked "icacls $target" 'icacls.exe' @($target)
+            $null = $aclText.Add("--- $target`r`n$($acl.Output)")
+        }
+    }
+    if ($infra.ntfs_vhd) {
+        $acl = Invoke-Checked "icacls ${NtfsLetter}:\" 'icacls.exe' @("${NtfsLetter}:\")
+        $null = $aclText.Add("--- ${NtfsLetter}:\`r`n$($acl.Output)")
+        $null = $aclText.Add("--- fsutil volumeinfo of the NTFS mount`r`n" + (Invoke-Checked 'fsutil volumeinfo (NTFS)' 'fsutil.exe' @('fsinfo', 'volumeinfo', "${NtfsLetter}:\")).Output)
+    }
+    if ($infra.fat32_vhd) {
+        $null = $aclText.Add("--- fsutil volumeinfo of the FAT32 mount`r`n" + (Invoke-Checked 'fsutil volumeinfo (FAT32)' 'fsutil.exe' @('fsinfo', 'volumeinfo', "$FatMount\")).Output)
+    }
+    Write-Utf8NoBom (Join-Path $evidence 'icacls-and-volume-details.txt') (($aclText -join "`r`n`r`n") + "`r`n")
+    Write-Utf8NoBom (Join-Path $evidence 'daemon-version.txt') ((Invoke-Checked 'blackcoind --version' $Daemon @('--version')).Output)
 
-    # ----- the child, as the standard user -----
+    # ----- the child, as the standard user, with a deadline -----
     $ChildScript = Join-Path $Harness 'qualify-child.ps1'
     $arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$ChildScript`" -Layout `"$LayoutPath`" -Results `"$ResultsDir`" -PythonExe `"$PythonExe`" -HarnessDir `"$Harness`""
-    Write-Host "starting the child as $user"
+    Write-Host "starting the child as $user (deadline $ChildTimeoutMinutes minutes)"
+    $childStarted = Get-Date
     $p = Start-Process -FilePath 'powershell.exe' -Credential $cred -LoadUserProfile -WorkingDirectory $Root `
-        -ArgumentList $arguments -Wait -PassThru
+        -ArgumentList $arguments -PassThru
+    $null = $p.Handle          # keeps the process handle open, which is what makes ExitCode readable after the exit
+    $finished = $p.WaitForExit($ChildTimeoutMinutes * 60 * 1000)
+    $killOutput = ''
+    if (-not $finished) {
+        $timedOut = $true
+        Write-Host "::error::the child did not finish within $ChildTimeoutMinutes minutes: terminating its process tree"
+        $kill = Invoke-Native 'taskkill.exe' @('/T', '/F', '/PID', "$($p.Id)")
+        $killOutput = "taskkill exit code $($kill.Code): $($kill.Output)"
+        Write-Host $killOutput
+        $null = $p.WaitForExit(60000)
+    } else {
+        $p.WaitForExit()       # lets the redirected streams and the exit code settle
+    }
     $childCode = $null
-    try { $childCode = $p.ExitCode } catch { Write-Host "the child's exit code is not readable: $($_.Exception.Message)" }
-    Write-Host "child exit code: $childCode"
+    try { $childCode = [int]$p.ExitCode } catch { Write-Host "the child's exit code is not readable: $($_.Exception.Message)" }
+    Write-Host "child exit code: $childCode (timed out: $timedOut)"
+    $childRun = [ordered]@{
+        started = $childStarted.ToUniversalTime().ToString('o'); finished = (Get-Date).ToUniversalTime().ToString('o')
+        timeout_minutes = $ChildTimeoutMinutes; timed_out = $timedOut; exit_code = $childCode; kill = $killOutput
+    }
+    Write-Utf8NoBom (Join-Path $evidence 'child-run.json') ($childRun | ConvertTo-Json -Depth 3)
+    if ($timedOut) { throw "the child exceeded its $ChildTimeoutMinutes minute budget and was terminated" }
+    if ($null -eq $childCode) { throw 'the child exit code could not be read, so the run is not accepted' }
 
-    # ----- verdict: the child's own identity check and the harness summary (the exit code alone is not trusted) -----
+    # ----- verdict: the child's own identity check, the harness summary and the real exit code -----
     $identityPath = Join-Path $ResultsDir 'child-identity.json'
     $summaryPath = Join-Path $ResultsDir 'summary.json'
     if (-not (Test-Path $identityPath)) { throw 'the child recorded no identity: it did not run as a standard user' }
     $identity = Get-Content -Raw $identityPath | ConvertFrom-Json
-    if ($identity.is_administrator -or $identity.elevated -or @($identity.enabled_backup_restore_privileges).Count -gt 0) {
+    if ($identity.is_administrator -or $identity.administrators_sid_in_token -or $identity.elevated -or @($identity.enabled_backup_restore_privileges).Count -gt 0) {
         throw 'the child is an administrator or holds backup/restore privileges'
     }
+    if (-not $identity.profile_verified) { throw 'the child did not verify its own profile folders' }
     if (-not (Test-Path $summaryPath)) { throw 'the harness wrote no summary' }
     $summary = Get-Content -Raw $summaryPath | ConvertFrom-Json
-    $listed = Invoke-Native $PythonExe @((Join-Path $Harness 'harness.py'), '--list')
+    $listed = Invoke-Checked 'harness.py --list' $PythonExe @((Join-Path $Harness 'harness.py'), '--list')
     $expectedCases = @($listed.Output -split "`n" | Where-Object { $_.Trim() }).Count
     Write-Host ("summary: passed={0} failed={1} unresolved={2} of {3} cases" -f $summary.passed, $summary.failed, $summary.unresolved, $expectedCases)
     if ($summary.failed -ne 0 -or $summary.unresolved -ne 0 -or $summary.passed -ne $expectedCases) {
         throw 'the qualification did not pass every case (failed or unresolved cases fail the job)'
     }
-    if (($null -ne $childCode) -and ($childCode -ne 0)) { throw "the child exited with $childCode" }
+    if ($childCode -ne 0) { throw "the child exited with $childCode" }
     $exitCode = 0
 } catch {
     Write-Host "::error::$($_.Exception.Message)"
     $exitCode = 1
 } finally {
-    # results first (outside the root), then the clean-up
+    # results first (outside the root), then the clean-up, then the receipt that says how the clean-up went
     try {
         if (Test-Path (Join-Path $Root 'results')) {
             New-Item -ItemType Directory -Force -Path $ResultsOut | Out-Null
+            $sourceFiles = @(Get-ChildItem -LiteralPath (Join-Path $Root 'results') -Recurse -File)
             Copy-Item -Path (Join-Path $Root 'results\*') -Destination $ResultsOut -Recurse -Force
+            $copied = @(Get-ChildItem -LiteralPath $ResultsOut -Recurse -File)
+            $missing = @($sourceFiles | Where-Object {
+                    $relative = $_.FullName.Substring((Join-Path $Root 'results').Length).TrimStart('\')
+                    -not (Test-Path -LiteralPath (Join-Path $ResultsOut $relative))
+                })
+            if ($missing.Count -gt 0) { throw "$($missing.Count) result files did not arrive in $ResultsOut" }
+            if ($exitCode -eq 0 -and -not (Test-Path -LiteralPath (Join-Path $ResultsOut 'summary.json'))) { throw 'summary.json is not in the copied results' }
+        } elseif ($exitCode -eq 0) {
+            throw 'there is no results directory to copy'
         }
     } catch {
-        Write-Host "::warning::copying the results failed: $($_.Exception.Message)"
+        $copyProblem = $_.Exception.Message
+        Write-Host "::error::copying the results failed: $copyProblem"
+        $exitCode = 1
     }
-    try { Invoke-Teardown } catch { Write-Host "::warning::teardown: $($_.Exception.Message)" }
+    try {
+        $teardownOutcome = Invoke-Teardown
+        if (@($teardownOutcome.failures).Count -gt 0) { $exitCode = 1 }
+    } catch {
+        Write-Host "::error::teardown threw: $($_.Exception.Message)"
+        $teardownOutcome = [pscustomobject]@{ failures = @("teardown threw: $($_.Exception.Message)"); steps = @() }
+        $exitCode = 1
+    }
+    try {
+        New-Item -ItemType Directory -Force -Path $ResultsOut | Out-Null
+        $receipt = [ordered]@{
+            exit_code = $exitCode; child_timed_out = $timedOut; results_copy_problem = $copyProblem
+            teardown = $teardownOutcome; recorded = (Get-Date).ToUniversalTime().ToString('o')
+        }
+        Write-Utf8NoBom (Join-Path $ResultsOut 'final-receipt.json') ($receipt | ConvertTo-Json -Depth 6)
+    } catch {
+        Write-Host "::error::writing the final receipt failed: $($_.Exception.Message)"
+        $exitCode = 1
+    }
 }
 exit $exitCode

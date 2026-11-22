@@ -133,6 +133,52 @@ def seed_generation(directory):
     return SEED_GENERATION
 
 
+def parse_manifest(text):
+    """The inverse of generation_manifest: {"file", "sequence", "keys"}; ValueError when the text is not a manifest."""
+    lines = text.splitlines()
+    if len(lines) < 5 or lines[0] != "quantum-key-backup-manifest 1" or lines[-1] != "end":
+        raise ValueError("not a quantum key backup manifest")
+    fields = {}
+    for line, name in zip(lines[1:4], ("file", "sequence", "keys")):
+        key, _, value = line.partition(" ")
+        if key != name or not value:
+            raise ValueError("manifest line %r is not %r" % (line, name))
+        fields[name] = value
+    keys = lines[4:-1]
+    if len(keys) != int(fields["keys"]):
+        raise ValueError("the manifest says %s keys and lists %d" % (fields["keys"], len(keys)))
+    return {"file": fields["file"], "sequence": int(fields["sequence"]), "keys": keys}
+
+
+def read_generation(directory, name):
+    """The parsed manifest of one generation (name = wallet file name)."""
+    with open(os.path.join(directory, name + ".keys"), "r", encoding="utf-8") as handle:
+        return parse_manifest(handle.read())
+
+
+def generation_files(names):
+    """The directory listing of these generations: each wallet file and the manifest next to it."""
+    return set(names) | {name + ".keys" for name in names}
+
+
+def expected_survivors(sequences, keep=3):
+    """Which generations the pruner leaves when every generation holds the same keys (so no older one is the only
+    holder of a live key): the newest `keep` by sequence (SelectQuantumKeyBackupsToPrune, l.411-441). sequences is
+    {file name: sequence}."""
+    ordered = sorted(sequences, key=lambda name: (sequences[name], name), reverse=True)
+    return set(ordered[:keep])
+
+
+VOLUME_GUID_RE = re.compile(r"^(\\\\\?\\Volume\{[0-9A-Fa-f-]+\}\\)", re.IGNORECASE)
+
+
+def volume_guid_prefix(final_path):
+    """The volume-GUID prefix (the part up to the closing brace and its backslash) of a GetFinalPathNameByHandleW result in
+    VOLUME_NAME_GUID form, lower-cased, or None when the path is not in that form."""
+    match = VOLUME_GUID_RE.match(final_path or "")
+    return match.group(1).lower() if match else None
+
+
 def snapshot(directory):
     """{file name: sha256} of the files directly in directory ({} when it does not exist)."""
     result = {}
@@ -162,6 +208,18 @@ def wallet_files(directory):
 
 def default_backup_root(datadir):
     return os.path.join(datadir, "regtest", "quantum-key-backups")
+
+
+def file_sha256(path):
+    """SHA-256 of a file ("" when it cannot be read): recorded so the results name the exact bytes that ran."""
+    try:
+        digest = hashlib.sha256()
+        with open(path, "rb") as handle:
+            for chunk in iter(lambda: handle.read(1 << 20), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+    except OSError:
+        return ""
 
 
 def free_port():
@@ -257,6 +315,40 @@ def volume_facts(path):
             "drive_type": drive_type.get(kernel32.GetDriveTypeW(root.value), "unknown")}
 
 
+def volume_identity(path):
+    """The volume of path the way the product identifies it (src/util/fs_helpers.cpp): open the path, ask
+    GetFinalPathNameByHandleW for the VOLUME_NAME_GUID form, and keep the `\\\\?\\Volume{guid}\\` prefix. A drive made by
+    subst resolves to the volume of its underlying folder here, which a drive letter or a path prefix would not show."""
+    if os.name != "nt":
+        return {}
+    import ctypes
+    from ctypes import wintypes
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID, wintypes.DWORD,
+                                     wintypes.DWORD, wintypes.HANDLE]
+    kernel32.GetFinalPathNameByHandleW.restype = wintypes.DWORD
+    kernel32.GetFinalPathNameByHandleW.argtypes = [wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD, wintypes.DWORD]
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    file_share_all, open_existing, backup_semantics, volume_name_guid = 7, 3, 0x02000000, 0x1
+    handle = kernel32.CreateFileW(os.path.abspath(path), 0, file_share_all, None, open_existing, backup_semantics, None)
+    if handle is None or handle == wintypes.HANDLE(-1).value:
+        return {"path": path, "error": "CreateFileW failed: %d" % ctypes.get_last_error()}
+    try:
+        size = 1024
+        buffer = ctypes.create_unicode_buffer(size)
+        length = kernel32.GetFinalPathNameByHandleW(handle, buffer, size, volume_name_guid)
+        if length > size:
+            size = length + 1
+            buffer = ctypes.create_unicode_buffer(size)
+            length = kernel32.GetFinalPathNameByHandleW(handle, buffer, size, volume_name_guid)
+        if length == 0:
+            return {"path": path, "error": "GetFinalPathNameByHandleW failed: %d" % ctypes.get_last_error()}
+        return {"path": path, "final_path": buffer.value, "volume_guid": volume_guid_prefix(buffer.value)}
+    finally:
+        kernel32.CloseHandle(handle)
+
+
 def run_command(arguments, timeout=120):
     """Run a command; return (exit code, combined output)."""
     try:
@@ -265,6 +357,14 @@ def run_command(arguments, timeout=120):
         return completed.returncode, completed.stdout.decode("utf-8", "replace").strip()
     except (OSError, subprocess.SubprocessError) as error:
         return -1, "%s: %s" % (type(error).__name__, error)
+
+
+def run_checked(what, arguments, timeout=120):
+    """run_command for infrastructure commands (net, subst, icacls, mklink): a nonzero exit code makes the case
+    unresolved, never a silent success. Returns the output."""
+    code, output = run_command(arguments, timeout)
+    precondition(code == 0, "%s failed with exit code %s: %s" % (what, code, output))
+    return output
 
 
 # ----- a daemon -----
@@ -278,6 +378,7 @@ class Node:
         self.rpc_port = free_port()
         self.process = None
         self.stdout = None
+        self.forced_kill = False
         self.cookie = os.path.join(datadir, "regtest", ".cookie")
 
     @property
@@ -333,7 +434,10 @@ class Node:
         except subprocess.TimeoutExpired:
             raise CheckFailed("the daemon did not exit within %d seconds" % timeout)
 
-    def stop(self, timeout=120):
+    def stop(self, timeout=120, clean=True):
+        """Ask the daemon to stop. A stop that does not finish within the timeout ends in a kill of this harness's own
+        child (by its handle); that is recorded, and with clean=True it fails the case, because every case that restarts
+        a node relies on the previous run having shut down normally."""
         if self.process is None or self.process.poll() is not None:
             return
         try:
@@ -343,12 +447,25 @@ class Node:
         try:
             self.process.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
-            self.process.kill()  # this harness's own child, by its handle
+            self.forced_kill = True
+            self.env.forced_kills.append("%s/%s after %d s" % (self.env.case, self.label, timeout))
+            self.process.kill()
             self.process.wait(timeout=30)
+            if clean:
+                raise CheckFailed("the daemon %s did not stop within %d seconds and was killed: the restart that follows "
+                                  "would not test a clean shutdown" % (self.label, timeout))
 
     def restart(self, extra_args=None):
         self.stop()
         return self.start(extra_args)
+
+    def save_full_log(self, destination):
+        """The whole debug.log of this daemon, copied next to the results (the data directory is deleted afterwards)."""
+        try:
+            shutil.copyfile(self.log_file, destination)
+            return True
+        except OSError:
+            return False
 
     def log_excerpt(self, limit=60):
         try:
@@ -372,6 +489,7 @@ class Env:
         self.nodes = []
         self.case = ""
         self.cleanups = []
+        self.forced_kills = []
 
     def case_dir(self, name):
         path = os.path.join(self.layout["cases"], name)
@@ -382,14 +500,22 @@ class Env:
         return Node(self, datadir, extra_args, label or "node%d" % (len(self.nodes) + 1))
 
     def finish_case(self):
+        """Stop every node (a forced kill is recorded, not raised), then run the cleanups; return what failed."""
+        problems = []
         for node in self.nodes:
-            node.stop()
+            try:
+                node.stop(clean=False)
+            except Exception as error:  # pylint: disable=broad-except
+                problems.append("stopping %s: %s" % (node.label, error))
         for cleanup in reversed(self.cleanups):
             try:
-                cleanup()
-            except Exception:  # pylint: disable=broad-except
-                pass
+                outcome = cleanup()
+                if isinstance(outcome, tuple) and outcome[0] != 0:
+                    problems.append("cleanup command exited with %s: %s" % outcome)
+            except Exception as error:  # pylint: disable=broad-except
+                problems.append("cleanup raised %s: %s" % (type(error).__name__, error))
         self.cleanups = []
+        return problems
 
 
 # ----- wallet steps shared by the cases -----
@@ -429,15 +555,43 @@ def key_dump(wallet, address):
     return {"private_key": info["private_key"], "public_key": info["public_key"]}
 
 
-def restore_and_compare(node, backup_file, new_name, address, original_dump, passphrase):
-    """Restore a backup into node as a new wallet; the restored wallet owns the address and holds the same key."""
+def wallet_inventory(wallet):
+    """Every address of the wallet's address book by label (the quantum return keys are all there), and the readiness
+    of the stake return: the state compared before a failure, after a restart and after the recovery. A key that is
+    missing, or an extra one, shows here and not in a check of the pending address alone."""
+    book = {}
+    for label in wallet.listlabels():
+        book[label] = sorted(wallet.getaddressesbylabel(label).keys())
+    state = stake_state(wallet)
+    keep = ("ready", "address", "pending", "pending_address", "backup_verified")
+    return {"address_book": book, "stake_return": {key: state.get(key) for key in keep}}
+
+
+def restore_and_compare(node, backup_file, new_name, address, original_dump, passphrase, also=None):
+    """Restore a backup into node as a new wallet; the restored wallet owns the address and holds the same key.
+
+    Then call backupwallet on the restored wallet (normally unlocked): the daemon stages a copy, reopens it, and signs
+    and verifies a fresh ML-DSA challenge with every quantum key of the restored wallet (src/wallet/wallet.cpp,
+    BackupWallet with verify_quantum_keys) before it installs the file. That is the signing test after a restore. It is
+    not a transaction: no funded chain is used and nothing here claims that a spend is accepted. `also` maps further
+    addresses to their original key dumps, compared the same way."""
     node.rpc().restorewallet(new_name, backup_file)
     restored = node.rpc(wallet=new_name)
     unlock(restored, passphrase)
     check(restored.getaddressinfo(address)["ismine"] is True, "the restored wallet does not own %s" % address)
     check(key_dump(restored, address) == original_dump,
           "the restored wallet's key for %s differs from the key that was backed up" % address)
-    return True
+    for other, dump in (also or {}).items():
+        check(restored.getaddressinfo(other)["ismine"] is True, "the restored wallet does not own %s" % other)
+        check(key_dump(restored, other) == dump, "the restored wallet's key for %s differs" % other)
+    challenge = os.path.join(node.datadir, new_name + "-challenge.dat")
+    try:
+        restored.backupwallet(challenge)
+    except RpcError as error:
+        raise CheckFailed("the restored wallet %s cannot make a verified backup (ML-DSA challenge): %s" % (new_name, error))
+    check(os.path.isfile(challenge) and os.path.getsize(challenge) > 0,
+          "backupwallet reported success but %s is missing or empty" % challenge)
+    return {"restored_wallet": new_name, "challenge_backup": challenge, "challenge_bytes": os.path.getsize(challenge)}
 
 
 def exercise_success(node, backup_root, name, passphrase, restore_node=None):
@@ -456,8 +610,9 @@ def exercise_success(node, backup_root, name, passphrase, restore_node=None):
     check(len(found) == 1, "expected one verified generation in %s, found %s" % (directory, found))
     dump = key_dump(wallet, result["address"])
     target = restore_node or node
-    restore_and_compare(target, os.path.join(directory, found[0]), name + "-restored", result["address"], dump, passphrase)
-    return {"address": result["address"], "backup_directory": directory, "generation": found[0],
+    restored = restore_and_compare(target, os.path.join(directory, found[0]), name + "-restored", result["address"], dump,
+                                   passphrase)
+    return {"address": result["address"], "backup_directory": directory, "generation": found[0], "restore": restored,
             "restored_on": "fresh datadir" if restore_node else "same node, new wallet name"}
 
 
@@ -489,11 +644,22 @@ def case_flush_probe(env, rec):
     check(code == 0 and report.get("pass") is True and report.get("checks"), "probe checks failed: %s" % failing)
 
 
+def child_profile(env):
+    """child-profile.json as qualify-child.ps1 wrote it (the profile checked against the SID's registered profile)."""
+    try:
+        with open(os.path.join(env.results, "child-profile.json"), "r", encoding="utf-8-sig") as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        return {}
+
+
 def case_default_path(env, rec):
     profile = os.environ.get("LOCALAPPDATA", "")
-    username = env.layout["username"]
-    precondition(profile and username.lower() in profile.lower(),
-                 "LOCALAPPDATA %r is not in the profile of %r: the child did not get its own profile" % (profile, username))
+    recorded = child_profile(env)
+    precondition(recorded.get("ok") is True and profile and os.path.normcase(profile) == os.path.normcase(recorded.get("localappdata", "")),
+                 "LOCALAPPDATA %r is not the profile folder the child verified against its SID's registered profile (%s)" % (
+                     profile, recorded or "no child-profile.json"))
+    rec["observed"]["verified_profile"] = recorded
     datadir = os.path.join(profile, "QBackupQual", "data")
     shutil.rmtree(os.path.dirname(datadir), ignore_errors=True)
     node = env.node(datadir).start()  # no -quantumkeybackupdir: the default path beneath the network datadir
@@ -508,9 +674,9 @@ def case_default_path(env, rec):
     fresh = env.node(os.path.join(env.case_dir("default-path"), "restore", "data"), label="restore").start()
     for name, passphrase in (("wdefplain", None), ("wdefenc", PASSPHRASE)):
         data = originals[name]
-        restore_and_compare(fresh, os.path.join(data["backup_directory"], data["generation"]), name + "-fresh",
-                            data["address"], data["dump"], passphrase)
-        rec["observed"][name]["restored_in_fresh_datadir"] = True
+        restored = restore_and_compare(fresh, os.path.join(data["backup_directory"], data["generation"]), name + "-fresh",
+                                       data["address"], data["dump"], passphrase)
+        rec["observed"][name]["restored_in_fresh_datadir"] = restored
 
 
 def exercise_success_to_fresh(node, backup_root, name, passphrase, originals):
@@ -554,9 +720,7 @@ def case_junction(env, rec):
     shutil.rmtree(datadir, ignore_errors=True)
     junction = os.path.join(datadir, "regtest", "junction")
     os.makedirs(os.path.dirname(junction))
-    code, output = run_command(["cmd", "/c", "mklink", "/J", junction, target])
-    rec["observed"]["mklink"] = output
-    precondition(code == 0, "mklink /J failed: %s" % output)
+    rec["observed"]["mklink"] = run_checked("mklink /J", ["cmd", "/c", "mklink", "/J", junction, target])
     env.cleanups.append(lambda: run_command(["cmd", "/c", "rmdir", junction]))
     node = env.node(datadir, ["-quantumkeybackupdir=junction\\qb"]).start()
     for name, passphrase in (("wjunplain", None), ("wjunenc", PASSPHRASE)):
@@ -574,22 +738,31 @@ def case_subst(env, rec):
     datadir = os.path.join(underlying, "data")
     shutil.rmtree(datadir, ignore_errors=True)
     os.makedirs(datadir)
-    code, listing = run_command(["subst"])
+    listing = run_checked("subst (listing)", ["subst"])
     precondition(drive.upper() + "\\" not in listing.upper(), "%s is already a substituted drive: %s" % (drive, listing))
-    code, output = run_command(["subst", drive, underlying])
-    precondition(code == 0, "subst failed: %s" % output)
-    env.cleanups.append(lambda: run_command(["subst", drive, "/D"]))
-    rec["observed"]["subst"] = run_command(["subst"])[1]
+    run_checked("subst " + drive, ["subst", drive, underlying])
+    env.cleanups.append(lambda: run_command(["subst", drive, "/D"]))  # after the node stopped; its exit code is checked
+    rec["observed"]["subst"] = run_checked("subst (listing)", ["subst"])
     rec["observed"]["drive_facts"] = volume_facts(drive + "\\")
+    # the substituted path and its underlying folder must be the same volume, by the opened handle's volume GUID path
+    substituted_identity = volume_identity(drive + "\\data")
+    underlying_identity = volume_identity(datadir)
+    rec["observed"]["substituted_identity"] = substituted_identity
+    rec["observed"]["underlying_identity"] = underlying_identity
+    precondition(substituted_identity.get("volume_guid") and underlying_identity.get("volume_guid"),
+                 "a volume GUID path could not be read: %s / %s" % (substituted_identity, underlying_identity))
+    check(substituted_identity["volume_guid"] == underlying_identity["volume_guid"],
+          "the substituted drive and its underlying folder are different volumes: %s / %s" % (substituted_identity, underlying_identity))
     node = env.node(drive + "\\data").start()
     for name, passphrase in (("wsubplain", None), ("wsubenc", PASSPHRASE)):
         outcome = exercise_success(node, default_backup_root(drive + "\\data"), name, passphrase)
         physical = os.path.join(default_backup_root(datadir), component(name), outcome["generation"])
         check(os.path.isfile(physical), "the generation is not under the underlying folder: %s" % physical)
         outcome["underlying_path"] = physical
+        outcome["backup_volume_identity"] = volume_identity(os.path.dirname(physical))
+        check(outcome["backup_volume_identity"].get("volume_guid") == underlying_identity["volume_guid"],
+              "the backup file is not on the volume of the underlying folder: %s" % outcome["backup_volume_identity"])
         rec["observed"][name] = outcome
-    node.stop()
-    run_command(["subst", drive, "/D"])
 
 
 def pending_checks(wallet, address=None):
@@ -617,6 +790,7 @@ def refused_and_recovered(env, rec, node, wallet_name, passphrase, error_checks,
     check(pending_address in wallet.getaddressesbylabel("PoS - Quantum Stake Address"),
           "%s: the pending key is not in the wallet" % label)
     check(len(wallet.getaddressesbylabel("PoS - Quantum Stake Address")) == 1, "%s: more than one key was made" % label)
+    inventory_before = wallet_inventory(wallet)
     if guarded_directory is not None:
         check(snapshot(guarded_directory) == directory_files_before,
               "%s: existing generations in %s changed" % (label, guarded_directory))
@@ -629,11 +803,19 @@ def refused_and_recovered(env, rec, node, wallet_name, passphrase, error_checks,
     check(result["address"] == pending_address and result["ready"] is True and result["backup_verified"] is True,
           "%s: the same key did not activate after switching to the default path: %s" % (label, result))
     state = stake_state(wallet)
-    check(state["pending"] is False and state["ready"] is True and state["address"] == pending_address,
-          "%s: the state after recovery is wrong: %s" % (label, state))
-    found = generations(os.path.join(default_backup_root(datadir), component(wallet_name)))
+    check(state["pending"] is False and state["ready"] is True and state["address"] == pending_address
+          and state["backup_verified"] is True, "%s: the state after recovery is wrong: %s" % (label, state))
+    inventory_after = wallet_inventory(wallet)
+    check(inventory_after["address_book"] == inventory_before["address_book"],
+          "%s: the key inventory changed across the recovery: %s -> %s" % (label, inventory_before, inventory_after))
+    directory = os.path.join(default_backup_root(datadir), component(wallet_name))
+    found = generations(directory)
     check(len(found) == 1, "%s: expected one generation in the default directory, found %s" % (label, found))
+    restored = restore_and_compare(node, os.path.join(directory, found[0]), wallet_name + "-restored", pending_address,
+                                   key_dump(wallet, pending_address), passphrase)
     rec["observed"][label + "_recovered_address"] = pending_address
+    rec["observed"][label + "_recovery_restore"] = restored
+    rec["observed"][label + "_inventory"] = inventory_after
 
 
 def case_outside_denied(env, rec):
@@ -710,9 +892,7 @@ def case_unc_share(env, rec):
 def case_mapped_drive(env, rec):
     require_infra(env, "share", "the SMB share")
     letter = env.layout["mapped_letter"] + ":"
-    code, output = run_command(["net", "use", letter, env.layout["share_unc"], "/persistent:no"])
-    rec["observed"]["net_use"] = output
-    precondition(code == 0, "net use failed: %s" % output)
+    rec["observed"]["net_use"] = run_checked("net use", ["net", "use", letter, env.layout["share_unc"], "/persistent:no"])
     env.cleanups.append(lambda: run_command(["net", "use", letter, "/delete", "/y"]))
     rec["observed"]["drive_facts"] = volume_facts(letter + "\\")
     unsupported_case(env, rec, "mapped", letter + "\\backups", letter + "\\backups", "wmap", "mapped")
@@ -725,10 +905,9 @@ def case_denied_ancestor(env, rec):
     blocked = os.path.join(datadir, "regtest", "blocked")
     leaf = os.path.join(blocked, "sub", component("wblk"))
     os.makedirs(leaf)  # the leaf exists before the ancestor is denied
-    code, output = run_command(["icacls", blocked, "/deny", "%s:(W)" % user])
-    rec["observed"]["icacls_deny"] = output
-    precondition(code == 0, "icacls /deny failed: %s" % output)
-    env.cleanups.append(lambda: run_command(["icacls", blocked, "/remove:d", user]))
+    rec["observed"]["icacls_deny"] = run_checked("icacls /deny", ["icacls", blocked, "/deny", "%s:(W)" % user])
+    denial = {"active": True}
+    env.cleanups.append(lambda: run_command(["icacls", blocked, "/remove:d", user]) if denial["active"] else None)
     try:
         with open(os.path.join(leaf, "leaf-access.txt"), "w", encoding="utf-8") as handle:
             handle.write("the leaf is still writable\n")
@@ -743,18 +922,187 @@ def case_denied_ancestor(env, rec):
     check(re.search(r"\\blocked durable", message, re.I), "the error does not name the denied ancestor: %s" % message)
     state = pending_checks(wallet)
     pending_address = state["pending_address"]
+    inventory_before = wallet_inventory(wallet)
     check(not wallet_files(leaf), "a backup file was written although the ancestor was denied")
     node.stop()
     code, output = run_command(["icacls", blocked, "/remove:d", user])
     rec["observed"]["icacls_remove"] = output
     check(code == 0, "icacls /remove:d failed: %s" % output)
+    denial["active"] = False
     node.start(extra_args=["-quantumkeybackupdir=blocked\\sub"])  # retry after a restart
     wallet = node.wait_wallet("wblk")
     result = wallet.setquantumstakereturn()
     check(result["address"] == pending_address and result["ready"] is True and result["backup_verified"] is True,
           "the same key did not activate after the denial was removed: %s" % result)
+    state = stake_state(wallet)
+    check(state["pending"] is False and state["backup_verified"] is True and state["address"] == pending_address,
+          "the state after the recovery is wrong: %s" % state)
+    inventory_after = wallet_inventory(wallet)
+    check(inventory_after["address_book"] == inventory_before["address_book"], "the key inventory changed across the recovery")
     check(len(generations(leaf)) == 1, "no verified generation in the leaf after the retry")
+    rec["observed"]["recovery_restore"] = restore_and_compare(
+        node, os.path.join(leaf, generations(leaf)[0]), "wblk-restored", pending_address, key_dump(wallet, pending_address), None)
     rec["observed"]["recovered_address"] = pending_address
+
+
+def crash_cycle(node, base_args, point, name, passphrase):
+    """Restart the node with a crash point, make it reach the point through setquantumstakereturn, and require the
+    abrupt exit (TerminateProcess, exit code 7). The wallet and the files stay as the daemon itself left them."""
+    node.restart(extra_args=list(base_args) + ["-quantumreturncrashpoint=" + point])
+    wallet = node.wait_wallet(name)
+    unlock(wallet, passphrase)
+    try:
+        consent(wallet)
+    except (RpcUnavailable, RpcError):
+        pass  # the connection closes with the process
+    else:
+        raise CheckFailed("the daemon did not stop at %s" % point)
+    code = node.wait_exit(90)
+    check(code == WINDOWS_CRASH_EXIT, "crash point %s: exit code %s, expected %s" % (point, code, WINDOWS_CRASH_EXIT))
+    return code
+
+
+def case_affected_wallet(env, rec):
+    """The state the preservation promise is about: the AFFECTED wallet has an active return address, a second key is
+    pending, and a failing backup path is retried while several verified generations sit in that path's directory.
+
+    How the product reaches that state (read from the source, not assumed):
+     - PrepareQuantumStakeReturn creates a new key only when no usable return address is saved
+       (src/wallet/staking.cpp, the `already saved` return in PrepareQuantumStakeReturn), so allow_new_quantum_key
+       cannot make a second pending key next to an active address.
+     - The way in is the other order: a key becomes pending first (crash point after_key_insertion leaves it pending), and
+       an existing quantum address of the wallet is then saved with existing_address (SetQuantumStakeReturn does not
+       touch the pending record). ActivatePendingQuantumStakeReturn is written for exactly this ("unless a valid
+       destination was saved meanwhile"): the pending key is backed up but the saved address stays.
+     - Generations are only written by BackupQuantumReturnKey, which only FinishPendingQuantumStakeReturn calls, and
+       pruning runs only after a successful activation. A backup that succeeds but is followed by the crash point
+       before_activation leaves a genuine, manifested generation and the key still pending; repeating that gives as many
+       real generations as wanted, all produced by the daemon.
+    Only then the path is made to fail (an ancestor is denied), the call is repeated, the daemon is restarted, the
+    denial is removed and the same key completes: the generations of the failing path must be untouched at every step
+    and the pruning that follows the success must leave exactly the newest three."""
+    user = env.layout["user"]
+    datadir = os.path.join(env.case_dir("affected"), "data")
+    shutil.rmtree(datadir, ignore_errors=True)
+    blocked = os.path.join(datadir, "regtest", "blocked")
+    name, passphrase = "waffect", PASSPHRASE
+    leaf = os.path.join(blocked, "sub", component(name))
+    os.makedirs(os.path.dirname(leaf))
+    arguments = ["-quantumkeybackupdir=blocked\\sub"]
+    node = env.node(datadir)
+    node.start(extra_args=arguments)
+    wallet = make_wallet(node, name, passphrase)
+
+    # 1. a key becomes pending: the daemon ends right after the key was stored, before any backup
+    crash_cycle(node, arguments, "after_key_insertion", name, passphrase)
+    node.restart(extra_args=arguments)
+    wallet = node.wait_wallet(name)
+    unlock(wallet, passphrase)
+    state = pending_checks(wallet)
+    pending_address = state["pending_address"]
+    check(not wallet_files(leaf), "a backup exists before any backup was made")
+
+    # 2. an existing quantum address of the wallet becomes the active return address while that key is pending
+    active_address = wallet.getnewquantumaddress("affected-destination")["address"]
+    saved = wallet.setquantumstakereturn({"existing_address": active_address})
+    check(saved["address"] == active_address and saved["ready"] is True, "the existing address was not saved: %s" % saved)
+    state = stake_state(wallet)
+    check(state["ready"] is True and state["address"] == active_address and state["pending"] is True
+          and state["pending_address"] == pending_address, "the wallet is not in the pending-plus-active state: %s" % state)
+    dumps = {active_address: key_dump(wallet, active_address), pending_address: key_dump(wallet, pending_address)}
+
+    # 3. four genuine generations written by the daemon, the key staying pending and the active address staying active
+    sequences = {}
+    for round_number in range(1, 5):
+        crash_cycle(node, arguments, "before_activation", name, passphrase)
+        found = generations(leaf)
+        check(len(found) == round_number, "expected %d verified generations after round %d, found %s" % (round_number, round_number, found))
+        sequences = {n: read_generation(leaf, n)["sequence"] for n in found}
+        check(len(set(sequences.values())) == len(sequences), "two generations share a sequence number: %s" % sequences)
+    node.restart(extra_args=arguments)
+    wallet = node.wait_wallet(name)
+    unlock(wallet, passphrase)
+    old_generations = generations(leaf)
+    manifests = {n: read_generation(leaf, n) for n in old_generations}
+    key_lists = {tuple(sorted(m["keys"])) for m in manifests.values()}
+    check(len(key_lists) == 1 and len(next(iter(key_lists))) >= 2, "the generations do not hold the same two or more keys: %s" % manifests)
+    inventory_start = wallet_inventory(wallet)
+    check(inventory_start["stake_return"]["pending"] is True and inventory_start["stake_return"]["address"] == active_address,
+          "the state before the failure is wrong: %s" % inventory_start)
+    snapshot_start = snapshot(leaf)
+    check(set(snapshot_start) == generation_files(old_generations),
+          "the directory holds %s, expected exactly four wallet files and their four manifests" % sorted(snapshot_start))
+    rec["observed"]["generations_before"] = {n: manifests[n]["sequence"] for n in old_generations}
+    rec["observed"]["inventory_before"] = inventory_start
+
+    # 4. the path fails: an ancestor of the (existing) leaf is denied; the call is repeated, then the node restarted
+    node.stop()
+    rec["observed"]["icacls_deny"] = run_checked("icacls /deny", ["icacls", blocked, "/deny", "%s:(W)" % user])
+    denial = {"active": True}
+    env.cleanups.append(lambda: run_command(["icacls", blocked, "/remove:d", user]) if denial["active"] else None)
+    try:
+        probe = os.path.join(leaf, "leaf-access.txt")
+        with open(probe, "w", encoding="utf-8") as handle:
+            handle.write("the leaf is still writable\n")
+        os.remove(probe)
+    except OSError as error:
+        raise Unresolved("the leaf is not writable although only the ancestor was denied: %s" % error)
+    node.start(extra_args=arguments)
+    wallet = node.wait_wallet(name)
+    unlock(wallet, passphrase)
+    message = expect_rpc_error(lambda: consent(wallet))
+    record_error(rec, message)
+    check(DURABLE_RE.search(message) and DENIED_RE.search(message), "not an access-denied durability error: %s" % message)
+    check(re.search(r"\\blocked durable", message, re.I), "the error does not name the denied ancestor: %s" % message)
+    after_failure = wallet_inventory(wallet)
+    check(after_failure["stake_return"]["pending"] is True and after_failure["stake_return"]["pending_address"] == pending_address
+          and after_failure["stake_return"]["address"] == active_address and after_failure["stake_return"]["ready"] is True,
+          "the active address or the pending key changed after the failed retry: %s" % after_failure)
+    check(after_failure["address_book"] == inventory_start["address_book"], "the key inventory changed after the failed retry")
+    check(snapshot(leaf) == snapshot_start, "the generations of the failing path changed during the failed retry")
+    node.restart(extra_args=arguments)  # still denied
+    wallet = node.wait_wallet(name)
+    unlock(wallet, passphrase)
+    after_restart = wallet_inventory(wallet)
+    check(after_restart == after_failure, "the inventory differs after the restart: %s -> %s" % (after_failure, after_restart))
+    check(snapshot(leaf) == snapshot_start, "the generations of the failing path changed across the restart")
+    rec["observed"]["inventory_after_failure"] = after_failure
+    rec["observed"]["inventory_after_restart"] = after_restart
+
+    # 5. the denial is removed after a clean stop; the same key completes and only now are the generations pruned
+    node.stop()
+    code, output = run_command(["icacls", blocked, "/remove:d", user])
+    rec["observed"]["icacls_remove"] = output
+    check(code == 0, "icacls /remove:d failed: %s" % output)
+    denial["active"] = False
+    node.start(extra_args=arguments)
+    wallet = node.wait_wallet(name)
+    unlock(wallet, passphrase)
+    result = wallet.setquantumstakereturn()
+    check(result["address"] == active_address and result["ready"] is True and result["backup_verified"] is True,
+          "the saved address is not intact after the recovery: %s" % result)
+    after_recovery = wallet_inventory(wallet)
+    check(after_recovery["stake_return"]["pending"] is False and after_recovery["stake_return"]["backup_verified"] is True
+          and after_recovery["stake_return"]["address"] == active_address, "the state after the recovery is wrong: %s" % after_recovery)
+    check(after_recovery["address_book"] == inventory_start["address_book"], "the key inventory changed across the recovery")
+    rec["observed"]["inventory_after_recovery"] = after_recovery
+    survivors = generations(leaf)
+    all_sequences = dict(sequences)
+    new_names = [n for n in survivors if n not in old_generations]
+    check(len(new_names) == 1, "expected one new generation from the recovery, found %s" % new_names)
+    all_sequences[new_names[0]] = read_generation(leaf, new_names[0])["sequence"]
+    expected = expected_survivors(all_sequences, 3)
+    check(set(survivors) == expected, "pruning left %s, expected the newest three %s" % (sorted(survivors), sorted(expected)))
+    check(set(snapshot(leaf)) == generation_files(survivors),
+          "the directory holds %s, expected exactly three wallet files and their manifests" % sorted(snapshot(leaf)))
+    check(all(tuple(sorted(read_generation(leaf, n)["keys"])) == next(iter(key_lists)) for n in survivors),
+          "the key list of a surviving generation changed")
+    rec["observed"]["survivors"] = {n: all_sequences[n] for n in sorted(survivors)}
+    rec["observed"]["restore"] = restore_and_compare(
+        node, os.path.join(leaf, new_names[0]), name + "-restored", pending_address, dumps[pending_address], passphrase,
+        also={active_address: dumps[active_address]})
+    rec["observed"]["pending_address"] = pending_address
+    rec["observed"]["active_address"] = active_address
 
 
 def case_fat32(env, rec):
@@ -804,11 +1152,21 @@ def case_failcommit(env, rec):
     for name, passphrase in (("wfcplain", None), ("wfcenc", PASSPHRASE)):
         wallet = node.wait_wallet(name)
         unlock(wallet, passphrase)
+        inventory_before = wallet_inventory(wallet)
         result = wallet.setquantumstakereturn()
-        check(result["address"] == pending[name] and result["ready"] is True,
+        check(result["address"] == pending[name] and result["ready"] is True and result["backup_verified"] is True,
               "%s: the same key did not activate on retry: %s" % (name, result))
-        check(len(generations(os.path.join(default_backup_root(datadir), component(name)))) == 1, "no generation")
-        rec["observed"][name] = {"pending_then_active_address": pending[name]}
+        state = stake_state(wallet)
+        check(state["pending"] is False and state["backup_verified"] is True and state["address"] == pending[name],
+              "%s: the state after the retry is wrong: %s" % (name, state))
+        inventory_after = wallet_inventory(wallet)
+        check(inventory_after["address_book"] == inventory_before["address_book"], "%s: the key inventory changed" % name)
+        directory = os.path.join(default_backup_root(datadir), component(name))
+        found = generations(directory)
+        check(len(found) == 1, "no generation")
+        restored = restore_and_compare(node, os.path.join(directory, found[0]), name + "-restored", pending[name],
+                                       key_dump(wallet, pending[name]), passphrase)
+        rec["observed"][name] = {"pending_then_active_address": pending[name], "recovery_restore": restored}
 
 
 def crash_at(node, point, name, passphrase):
@@ -867,7 +1225,7 @@ def case_crash_points(env, rec):
             check(result["address"] == address and result["ready"] is True, "the same key did not activate: %s" % result)
         dump = key_dump(wallet, address)
         latest = generations(directory)[-1]
-        restore_and_compare(node, os.path.join(directory, latest), name + "-restored", address, dump, passphrase)
+        found["restore"] = restore_and_compare(node, os.path.join(directory, latest), name + "-restored", address, dump, passphrase)
         found["address"] = address
         found["recoverable"] = True
         rec["observed"][point] = found
@@ -892,6 +1250,9 @@ CASES = [
     ("mapped-drive", "a mapped drive is refused as unsupported, with the same pending and recovery behaviour", case_mapped_drive),
     ("denied-ancestor", "a denied ancestor gives an ancestor-specific refusal; after the denial is removed and the node restarted the "
      "same key activates", case_denied_ancestor),
+    ("affected-wallet", "the affected wallet has an active return address and a second key pending: after four real generations and a "
+     "failing path, the retry, a restart and the recovery leave the active address, the key inventory and the generations of the "
+     "failing path untouched until the success prunes to the newest three", case_affected_wallet),
     ("fat32", "a FAT32 mounted volume is refused naming the file system although ordinary writes succeed", case_fat32),
     ("failcommit", "-quantumreturnfailcommit fails the entry commit, the key stays pending, a restart without it activates the same key",
      case_failcommit),
@@ -905,6 +1266,7 @@ def run_case(env, name, expected, function):
            "log_lines": [], "started": now(), "finished": None, "failure": ""}
     env.case = name
     env.nodes = []
+    env.forced_kills = []
     try:
         function(env, rec)
         rec["status"] = "pass"
@@ -918,12 +1280,26 @@ def run_case(env, name, expected, function):
     except Exception:  # pylint: disable=broad-except
         rec["failure"] = traceback.format_exc()
     finally:
-        for node in env.nodes:
-            rec["log_lines"].extend("[%s] %s" % (node.label, line) for line in node.log_excerpt())
+        problems = []
         try:
-            env.finish_case()
-        except Exception:  # pylint: disable=broad-except
-            pass
+            problems = env.finish_case()
+        except Exception as error:  # pylint: disable=broad-except
+            problems = ["finishing the case raised %s: %s" % (type(error).__name__, error)]
+        rec["full_logs"] = []
+        for index, node in enumerate(env.nodes, 1):
+            rec["log_lines"].extend("[%s] %s" % (node.label, line) for line in node.log_excerpt())
+            destination = os.path.join(env.logs, "%s-%d-%s-debug.log" % (safe_name(name), index, safe_name(node.label)))
+            if node.save_full_log(destination):
+                rec["full_logs"].append(os.path.basename(destination))
+        rec["forced_kills"] = list(env.forced_kills)
+        rec["cleanup_problems"] = problems
+        if problems:
+            rec["failure"] = (rec["failure"] + "\n" if rec["failure"] else "") + "clean-up problems: " + "; ".join(problems)
+            if rec["status"] == "pass":
+                rec["status"] = "fail"
+        if env.forced_kills and rec["status"] == "pass":
+            rec["status"] = "fail"
+            rec["failure"] = "a daemon had to be killed after a stop timeout: %s" % env.forced_kills
     rec["pass"] = rec["status"] == "pass"
     rec["finished"] = now()
     write_json(os.path.join(env.results, "case-%s.json" % safe_name(name)), rec)
@@ -939,7 +1315,9 @@ def run_all(layout_path, results, daemon, probe, only):
     env = Env(layout, results, daemon or layout["daemon"], probe or layout["probe"])
     identity = {"user": os.environ.get("USERNAME"), "profile": os.environ.get("USERPROFILE"),
                 "localappdata": os.environ.get("LOCALAPPDATA"), "temp": os.environ.get("TEMP"),
-                "python": sys.version, "daemon": env.daemon, "started": now()}
+                "python": sys.version, "daemon": env.daemon, "started": now(),
+                "harness_sha256": file_sha256(os.path.abspath(__file__)), "daemon_sha256": file_sha256(env.daemon),
+                "probe_sha256": file_sha256(env.probe)}
     write_json(os.path.join(results, "harness-identity.json"), identity)
     records = []
     for name, expected, function in CASES:
@@ -988,6 +1366,27 @@ def selftest():
            "a flush does not prove that the directory entries are on disk; use a folder on a local NTFS volume")
     assert FAT32_RE.search(fat) and DURABLE_RE.search(fat)
     assert ENTRY_FAIL_RE.search("cannot make the entry of the backup directory C:\\x\\n_wfp durable")
+    # manifests, pruning expectation, volume GUID paths, hashes
+    text = generation_manifest("f.dat", 7, ["aa", "bb"])
+    assert parse_manifest(text) == {"file": "f.dat", "sequence": 7, "keys": ["aa", "bb"]}
+    assert parse_manifest(generation_manifest("g.dat", 1)) == {"file": "g.dat", "sequence": 1, "keys": []}
+    for bad in ("", "x\n", text.replace("keys 2", "keys 3"), text.replace("sequence 7", "seq 7"), text[:-4], text.replace(" 1\n", " 2\n", 1)):
+        try:
+            parse_manifest(bad)
+            raise AssertionError("accepted %r" % bad)
+        except ValueError:
+            pass
+    assert expected_survivors({"a": 1, "b": 2, "c": 3, "d": 4, "e": 5}, 3) == {"c", "d", "e"}
+    assert expected_survivors({"a": 1, "b": 2}, 3) == {"a", "b"}
+    assert generation_files(["a", "b"]) == {"a", "b", "a.keys", "b.keys"}
+    assert expected_survivors({"x": 5, "y": 5, "z": 1}, 1) == {"y"}
+    guid = "\\\\?\\Volume{12345678-1234-1234-1234-123456789ABC}\\"
+    assert volume_guid_prefix(guid + "data\\regtest") == guid.lower()
+    assert volume_guid_prefix("\\\\?\\C:\\data") is None and volume_guid_prefix("") is None and volume_guid_prefix(None) is None
+    assert volume_guid_prefix("\\\\?\\Volume{12345678-1234-1234-1234-123456789ABC}") is None
+    assert volume_identity("anything") == {} or os.name == "nt"
+    assert file_sha256(__file__) != "" and file_sha256(__file__ + ".missing") == ""
+    assert {"affected-wallet", "denied-ancestor"} <= {case_name for case_name, _, _ in CASES}
     assert not DURABLE_RE.search("cannot make the entry of the backup directory C:\\x durable")
     with tempfile.TemporaryDirectory() as temporary:
         directory = os.path.join(temporary, "n_w")
@@ -1067,6 +1466,27 @@ def selftest():
         raise AssertionError("precondition must raise")
     except Unresolved:
         pass
+    # a stop that times out ends in a recorded kill that fails the case; clean-up commands that fail are reported
+    with tempfile.TemporaryDirectory() as temporary:
+        env = Env({"cases": temporary}, os.path.join(temporary, "results"), "daemon", "probe")
+        env.case = "selftest"
+        node = Node(env, os.path.join(temporary, "data"), label="fake")
+        node.process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        env.nodes.append(node)
+        try:
+            node.stop(timeout=1)
+            raise AssertionError("a killed daemon must fail a clean stop")
+        except CheckFailed:
+            pass
+        assert node.forced_kill and env.forced_kills and node.process.poll() is not None
+        node.process = subprocess.Popen([sys.executable, "-c", "pass"])
+        node.process.wait()
+        env.cleanups.append(lambda: (3, "boom"))
+        env.cleanups.append(lambda: (0, "fine"))
+        env.cleanups.append(lambda: None)
+        problems = env.finish_case()
+        assert any("exited with 3" in problem for problem in problems) and len(problems) == 1
+        assert env.cleanups == []
     assert {name for name, _, _ in CASES} >= {"flush-probe", "default-path", "crash-points", "fat32"}
     print("harness self-test passed")
     return 0

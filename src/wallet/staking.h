@@ -468,6 +468,51 @@ int MaybeAutoDemurrageAttest(CWallet& wallet);
 
 /** Whether the wallet owns, and can sign for, a live legacy output the staker could stake. */
 bool WalletHoldsLegacyStakableCoin(const CWallet& wallet) EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet);
+
+//! An attestation that a transaction of this wallet carries and that is neither confirmed nor abandoned.
+struct PendingWalletAttestation
+{
+    uint256 key_hash;
+    std::optional<int> previous_height;
+    uint32_t previous_time{0};
+    uint32_t previous_coverage_start_height{0};
+    //! The block, transaction and output of the state the attestation references.
+    std::optional<Consensus::DemurrageAttestationSource> previous_source;
+    COutPoint target;
+    uint256 txid;
+    bool in_mempool{false};
+    //! Created by the automatic path (its transactions carry the automatic attestation comment); only
+    //! those may be abandoned automatically.
+    bool automatic{false};
+};
+
+/** What the automatic path may do with a pending attestation of the wallet. */
+enum class PendingAttestationUse {
+    REUSABLE,                //! still usable and can be offered to the network again
+    TEMPORARILY_UNAVAILABLE, //! still usable, but cannot be offered now (broadcasting is disabled): keep it
+    UNUSABLE,                //! the referenced state, the target or an input is gone: it cannot confirm
+};
+
+std::vector<PendingWalletAttestation> PendingWalletDemurrageAttestations(const CWallet& wallet)
+    EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet);
+
+/** Whether the attestation references exactly this record (height, time, coverage, source block hash,
+ *  source transaction and output), or no state at all when there is none. */
+bool PendingAttestationReferencesRecord(const PendingWalletAttestation& entry,
+                                        const std::optional<Consensus::DemurrageAttestationRecord>& record);
+
+/** The first pending attestation for this key that references exactly the key's current record. */
+const PendingWalletAttestation* FindPendingAttestationForState(const std::vector<PendingWalletAttestation>& pending,
+                                                               const uint256& key_hash,
+                                                               const std::optional<Consensus::DemurrageAttestationRecord>& record);
+
+/** Reusable, temporarily unavailable, or no longer usable. A failed submission is never evidence of the
+ *  last: the answer comes from the referenced state, the target and the inputs. */
+PendingAttestationUse ClassifyPendingAttestation(const CWallet& wallet, const CCoinsViewCache& view,
+                                                 const Consensus::Params& consensus, int evaluation_height,
+                                                 int64_t evaluation_time, const PendingWalletAttestation& entry,
+                                                 const std::optional<Consensus::DemurrageAttestationRecord>& record)
+    EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet);
 int MaybeAutoShadowSignal(CWallet& wallet);
 int MaybeAutoRedelegateQuantumColdStake(CWallet& wallet);
 

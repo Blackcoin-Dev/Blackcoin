@@ -87,61 +87,6 @@ struct AutoDemurrageAttestCandidate
     std::optional<Consensus::DemurrageAttestationState> state;
 };
 
-//! An attestation that a transaction of this wallet carries and that is neither confirmed nor abandoned.
-struct PendingWalletAttestation
-{
-    uint256 key_hash;
-    std::optional<int> previous_height;
-    uint32_t previous_time{0};
-    uint32_t previous_coverage_start_height{0};
-    uint256 txid;
-    bool in_mempool{false};
-};
-
-/** The attestations of this wallet's unconfirmed, not abandoned transactions. A retry record is erased when
- *  a block is disconnected, but the attestation transaction that block held is back in the wallet as
- *  unconfirmed (or, after a restart, was never confirmed): signing another one for the same key and state
- *  would only add churn, so the automatic path first looks here. */
-std::vector<PendingWalletAttestation> PendingWalletDemurrageAttestations(const CWallet& wallet)
-    EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet)
-{
-    AssertLockHeld(wallet.cs_wallet);
-    std::vector<PendingWalletAttestation> pending;
-    for (const auto& [txid, wtx] : wallet.mapWallet) {
-        if (!wtx.isUnconfirmed() || !wtx.tx || wtx.tx->IsCoinBase()) continue;
-        for (const Consensus::DemurrageAttestation& attestation : Consensus::ExtractDemurrageAttestations(*wtx.tx)) {
-            if (attestation.height < 0) continue; // not a well-formed payload
-            PendingWalletAttestation entry;
-            entry.key_hash = attestation.pubkey_hash;
-            entry.previous_height = attestation.previous_height;
-            entry.previous_time = attestation.previous_time;
-            entry.previous_coverage_start_height = attestation.previous_coverage_start_height;
-            entry.txid = txid;
-            entry.in_mempool = wtx.InMempool();
-            pending.push_back(std::move(entry));
-        }
-    }
-    return pending;
-}
-
-/** The pending attestation, if any, that refreshes this key from this very state: the same logical action. */
-const PendingWalletAttestation* FindPendingAttestationForState(const std::vector<PendingWalletAttestation>& pending,
-                                                               const uint256& key_hash,
-                                                               const std::optional<Consensus::DemurrageAttestationState>& state)
-{
-    for (const PendingWalletAttestation& entry : pending) {
-        if (entry.key_hash != key_hash) continue;
-        if (state.has_value() != entry.previous_height.has_value()) continue;
-        if (state && (state->height != *entry.previous_height || state->time != entry.previous_time ||
-                      state->coverage_start_height != entry.previous_coverage_start_height)) {
-            continue;
-        }
-        if (!state && (entry.previous_time != 0 || entry.previous_coverage_start_height != 0)) continue;
-        return &entry;
-    }
-    return nullptr;
-}
-
 struct AutoRedelegationSource
 {
     CTxDestination source_dest;
@@ -919,6 +864,110 @@ bool ValidateSelectedDemurrageAttestationFeeOutpoints(CWallet& wallet,
 
 } // namespace
 
+namespace {
+//! The comment the automatic path gives the attestation transactions it creates; no other transaction
+//! carries it, so it tells what the automatic path may clean up.
+constexpr const char* AUTO_DEMURRAGE_ATTEST_COMMENT{"Quantum Quasar demurrage auto-attestation"};
+} // namespace
+
+/** The attestations of this wallet's unconfirmed, not abandoned transactions. A retry record is erased when
+ *  a block is disconnected, but the attestation transaction that block held is back in the wallet as
+ *  unconfirmed (or, after a restart, was never confirmed): signing another one for the same key and state
+ *  would only add churn, so the automatic path first looks here. */
+std::vector<PendingWalletAttestation> PendingWalletDemurrageAttestations(const CWallet& wallet)
+{
+    AssertLockHeld(wallet.cs_wallet);
+    std::vector<PendingWalletAttestation> pending;
+    for (const auto& [txid, wtx] : wallet.mapWallet) {
+        if (!wtx.isUnconfirmed() || !wtx.tx || wtx.tx->IsCoinBase()) continue;
+        const auto comment = wtx.mapValue.find("comment");
+        const bool automatic = comment != wtx.mapValue.end() && comment->second == AUTO_DEMURRAGE_ATTEST_COMMENT;
+        for (const Consensus::DemurrageAttestation& attestation : Consensus::ExtractDemurrageAttestations(*wtx.tx)) {
+            if (attestation.height < 0) continue; // not a well-formed payload
+            PendingWalletAttestation entry;
+            entry.key_hash = attestation.pubkey_hash;
+            entry.previous_height = attestation.previous_height;
+            entry.previous_time = attestation.previous_time;
+            entry.previous_coverage_start_height = attestation.previous_coverage_start_height;
+            entry.previous_source = attestation.previous_source;
+            entry.target = attestation.target_outpoint;
+            entry.txid = txid;
+            entry.in_mempool = wtx.InMempool();
+            entry.automatic = automatic;
+            pending.push_back(std::move(entry));
+        }
+    }
+    return pending;
+}
+
+bool PendingAttestationReferencesRecord(const PendingWalletAttestation& entry,
+                                        const std::optional<Consensus::DemurrageAttestationRecord>& record)
+{
+    if (record.has_value() != entry.previous_height.has_value()) return false;
+    if (record.has_value() != entry.previous_source.has_value()) return false;
+    if (!record) return entry.previous_time == 0 && entry.previous_coverage_start_height == 0;
+    // The complete referenced state, source included: equal coordinates on a competing history are a
+    // different state, and the attestation protocol binds the source block, transaction and output.
+    return record->state.height == *entry.previous_height && record->state.time == entry.previous_time &&
+           record->state.coverage_start_height == entry.previous_coverage_start_height &&
+           record->source_block_hash == entry.previous_source->block_hash &&
+           record->source_txid == entry.previous_source->txid &&
+           record->source_output_index == entry.previous_source->output_index;
+}
+
+/** The pending attestation, if any, that refreshes this key from this very state: the same logical action. */
+const PendingWalletAttestation* FindPendingAttestationForState(const std::vector<PendingWalletAttestation>& pending,
+                                                               const uint256& key_hash,
+                                                               const std::optional<Consensus::DemurrageAttestationRecord>& record)
+{
+    for (const PendingWalletAttestation& entry : pending) {
+        if (entry.key_hash != key_hash) continue;
+        if (PendingAttestationReferencesRecord(entry, record)) return &entry;
+    }
+    return nullptr;
+}
+
+PendingAttestationUse ClassifyPendingAttestation(const CWallet& wallet, const CCoinsViewCache& view,
+                                                 const Consensus::Params& consensus, int evaluation_height,
+                                                 int64_t evaluation_time, const PendingWalletAttestation& entry,
+                                                 const std::optional<Consensus::DemurrageAttestationRecord>& record)
+{
+    AssertLockHeld(wallet.cs_wallet);
+    // The referenced state is no longer the key's current state: the mempool would refuse it as stale.
+    if (!PendingAttestationReferencesRecord(entry, record)) return PendingAttestationUse::UNUSABLE;
+
+    // The target must still be a live coin the key controls, and not locked by demurrage.
+    Coin target;
+    if (!view.GetCoin(entry.target, target) || target.IsSpent()) return PendingAttestationUse::UNUSABLE;
+    const std::optional<uint256> controlling_key = Consensus::DemurrageControllingKeyHashForScript(target.out.scriptPubKey);
+    if (!controlling_key || *controlling_key != entry.key_hash) return PendingAttestationUse::UNUSABLE;
+    const Consensus::DemurrageEvaluation eval = Consensus::EvaluateDemurrage(
+        target, consensus, evaluation_height, evaluation_time,
+        record ? std::optional<int>{record->state.height} : std::nullopt,
+        record ? std::optional<int>{static_cast<int>(record->state.coverage_start_height)} : std::nullopt);
+    if (eval.locked) return PendingAttestationUse::UNUSABLE;
+
+    // Every input must still exist: a coin of the chain, or an output of another unconfirmed, not
+    // abandoned transaction of this wallet.
+    const auto wtx_it = wallet.mapWallet.find(entry.txid);
+    if (wtx_it == wallet.mapWallet.end() || !wtx_it->second.tx) return PendingAttestationUse::UNUSABLE;
+    for (const CTxIn& txin : wtx_it->second.tx->vin) {
+        Coin coin;
+        if (view.GetCoin(txin.prevout, coin) && !coin.IsSpent()) continue;
+        const auto parent = wallet.mapWallet.find(txin.prevout.hash);
+        if (parent != wallet.mapWallet.end() && parent->second.isUnconfirmed() &&
+            txin.prevout.n < parent->second.tx->vout.size()) {
+            continue;
+        }
+        return PendingAttestationUse::UNUSABLE;
+    }
+
+    // Still usable, but the wallet cannot offer it to the network now.
+    if (!wallet.GetBroadcastTransactions()) return PendingAttestationUse::TEMPORARILY_UNAVAILABLE;
+    return PendingAttestationUse::REUSABLE;
+}
+
+
 std::vector<WalletShadowSolveReference> GetWalletShadowSolveReferences(const CWallet& wallet, int tip_height)
 {
     AssertLockHeld(wallet.cs_wallet);
@@ -1485,6 +1534,7 @@ int MaybeAutoDemurrageAttest(CWallet& wallet)
     std::vector<AutoDemurrageAttestCandidate> candidates;
     std::vector<COutPoint> fee_outpoints;
     std::set<uint256> to_resubmit; // pending attestations of the wallet that are not in the mempool
+    std::set<uint256> to_abandon;  // pending attestations of the automatic path that can no longer confirm
     {
         LOCK2(cs_main, wallet.cs_wallet);
         CoinsResult available_list = AvailableCoinsListUnspent(wallet);
@@ -1499,6 +1549,7 @@ int MaybeAutoDemurrageAttest(CWallet& wallet)
         std::vector<PendingWalletAttestation> pending_attestations;
         bool pending_scanned{false};
         std::set<uint256> suppressed_keys;
+        std::set<uint256> stale_scanned_keys;
         for (const COutput& out : available_list.All()) {
             if (!IsQuantumMigrationScript(out.txout.scriptPubKey)) continue;
             CTxDestination dest;
@@ -1533,14 +1584,33 @@ int MaybeAutoDemurrageAttest(CWallet& wallet)
                 pending_attestations = PendingWalletDemurrageAttestations(wallet);
                 pending_scanned = true;
             }
-            if (const PendingWalletAttestation* pending = FindPendingAttestationForState(pending_attestations, *key_hash, latest_attestation)) {
-                if (!pending->in_mempool) to_resubmit.insert(pending->txid);
-                if (suppressed_keys.insert(*key_hash).second) {
-                    wallet.WalletLogPrintf("Demurrage auto-attest suppressed for key %s: attestation %s for the same state is already pending in this wallet%s\n",
-                                           key_hash->ToString(), pending->txid.ToString(),
-                                           pending->in_mempool ? "" : " (submitting it again)");
+            const std::optional<Consensus::DemurrageAttestationRecord> latest_record =
+                Consensus::LatestDemurrageAttestationRecord(view, *key_hash);
+            if (const PendingWalletAttestation* pending = FindPendingAttestationForState(pending_attestations, *key_hash, latest_record)) {
+                const PendingAttestationUse use = ClassifyPendingAttestation(
+                    wallet, view, consensus, evaluation_height, evaluation_time, *pending, latest_record);
+                if (use == PendingAttestationUse::UNUSABLE) {
+                    // Its target or an input is gone. Only a transaction the automatic path created is cleaned
+                    // up automatically, and never one the mempool still holds.
+                    if (pending->automatic && !pending->in_mempool) to_abandon.insert(pending->txid);
+                } else {
+                    if (use == PendingAttestationUse::REUSABLE && !pending->in_mempool) to_resubmit.insert(pending->txid);
+                    if (suppressed_keys.insert(*key_hash).second) {
+                        wallet.WalletLogPrintf("Demurrage auto-attest suppressed for key %s: attestation %s for the same state is already pending in this wallet%s\n",
+                                               key_hash->ToString(), pending->txid.ToString(),
+                                               pending->in_mempool ? "" : (use == PendingAttestationUse::REUSABLE ? " (submitting it again)" : " (kept: it cannot be submitted now)"));
+                    }
+                    continue;
                 }
-                continue;
+            }
+            // Attestations of the automatic path that reference a state this key no longer has cannot confirm.
+            if (stale_scanned_keys.insert(*key_hash).second) {
+                for (const PendingWalletAttestation& entry : pending_attestations) {
+                    if (entry.key_hash == *key_hash && entry.automatic && !entry.in_mempool &&
+                        !PendingAttestationReferencesRecord(entry, latest_record)) {
+                        to_abandon.insert(entry.txid);
+                    }
+                }
             }
 
             AutoDemurrageAttestCandidate candidate;
@@ -1579,17 +1649,24 @@ int MaybeAutoDemurrageAttest(CWallet& wallet)
         }
     }
 
-    // Reuse: submit a pending attestation that the mempool does not hold (after a restart that did not keep
-    // the mempool, or a reorganisation). Outside the wallet and chain locks.
+    // Reuse: offer a pending attestation that the mempool does not hold again (after a restart that did not
+    // keep the mempool, or a reorganisation). Outside the wallet and chain locks. A failed submission is not
+    // evidence that it is unusable (broadcasting may be off, the mempool may refuse it for now, the node may
+    // have failed locally): it is kept and offered again on a later scan.
     for (const uint256& txid : to_resubmit) {
         std::string submit_error;
         if (!wallet.SubmitTxMemoryPoolAndRelay(txid, submit_error, /*relay=*/true)) {
-            // It cannot be reused (its inputs or referenced state are no longer usable): drop it, so a
-            // later scan may sign a new one instead of being held back by a transaction that cannot confirm.
-            wallet.WalletLogPrintf("Demurrage auto-attest: pending attestation %s was not accepted again (%s); abandoning it\n", txid.ToString(), submit_error);
-            if (!wallet.AbandonTransaction(txid)) {
-                wallet.WalletLogPrintf("Demurrage auto-attest: pending attestation %s could not be abandoned\n", txid.ToString());
-            }
+            wallet.WalletLogPrintf("Demurrage auto-attest: pending attestation %s was not accepted again (%s); keeping it\n",
+                                   txid.ToString(), submit_error.empty() ? "not submitted" : submit_error);
+        }
+    }
+    // Clean up: a transaction of the automatic path whose referenced state, target or inputs are gone cannot
+    // confirm and would otherwise keep its inputs reserved.
+    for (const uint256& txid : to_abandon) {
+        if (wallet.AbandonTransaction(txid)) {
+            wallet.WalletLogPrintf("Demurrage auto-attest: pending attestation %s can no longer confirm (its state, target or an input is gone); abandoned\n", txid.ToString());
+        } else {
+            wallet.WalletLogPrintf("Demurrage auto-attest: pending attestation %s could not be abandoned\n", txid.ToString());
         }
     }
 
@@ -1634,7 +1711,7 @@ int MaybeAutoDemurrageAttest(CWallet& wallet)
             }
 
             mapValue_t map_value;
-            map_value["comment"] = "Quantum Quasar demurrage auto-attestation";
+            map_value["comment"] = AUTO_DEMURRAGE_ATTEST_COMMENT;
             std::string broadcast_error;
             if (!wallet.CommitTransaction(tx_result.tx, std::move(map_value), {}, &broadcast_error)) {
                 if (!wallet.AbandonTransaction(tx_result.tx->GetHash())) {

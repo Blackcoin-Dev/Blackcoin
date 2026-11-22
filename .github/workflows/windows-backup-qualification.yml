@@ -1,0 +1,212 @@
+name: Windows quantum key backup qualification (manual)
+
+# Native Windows evidence for the quantum stake return key backup (src/wallet/quantum_return_backup.cpp). Manual only,
+# separate from the pinned PR gate and from the release build: it never publishes anything and tests an UNPUBLISHED
+# build.yml Windows artifact of the exact commit named in target_sha. See ci/windows-backup-qualification/README.md.
+#
+# Dispatch it from a branch whose head holds this workflow and the harness; target_sha is the commit under
+# qualification (its sources are checked out separately), build_run_id and artifact_name name the build.yml run and
+# its Windows artifact (release-<package_label>-windows-64-bit-<primary|verifier>-<target_sha>).
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_sha:
+        description: Full 40-character commit SHA under qualification (the build run's head and the artifact's commit)
+        required: true
+        type: string
+      build_run_id:
+        description: Run id of the build.yml run that produced the Windows artifact
+        required: true
+        type: string
+      artifact_name:
+        description: Windows artifact of that run, release-<package_label>-windows-64-bit-<primary|verifier>-<target_sha>
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: windows-backup-qualification-${{ inputs.target_sha }}
+  cancel-in-progress: false
+
+jobs:
+  flush-probe:
+    name: Build the FlushFileBuffers probe from the target sources
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    env:
+      TARGET_SHA: ${{ inputs.target_sha }}
+    steps:
+      - name: Checkout the qualification harness (this ref)
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.0
+        with:
+          path: harness
+          fetch-depth: 1
+
+      - name: Checkout the product sources of target_sha
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.0
+        with:
+          ref: ${{ inputs.target_sha }}
+          path: product
+          fetch-depth: 1
+
+      - name: Verify the exact checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git -C product rev-parse HEAD)" = "$TARGET_SHA"
+          test -f product/src/wallet/quantum_return_backup.cpp
+          python3 harness/ci/windows-backup-qualification/verify_inputs.py selftest
+
+      - name: Install the MinGW toolchain (as build.yml does for windows-64-bit)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential g++-mingw-w64-x86-64
+          sudo update-alternatives --set x86_64-w64-mingw32-gcc /usr/bin/x86_64-w64-mingw32-gcc-posix
+          sudo update-alternatives --set x86_64-w64-mingw32-g++ /usr/bin/x86_64-w64-mingw32-g++-posix
+
+      - name: Build only the probe (the real backup source compiled in, FlushFileBuffers shimmed)
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash harness/ci/windows-backup-qualification/build-probe.sh product probe-out
+          x86_64-w64-mingw32-objdump -f probe-out/flush_probe.exe | tee probe-out/flush_probe.objdump.txt
+          grep -q 'file format pei-x86-64' probe-out/flush_probe.objdump.txt
+          cat probe-out/flush_probe.provenance.txt
+          grep -Fx "checkout_head=$TARGET_SHA" probe-out/flush_probe.provenance.txt
+
+      - name: Upload the probe with its SHA-256 and provenance
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: flush-probe-${{ inputs.target_sha }}
+          path: |
+            probe-out/flush_probe.exe
+            probe-out/flush_probe.exe.sha256
+            probe-out/flush_probe.provenance.txt
+            probe-out/flush_probe.objdump.txt
+          if-no-files-found: error
+          retention-days: 7
+
+  windows-backup:
+    name: Native Windows backup qualification as a standard user
+    needs: flush-probe
+    runs-on: windows-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    env:
+      TARGET_SHA: ${{ inputs.target_sha }}
+      BUILD_RUN_ID: ${{ inputs.build_run_id }}
+      ARTIFACT_NAME: ${{ inputs.artifact_name }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Checkout the qualification harness (this ref)
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.0
+        with:
+          path: harness
+          fetch-depth: 1
+
+      - name: Checkout the product sources of target_sha (version and payload verifiers)
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.0
+        with:
+          ref: ${{ inputs.target_sha }}
+          path: product
+          fetch-depth: 1
+
+      - id: names
+        name: Verify the inputs and the build run
+        run: |
+          set -euo pipefail
+          tools=harness/ci/windows-backup-qualification
+          python --version
+          python "$tools/verify_inputs.py" selftest
+          [[ "$BUILD_RUN_ID" =~ ^[0-9]+$ ]]
+          test "$(git -C product rev-parse HEAD)" = "$TARGET_SHA"
+          python "$tools/verify_inputs.py" parse --artifact-name "$ARTIFACT_NAME" --target-sha "$TARGET_SHA" | tee names.txt
+          cat names.txt >> "$GITHUB_OUTPUT"
+          mkdir -p qualification-results
+          gh run view "$BUILD_RUN_ID" --repo "$GITHUB_REPOSITORY" \
+            --json headSha,status,conclusion,event,url,workflowName,databaseId > qualification-results/build-run.json
+          cat qualification-results/build-run.json
+          python "$tools/verify_inputs.py" run --json qualification-results/build-run.json --target-sha "$TARGET_SHA"
+          configured=$(python "$tools/verify_inputs.py" version --configure-ac product/configure.ac)
+          echo "configured_version=$configured" >> "$GITHUB_OUTPUT"
+
+      - name: Download the build.yml Windows artifact of the run
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          run-id: ${{ inputs.build_run_id }}
+          github-token: ${{ github.token }}
+          name: ${{ inputs.artifact_name }}
+          path: incoming/build
+
+      - name: Download the unsigned canary bundle of the same run (its manifest and checksums)
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          run-id: ${{ inputs.build_run_id }}
+          github-token: ${{ github.token }}
+          name: ${{ steps.names.outputs.canary_name }}
+          path: incoming/canary
+
+      - name: Download the probe built by the first job
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: flush-probe-${{ inputs.target_sha }}
+          path: incoming/probe
+
+      - name: Verify the artifact hashes, the payload, the daemon identity and the probe
+        env:
+          PORTABLE: ${{ steps.names.outputs.portable }}
+          CONFIGURED_VERSION: ${{ steps.names.outputs.configured_version }}
+        run: |
+          set -euo pipefail
+          tools=harness/ci/windows-backup-qualification
+          python "$tools/verify_inputs.py" files --build-dir incoming/build --canary-dir incoming/canary \
+            --artifact-name "$ARTIFACT_NAME" --target-sha "$TARGET_SHA" --build-run-id "$BUILD_RUN_ID" \
+            --output qualification-results/artifact-verification.json
+          python product/ci/release/verify_windows_payload.py unsigned-archive "incoming/build/$PORTABLE"
+          mkdir payload
+          python -c 'import sys, zipfile; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])' "incoming/build/$PORTABLE" payload
+          python product/ci/release/verify_windows_payload.py directory payload
+          python product/ci/release/verify_windows_payload.py identity payload/blackcoind.exe \
+            --version "$CONFIGURED_VERSION" --source-sha "$TARGET_SHA"
+          # the daemon itself reports the same identity build.yml's other targets are checked for
+          version_output=$(payload/blackcoind.exe --version 2>&1 | tr -d '\r')
+          printf '%s\n' "$version_output" | tee qualification-results/daemon-version.txt
+          printf '%s\n' "$version_output" | grep -Fx "Blackcoin version v$CONFIGURED_VERSION-${TARGET_SHA:0:12}"
+          (cd incoming/probe && sha256sum --check --strict flush_probe.exe.sha256)
+          grep -Fx "checkout_head=$TARGET_SHA" incoming/probe/flush_probe.provenance.txt
+          cp incoming/probe/flush_probe.provenance.txt incoming/probe/flush_probe.exe.sha256 qualification-results/
+
+      - name: Qualify as a standard user (set up, run, collect, tear down)
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $python = (Get-Command python).Source
+          $ws = $env:GITHUB_WORKSPACE
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$ws\harness\ci\windows-backup-qualification\qualify-admin.ps1" `
+            -Action Run -PayloadDir "$ws\payload" -ProbeExe "$ws\incoming\probe\flush_probe.exe" `
+            -HarnessDir "$ws\harness\ci\windows-backup-qualification" -PythonExe $python `
+            -ResultsOut "$ws\qualification-results"
+          exit $LASTEXITCODE
+
+      - name: Upload the results (always)
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: windows-backup-qualification-results-${{ inputs.target_sha }}-${{ github.run_id }}
+          path: qualification-results
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Clean up the user, VHDs, share and files (always)
+        if: always()
+        shell: powershell
+        run: |
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$env:GITHUB_WORKSPACE\harness\ci\windows-backup-qualification\qualify-admin.ps1" -Action Teardown
+          exit 0

@@ -203,15 +203,22 @@ BOOST_AUTO_TEST_CASE(memo_is_per_call_and_sees_wallet_changes)
     LOCK2(::cs_main, wallet.cs_wallet);
     CoinFilterParams params;
     params.include_immature_coinbase = true;
-    const size_t before = AvailableCoins(wallet, nullptr, std::nullopt, params).Size();
-    // Lock one output: the next call leaves it out. Nothing is remembered between calls.
-    const COutPoint locked = *setup.added.begin();
-    // (the first added output pays the P2PK script the wallet owns)
+    const CoinsResult initial = AvailableCoins(wallet, nullptr, std::nullopt, params);
+    const size_t before = initial.Size();
+    BOOST_REQUIRE(before > 0);
+    // Lock one output the call returned (the set of added outputs also holds the foreign script's, which are
+    // never returned, and sorts them among the others): the next call leaves it out. Nothing is remembered
+    // between calls.
+    const COutPoint locked = initial.All().front().outpoint;
     BOOST_REQUIRE(wallet.LockCoin(locked));
     const CoinsResult after = AvailableCoins(wallet, nullptr, std::nullopt, params);
     BOOST_CHECK_EQUAL(after.Size(), before - 1);
+    for (const COutput& coin : after.All()) BOOST_CHECK(coin.outpoint != locked);
     wallet.UnlockCoin(locked);
-    BOOST_CHECK_EQUAL(AvailableCoins(wallet, nullptr, std::nullopt, params).Size(), before);
+    const CoinsResult restored = AvailableCoins(wallet, nullptr, std::nullopt, params);
+    BOOST_CHECK_EQUAL(restored.Size(), before);
+    const std::vector<COutput> returned = restored.All();
+    BOOST_CHECK(std::any_of(returned.begin(), returned.end(), [&](const COutput& coin) { return coin.outpoint == locked; }));
 }
 
 BOOST_AUTO_TEST_SUITE_END()

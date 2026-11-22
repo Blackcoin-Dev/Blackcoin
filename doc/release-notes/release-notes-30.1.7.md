@@ -108,6 +108,44 @@ Release qualification is pending.
 - **Faster PSBT signing.** Signing a PSBT with many inputs no longer copies the whole PSBT for
   every input.
 
+- **Legacy self-stakes are paid as quantum coins from 6,917,000, when a return address is ready.**
+  Ten maturities before the first Final block (6,917,000 on mainnet; never before the first
+  Migration block) a wallet that has a ready quantum stake return address already pays a legacy
+  self-stake (a pay-to-pubkey, pay-to-pubkey-hash or bech32 kernel) as ONE positive quantum
+  output: all principal, reward and fees, no stake split and no donation output, and the legacy
+  key still signs in the zero-value output, so every released version accepts the block. The same
+  independent check that guards the last 500 blocks (a refusal if the coinstake has any other
+  output of value) now covers every redirected coinstake. Without a ready address the wallet
+  stakes legacy outputs exactly as before until 6,921,499, and `getstakinginfo`, `getmigrationstatus`
+  and the Staking page notice name the action to take (`legacy_staking_opportunistic_start_height`,
+  `legacy_staking_in_opportunistic_window`, and an "Opportunistic return is OFF" line in the
+  notice). The mandatory window (6,921,499 to 6,921,999, no ready address means no legacy
+  staking) is unchanged. Quantum cold-stake kernels, delegation restrictions, operator payments and
+  tier covenants are untouched, and a delegator's principal is never redirected to an operator's
+  return address. This is wallet policy only.
+- **A final stake reserve keeps outputs for the first Final block.** A quantum coinstake made
+  in the last 500 blocks of Migration cannot stake again before the first Final block, so a wallet
+  that stakes all its quantum outputs there can have nothing mature when Final starts. For the
+  candidate heights 6,921,500 to 6,921,999 (inclusive; released for 6,922,000) the wallet now
+  holds back R = min(32, (N + 1) / 2) of its N qualifying quantum outputs, the largest effective
+  value at the first Final block first. N counts the outputs that are unspent and will be able to
+  stake at the first Final block (a v16 output the wallet holds the key for, or a v14 cold-stake
+  output it holds the staker key for, created at or before height 6,921,500, not locked by the
+  user), plus those its confirmed coinstakes consumed since 6,921,500, so the reserve does not
+  shrink as the wallet stakes. The reserve is recomputed from the wallet and the active chain on
+  every staking pass and is never stored (a restart or a reorganisation gives the same answer, and
+  nothing is added to the wallet file); the staker leaves the reserve out of kernels and of
+  added inputs, and automatic coin selection (an ordinary send, `sendall`, the migration batches,
+  the automatic demurrage-attestation fee input and the automatic redelegation) leaves it alone
+  and rechecks it before it commits. Explicit coin control can still spend a reserved output; the
+  readiness report then shows the reduction. `getquantumstakereadiness` reports the guard in
+  `final_stake_reserve`: whether it is enabled and active, N, the target R, the reserved
+  outpoints and their weight, the outputs and weight eligible at the first Final block, any
+  shortfall, and what excluded an output (a missing key is told apart from a locked wallet).
+  `-finalstakereserve=0` turns it off. A wallet with a single output withholds it for the 500
+  candidate heights and stakes it again from the first Final block. Winning the first Final block
+  stays a matter of chance. Wallet policy only; no consensus rule changes.
+
 ## Staking readiness for the first Final block
 
 None of these changes alters which blocks or transactions are valid. They change which
@@ -337,6 +375,9 @@ operator can see before the last Gold Rush block (height 6,192,999), in plain la
   block, so it has only that one block (the margin) to be spent before Final; a return created from
   6,921,500 on matures too late and can never be spent. Switch legacy staking off from height
   6,921,499, or stay on 30.1.7.
+  Likewise 30.1.6 does not know the opportunistic window (from 6,917,000) or the final stake
+  reserve: it pays legacy stakes to legacy outputs in that window, and it stakes every quantum
+  output in the last 500 blocks of Migration.
 
 ## Version identity
 

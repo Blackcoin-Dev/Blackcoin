@@ -89,13 +89,13 @@ jobs:
             probe-out/flush_probe.provenance.txt
             probe-out/flush_probe.objdump.txt
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 30
 
   windows-backup:
     name: Native Windows backup qualification as a standard user
     needs: flush-probe
     runs-on: windows-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     defaults:
       run:
         shell: bash
@@ -133,7 +133,17 @@ jobs:
           gh run view "$BUILD_RUN_ID" --repo "$GITHUB_REPOSITORY" \
             --json headSha,status,conclusion,event,url,workflowName,databaseId > qualification-results/build-run.json
           cat qualification-results/build-run.json
-          python "$tools/verify_inputs.py" run --json qualification-results/build-run.json --target-sha "$TARGET_SHA"
+          python "$tools/verify_inputs.py" run --json qualification-results/build-run.json --target-sha "$TARGET_SHA" \
+            --run-id "$BUILD_RUN_ID"
+          # workflowName is only a display name: the run must belong to the workflow FILE build.yml of THIS repository
+          # (the API's `path` field of the run, and the id of the workflow that file resolves to)
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$BUILD_RUN_ID" > qualification-results/build-run-api.json
+          gh api "repos/$GITHUB_REPOSITORY/actions/workflows/build.yml" > qualification-results/build-workflow-api.json
+          python "$tools/verify_inputs.py" api-run --run-json qualification-results/build-run-api.json \
+            --workflow-json qualification-results/build-workflow-api.json --repository "$GITHUB_REPOSITORY" \
+            --run-id "$BUILD_RUN_ID" --target-sha "$TARGET_SHA" | tee qualification-results/build-run-verification.json
+          # the build artifacts expire (the canary bundle after 7 days): their expiry is part of the receipt
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$BUILD_RUN_ID/artifacts" > qualification-results/build-artifacts.json
           configured=$(python "$tools/verify_inputs.py" version --configure-ac product/configure.ac)
           echo "configured_version=$configured" >> "$GITHUB_OUTPUT"
 
@@ -182,9 +192,16 @@ jobs:
           (cd incoming/probe && sha256sum --check --strict flush_probe.exe.sha256)
           grep -Fx "checkout_head=$TARGET_SHA" incoming/probe/flush_probe.provenance.txt
           cp incoming/probe/flush_probe.provenance.txt incoming/probe/flush_probe.exe.sha256 qualification-results/
+          # keep the exact probe and tested payload for the results' retention period (the build artifacts expire sooner)
+          mkdir -p qualification-results/tested
+          cp "incoming/build/$PORTABLE" incoming/probe/flush_probe.exe qualification-results/tested/
+          (cd qualification-results/tested && sha256sum -- * | tee SHA256SUMS.txt)
 
       - name: Qualify as a standard user (set up, run, collect, tear down)
         shell: powershell
+        # the child has its own 30 minute budget inside the script; this step limit leaves the rest of the job for the
+        # always-run steps (upload, clean-up) even when the step itself is cancelled
+        timeout-minutes: 45
         run: |
           $ErrorActionPreference = 'Stop'
           $python = (Get-Command python).Source
@@ -204,9 +221,18 @@ jobs:
           if-no-files-found: warn
           retention-days: 30
 
-      - name: Clean up the user, VHDs, share and files (always)
+      - name: Upload the live results directory (fallback when the copy to the workspace failed)
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: windows-backup-qualification-live-results-${{ inputs.target_sha }}-${{ github.run_id }}
+          path: C:\q\results
+          if-no-files-found: ignore
+          retention-days: 30
+
+      - name: Clean up the user, VHDs, share and files (always; a failed clean-up fails the job)
         if: always()
         shell: powershell
         run: |
           & powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$env:GITHUB_WORKSPACE\harness\ci\windows-backup-qualification\qualify-admin.ps1" -Action Teardown
-          exit 0
+          exit $LASTEXITCODE

@@ -70,13 +70,44 @@ def configured_version(configure_ac):
     return version
 
 
-def verify_run(run, target_sha):
-    """`gh run view --json headSha,conclusion,status,event`: a finished successful dispatch of exactly target_sha."""
+BUILD_WORKFLOW_PATH = ".github/workflows/build.yml"
+REPOSITORY_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+
+
+def verify_run(run, target_sha, run_id=None):
+    """`gh run view --json headSha,conclusion,status,event,databaseId`: a finished successful dispatch of exactly
+    target_sha (and, when run_id is given, of exactly that run)."""
+    if run_id is not None:
+        require(str(run.get("databaseId")) == str(run_id), "gh run view returned run %r, not %s" % (run.get("databaseId"), run_id))
     require(run.get("headSha") == target_sha, "the build run's head is %r, not target_sha" % run.get("headSha"))
     require(run.get("status") == "completed" and run.get("conclusion") == "success",
             "the build run is %s/%s, not completed/success" % (run.get("status"), run.get("conclusion")))
     require(run.get("event") == "workflow_dispatch", "the build run is a %r event, not workflow_dispatch" % run.get("event"))
     return {"head_sha": run["headSha"], "event": run["event"], "url": run.get("url", "")}
+
+
+def workflow_path_ok(path):
+    """The REST API reports a run's workflow file as `.github/workflows/build.yml`, and for some triggers with a
+    `@<ref>` suffix; anything else (another file, a nested path, a dynamic workflow) is not build.yml."""
+    return isinstance(path, str) and (path == BUILD_WORKFLOW_PATH or path.startswith(BUILD_WORKFLOW_PATH + "@"))
+
+
+def verify_run_api(run, workflow, repository, run_id, target_sha):
+    """`gh api repos/<repo>/actions/runs/<id>` (run) and `gh api repos/<repo>/actions/workflows/build.yml` (workflow):
+    the run is of THIS repository, has the requested id and head, and belongs to the workflow file build.yml."""
+    require(REPOSITORY_RE.match(repository or "") is not None, "the repository %r is not owner/name" % repository)
+    require(str(run.get("id")) == str(run_id), "the API returned run %r, not %s" % (run.get("id"), run_id))
+    require((run.get("repository") or {}).get("full_name", "").lower() == repository.lower(),
+            "the run belongs to repository %r, not %s" % ((run.get("repository") or {}).get("full_name"), repository))
+    require((run.get("head_repository") or {}).get("full_name", "").lower() == repository.lower(),
+            "the run's head repository is %r (a fork?), not %s" % ((run.get("head_repository") or {}).get("full_name"), repository))
+    require(run.get("head_sha") == target_sha, "the API reports head %r, not target_sha" % run.get("head_sha"))
+    require(workflow_path_ok(run.get("path")), "the run's workflow path is %r, not %s" % (run.get("path"), BUILD_WORKFLOW_PATH))
+    require(workflow.get("path") == BUILD_WORKFLOW_PATH, "the workflow file %s resolves to path %r" % (BUILD_WORKFLOW_PATH, workflow.get("path")))
+    require(workflow.get("id") is not None and run.get("workflow_id") == workflow.get("id"),
+            "the run's workflow id %r is not the id %r of %s" % (run.get("workflow_id"), workflow.get("id"), BUILD_WORKFLOW_PATH))
+    return {"run_id": str(run["id"]), "repository": repository, "workflow_path": run["path"], "workflow_id": run["workflow_id"],
+            "head_sha": run["head_sha"], "event": run.get("event"), "html_url": run.get("html_url", "")}
 
 
 def sha256_file(path):
@@ -112,12 +143,22 @@ def verify_files(build_dir, canary_dir, names, target_sha, build_run_id):
     require(manifest.get("source", {}).get("commit") == target_sha, "the manifest names a different source commit")
     require(str(manifest.get("workflow", {}).get("run_id")) == str(build_run_id), "the manifest names a different build run")
     require(manifest.get("release", {}).get("published") is False, "the manifest does not say unpublished")
-    listed = {entry["name"]: entry["sha256"] for entry in manifest.get("artifacts", [])}
+    listed = {}
+    for entry in manifest.get("artifacts", []):
+        require(entry["name"] not in listed, "the manifest lists %s twice" % entry["name"])
+        listed[entry["name"]] = entry["sha256"]
     sums = {}
     with open(os.path.join(canary_dir, sums_name), "r", encoding="utf-8") as handle:
         for line in handle.read().splitlines():
-            digest, _, name = line.partition("  ")
+            if not line.strip():
+                continue
+            digest, separator, name = line.partition("  ")
+            require(separator == "  " and name != "", "malformed checksum line %r" % line)
+            require(name not in sums, "the checksum list names %s twice" % name)
             sums[name] = digest
+    # the checksum list also vouches for the manifest itself, which is how the manifest is bound to the run
+    require(sums.get(manifest_name) == sha256_file(os.path.join(canary_dir, manifest_name)), "manifest checksum mismatch")
+    require(sums_name not in sums, "the checksum list lists itself")
     for name in expected:
         require(listed.get(name) == hashes[name], "the manifest hash of %s does not match the downloaded file" % name)
         require(sums.get(name) == hashes[name], "the checksum list hash of %s does not match the downloaded file" % name)
@@ -160,6 +201,36 @@ def selftest():
             raise AssertionError("accepted %s" % change)
         except Rejected:
             pass
+    assert verify_run(dict(good, databaseId=42), sha, 42)["head_sha"] == sha
+    try:
+        verify_run(dict(good, databaseId=43), sha, 42)
+        raise AssertionError("accepted another run id")
+    except Rejected:
+        pass
+    api = {"id": 42, "repository": {"full_name": "Owner/Repo"}, "head_repository": {"full_name": "owner/repo"},
+           "head_sha": sha, "path": BUILD_WORKFLOW_PATH, "workflow_id": 7, "event": "workflow_dispatch"}
+    flow = {"id": 7, "path": BUILD_WORKFLOW_PATH}
+    assert verify_run_api(api, flow, "owner/repo", 42, sha)["workflow_id"] == 7
+    assert verify_run_api(dict(api, path=BUILD_WORKFLOW_PATH + "@refs/heads/x"), flow, "owner/repo", "42", sha)
+    for change in ({"id": 43}, {"repository": {"full_name": "other/repo"}}, {"head_repository": {"full_name": "fork/repo"}},
+                   {"head_sha": "b" * 40}, {"path": ".github/workflows/other.yml"}, {"path": BUILD_WORKFLOW_PATH + "x"},
+                   {"path": "dynamic/pages"}, {"workflow_id": 8}, {"workflow_id": None}):
+        try:
+            verify_run_api(dict(api, **change), flow, "owner/repo", 42, sha)
+            raise AssertionError("accepted %s" % change)
+        except Rejected:
+            pass
+    for bad_flow in ({"id": 7, "path": ".github/workflows/other.yml"}, {"path": BUILD_WORKFLOW_PATH}):
+        try:
+            verify_run_api(api, bad_flow, "owner/repo", 42, sha)
+            raise AssertionError("accepted %s" % bad_flow)
+        except Rejected:
+            pass
+    try:
+        verify_run_api(api, flow, "not a repository", 42, sha)
+        raise AssertionError("accepted a malformed repository")
+    except Rejected:
+        pass
     with tempfile.TemporaryDirectory() as temporary:
         build = os.path.join(temporary, "build")
         canary = os.path.join(temporary, "canary")
@@ -179,12 +250,15 @@ def selftest():
                     "artifacts": [{"name": n, "sha256": hashlib.sha256(d).hexdigest()} for n, d in contents.items()]}
         with open(os.path.join(canary, names["prefix"] + "-MANIFEST-UNSIGNED.json"), "w", encoding="utf-8") as handle:
             json.dump(manifest, handle)
+        manifest_file = names["prefix"] + "-MANIFEST-UNSIGNED.json"
         lines = ["%s  %s" % (hashlib.sha256(d).hexdigest(), n) for n, d in contents.items()]
         lines.append("%s  %s" % (hashlib.sha256(b"unsigned").hexdigest(), marker))
+        lines.append("%s  %s" % (sha256_file(os.path.join(canary, manifest_file)), manifest_file))
         with open(os.path.join(canary, names["prefix"] + "-SHA256SUMS-UNSIGNED.txt"), "w", encoding="utf-8") as handle:
             handle.write("\n".join(lines) + "\n")
         assert verify_files(build, canary, names, sha, 42)["run_id"] == "42"
-        for attack in ("extra", "tamper", "wrong-run", "wrong-commit"):
+        for attack in ("extra", "tamper", "wrong-run", "wrong-commit", "manifest-edit", "manifest-duplicate", "sums-duplicate",
+                       "manifest-unlisted"):
             copy_build, copy_canary = build + "-" + attack, canary + "-" + attack
             os.makedirs(copy_build)
             os.makedirs(copy_canary)
@@ -205,6 +279,25 @@ def selftest():
                     handle.write(b"other")
             elif attack == "wrong-run":
                 run_id = 43
+            elif attack == "manifest-edit":
+                edited = os.path.join(copy_canary, names["prefix"] + "-MANIFEST-UNSIGNED.json")
+                with open(edited, "a", encoding="utf-8") as handle:
+                    handle.write(" ")  # still valid JSON, but no longer the file the checksum list vouches for
+            elif attack == "manifest-duplicate":
+                path = os.path.join(copy_canary, names["prefix"] + "-MANIFEST-UNSIGNED.json")
+                doubled = dict(manifest, artifacts=manifest["artifacts"] + manifest["artifacts"][:1])
+                with open(path, "w", encoding="utf-8") as handle:
+                    json.dump(doubled, handle)
+                lines_fixed = [line for line in lines if not line.endswith(names["prefix"] + "-MANIFEST-UNSIGNED.json")]
+                lines_fixed.append("%s  %s" % (sha256_file(path), names["prefix"] + "-MANIFEST-UNSIGNED.json"))
+                with open(os.path.join(copy_canary, names["prefix"] + "-SHA256SUMS-UNSIGNED.txt"), "w", encoding="utf-8") as handle:
+                    handle.write("\n".join(lines_fixed) + "\n")
+            elif attack == "sums-duplicate":
+                with open(os.path.join(copy_canary, names["prefix"] + "-SHA256SUMS-UNSIGNED.txt"), "a", encoding="utf-8") as handle:
+                    handle.write(lines[0] + "\n")
+            elif attack == "manifest-unlisted":
+                with open(os.path.join(copy_canary, names["prefix"] + "-SHA256SUMS-UNSIGNED.txt"), "w", encoding="utf-8") as handle:
+                    handle.write("\n".join(lines[:-1]) + "\n")
             else:
                 with open(os.path.join(copy_build, names["source_commit"]), "w", encoding="utf-8") as handle:
                     handle.write("b" * 40 + "\n")
@@ -226,6 +319,13 @@ def main():
     run = sub.add_parser("run", help="check `gh run view --json headSha,status,conclusion,event,url` output")
     run.add_argument("--json", required=True)
     run.add_argument("--target-sha", required=True)
+    run.add_argument("--run-id", help="the run id the request named (checked against databaseId)")
+    api = sub.add_parser("api-run", help="check `gh api` output for the run and for the build.yml workflow file")
+    api.add_argument("--run-json", required=True)
+    api.add_argument("--workflow-json", required=True)
+    api.add_argument("--repository", required=True)
+    api.add_argument("--run-id", required=True)
+    api.add_argument("--target-sha", required=True)
     files = sub.add_parser("files", help="check the downloaded build artifact against the canary bundle")
     files.add_argument("--build-dir", required=True)
     files.add_argument("--canary-dir", required=True)
@@ -245,7 +345,13 @@ def main():
                 print("%s=%s" % (key, value))
         elif args.command == "run":
             with open(args.json, "r", encoding="utf-8") as handle:
-                print(json.dumps(verify_run(json.load(handle), args.target_sha)))
+                print(json.dumps(verify_run(json.load(handle), args.target_sha, args.run_id)))
+        elif args.command == "api-run":
+            with open(args.run_json, "r", encoding="utf-8") as handle:
+                run_document = json.load(handle)
+            with open(args.workflow_json, "r", encoding="utf-8") as handle:
+                workflow_document = json.load(handle)
+            print(json.dumps(verify_run_api(run_document, workflow_document, args.repository, args.run_id, args.target_sha)))
         elif args.command == "files":
             names = parse_artifact_name(args.artifact_name, args.target_sha)
             evidence = verify_files(args.build_dir, args.canary_dir, names, args.target_sha, args.build_run_id)

@@ -1081,6 +1081,55 @@ BOOST_FIXTURE_TEST_CASE(automatic_return_gate_needs_an_owned_signable_legacy_coi
         BOOST_CHECK(!watch->GetLiveUnspentStakeCandidateOutpoints().empty());
         BOOST_CHECK(!WalletHoldsLegacyStakableCoin(*watch));
     }
+
+    // A protected asset: an owned legacy output of a stakable class, above the minimum and signable, that
+    // carries a live RGB assignment. Spending it as ordinary coin would burn the asset, so the automatic
+    // preparation must not treat it as a legacy stake; once the protection is gone, the same output qualifies.
+    {
+        auto holder = CreateSyncedWallet(*m_node.chain,
+            WITH_LOCK(Assert(m_node.chainman)->GetMutex(), return m_node.chainman->ActiveChain()), own_key);
+        const CTransactionRef protected_tx = PayTo(own_pkh, amount, 9);
+        const COutPoint protected_out{protected_tx->GetHash(), 0};
+        const uint256 contract_id = uint256S("c0");
+        RGBContractRecord contract;
+        contract.ticker = "TST";
+        contract.name = "Protected test asset";
+        contract.total_supply = 1000;
+        contract.creation_time = 1;
+        BOOST_REQUIRE(holder->AddRGBContract(contract_id, contract));
+        RGBOwnedAssignmentRecord assignment;
+        assignment.amount = 1000;
+        assignment.creation_time = 1;
+        BOOST_REQUIRE(holder->AddRGBAssignment(contract_id, protected_out, assignment));
+        {
+            LOCK2(::cs_main, holder->cs_wallet);
+            BOOST_REQUIRE(holder->AddToWallet(protected_tx, confirmed));
+            BOOST_CHECK(holder->GetProtectedRGBSeals().count(protected_out) == 1);
+            // Otherwise qualifying: it is in the candidate index and nothing but the protection excludes it.
+            BOOST_CHECK(!holder->GetLiveUnspentStakeCandidateOutpoints().empty());
+            BOOST_CHECK(!WalletHoldsLegacyStakableCoin(*holder));
+        }
+        using Outcome = QuantumStakeReturnPreparation::Outcome;
+        gArgs.ForceSetArg("-qqallowautokeycreation", "1");
+        const QuantumStakeReturnPreparation protected_prep = PrepareQuantumStakeReturn(*holder, QuantumStakeReturnTrigger::AUTOMATIC);
+        BOOST_CHECK(protected_prep.outcome == Outcome::NO_ACTION);
+        BOOST_CHECK(!protected_prep.key_created);
+        BOOST_CHECK(WITH_LOCK(holder->cs_wallet, return holder->m_quantum_stake_return.empty()));
+        BOOST_CHECK_EQUAL(WITH_LOCK(holder->cs_wallet, return holder->ListQuantumKeyInfos().size()), size_t{0});
+
+        // The protection removed (the assignment is spent): the same output qualifies, and the same call acts.
+        bool changed{false};
+        BOOST_REQUIRE(holder->SetRGBAssignmentSpent(contract_id, protected_out, /*spent=*/true, changed));
+        BOOST_CHECK(changed);
+        {
+            LOCK2(::cs_main, holder->cs_wallet);
+            BOOST_CHECK(holder->GetProtectedRGBSeals().empty());
+            BOOST_CHECK(WalletHoldsLegacyStakableCoin(*holder));
+        }
+        const QuantumStakeReturnPreparation open_prep = PrepareQuantumStakeReturn(*holder, QuantumStakeReturnTrigger::AUTOMATIC);
+        gArgs.ForceSetArg("-qqallowautokeycreation", "0");
+        BOOST_CHECK(open_prep.outcome != Outcome::NO_ACTION);
+    }
 }
 
 BOOST_AUTO_TEST_SUITE_END()

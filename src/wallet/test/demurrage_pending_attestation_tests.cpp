@@ -10,6 +10,7 @@
 #include <key.h>
 #include <script/script.h>
 #include <test/util/setup_common.h>
+#include <tinyformat.h>
 #include <uint256.h>
 #include <validation.h>
 #include <wallet/staking.h>
@@ -17,6 +18,8 @@
 #include <wallet/wallet.h>
 
 #include <boost/test/unit_test.hpp>
+
+#include <memory>
 
 namespace wallet {
 namespace {
@@ -277,6 +280,147 @@ BOOST_AUTO_TEST_CASE(pending_attestations_are_classified_by_state_target_inputs_
         BOOST_REQUIRE(m_node.chainman->ActiveChainstate().CoinsTip().SpendCoin(fee_input));
     }
     BOOST_CHECK(classify(find(auto_txid), std::nullopt) == PendingAttestationUse::UNUSABLE);
+}
+
+namespace {
+//! A wallet, a chain view with a live target for the key and a spendable fee input, and a way to add pending
+//! attestation transactions (automatic or manual) that spend a given input and attest a given target.
+struct KeyDecisionFixture {
+    PendingFixture f{MakeKey()};
+    CKey wallet_key;
+    std::unique_ptr<CWallet> wallet;
+    COutPoint live_target{uint256S("8a"), 0};
+    COutPoint dead_target{uint256S("8b"), 0}; // never in the chain view: a spent or missing target
+    int next_input{0};
+
+    KeyDecisionFixture(TestChain100Setup& setup)
+    {
+        wallet_key.MakeNewKey(true);
+        wallet = CreateSyncedWallet(*setup.m_node.chain,
+            WITH_LOCK(Assert(setup.m_node.chainman)->GetMutex(), return setup.m_node.chainman->ActiveChain()), wallet_key);
+        wallet->SetBroadcastTransactions(true);
+        LOCK(cs_main);
+        setup.m_node.chainman->ActiveChainstate().CoinsTip().AddCoin(
+            live_target, Coin{CTxOut{5 * COIN, f.key_script}, 10, false, false, 0}, /*possible_overwrite=*/false);
+    }
+
+    COutPoint FeeInput(TestChain100Setup& setup)
+    {
+        const COutPoint input{uint256S(strprintf("9%03x", next_input++)), 1};
+        LOCK(cs_main);
+        setup.m_node.chainman->ActiveChainstate().CoinsTip().AddCoin(
+            input, Coin{CTxOut{2 * COIN, GetScriptForDestination(PKHash(wallet_key.GetPubKey()))}, 10, false, false, 0}, false);
+        return input;
+    }
+
+    uint256 AddPending(const COutPoint& input, const COutPoint& target, bool automatic,
+                       const std::optional<Consensus::DemurrageAttestationRecord>& record = std::nullopt)
+    {
+        const CTransactionRef tx = AttestationTransaction(f, input, target, record);
+        LOCK(wallet->cs_wallet);
+        BOOST_REQUIRE(wallet->AddToWallet(tx, TxStateInactive{}, [&](CWalletTx& wtx, bool) {
+            if (automatic) wtx.mapValue["comment"] = "Quantum Quasar demurrage auto-attestation";
+            return true;
+        }));
+        return tx->GetHash();
+    }
+};
+
+const PendingWalletAttestation* Entry(const std::vector<PendingWalletAttestation>& pending, const uint256& txid)
+{
+    for (const PendingWalletAttestation& entry : pending) if (entry.txid == txid) return &entry;
+    return nullptr;
+}
+} // namespace
+
+BOOST_AUTO_TEST_CASE(an_unusable_pending_attestation_never_hides_a_usable_one_for_the_same_key)
+{
+    KeyDecisionFixture fx(*this);
+    const Consensus::Params& consensus = Params().GetConsensus();
+    const int height = 150;
+    const int64_t time = 1700000000;
+    const uint256 manual_unusable = fx.AddPending(fx.FeeInput(*this), fx.dead_target, /*automatic=*/false);
+    const uint256 usable_outside_mempool = fx.AddPending(fx.FeeInput(*this), fx.live_target, /*automatic=*/false);
+
+    LOCK(cs_main);
+    LOCK(fx.wallet->cs_wallet);
+    const CCoinsViewCache& view = m_node.chainman->ActiveChainstate().CoinsTip();
+    const std::vector<PendingWalletAttestation> pending = PendingWalletDemurrageAttestations(*fx.wallet);
+    const PendingWalletAttestation* bad = Entry(pending, manual_unusable);
+    const PendingWalletAttestation* good = Entry(pending, usable_outside_mempool);
+    BOOST_REQUIRE(bad && good);
+    BOOST_CHECK(!good->in_mempool);
+    BOOST_CHECK(ClassifyPendingAttestation(*fx.wallet, view, consensus, height, time, *bad, std::nullopt) == PendingAttestationUse::UNUSABLE);
+
+    // Either order (the wallet's map order is not defined): the usable entry suppresses construction, is
+    // offered again, and the manual unusable one is preserved.
+    for (const bool unusable_first : {true, false}) {
+        const std::vector<const PendingWalletAttestation*> order = unusable_first
+            ? std::vector<const PendingWalletAttestation*>{bad, good}
+            : std::vector<const PendingWalletAttestation*>{good, bad};
+        const KeyPendingDecision decision = DecidePendingAttestationsForKey(*fx.wallet, view, consensus, height, time, order, std::nullopt);
+        BOOST_CHECK(decision.suppress_construction);
+        BOOST_REQUIRE(decision.reported != nullptr);
+        BOOST_CHECK(decision.reported->txid == usable_outside_mempool);
+        BOOST_CHECK(decision.reported_use == PendingAttestationUse::REUSABLE);
+        BOOST_REQUIRE_EQUAL(decision.to_resubmit.size(), size_t{1});
+        BOOST_CHECK(decision.to_resubmit.front() == usable_outside_mempool);
+        BOOST_CHECK(decision.to_abandon.empty());
+    }
+
+    // Only the unusable one: construction is not suppressed, and a manual transaction is still not cleaned up.
+    {
+        const KeyPendingDecision decision = DecidePendingAttestationsForKey(*fx.wallet, view, consensus, height, time, {bad}, std::nullopt);
+        BOOST_CHECK(!decision.suppress_construction);
+        BOOST_CHECK(decision.reported == nullptr);
+        BOOST_CHECK(decision.to_resubmit.empty());
+        BOOST_CHECK(decision.to_abandon.empty());
+    }
+    // Usable but temporarily unavailable (broadcasting off) still suppresses, and is kept, not offered.
+    fx.wallet->SetBroadcastTransactions(false);
+    {
+        const KeyPendingDecision decision = DecidePendingAttestationsForKey(*fx.wallet, view, consensus, height, time, {bad, good}, std::nullopt);
+        BOOST_CHECK(decision.suppress_construction);
+        BOOST_CHECK(decision.reported_use == PendingAttestationUse::TEMPORARILY_UNAVAILABLE);
+        BOOST_CHECK(decision.to_resubmit.empty());
+    }
+}
+
+BOOST_AUTO_TEST_CASE(unusable_automatic_attestations_are_cleaned_up_separately_and_never_under_a_usable_child)
+{
+    KeyDecisionFixture fx(*this);
+    const Consensus::Params& consensus = Params().GetConsensus();
+    const int height = 150;
+    const int64_t time = 1700000000;
+    const uint256 automatic_unusable = fx.AddPending(fx.FeeInput(*this), fx.dead_target, /*automatic=*/true);
+    const uint256 usable = fx.AddPending(fx.FeeInput(*this), fx.live_target, /*automatic=*/true);
+    // A usable attestation that spends an output of the unusable automatic one: abandoning the parent would
+    // abandon it as well, so the parent is kept.
+    const uint256 child = fx.AddPending(COutPoint{automatic_unusable, 0}, fx.live_target, /*automatic=*/false);
+
+    LOCK(cs_main);
+    LOCK(fx.wallet->cs_wallet);
+    const CCoinsViewCache& view = m_node.chainman->ActiveChainstate().CoinsTip();
+    const std::vector<PendingWalletAttestation> pending = PendingWalletDemurrageAttestations(*fx.wallet);
+    const PendingWalletAttestation* bad = Entry(pending, automatic_unusable);
+    const PendingWalletAttestation* good = Entry(pending, usable);
+    const PendingWalletAttestation* kid = Entry(pending, child);
+    BOOST_REQUIRE(bad && good && kid);
+    BOOST_CHECK(bad->automatic && !bad->in_mempool);
+
+    // Alongside a usable entry the unusable automatic one is cleaned up, and construction is suppressed.
+    KeyPendingDecision decision = DecidePendingAttestationsForKey(*fx.wallet, view, consensus, height, time, {bad, good}, std::nullopt);
+    BOOST_CHECK(decision.suppress_construction);
+    BOOST_REQUIRE_EQUAL(decision.to_abandon.size(), size_t{1});
+    BOOST_CHECK(decision.to_abandon.front() == automatic_unusable);
+    // Alone, it is cleaned up and construction proceeds.
+    decision = DecidePendingAttestationsForKey(*fx.wallet, view, consensus, height, time, {bad}, std::nullopt);
+    BOOST_CHECK(!decision.suppress_construction);
+    BOOST_REQUIRE_EQUAL(decision.to_abandon.size(), size_t{1});
+    // With a usable child that spends it, it is kept.
+    decision = DecidePendingAttestationsForKey(*fx.wallet, view, consensus, height, time, {bad, kid}, std::nullopt);
+    BOOST_CHECK(decision.suppress_construction);
+    BOOST_CHECK(decision.to_abandon.empty());
 }
 
 BOOST_AUTO_TEST_SUITE_END()

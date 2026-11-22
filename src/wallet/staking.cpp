@@ -967,6 +967,49 @@ PendingAttestationUse ClassifyPendingAttestation(const CWallet& wallet, const CC
     return PendingAttestationUse::REUSABLE;
 }
 
+KeyPendingDecision DecidePendingAttestationsForKey(const CWallet& wallet, const CCoinsViewCache& view,
+                                                   const Consensus::Params& consensus, int evaluation_height,
+                                                   int64_t evaluation_time,
+                                                   const std::vector<const PendingWalletAttestation*>& key_pending,
+                                                   const std::optional<Consensus::DemurrageAttestationRecord>& record)
+{
+    AssertLockHeld(wallet.cs_wallet);
+    KeyPendingDecision decision;
+    std::vector<const PendingWalletAttestation*> unusable_automatic;
+    std::set<uint256> usable_parents; // transactions that a usable entry spends from
+    const PendingWalletAttestation* resubmit{nullptr};
+    bool usable_in_mempool{false};
+    for (const PendingWalletAttestation* entry : key_pending) {
+        // An entry that references another state is classified unusable by the same call.
+        const PendingAttestationUse use = ClassifyPendingAttestation(
+            wallet, view, consensus, evaluation_height, evaluation_time, *entry, record);
+        if (use == PendingAttestationUse::UNUSABLE) {
+            // Only a transaction the automatic path created is cleaned up, and never one the mempool holds.
+            if (entry->automatic && !entry->in_mempool) unusable_automatic.push_back(entry);
+            continue;
+        }
+        decision.suppress_construction = true;
+        if (!decision.reported || (entry->in_mempool && !decision.reported->in_mempool)) {
+            decision.reported = entry;
+            decision.reported_use = use;
+        }
+        if (entry->in_mempool) {
+            usable_in_mempool = true;
+        } else if (use == PendingAttestationUse::REUSABLE && !resubmit) {
+            resubmit = entry;
+        }
+        const auto wtx_it = wallet.mapWallet.find(entry->txid);
+        if (wtx_it != wallet.mapWallet.end() && wtx_it->second.tx) {
+            for (const CTxIn& txin : wtx_it->second.tx->vin) usable_parents.insert(txin.prevout.hash);
+        }
+    }
+    if (resubmit && !usable_in_mempool) decision.to_resubmit.push_back(resubmit->txid);
+    for (const PendingWalletAttestation* entry : unusable_automatic) {
+        if (!usable_parents.count(entry->txid)) decision.to_abandon.push_back(entry->txid);
+    }
+    return decision;
+}
+
 
 std::vector<WalletShadowSolveReference> GetWalletShadowSolveReferences(const CWallet& wallet, int tip_height)
 {
@@ -1549,7 +1592,7 @@ int MaybeAutoDemurrageAttest(CWallet& wallet)
         std::vector<PendingWalletAttestation> pending_attestations;
         bool pending_scanned{false};
         std::set<uint256> suppressed_keys;
-        std::set<uint256> stale_scanned_keys;
+        std::map<uint256, KeyPendingDecision> key_decisions;
         std::map<uint256, std::vector<const PendingWalletAttestation*>> pending_by_key;
         for (const COutput& out : available_list.All()) {
             if (!IsQuantumMigrationScript(out.txout.scriptPubKey)) continue;
@@ -1585,48 +1628,40 @@ int MaybeAutoDemurrageAttest(CWallet& wallet)
                 pending_attestations = PendingWalletDemurrageAttestations(wallet);
                 // Indexed by key once, so that a wallet with many outputs and many pending transactions does a
                 // lookup per key instead of walking the whole pending list for every output.
+                // Considered in transaction id order, so that the choice among several usable entries does not
+                // depend on the wallet's unordered map.
+                std::sort(pending_attestations.begin(), pending_attestations.end(),
+                          [](const PendingWalletAttestation& a, const PendingWalletAttestation& b) {
+                              return a.txid < b.txid;
+                          });
                 for (const PendingWalletAttestation& entry : pending_attestations) {
                     pending_by_key[entry.key_hash].push_back(&entry);
                 }
                 pending_scanned = true;
             }
-            const std::optional<Consensus::DemurrageAttestationRecord> latest_record =
-                Consensus::LatestDemurrageAttestationRecord(view, *key_hash);
-            const std::vector<const PendingWalletAttestation*> no_pending;
-            const auto key_pending_it = pending_by_key.find(*key_hash);
-            const std::vector<const PendingWalletAttestation*>& key_pending =
-                key_pending_it == pending_by_key.end() ? no_pending : key_pending_it->second;
-            const PendingWalletAttestation* matched = nullptr;
-            for (const PendingWalletAttestation* entry : key_pending) {
-                if (PendingAttestationReferencesRecord(*entry, latest_record)) {
-                    matched = entry;
-                    break;
-                }
+            auto decision_it = key_decisions.find(*key_hash);
+            if (decision_it == key_decisions.end()) {
+                // The key-level decision, once per scan: every pending entry for the key is examined, and any
+                // usable one suppresses a new attestation.
+                const std::optional<Consensus::DemurrageAttestationRecord> latest_record =
+                    Consensus::LatestDemurrageAttestationRecord(view, *key_hash);
+                const auto key_pending_it = pending_by_key.find(*key_hash);
+                const std::vector<const PendingWalletAttestation*> no_pending;
+                decision_it = key_decisions.emplace(*key_hash, DecidePendingAttestationsForKey(
+                    wallet, view, consensus, evaluation_height, evaluation_time,
+                    key_pending_it == pending_by_key.end() ? no_pending : key_pending_it->second, latest_record)).first;
+                to_resubmit.insert(decision_it->second.to_resubmit.begin(), decision_it->second.to_resubmit.end());
+                to_abandon.insert(decision_it->second.to_abandon.begin(), decision_it->second.to_abandon.end());
             }
-            if (const PendingWalletAttestation* pending = matched) {
-                const PendingAttestationUse use = ClassifyPendingAttestation(
-                    wallet, view, consensus, evaluation_height, evaluation_time, *pending, latest_record);
-                if (use == PendingAttestationUse::UNUSABLE) {
-                    // Its target or an input is gone. Only a transaction the automatic path created is cleaned
-                    // up automatically, and never one the mempool still holds.
-                    if (pending->automatic && !pending->in_mempool) to_abandon.insert(pending->txid);
-                } else {
-                    if (use == PendingAttestationUse::REUSABLE && !pending->in_mempool) to_resubmit.insert(pending->txid);
-                    if (suppressed_keys.insert(*key_hash).second) {
-                        wallet.WalletLogPrintf("Demurrage auto-attest suppressed for key %s: attestation %s for the same state is already pending in this wallet%s\n",
-                                               key_hash->ToString(), pending->txid.ToString(),
-                                               pending->in_mempool ? "" : (use == PendingAttestationUse::REUSABLE ? " (submitting it again)" : " (kept: it cannot be submitted now)"));
-                    }
-                    continue;
+            const KeyPendingDecision& key_decision = decision_it->second;
+            if (key_decision.suppress_construction) {
+                if (suppressed_keys.insert(*key_hash).second) {
+                    const PendingWalletAttestation& pending = *key_decision.reported;
+                    wallet.WalletLogPrintf("Demurrage auto-attest suppressed for key %s: attestation %s for the same state is already pending in this wallet%s\n",
+                                           key_hash->ToString(), pending.txid.ToString(),
+                                           pending.in_mempool ? "" : (key_decision.reported_use == PendingAttestationUse::REUSABLE ? " (submitting it again)" : " (kept: it cannot be submitted now)"));
                 }
-            }
-            // Attestations of the automatic path that reference a state this key no longer has cannot confirm.
-            if (stale_scanned_keys.insert(*key_hash).second) {
-                for (const PendingWalletAttestation* entry : key_pending) {
-                    if (entry->automatic && !entry->in_mempool && !PendingAttestationReferencesRecord(*entry, latest_record)) {
-                        to_abandon.insert(entry->txid);
-                    }
-                }
+                continue;
             }
 
             AutoDemurrageAttestCandidate candidate;

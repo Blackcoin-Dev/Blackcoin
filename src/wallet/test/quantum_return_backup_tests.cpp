@@ -2,6 +2,7 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
+#include <chainparams.h>
 #include <common/args.h>
 #include <test/util/setup_common.h>
 #include <util/fs.h>
@@ -213,6 +214,73 @@ BOOST_AUTO_TEST_CASE(a_generation_on_disk_needs_its_manifest_and_only_generation
     BOOST_CHECK(fs::exists(directory / fs::PathFromString(no_manifest)));
     BOOST_CHECK(fs::exists(directory / fs::PathFromString(truncated)));
     BOOST_CHECK_EQUAL(NextQuantumKeyBackupSequence(directory), uint64_t{6});
+}
+
+namespace {
+/** Test-chain fault injection of the directory commit, and a default chain again afterwards. */
+class ScopedDirectoryCommitFault
+{
+public:
+    explicit ScopedDirectoryCommitFault(const std::string& name)
+    {
+        SelectParams(ChainType::REGTEST);
+        gArgs.ForceSetArg("-quantumreturnfailcommit", name);
+    }
+    ~ScopedDirectoryCommitFault()
+    {
+        gArgs.ForceSetArg("-quantumreturnfailcommit", "");
+        SelectParams(ChainType::MAIN);
+    }
+};
+} // namespace
+
+// Every directory the wallet's backup path needs is made private on its own, so a permissive umask cannot widen one,
+// and each is committed to disk with its entry in the directory above before anything is backed up into it.
+#ifndef WIN32
+BOOST_AUTO_TEST_CASE(created_backup_directories_are_private_whatever_the_umask)
+{
+    const mode_t previous = ::umask(0);
+    const fs::path directory = m_path_root / "umask-base" / "level-one" / "wallet";
+    std::string error;
+    const bool made = EnsureQuantumKeyBackupDirectory(directory, error);
+    ::umask(previous);
+    BOOST_REQUIRE_MESSAGE(made, error);
+    for (const fs::path& path : {m_path_root / "umask-base", m_path_root / "umask-base" / "level-one", directory}) {
+        struct stat st;
+        BOOST_REQUIRE_EQUAL(::stat(fs::PathToString(path).c_str(), &st), 0);
+        BOOST_CHECK_MESSAGE((st.st_mode & 0777) == 0700U, fs::PathToString(path) << " has mode " << (st.st_mode & 0777));
+    }
+}
+#endif
+
+BOOST_AUTO_TEST_CASE(a_failed_commit_of_a_new_backup_directory_or_its_parent_entry_fails_the_preparation)
+{
+    const fs::path directory = m_path_root / "durable-base" / "level-one" / "wallet";
+    std::string error;
+    // The entry of each directory made, the wallet's own directory and the base above it: each commit failing stops it.
+    for (const std::string name : {"durable-base", "level-one", "wallet"}) {
+        error.clear();
+        {
+            ScopedDirectoryCommitFault fault{name};
+            BOOST_CHECK_MESSAGE(!EnsureQuantumKeyBackupDirectory(directory, error), "commit of " << name << " did not fail the preparation");
+            BOOST_CHECK_MESSAGE(error.find("durable") != std::string::npos, error);
+            // The directories now exist (a failed attempt left them in the page cache), yet the next attempt does not
+            // take them as durable: the same failure is seen again.
+            error.clear();
+            BOOST_CHECK_MESSAGE(!EnsureQuantumKeyBackupDirectory(directory, error), "retry skipped the commit of " << name);
+            BOOST_CHECK(error.find("durable") != std::string::npos);
+        }
+    }
+    // The fault is for a test chain only.
+    SelectParams(ChainType::MAIN);
+    gArgs.ForceSetArg("-quantumreturnfailcommit", "wallet");
+    error.clear();
+    BOOST_CHECK_MESSAGE(EnsureQuantumKeyBackupDirectory(directory, error), error);
+    // And without it the directories are made and committed.
+    gArgs.ForceSetArg("-quantumreturnfailcommit", "");
+    const fs::path other = m_path_root / "durable-other" / "wallet";
+    BOOST_CHECK_MESSAGE(EnsureQuantumKeyBackupDirectory(other, error), error);
+    BOOST_CHECK(fs::is_directory(other));
 }
 
 BOOST_AUTO_TEST_CASE(the_backup_directory_defaults_under_the_network_data_directory)

@@ -1558,6 +1558,41 @@ BOOST_FIXTURE_TEST_CASE(a_pending_key_whose_backup_failed_before_the_window_ende
     BOOST_CHECK_EQUAL(prep.detail, "the window has passed");
 }
 
+// The directories that hold the backup are made durable before the key is activated: when the commit of a new
+// directory's entry fails, the key stays pending with the previous destination, and the retry completes it.
+// (The failure is injected through a test-chain-only option, -quantumreturnfailcommit.)
+BOOST_FIXTURE_TEST_CASE(a_failed_commit_of_a_new_backup_directory_keeps_the_new_key_pending, LegacyStakeWindowSetup)
+{
+    using Outcome = QuantumStakeReturnPreparation::Outcome;
+    ScopedArgsRestore restore_args;
+    const fs::path base = m_path_root / "qkb-durable" / "inner";
+    ScopedQuantumBackupDir backups{base};
+    auto wallet = CreateSyncedDiskWallet(*this, coinbaseKey, "durable-wallet");
+    ScopedArgsRestore fault_scope;
+    gArgs.ForceSetArg("-quantumreturnfailcommit", "inner"); // the entry of the base directory made for this wallet
+    QuantumStakeReturnPreparation prep = PrepareQuantumStakeReturn(*wallet, QuantumStakeReturnTrigger::EXPLICIT, true);
+    BOOST_CHECK(prep.outcome == Outcome::PENDING_BACKUP);
+    BOOST_CHECK_MESSAGE(prep.detail.find("durable") != std::string::npos, prep.detail);
+    {
+        LOCK(wallet->cs_wallet);
+        BOOST_CHECK(wallet->m_quantum_stake_return.empty());
+        BOOST_CHECK(wallet->m_quantum_return_pending.has_value());
+        BOOST_CHECK_EQUAL(wallet->ListQuantumKeyInfos().size(), size_t{1});
+    }
+    // No backup was made while the directory was not durable.
+    const fs::path directory = base / fs::PathFromString(QuantumKeyBackupWalletComponent("durable-wallet"));
+    BOOST_CHECK(ListQuantumKeyBackupGenerations(directory).empty());
+    // Still failing: the retry does not take the directories left by the first attempt as durable.
+    prep = PrepareQuantumStakeReturn(*wallet, QuantumStakeReturnTrigger::EXPLICIT);
+    BOOST_CHECK(prep.outcome == Outcome::PENDING_BACKUP);
+    BOOST_CHECK(WITH_LOCK(wallet->cs_wallet, return wallet->m_quantum_stake_return.empty()));
+    gArgs.ForceSetArg("-quantumreturnfailcommit", "");
+    prep = PrepareQuantumStakeReturn(*wallet, QuantumStakeReturnTrigger::EXPLICIT);
+    BOOST_CHECK(prep.outcome == Outcome::CREATED_ADDRESS);
+    BOOST_CHECK_EQUAL(WITH_LOCK(wallet->cs_wallet, return wallet->ListQuantumKeyInfos().size()), size_t{1});
+    BOOST_CHECK_EQUAL(ListQuantumKeyBackupGenerations(directory).size(), size_t{1});
+}
+
 BOOST_FIXTURE_TEST_CASE(concurrent_preparations_make_one_key_and_one_backup, LegacyStakeWindowSetup)
 {
     ScopedQuantumBackupDir backups{m_path_root / "qkb-concurrent"};

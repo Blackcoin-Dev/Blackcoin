@@ -4,6 +4,7 @@
 
 #include <wallet/quantum_return_backup.h>
 
+#include <chainparams.h>
 #include <common/args.h>
 #include <crypto/sha256.h>
 #include <logging.h>
@@ -20,6 +21,7 @@
 #include <cstdio>
 #include <map>
 #include <optional>
+#include <set>
 #include <system_error>
 
 #ifndef WIN32
@@ -48,6 +50,18 @@ bool IsDigits(std::string_view s)
 bool IsLowerHex(std::string_view s)
 {
     return !s.empty() && std::all_of(s.begin(), s.end(), [](char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'); });
+}
+
+/** Make a directory and its entry in the directory above it durable. Without the second step a power loss can
+ *  keep the files below while the directory's own name is lost. On a test chain,
+ *  -quantumreturnfailcommit=<name> makes the commit of the entry of the directory called <name> fail, which is
+ *  how the tests show that a failure here keeps the key pending. Never reachable on a production chain. */
+bool CommitDirectoryEntry(const fs::path& directory)
+{
+    if (!DirectoryCommit(directory)) return false;
+    if (Params().IsTestChain() && gArgs.GetArg("-quantumreturnfailcommit", "") == fs::PathToString(directory.filename())) return false;
+    const fs::path parent = directory.parent_path();
+    return DirectoryCommit(parent.empty() ? fs::path{"."} : parent);
 }
 
 std::string ManifestName(const std::string& file_name)
@@ -147,6 +161,7 @@ bool EnsureQuantumKeyBackupDirectory(const fs::path& directory, std::string& err
             missing.push_back(path);
             if (path == path.parent_path()) break;
         }
+        std::set<fs::path> committed;
         for (auto it = missing.rbegin(); it != missing.rend(); ++it) {
 #ifndef WIN32
             if (::mkdir(it->c_str(), S_IRWXU) != 0 && errno != EEXIST) {
@@ -161,6 +176,17 @@ bool EnsureQuantumKeyBackupDirectory(const fs::path& directory, std::string& err
                 return false;
             }
 #endif
+            // Each directory made here is made durable, with its entry in the directory above it, before the next
+            // one and before the backup and the activation of the key it protects. When that fails the directory
+            // is taken away again (it is empty), so that the next attempt makes and commits it anew instead of
+            // finding it and taking it as durable.
+            if (!CommitDirectoryEntry(*it)) {
+                std::error_code ignored;
+                fs::remove(*it, ignored);
+                error = strprintf("cannot make the new backup directory %s durable", fs::PathToString(*it));
+                return false;
+            }
+            committed.insert(*it);
         }
         if (!fs::is_directory(directory)) {
             error = strprintf("the backup path %s is not a directory", fs::PathToString(directory));
@@ -177,6 +203,15 @@ bool EnsureQuantumKeyBackupDirectory(const fs::path& directory, std::string& err
             }
         }
 #endif
+        // The wallet's directory and the base above it are committed on every call as well: one a failed or
+        // interrupted earlier attempt left only in the page cache is not taken as durable.
+        for (const fs::path& path : std::array<fs::path, 2>{directory, directory.parent_path()}) {
+            if (path.empty() || committed.count(path)) continue;
+            if (!CommitDirectoryEntry(path)) {
+                error = strprintf("cannot make the backup directory %s durable", fs::PathToString(path));
+                return false;
+            }
+        }
     } catch (const fs::filesystem_error& e) {
         error = strprintf("the backup directory %s is not usable: %s", fs::PathToString(directory), fsbridge::get_filesystem_error_message(e));
         return false;

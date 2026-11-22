@@ -441,6 +441,11 @@ operator can see before the last Gold Rush block (height 6,192,999), in plain la
   pending record, so it may treat a new quantum key that is still waiting for its first verified
   backup like any other key. Finish the pending backup (`setquantumstakereturn`) before
   downgrading, and do not use a pending key for anything while 30.1.6 runs.
+- **A newly created encrypted legacy-format wallet can miss incoming confirmed transactions.** A legacy
+  (Berkeley DB) wallet that is created with a passphrase does not refresh its cached birth time when its key
+  generation runs after encryption, so every block counts as older than the wallet and nothing in it is added
+  until the node is restarted and the blocks that were missed are rescanned (`rescanblockchain`). This is present
+  in 30.1.6 as well and is not changed in 30.1.7. Descriptor wallets are not affected.
 
 ## Version identity
 

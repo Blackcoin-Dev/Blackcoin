@@ -90,11 +90,12 @@ class OldBackupRecoveryTest(TransitionTFinalTestBase, BitcoinTestFramework):
             self.generatetoaddress(n0, 1, legacy_addr, sync_fun=self.sync_all)
             self.bump()
             if passphrase and not self.options.descriptors:
-                # A legacy (BDB) wallet created with a passphrase never connects its key-time notifier to the wallet's
-                # birth time (CWallet::ConnectScriptPubKeyManNotifiers runs before the key manager exists), so the
-                # birth time stays unknown, every block counts as older than the wallet and nothing is added to it
-                # ("0 live wallet outputs indexed for staking"). v30.1.6 does the same. A rescan reads the block it
-                # missed; the key manager is connected after the next restart.
+                # A legacy (BDB) wallet created with a passphrase: its key manager exists before the post-encryption
+                # key generation, and the key-time notifications of that generation happen BEFORE PublishRuntimeWallet
+                # connects the notifiers, so the cached wallet birth time is never refreshed. Every block then counts
+                # as older than the wallet and nothing is added to it ("0 live wallet outputs indexed for staking").
+                # v30.1.6 does the same; descriptor wallets are not affected. Not fixed in 30.1.7 (see the release
+                # notes): a rescan reads the block that was missed.
                 n0.syncwithvalidationinterfacequeue()
                 wallet.rescanblockchain()
                 assert_equal(wallet.getwalletinfo()["txcount"], 1)

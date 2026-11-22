@@ -4062,7 +4062,7 @@ RPCHelpMan getmigrationstatus()
                     {RPCResult::Type::STR_AMOUNT, "burned_amount", "value removed by demurrage"},
                 }},
             }},
-            {RPCResult::Type::NUM, "legacy_staking_last_height", /*optional=*/true, "last block height at which this wallet still creates a legacy coinstake that pays a legacy output (absent without a height-authoritative schedule); from the next height a wallet with a ready quantum stake return address pays legacy stakes to that address and one without it stops legacy staking"},
+            {RPCResult::Type::NUM, "legacy_staking_last_height", /*optional=*/true, "last block height at which this wallet still creates a legacy coinstake that pays a legacy output (absent without a height-authoritative schedule). The wallet stops creating legacy return outputs one block before the last height from which they could mature for spending in Migration; from the next height a wallet with a ready quantum stake return address pays legacy stakes to that address (a quantum return) and one without it stops legacy staking"},
             {RPCResult::Type::STR, "legacy_staking_notice", /*optional=*/true, "plain-language notice: when legacy stakes start to be paid to a quantum address, whether the return address is ready, and migrating legacy coins that do not stake before Final"},
             {RPCResult::Type::NUM, "legacy_staking_window_start_height", /*optional=*/true, "first block height at which a legacy stake is paid to a quantum address"},
             {RPCResult::Type::BOOL, "legacy_staking_in_window", /*optional=*/true, "whether the next block is inside that window"},

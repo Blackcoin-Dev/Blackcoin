@@ -978,7 +978,9 @@ private:
      * Full demurrage attestation verification (ML-DSA signatures included) for mempool admission.
      * It runs after every cheap decision that can reject non-punitively (input value, locks,
      * minimum fee, standardness, sequence locks, feerate, mempool chain limits), so no signature
-     * is verified for a transaction that is then turned away without punishing its sender.
+     * is verified for a transaction that one of those decisions turns away without punishing its
+     * sender. It is not a guarantee about every later rejection: script-policy failures and the
+     * final mempool trimming can still reject a transaction whose signatures were verified.
      * Reads through the view with its mempool backend, exactly as the check did when it ran earlier.
      */
     Consensus::DemurrageAttestationValidationResult VerifyDemurrageAttestations(

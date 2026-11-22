@@ -51,8 +51,9 @@ and earlier.
   inputs; a batch is always cut to fit a standard transaction). The result lists how many outputs
   remain (`remaining_inputs`, `remaining_amount`, `more_batches`); call again with
   `existing_address` set to the returned destination until `more_batches` is false. A partial batch
-  always leaves a way to finish: once no legacy anchor is left, the confirmed quantum output of the
-  earlier batch anchors and funds the next one (and funds a tail that cannot pay its own fee); its
+  leaves a way to finish only as far as the wallet could simulate it, for the inputs, destination, fee
+  assumptions and eligible remainder it saw: once no legacy anchor is left, the confirmed quantum output of the
+  earlier batch can anchor and fund the next one (and fund a tail that cannot pay its own fee); its
   value is reported separately as `auxiliary_inputs` and `auxiliary_amount`, never as legacy value
   moved. A batch that would strand the rest is refused before anything is committed or broadcast (the first
   transaction has been constructed by then, and signed on the signed path, and is discarded). `more_batches` false means
@@ -164,7 +165,9 @@ outputs the wallet stakes, what it reports, and what it tells the user to do.
   relayed; only the penalty for the sender is gone. Blocks are validated exactly
   as before, and genuinely malformed transactions, bad signatures, a fee that was
   already below the minimum and every rejection that does not depend on the
-  lifecycle phase still penalize the sender.
+  lifecycle phase still penalize the sender. A bad signature is punished when its
+  verification is reached; an earlier rejection that does not penalize (see the
+  attestation check below) can end the admission first.
 - The missing-FORKID case is identified by a distinct internal script error
   value reported with the same text as before; no second script evaluation is
   run and no block-height window applies.
@@ -175,13 +178,19 @@ outputs the wallet stakes, what it reports, and what it tells the user to do.
   peer's is in flight, and a target can become locked in the same way. The check
   looks at the target, the controlling key, the referenced state, the lock state
   and the minimum interval, in the mempool only; a flood of such candidates
-  costs no signature verification. A bad signature on a current state, a target
-  the transaction itself spends and a key that does not control the target are still
-  rejected and still penalize the sender. A target that is not a confirmed unspent coin is
+  costs no signature verification. In the mempool the signature verification itself now comes
+  after the other cheap admission decisions (sequence locks, input value, locks, minimum fee,
+  standardness, signature operation count, feerate, ancestor and package limits), for a single
+  transaction and for a package. A bad signature on a current state is still rejected and
+  penalizes the sender if verification is reached, as does a target the transaction itself spends
+  and a key that does not control the target. A target that is not a confirmed unspent coin is
   turned away earlier, as mempool policy, without a penalty. Block
   validation does not use the check and is unchanged: the same attestation in a
   block is still invalid.
-- The rejection text of `sendrawtransaction` is unchanged. The debug message only
+- The rejection text of `sendrawtransaction` for a transaction with a single failure is as before.
+  A transaction that fails more than one check is reported for the first check it fails, and for a
+  transaction with an attestation that order has changed (the cheap checks now come before the
+  signature verification), so a different failure can be reported first. The debug message only
   states that the transaction conflicts with lifecycle-dependent or demurrage
   rules at the current next-block evaluation point.
 

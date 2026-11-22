@@ -45,6 +45,7 @@
 #include <rpc/util.h>
 #include <script/solver.h>
 #include <shadow.h>
+#include <test/util/allocator_statistics.h>
 #include <test/util/setup_common.h>
 #include <node/interface_ui.h>
 #include <util/strencodings.h>
@@ -5863,10 +5864,13 @@ void TestHistoryRowAllocations()
     };
     const auto legacy = per_row(legacy_before, legacy_after);
     const auto current = per_row(current_before, current_after);
-    qInfo("History row cost (malloc zones, %d rows): rc11 layout %.2f allocations %.1f bytes per row; now %.2f allocations %.1f bytes per row; sizeof %zu -> %zu",
+    if (NATIVE_ALLOCATOR_STATISTICS) qInfo("History row cost (malloc zones, %d rows): rc11 layout %.2f allocations %.1f bytes per row; now %.2f allocations %.1f bytes per row; sizeof %zu -> %zu",
         ROWS, legacy.first, legacy.second, current.first, current.second, sizeof(LegacyRecord), sizeof(TransactionRecord));
-    QVERIFY(current.first < legacy.first / 2);
-    QVERIFY(current.second < legacy.second * 0.7);
+    // Only the native allocator's statistics measure the heap; a sanitizer replaces it.
+    if (NATIVE_ALLOCATOR_STATISTICS) {
+        QVERIFY(current.first < legacy.first / 2);
+        QVERIFY(current.second < legacy.second * 0.7);
+    }
 }
 #endif
 

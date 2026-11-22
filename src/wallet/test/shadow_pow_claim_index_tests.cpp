@@ -7,6 +7,7 @@
 #include <script/script.h>
 #include <script/solver.h>
 #include <shadow.h>
+#include <test/util/allocator_statistics.h>
 #include <test/util/setup_common.h>
 #include <util/string.h>
 #include <wallet/shadow_pow_claim_recovery_types.h>
@@ -267,13 +268,14 @@ BOOST_AUTO_TEST_CASE(claim_index_memory_measurement)
         rc12->claim_txids.insert(txid);
     }
     const auto rc12_after = heap();
-    BOOST_TEST_MESSAGE(strprintf(
+    if (NATIVE_ALLOCATOR_STATISTICS) BOOST_TEST_MESSAGE(strprintf(
         "claim indexes per confirmed authored claim (%u claims): rc12 containers %.0f heap bytes in %.1f allocations; "
         "now %.0f heap bytes in %.1f allocations plus %u bytes in the record; sizeof(CWalletTx) = %u",
         CLAIMS, double(rc12_after.second - rc12_before.second) / CLAIMS, double(rc12_after.first - rc12_before.first) / CLAIMS,
         double(after.second - before.second) / CLAIMS, double(after.first - before.first) / CLAIMS,
         unsigned(sizeof(CWalletTx::ShadowPowIndexState) + sizeof(CWalletTx::ShadowPowRelayFrontier)), unsigned(sizeof(CWalletTx))));
-    BOOST_CHECK((after.second - before.second) * 2 < rc12_after.second - rc12_before.second);
+    // Only the native allocator's statistics measure the heap; a sanitizer replaces it.
+    if (NATIVE_ALLOCATOR_STATISTICS) BOOST_CHECK((after.second - before.second) * 2 < rc12_after.second - rc12_before.second);
 
     // Not folded: the reverse map from a payout to its block (see the report
     // for why). Its cost per confirmed synthetic payout, for reference.
@@ -281,7 +283,7 @@ BOOST_AUTO_TEST_CASE(claim_index_memory_measurement)
     auto block_by_txid = std::make_unique<std::map<uint256, uint256>>();
     for (uint32_t i{0}; i < CLAIMS; ++i) block_by_txid->emplace(claims[i]->GetHash(), uint256{7});
     const auto payout_after = heap();
-    BOOST_TEST_MESSAGE(strprintf("m_confirmed_synthetic_payout_block_by_txid: %.0f heap bytes in %.1f allocations per payout (kept)",
+    if (NATIVE_ALLOCATOR_STATISTICS) BOOST_TEST_MESSAGE(strprintf("m_confirmed_synthetic_payout_block_by_txid: %.0f heap bytes in %.1f allocations per payout (kept)",
                                  double(payout_after.second - payout_before.second) / CLAIMS, double(payout_after.first - payout_before.first) / CLAIMS));
     std::string failure;
     BOOST_CHECK_MESSAGE(wallet.CheckShadowPowClaimIndexConsistencyLocked(&failure), failure);

@@ -126,7 +126,11 @@ class DemurrageAutoAttestKeepPendingTest(BitcoinTestFramework):
             return node.get_wallet_rpc("auto")
 
         def abandoned(wallet, txid):
-            return wallet.gettransaction(txid).get("abandoned", False)
+            # The flag is on the per-output entries of gettransaction, not on the transaction itself.
+            details = wallet.gettransaction(txid)["details"]
+            assert details, "the wallet lists no entry for the transaction"
+            assert all("abandoned" in d for d in details), details
+            return any(d["abandoned"] for d in details)
 
         self.log.info("Broadcasting disabled: the pending attestation is kept and nothing else is signed")
         auto = restart(["-walletbroadcast=0"])

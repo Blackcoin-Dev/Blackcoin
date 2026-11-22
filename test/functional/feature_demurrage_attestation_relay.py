@@ -29,13 +29,24 @@ with a corrupted signature and the same cheap failure is reported for the cheap 
 signature can only be reported by verifying it). The same current attestation with a corrupted
 signature and nothing else wrong is verified and punished (the P2P control for the verification
 path), and the unchanged attestation passes testmempoolaccept with exactly one verification.
+
+Two more cases go through real admission with a valid current attestation and assert that no
+attestation verification pass happens at all:
+
+ * the demurrage value boundary: a fee input that was still inside the grace period at the tip and
+   decays at the next block (it "just crossed the boundary"). The transaction was valid when signed;
+   at the next-block evaluation point its input is worth less than its output. It is turned away as a
+   recent consensus change (not punished). The same transaction with an output no input could pay for
+   at either point is a plain consensus failure (punished). Neither reaches the verification;
+ * a package whose members pass their own checks and is rejected at the package stage (the package
+   ancestor limit, node restarted with -limitancestorcount=1): nothing is verified.
 """
 from decimal import Decimal
 import copy as copy_module
 import time
 
 from test_framework.blocktools import COINBASE_MATURITY
-from test_framework.messages import CTransaction, from_hex, msg_tx
+from test_framework.messages import COIN, CTransaction, from_hex, msg_tx
 from test_framework.p2p import P2PInterface
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import assert_equal, assert_raises_rpc_error
@@ -92,7 +103,7 @@ class DemurrageAttestationRelayTest(BitcoinTestFramework):
         self.set_mt((int(time.time()) & ~0xf) + 16)
         for n in self.nodes:
             n.get_wallet_rpc(self.default_wallet_name).staking(False)
-        node0.createwallet(wallet_name="relay")
+        node0.createwallet(wallet_name="relay", load_on_startup=True)
         wallet = node0.get_wallet_rpc("relay")
         wallet.staking(False)
 
@@ -231,6 +242,31 @@ class DemurrageAttestationRelayTest(BitcoinTestFramework):
         assert_equal(child_entry(result)["reject-reason"], "bad-demurrage-attestation-signature")
         assert_equal(verifications(), count + 2)
 
+        self.log.info("A package rejected at the package stage (ancestor limit) after its members' own checks verifies nothing")
+        self.restart_node(0, extra_args=self.extra_args[0] + ["-limitancestorcount=1", f"-mocktime={self.mt}"])
+        self.set_mt(self.mt)
+        node0.get_wallet_rpc(self.default_wallet_name).staking(False)
+        wallet = node0.get_wallet_rpc("relay")  # loaded at startup; the old proxy is stale after a restart
+        wallet.staking(False)
+        count = verifications()
+        result = node0.testmempoolaccept([p_hex, child_hex])
+        assert not any(r.get("allowed") for r in result), result
+        assert any("package-mempool-limits" in str(r.get("package-error", "")) for r in result), result
+        assert_equal(verifications(), count)  # members passed their cheap checks; the package stage ended it
+        # The same package with a corrupted signature is also turned away at the package stage, unverified.
+        result = node0.testmempoolaccept([p_hex, package_variant(child_tx.vin[0].nSequence, corrupt=True).serialize_with_witness().hex()])
+        assert any("package-mempool-limits" in str(r.get("package-error", "")) for r in result), result
+        assert_equal(verifications(), count)
+        self.restart_node(0, extra_args=self.extra_args[0] + [f"-mocktime={self.mt}"])
+        self.set_mt(self.mt)
+        node0.get_wallet_rpc(self.default_wallet_name).staking(False)
+        wallet = node0.get_wallet_rpc("relay")
+        wallet.staking(False)
+        # Control: with the default limits the same package is verified once per attestation and accepted.
+        result = node0.testmempoolaccept([p_hex, child_hex])
+        assert all(r["allowed"] for r in result), result
+        assert_equal(verifications(), count + 1)
+
         self.log.info("A is signed on node 0 from other inputs and confirms; B is now a validly signed attestation over an old state")
         for txid, vout in b_inputs:
             wallet.lockunspent(False, [{"txid": txid, "vout": vout}])  # A must not reuse B's inputs
@@ -255,6 +291,63 @@ class DemurrageAttestationRelayTest(BitcoinTestFramework):
         bad_peer = node0.add_p2p_connection(P2PInterface())
         bad_peer.send_message(msg_tx(from_hex(CTransaction(), raw)))
         bad_peer.wait_for_disconnect()
+
+        self.log.info("The value boundary: a valid current attestation whose fee input decays at the next block")
+        self.connect_nodes(0, 1)
+        self.sync_blocks()
+        boundary_addr = copy.getnewquantumaddress()["address"]
+        wallet.sendtoaddress(address=boundary_addr, amount=Decimal("3"), change_address=wallet.getnewquantumaddress()["address"])
+        self.generate(1, mining, node=node0)
+        self.sync_blocks()
+        boundary_height = node0.getblockcount()
+        # The coin is created at boundary_height. Its grace period is 24 blocks (six months of four blocks): a
+        # spend in the block at boundary_height + 24 is still free of demurrage, one block later it is not.
+        # Sign at tip boundary_height + 23 (the wallet only uses a fee input that burns nothing next block).
+        self.generate(23, mining, node=node0)
+        self.sync_blocks()
+        assert_equal(node0.getblockcount(), boundary_height + 23)
+        boundary_utxo = [u for u in copy.listunspent(1) if u.get("address") == boundary_addr]
+        assert_equal(len(boundary_utxo), 1)
+        self.disconnect_nodes(0, 1)
+        held = []
+        for u in copy.listunspent(0):
+            if (u["txid"], u["vout"]) != (boundary_utxo[0]["txid"], boundary_utxo[0]["vout"]) and u.get("address") != package_key_addr:
+                copy.lockunspent(False, [{"txid": u["txid"], "vout": u["vout"]}])
+                held.append({"txid": u["txid"], "vout": u["vout"]})
+        x_txid = copy.senddemurrageattestation(package_key_addr)["txid"]
+        x_decoded = node1.getrawtransaction(x_txid, True)
+        assert_equal([(v["txid"], v["vout"]) for v in x_decoded["vin"]], [(boundary_utxo[0]["txid"], boundary_utxo[0]["vout"])])
+        x_hex = node1.getrawtransaction(x_txid)
+        copy.lockunspent(True, held)
+        x_tx = from_hex(CTransaction(), x_hex)
+        # One block later on node 0 alone: the fee input is now past its grace period for the next block.
+        self.generate(1, mining, node=node0)
+        assert_equal(node0.getblockcount(), boundary_height + 24)
+        count = verifications()
+        result = node0.testmempoolaccept([x_hex])[0]
+        assert_equal(result["allowed"], False)
+        # The input is worth less than at the tip, so the fee the wallet left is below the minimum now.
+        assert_equal(result["reject-reason"], "bad-txns-fee-not-enough")
+        peer = node0.add_p2p_connection(P2PInterface())
+        with node0.assert_debug_log(["bad-txns-fee-not-enough"], unexpected_msgs=[verify_line]):
+            peer.send_and_ping(msg_tx(x_tx))
+        assert peer.is_connected, "a fee shortfall caused only by the next block's demurrage is not punished"
+        assert x_txid not in node0.getrawmempool()
+        peer.peer_disconnect()
+        assert_equal(verifications(), count)
+
+        self.log.info("The same attestation paying out more than the input is worth at either point is a consensus failure, unverified")
+        short = copy_module.deepcopy(x_tx)
+        change = [o for o in short.vout if len(o.scriptPubKey) <= 1000][0]
+        change.nValue += 100 * COIN
+        short.rehash()
+        result = node0.testmempoolaccept([short.serialize_with_witness().hex()])[0]
+        assert_equal(result["reject-reason"], "bad-txns-in-belowout")
+        punished = node0.add_p2p_connection(P2PInterface())
+        with node0.assert_debug_log(["bad-txns-in-belowout"], unexpected_msgs=[verify_line]):
+            punished.send_message(msg_tx(short))
+            punished.wait_for_disconnect()
+        assert_equal(verifications(), count)
 
 
 if __name__ == '__main__':

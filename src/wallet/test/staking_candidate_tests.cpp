@@ -1503,6 +1503,61 @@ BOOST_FIXTURE_TEST_CASE(a_new_key_becomes_the_return_address_after_a_verified_ba
     BOOST_CHECK(fs::exists(directory / fs::PathFromString(generations[0].file_name)));
 }
 
+// A backup that failed before the last Migration block is still completed afterwards: the pending key is handled
+// before the automatic path's cutoff after M. The unlock requirement and the pause after a failure stay.
+BOOST_FIXTURE_TEST_CASE(a_pending_key_whose_backup_failed_before_the_window_ended_is_retried_after_final_starts, LegacyStakeWindowSetup)
+{
+    using Outcome = QuantumStakeReturnPreparation::Outcome;
+    const fs::path base = m_path_root / "qkb-after-final";
+    ScopedQuantumBackupDir backups{base};
+    auto wallet = CreateSyncedDiskWallet(*this, coinbaseKey, "after-final-wallet");
+    {
+        std::ofstream{m_path_root / "blocked-after-final"} << "a file";
+        gArgs.ForceSetArg("-quantumkeybackupdir", fs::PathToString(m_path_root / "blocked-after-final" / "below"));
+        const QuantumStakeReturnPreparation prep = PrepareQuantumStakeReturn(*wallet, QuantumStakeReturnTrigger::EXPLICIT, true);
+        BOOST_CHECK(prep.outcome == Outcome::PENDING_BACKUP);
+    }
+    gArgs.ForceSetArg("-quantumkeybackupdir", fs::PathToString(base));
+    const std::string pending_address = WITH_LOCK(wallet->cs_wallet, return EncodeDestination(WitnessUnknown{QUANTUM_MIGRATION_WITNESS_VERSION, wallet->m_quantum_return_pending->witness_program}));
+
+    // Restart-like state at the first Final block: the next block (106) is after the last Migration block (105).
+    mineBlocks(5);
+    BOOST_CHECK_EQUAL(WITH_LOCK(::cs_main, return m_node.chainman->ActiveChain().Height()), 105);
+    BOOST_CHECK(WITH_LOCK(wallet->cs_wallet, return wallet->m_quantum_return_pending.has_value()));
+
+    // Normal unlock requirements are kept: a staking-only unlock does not complete it.
+    wallet->m_quantum_return_retry_at = {};
+    wallet->m_wallet_unlock_staking_only = true;
+    BOOST_CHECK(PrepareQuantumStakeReturn(*wallet, QuantumStakeReturnTrigger::AUTOMATIC).outcome == Outcome::NO_ACTION);
+    BOOST_CHECK(WITH_LOCK(wallet->cs_wallet, return wallet->m_quantum_return_pending.has_value()));
+    wallet->m_wallet_unlock_staking_only = false;
+
+    // The pause after a failure is kept: the retry time of the failed attempt has not come.
+    wallet->m_quantum_return_retry_at = SteadyClock::now() + std::chrono::seconds{60};
+    QuantumStakeReturnPreparation prep = PrepareQuantumStakeReturn(*wallet, QuantumStakeReturnTrigger::AUTOMATIC);
+    BOOST_CHECK(prep.outcome == Outcome::NO_ACTION);
+    BOOST_CHECK(prep.detail.find("retried soon") != std::string::npos);
+    BOOST_CHECK(WITH_LOCK(wallet->cs_wallet, return wallet->m_quantum_return_pending.has_value()));
+
+    // Once it has, the automatic path completes the same key after Final has started.
+    wallet->m_quantum_return_retry_at = {};
+    prep = PrepareQuantumStakeReturn(*wallet, QuantumStakeReturnTrigger::AUTOMATIC);
+    BOOST_CHECK(prep.outcome == Outcome::CREATED_ADDRESS);
+    BOOST_CHECK_EQUAL(prep.address, pending_address);
+    {
+        LOCK(wallet->cs_wallet);
+        BOOST_CHECK(!wallet->m_quantum_return_pending.has_value());
+        BOOST_CHECK_EQUAL(wallet->m_quantum_stake_return, pending_address);
+    }
+    // Nothing else is chosen or made by the automatic path after the window: no pending key, no new choice.
+    gArgs.ForceSetArg("-qqallowautokeycreation", "1");
+    auto other = CreateSyncedDiskWallet(*this, coinbaseKey, "after-final-other");
+    prep = PrepareQuantumStakeReturn(*other, QuantumStakeReturnTrigger::AUTOMATIC);
+    gArgs.ForceSetArg("-qqallowautokeycreation", "0");
+    BOOST_CHECK(prep.outcome == Outcome::NO_ACTION);
+    BOOST_CHECK_EQUAL(prep.detail, "the window has passed");
+}
+
 BOOST_FIXTURE_TEST_CASE(concurrent_preparations_make_one_key_and_one_backup, LegacyStakeWindowSetup)
 {
     ScopedQuantumBackupDir backups{m_path_root / "qkb-concurrent"};

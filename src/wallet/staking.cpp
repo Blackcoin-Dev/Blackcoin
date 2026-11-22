@@ -2832,10 +2832,6 @@ QuantumStakeReturnPreparation PrepareQuantumStakeReturn(CWallet& wallet, Quantum
         prep.detail = "the chain has no tip yet";
         return prep;
     }
-    if (int64_t{*tip_height} + 1 > int64_t{consensus.nQuantumMigrationEndHeight} && trigger == QuantumStakeReturnTrigger::AUTOMATIC) {
-        prep.detail = "the window has passed";
-        return prep;
-    }
     // One preparation at a time per wallet, so concurrent callers produce one key. The mutex is taken before
     // any wallet lock, and the backup below runs with no wallet and no chain lock held.
     AssertLockNotHeld(::cs_main);
@@ -2850,6 +2846,12 @@ QuantumStakeReturnPreparation PrepareQuantumStakeReturn(CWallet& wallet, Quantum
             return prep;
         }
         return FinishPendingQuantumStakeReturn(wallet, prep);
+    }
+    // After the last Migration block the automatic path makes no new choice. A pending key is handled above, before
+    // this cutoff, so a backup that failed earlier is still completed after Final has started.
+    if (int64_t{*tip_height} + 1 > int64_t{consensus.nQuantumMigrationEndHeight} && trigger == QuantumStakeReturnTrigger::AUTOMATIC) {
+        prep.detail = "the window has passed";
+        return prep;
     }
     if (trigger == QuantumStakeReturnTrigger::AUTOMATIC) {
         // Not before Gold Rush has ended, and only for a wallet with legacy coins to return: a pre-end chain

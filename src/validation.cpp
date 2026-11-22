@@ -967,7 +967,23 @@ private:
     // Looks up inputs, calculates feerate, considers replacement, evaluates
     // package limits, etc. As this function can be invoked for "free" by a peer,
     // only tests that are fast should be done here (to avoid CPU DoS).
-    bool PreChecks(ATMPArgs& args, Workspace& ws) EXCLUSIVE_LOCKS_REQUIRED(cs_main, m_pool.cs);
+    /**
+     * @param[in] verify_attestations When false the ML-DSA verification of demurrage attestations is
+     * left to the caller, which runs VerifyDemurrageAttestations() once every cheap decision has
+     * passed (the package path does so for the whole package).
+     */
+    bool PreChecks(ATMPArgs& args, Workspace& ws, bool verify_attestations = true) EXCLUSIVE_LOCKS_REQUIRED(cs_main, m_pool.cs);
+
+    /**
+     * Full demurrage attestation verification (ML-DSA signatures included) for mempool admission.
+     * It runs after every cheap decision that can reject non-punitively (input value, locks,
+     * minimum fee, standardness, sequence locks, feerate, mempool chain limits), so no signature
+     * is verified for a transaction that is then turned away without punishing its sender.
+     * Reads through the view with its mempool backend, exactly as the check did when it ran earlier.
+     */
+    Consensus::DemurrageAttestationValidationResult VerifyDemurrageAttestations(
+        const CTransaction& tx, std::set<uint256>& attested_keys, size_t& attestation_count,
+        std::string& reject_reason) EXCLUSIVE_LOCKS_REQUIRED(cs_main, m_pool.cs);
 
     /*
     // Blackcoin
@@ -1049,7 +1065,33 @@ static void CollectMempoolDemurrageAttestationState(const CTxMemPool& pool,
     pool.GetDemurrageAttestationState(attested_keys, attestation_count);
 }
 
-bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
+Consensus::DemurrageAttestationValidationResult MemPoolAccept::VerifyDemurrageAttestations(
+    const CTransaction& tx, std::set<uint256>& attested_keys, size_t& attestation_count,
+    std::string& reject_reason)
+{
+    AssertLockHeld(cs_main);
+    AssertLockHeld(m_pool.cs);
+    const CBlockIndex* tip = m_active_chainstate.m_chain.Tip();
+    const Consensus::Params& consensus = m_active_chainstate.m_chainman.GetConsensus();
+    const int next_height = tip ? tip->nHeight + 1 : 0;
+    const int64_t next_block_mtp = tip ? tip->GetMedianTimePast() : GetAdjustedTimeSeconds();
+    // One line per verification pass: the functional tests assert that a transaction turned away by a
+    // cheap decision never reaches this point.
+    if (!Consensus::ExtractDemurrageAttestations(tx).empty()) {
+        LogPrint(BCLog::MEMPOOL, "Verifying demurrage attestation signatures of %s\n", tx.GetHash().ToString());
+    }
+    // PreChecks has switched the view to its dummy backend by now; the check reads the attestation
+    // state through the same backend it always read it through.
+    m_view.SetBackend(m_viewmempool);
+    const Consensus::DemurrageAttestationValidationResult result =
+        Consensus::CheckDemurrageAttestationsDetailed(
+            tx, m_view, consensus, next_height, next_block_mtp,
+            attested_keys, attestation_count, reject_reason);
+    m_view.SetBackend(m_dummy);
+    return result;
+}
+
+bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws, bool verify_attestations)
 {
     AssertLockHeld(cs_main);
     AssertLockHeld(m_pool.cs);
@@ -1275,13 +1317,6 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
         if (!consensus.IsDemurrageActive(next_height, next_block_mtp)) {
             return state.Invalid(TxValidationResult::TX_MEMPOOL_POLICY, "demurrage-attestation-premature");
         }
-        std::set<uint256> attested_keys;
-        size_t ignored_mempool_attestation_count{0};
-        CollectMempoolDemurrageAttestationState(m_pool, attested_keys, ignored_mempool_attestation_count);
-        // The 16-attestation cap is a block-construction/consensus cap, not a
-        // global mempool slot limit. Keeping more unique candidates prevents
-        // the first 16 relay arrivals from monopolizing all future blocks.
-        size_t transaction_attestation_count{0};
         for (const Consensus::DemurrageAttestation& attestation : demurrage_attestations) {
             Coin confirmed_target;
             if (!coins_cache.GetCoin(attestation.target_outpoint, confirmed_target) ||
@@ -1298,17 +1333,8 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
         if (!PreflightMempoolDemurrageAttestations(tx, m_view, consensus, next_height, next_block_mtp, state)) {
             return false;
         }
-        std::string demurrage_reject_reason;
-        const Consensus::DemurrageAttestationValidationResult attestation_result =
-            Consensus::CheckDemurrageAttestationsDetailed(
-                tx, m_view, consensus, next_height, next_block_mtp,
-                attested_keys, transaction_attestation_count, demurrage_reject_reason);
-        if (attestation_result == Consensus::DemurrageAttestationValidationResult::LOCAL_INTERNAL_ERROR) {
-            return state.Error(demurrage_reject_reason);
-        }
-        if (attestation_result == Consensus::DemurrageAttestationValidationResult::INVALID) {
-            return state.Invalid(TxValidationResult::TX_CONSENSUS, demurrage_reject_reason);
-        }
+        // The full verification, ML-DSA included, runs at the end of PreChecks, after the cheap
+        // decisions below (VerifyDemurrageAttestations).
     }
 
     // we have all inputs cached now, so switch back to dummy (to protect
@@ -1474,6 +1500,28 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
     }
 
     ws.m_ancestors = *ancestors;
+
+    // Every cheap decision that can turn the transaction away without punishing its sender has
+    // passed: only now pay for the attestation signatures (ML-DSA). The package path defers this to
+    // one pass over the whole package after its own cheap checks.
+    if (verify_attestations && !demurrage_attestations.empty()) {
+        std::set<uint256> attested_keys;
+        size_t ignored_mempool_attestation_count{0};
+        CollectMempoolDemurrageAttestationState(m_pool, attested_keys, ignored_mempool_attestation_count);
+        // The 16-attestation cap is a block-construction/consensus cap, not a
+        // global mempool slot limit. Keeping more unique candidates prevents
+        // the first 16 relay arrivals from monopolizing all future blocks.
+        size_t transaction_attestation_count{0};
+        std::string demurrage_reject_reason;
+        const Consensus::DemurrageAttestationValidationResult attestation_result =
+            VerifyDemurrageAttestations(tx, attested_keys, transaction_attestation_count, demurrage_reject_reason);
+        if (attestation_result == Consensus::DemurrageAttestationValidationResult::LOCAL_INTERNAL_ERROR) {
+            return state.Error(demurrage_reject_reason);
+        }
+        if (attestation_result == Consensus::DemurrageAttestationValidationResult::INVALID) {
+            return state.Invalid(TxValidationResult::TX_CONSENSUS, demurrage_reject_reason);
+        }
+    }
 
     // Blackcoin
     /*
@@ -1846,7 +1894,9 @@ PackageMempoolAcceptResult MemPoolAccept::AcceptMultipleTransactions(const std::
 
     // Do all PreChecks first and fail fast to avoid running expensive script checks when unnecessary.
     for (Workspace& ws : workspaces) {
-        if (!PreChecks(args, ws)) {
+        // Attestation signatures are verified once for the package below, after the package's own
+        // cheap checks, not inside a member's PreChecks ahead of the other members' decisions.
+        if (!PreChecks(args, ws, /*verify_attestations=*/false)) {
             if (ws.m_state.IsError()) {
                 package_state.Error(ws.m_state.GetRejectReason());
             } else {
@@ -1934,31 +1984,9 @@ PackageMempoolAcceptResult MemPoolAccept::AcceptMultipleTransactions(const std::
         }
 
         if (consensus.IsDemurrageActive(next_height, next_block_mtp)) {
-            std::set<uint256> attested_keys;
-            size_t ignored_mempool_attestation_count{0};
-            CollectMempoolDemurrageAttestationState(m_pool, attested_keys, ignored_mempool_attestation_count);
-            size_t package_attestation_count{0};
             for (Workspace& ws : workspaces) {
                 if (!PreflightMempoolDemurrageAttestations(*ws.m_ptx, m_view, consensus, next_height, next_block_mtp, ws.m_state)) {
                     package_state.Invalid(PackageValidationResult::PCKG_TX, "transaction failed");
-                    results.emplace(ws.m_ptx->GetWitnessHash(), MempoolAcceptResult::Failure(ws.m_state));
-                    return PackageMempoolAcceptResult(package_state, std::move(results));
-                }
-                std::string demurrage_reject_reason;
-                const Consensus::DemurrageAttestationValidationResult attestation_result =
-                    Consensus::CheckDemurrageAttestationsDetailed(
-                        *ws.m_ptx, m_view, consensus, next_height, next_block_mtp,
-                        attested_keys, package_attestation_count, demurrage_reject_reason);
-                if (attestation_result != Consensus::DemurrageAttestationValidationResult::VALID) {
-                    if (attestation_result == Consensus::DemurrageAttestationValidationResult::LOCAL_INTERNAL_ERROR) {
-                        ws.m_state.Error(demurrage_reject_reason);
-                        package_state.Error(demurrage_reject_reason);
-                    } else {
-                        ws.m_state.Invalid(TxValidationResult::TX_CONSENSUS,
-                                           demurrage_reject_reason);
-                        package_state.Invalid(PackageValidationResult::PCKG_TX,
-                                              "transaction failed");
-                    }
                     results.emplace(ws.m_ptx->GetWitnessHash(), MempoolAcceptResult::Failure(ws.m_state));
                     return PackageMempoolAcceptResult(package_state, std::move(results));
                 }
@@ -2015,6 +2043,40 @@ PackageMempoolAcceptResult MemPoolAccept::AcceptMultipleTransactions(const std::
     std::string err_string;
     if (txns.size() > 1 && !PackageMempoolChecks(txns, m_total_vsize, package_state)) {
         return PackageMempoolAcceptResult(package_state, std::move(results));
+    }
+
+    // Every cheap package decision has passed (member PreChecks, package feerate, package limits):
+    // verify the attestation signatures now, in one pass over the package with the same accumulated
+    // key set and count the earlier in-line check used.
+    {
+        const CBlockIndex* tip = m_active_chainstate.m_chain.Tip();
+        const Consensus::Params& consensus = m_active_chainstate.m_chainman.GetConsensus();
+        const int next_height = tip ? tip->nHeight + 1 : 0;
+        const int64_t next_block_mtp = tip ? tip->GetMedianTimePast() : args.m_accept_time;
+        if (consensus.IsDemurrageActive(next_height, next_block_mtp)) {
+            std::set<uint256> attested_keys;
+            size_t ignored_mempool_attestation_count{0};
+            CollectMempoolDemurrageAttestationState(m_pool, attested_keys, ignored_mempool_attestation_count);
+            size_t package_attestation_count{0};
+            for (Workspace& ws : workspaces) {
+                std::string demurrage_reject_reason;
+                const Consensus::DemurrageAttestationValidationResult attestation_result =
+                    VerifyDemurrageAttestations(*ws.m_ptx, attested_keys, package_attestation_count, demurrage_reject_reason);
+                if (attestation_result != Consensus::DemurrageAttestationValidationResult::VALID) {
+                    if (attestation_result == Consensus::DemurrageAttestationValidationResult::LOCAL_INTERNAL_ERROR) {
+                        ws.m_state.Error(demurrage_reject_reason);
+                        package_state.Error(demurrage_reject_reason);
+                    } else {
+                        ws.m_state.Invalid(TxValidationResult::TX_CONSENSUS,
+                                           demurrage_reject_reason);
+                        package_state.Invalid(PackageValidationResult::PCKG_TX,
+                                              "transaction failed");
+                    }
+                    results.emplace(ws.m_ptx->GetWitnessHash(), MempoolAcceptResult::Failure(ws.m_state));
+                    return PackageMempoolAcceptResult(package_state, std::move(results));
+                }
+            }
+        }
     }
 
     std::vector<uint256> all_package_wtxids;

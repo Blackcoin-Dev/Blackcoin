@@ -19,8 +19,19 @@ second, now stale, is then relayed to the first node by a peer:
  * the relaying peer stays connected (no punishment);
  * a peer that sends a consensus-invalid transaction (value out above value in) is disconnected,
    so the test would notice if "not punished" were simply "nothing is ever punished".
+
+No signature work may precede a rejection that ends without punishment. The attestation signature
+does not cover the sequence numbers of the enclosing transaction, so variants of one current
+attestation (with a relative lock the fee input cannot meet) carry a valid attestation into the
+mempool's cheap sequence-lock decision. The node logs one line each time it verifies attestation
+signatures (-debug=mempool); the variants must produce none and must not be punished. A variant
+with a corrupted signature and the same cheap failure is reported for the cheap reason (a corrupted
+signature can only be reported by verifying it). The same current attestation with a corrupted
+signature and nothing else wrong is verified and punished (the P2P control for the verification
+path), and the unchanged attestation passes testmempoolaccept with exactly one verification.
 """
 from decimal import Decimal
+import copy as copy_module
 import time
 
 from test_framework.blocktools import COINBASE_MATURITY
@@ -58,6 +69,7 @@ class DemurrageAttestationRelayTest(BitcoinTestFramework):
             f"-qqdemurrageheight={DEMURRAGE_ACTIVATION_HEIGHT}",
             "-qqdemurrageblockspermonth=4",
             "-rpcserialversion=1",  # raw transaction hex keeps the quantum witness
+            "-debug=mempool",
         ]
         self.extra_args = [args, args]
 
@@ -86,6 +98,7 @@ class DemurrageAttestationRelayTest(BitcoinTestFramework):
 
         funder = wallet.getnewaddress("", "legacy")
         attest_addr = wallet.getnewquantumaddress()["address"]
+        package_key_addr = wallet.getnewquantumaddress()["address"]  # a second key, attested by the package test
         fee_addrs = [wallet.getnewquantumaddress()["address"] for _ in range(2)]
         lock_addr = wallet.getnewquantumaddress()["address"]
         mining = wallet.getnewquantumaddress()["address"]
@@ -94,7 +107,7 @@ class DemurrageAttestationRelayTest(BitcoinTestFramework):
         self.generate(COINBASE_MATURITY + 2, funder)
         self.sync_blocks()
         # One transaction funds every output, so each stays an independent, unchained coin.
-        wallet.sendmany("", {attest_addr: Decimal("11"), fee_addrs[0]: Decimal("1"), fee_addrs[1]: Decimal("1"),
+        wallet.sendmany("", {attest_addr: Decimal("11"), package_key_addr: Decimal("11"), fee_addrs[0]: Decimal("1"), fee_addrs[1]: Decimal("1"),
                              lock_addr: Decimal("7")})
         self.generate(1, funder)
         self.log.info("Mine through the Migration window until demurrage is active")
@@ -114,22 +127,121 @@ class DemurrageAttestationRelayTest(BitcoinTestFramework):
         copy.staking(False)
         self.disconnect_nodes(0, 1)
 
-        self.log.info("Both sign an attestation for the same key, from different fee inputs")
-        a_txid = wallet.senddemurrageattestation(attest_addr)["txid"]
-        a_inputs = [(v["txid"], v["vout"]) for v in node0.getrawtransaction(a_txid, True)["vin"]]
-        for txid, vout in a_inputs:
-            copy.lockunspent(False, [{"txid": txid, "vout": vout}])  # B must not reuse A's inputs
+        self.log.info("B is signed on node 1 against the current state, from its own fee inputs")
         b_txid = copy.senddemurrageattestation(attest_addr)["txid"]
         b_inputs = [(v["txid"], v["vout"]) for v in node1.getrawtransaction(b_txid, True)["vin"]]
-        assert not set(a_inputs) & set(b_inputs), (a_inputs, b_inputs)
         b_hex = node1.getrawtransaction(b_txid)
+        b_tx = from_hex(CTransaction(), b_hex)
+        assert b_tx.nVersion >= 2, b_tx.nVersion  # relative locks apply
 
-        self.log.info("A confirms on node 0; B is now a validly signed attestation over an old state")
+        verify_line = "Verifying demurrage attestation signatures of"
+
+        def variant(sequence, corrupt=False):
+            tx = copy_module.deepcopy(b_tx)
+            tx.vin[0].nSequence = sequence  # not covered by the attestation signature
+            if corrupt:
+                attestation_outputs = [o for o in tx.vout if len(o.scriptPubKey) > 1000]
+                assert len(attestation_outputs) == 1, [len(o.scriptPubKey) for o in tx.vout]
+                script = bytearray(attestation_outputs[0].scriptPubKey)
+                script[-50] ^= 0x01  # inside the ML-DSA signature, which ends the payload
+                attestation_outputs[0].scriptPubKey = bytes(script)
+            tx.rehash()
+            return tx
+
+        self.log.info("No signature work before a cheap, non-punitive rejection (relative lock the input cannot meet)")
+        peer = node0.add_p2p_connection(P2PInterface())
+        for k, sequence in enumerate([1000, 2000, 3000]):
+            tx = variant(sequence)
+            with node0.assert_debug_log(["non-BIP68-final"], unexpected_msgs=[verify_line]):
+                peer.send_and_ping(msg_tx(tx))
+            assert tx.hash not in node0.getrawmempool()
+            assert peer.is_connected, "a cheap, non-punitive rejection must not punish"
+        # The same with a corrupted signature: only verification could report it, so the report is the cheap reason.
+        tx = variant(4000, corrupt=True)
+        with node0.assert_debug_log(["non-BIP68-final"], unexpected_msgs=[verify_line, "bad-demurrage-attestation-signature"]):
+            peer.send_and_ping(msg_tx(tx))
+        assert peer.is_connected
+        peer.peer_disconnect()
+
+        self.log.info("The unchanged current attestation is verified exactly once on the way to acceptance")
+        with node0.assert_debug_log([verify_line]):
+            assert_equal(node0.testmempoolaccept([b_hex])[0]["allowed"], True)
+        verified = [ln for ln in open(node0.debug_log_path, encoding="utf8") if verify_line in ln]
+        assert len(verified) == 1, verified
+
+        self.log.info("Control: a current attestation with a corrupted signature is verified and the peer punished")
+        bad_sig_peer = node0.add_p2p_connection(P2PInterface())
+        with node0.assert_debug_log([verify_line, "bad-demurrage-attestation-signature"]):
+            bad_sig_peer.send_message(msg_tx(variant(b_tx.vin[0].nSequence, corrupt=True)))
+            bad_sig_peer.wait_for_disconnect()
+
+        self.log.info("The package path: a parent and a child whose attestation is current")
+        copy_package_addr = copy.getnewquantumaddress()["address"]  # node 1's own address for the parent's output
+        copy_change_addr = copy.getnewquantumaddress()["address"]
+        p_txid = copy.sendtoaddress(address=copy_package_addr, amount=Decimal("2"), change_address=copy_change_addr)
+        p_hex = node1.getrawtransaction(p_txid)
+        p_vout = [i for i, o in enumerate(node1.getrawtransaction(p_txid, True)["vout"])
+                  if o["scriptPubKey"].get("address") == copy_package_addr][0]
+        locked = []
+        for u in copy.listunspent(0):
+            if (u["txid"], u["vout"]) != (p_txid, p_vout) and u.get("address") != package_key_addr:
+                copy.lockunspent(False, [{"txid": u["txid"], "vout": u["vout"]}])
+                locked.append({"txid": u["txid"], "vout": u["vout"]})
+        # The child attests the second key (the first one is pending on node 1) and pays its fee from the parent's output.
+        child_txid = copy.senddemurrageattestation(package_key_addr)["txid"]
+        child_hex = node1.getrawtransaction(child_txid)
+        child_tx = from_hex(CTransaction(), child_hex)
+        assert any(i.prevout.hash == int(p_txid, 16) and i.prevout.n == p_vout for i in child_tx.vin), "the child must spend the parent"
+        copy.lockunspent(True, locked)
+
+        def package_variant(sequence, corrupt=False):
+            tx = copy_module.deepcopy(child_tx)
+            tx.vin[0].nSequence = sequence
+            if corrupt:
+                big = [o for o in tx.vout if len(o.scriptPubKey) > 1000]
+                script = bytearray(big[0].scriptPubKey)
+                script[-50] ^= 0x01
+                big[0].scriptPubKey = bytes(script)
+            tx.rehash()
+            return tx
+
+        def verifications():
+            with open(node0.debug_log_path, encoding="utf8") as f:
+                return len([ln for ln in f if verify_line in ln])
+
+        def package_result(tx):
+            return node0.testmempoolaccept([p_hex, tx.serialize_with_witness().hex()])
+
+        def child_entry(result):
+            return [r for r in result if r["txid"] != p_txid][0]
+
+        count = verifications()
+        for sequence in (1000, 2000):
+            result = package_result(package_variant(sequence))
+            assert_equal(child_entry(result)["reject-reason"], "non-BIP68-final")
+        result = package_result(package_variant(3000, corrupt=True))
+        assert_equal(child_entry(result)["reject-reason"], "non-BIP68-final")
+        assert_equal(verifications(), count)  # no signature was verified for any of them
+
+        result = node0.testmempoolaccept([p_hex, child_hex])
+        assert all(r["allowed"] for r in result), result
+        assert_equal(verifications(), count + 1)  # the genuine package: one verification, for its one attestation
+
+        result = package_result(package_variant(child_tx.vin[0].nSequence, corrupt=True))
+        assert_equal(child_entry(result)["reject-reason"], "bad-demurrage-attestation-signature")
+        assert_equal(verifications(), count + 2)
+
+        self.log.info("A is signed on node 0 from other inputs and confirms; B is now a validly signed attestation over an old state")
+        for txid, vout in b_inputs:
+            wallet.lockunspent(False, [{"txid": txid, "vout": vout}])  # A must not reuse B's inputs
+        a_txid = wallet.senddemurrageattestation(attest_addr)["txid"]
+        a_inputs = [(v["txid"], v["vout"]) for v in node0.getrawtransaction(a_txid, True)["vin"]]
+        assert not set(a_inputs) & set(b_inputs), (a_inputs, b_inputs)
         self.generate(1, mining)
         assert_equal(node0.getrawtransaction(a_txid, True)["confirmations"], 1)
 
         peer = node0.add_p2p_connection(P2PInterface())
-        with node0.assert_debug_log(["stale-demurrage-attestation-state"]):
+        with node0.assert_debug_log(["stale-demurrage-attestation-state"], unexpected_msgs=[verify_line]):
             peer.send_and_ping(msg_tx(from_hex(CTransaction(), b_hex)))
         assert b_txid not in node0.getrawmempool()
         assert peer.is_connected, "relaying a stale attestation must not be punished"

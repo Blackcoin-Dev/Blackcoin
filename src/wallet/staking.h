@@ -535,7 +535,7 @@ struct KeyPendingDecision {
 /** Examines every pending entry for one key (given in the order they are to be considered): any usable
  *  entry whose referenced state is the key's current record, whether or not the mempool holds it,
  *  suppresses construction, and unusable entries never hide a usable one. Unusable automatic entries are
- *  listed for cleanup separately; one that a usable entry spends from is kept. The key's current record is
+ *  listed for cleanup separately (whether one has an unconfirmed descendant is decided at execution). The key's current record is
  *  read here from the chain state of `key_script`: a malformed local state is told apart from a missing
  *  record (IsDemurrageStateSaneForScript) before anything is matched, and then nothing is changed. */
 KeyPendingDecision DecidePendingAttestationsForKey(const CWallet& wallet, const CCoinsViewCache& view,
@@ -543,6 +543,10 @@ KeyPendingDecision DecidePendingAttestationsForKey(const CWallet& wallet, const 
                                                    int64_t evaluation_time, const CScript& key_script,
                                                    const std::vector<const PendingWalletAttestation*>& key_pending)
     EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet);
+/** Cleanup stage: abandons the listed automatic pending attestations, except any that has an unconfirmed,
+ *  not abandoned descendant anywhere in the wallet (any key, direct or indirect), since abandonment is
+ *  recursive. Decided under the wallet lock right before each abandonment. Returns how many were abandoned. */
+size_t AbandonStaleAutomaticAttestations(CWallet& wallet, const std::set<uint256>& candidates);
 int MaybeAutoShadowSignal(CWallet& wallet);
 int MaybeAutoRedelegateQuantumColdStake(CWallet& wallet);
 

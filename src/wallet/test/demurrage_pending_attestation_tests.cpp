@@ -20,6 +20,9 @@
 #include <boost/test/unit_test.hpp>
 
 #include <memory>
+#include <set>
+#include <utility>
+#include <vector>
 
 namespace wallet {
 namespace {
@@ -386,7 +389,7 @@ BOOST_AUTO_TEST_CASE(an_unusable_pending_attestation_never_hides_a_usable_one_fo
     }
 }
 
-BOOST_AUTO_TEST_CASE(unusable_automatic_attestations_are_cleaned_up_separately_and_never_under_a_usable_child)
+BOOST_AUTO_TEST_CASE(unusable_automatic_attestations_are_listed_for_cleanup_separately)
 {
     KeyDecisionFixture fx(*this);
     const Consensus::Params& consensus = Params().GetConsensus();
@@ -394,9 +397,6 @@ BOOST_AUTO_TEST_CASE(unusable_automatic_attestations_are_cleaned_up_separately_a
     const int64_t time = 1700000000;
     const uint256 automatic_unusable = fx.AddPending(fx.FeeInput(*this), fx.dead_target, /*automatic=*/true);
     const uint256 usable = fx.AddPending(fx.FeeInput(*this), fx.live_target, /*automatic=*/true);
-    // A usable attestation that spends an output of the unusable automatic one: abandoning the parent would
-    // abandon it as well, so the parent is kept.
-    const uint256 child = fx.AddPending(COutPoint{automatic_unusable, 0}, fx.live_target, /*automatic=*/false);
 
     LOCK(cs_main);
     LOCK(fx.wallet->cs_wallet);
@@ -404,23 +404,159 @@ BOOST_AUTO_TEST_CASE(unusable_automatic_attestations_are_cleaned_up_separately_a
     const std::vector<PendingWalletAttestation> pending = PendingWalletDemurrageAttestations(*fx.wallet);
     const PendingWalletAttestation* bad = Entry(pending, automatic_unusable);
     const PendingWalletAttestation* good = Entry(pending, usable);
-    const PendingWalletAttestation* kid = Entry(pending, child);
-    BOOST_REQUIRE(bad && good && kid);
+    BOOST_REQUIRE(bad && good);
     BOOST_CHECK(bad->automatic && !bad->in_mempool);
 
-    // Alongside a usable entry the unusable automatic one is cleaned up, and construction is suppressed.
+    // Alongside a usable entry the unusable automatic one is listed, and construction is suppressed.
     KeyPendingDecision decision = DecidePendingAttestationsForKey(*fx.wallet, view, consensus, height, time, fx.f.key_script, {bad, good});
     BOOST_CHECK(decision.suppress_construction);
     BOOST_REQUIRE_EQUAL(decision.to_abandon.size(), size_t{1});
     BOOST_CHECK(decision.to_abandon.front() == automatic_unusable);
-    // Alone, it is cleaned up and construction proceeds.
+    // Alone, it is listed and construction proceeds.
     decision = DecidePendingAttestationsForKey(*fx.wallet, view, consensus, height, time, fx.f.key_script, {bad});
     BOOST_CHECK(!decision.suppress_construction);
     BOOST_REQUIRE_EQUAL(decision.to_abandon.size(), size_t{1});
-    // With a usable child that spends it, it is kept.
-    decision = DecidePendingAttestationsForKey(*fx.wallet, view, consensus, height, time, fx.f.key_script, {bad, kid});
-    BOOST_CHECK(decision.suppress_construction);
-    BOOST_CHECK(decision.to_abandon.empty());
+}
+
+namespace {
+//! The cleanup stage as the automatic path runs it: the decision of every key in the wallet, then the abandonment
+//! of the union of their lists. Returns the union.
+std::set<uint256> DecideAndCleanUp(TestChain100Setup& setup, CWallet& wallet,
+                                   const std::vector<std::pair<CScript, std::vector<uint256>>>& keys)
+{
+    const Consensus::Params& consensus = Params().GetConsensus();
+    std::set<uint256> to_abandon;
+    {
+        LOCK(cs_main);
+        LOCK(wallet.cs_wallet);
+        const CCoinsViewCache& view = setup.m_node.chainman->ActiveChainstate().CoinsTip();
+        const std::vector<PendingWalletAttestation> pending = PendingWalletDemurrageAttestations(wallet);
+        for (const auto& [script, txids] : keys) {
+            std::vector<const PendingWalletAttestation*> key_pending;
+            for (const uint256& txid : txids) {
+                const PendingWalletAttestation* entry = Entry(pending, txid);
+                BOOST_REQUIRE(entry != nullptr);
+                key_pending.push_back(entry);
+            }
+            const KeyPendingDecision decision = DecidePendingAttestationsForKey(wallet, view, consensus, 150, 1700000000, script, key_pending);
+            to_abandon.insert(decision.to_abandon.begin(), decision.to_abandon.end());
+        }
+    }
+    AbandonStaleAutomaticAttestations(wallet, to_abandon);
+    return to_abandon;
+}
+
+bool Abandoned(const CWallet& wallet, const uint256& txid)
+{
+    LOCK(wallet.cs_wallet);
+    const auto it = wallet.mapWallet.find(txid);
+    return it != wallet.mapWallet.end() && it->second.isAbandoned();
+}
+
+//! A second key of the same wallet with a live target in the chain view.
+struct SecondKey {
+    PendingFixture f{MakeKey()};
+    COutPoint live_target{uint256S("8c"), 0};
+    explicit SecondKey(TestChain100Setup& setup)
+    {
+        LOCK(cs_main);
+        setup.m_node.chainman->ActiveChainstate().CoinsTip().AddCoin(
+            live_target, Coin{CTxOut{5 * COIN, f.key_script}, 10, false, false, 0}, /*possible_overwrite=*/false);
+    }
+};
+} // namespace
+
+BOOST_AUTO_TEST_CASE(cleanup_abandons_an_independent_stale_automatic_attestation_and_releases_its_input)
+{
+    KeyDecisionFixture fx(*this);
+    const COutPoint fee_input = fx.FeeInput(*this);
+    const uint256 stale = fx.AddPending(fee_input, fx.dead_target, /*automatic=*/true);
+    BOOST_CHECK(WITH_LOCK(fx.wallet->cs_wallet, return fx.wallet->IsSpent(fee_input)));
+
+    const std::set<uint256> listed = DecideAndCleanUp(*this, *fx.wallet, {{fx.f.key_script, {stale}}});
+    BOOST_CHECK(listed.count(stale));
+    BOOST_CHECK(Abandoned(*fx.wallet, stale));
+    BOOST_CHECK(!WITH_LOCK(fx.wallet->cs_wallet, return fx.wallet->IsSpent(fee_input)));
+}
+
+BOOST_AUTO_TEST_CASE(cleanup_keeps_a_stale_attestation_that_a_pending_attestation_of_another_key_spends)
+{
+    KeyDecisionFixture fx(*this);
+    SecondKey other(*this);
+    const COutPoint fee_input = fx.FeeInput(*this);
+    const uint256 stale = fx.AddPending(fee_input, fx.dead_target, /*automatic=*/true);
+    // A pending attestation of the other key spends the stale one's output; the other key's decision keeps it.
+    const CTransactionRef child_tx = AttestationTransaction(other.f, COutPoint{stale, 0}, other.live_target, std::nullopt);
+    {
+        LOCK(fx.wallet->cs_wallet);
+        BOOST_REQUIRE(fx.wallet->AddToWallet(child_tx, TxStateInactive{}));
+    }
+    const uint256 child = child_tx->GetHash();
+
+    const std::set<uint256> listed = DecideAndCleanUp(*this, *fx.wallet,
+        {{fx.f.key_script, {stale}}, {other.f.key_script, {child}}});
+    BOOST_CHECK(listed.count(stale)); // the first key lists it; the stage must still refuse
+    BOOST_CHECK(!Abandoned(*fx.wallet, stale));
+    BOOST_CHECK(!Abandoned(*fx.wallet, child));
+    BOOST_CHECK(WITH_LOCK(fx.wallet->cs_wallet, return fx.wallet->IsSpent(fee_input)));
+    BOOST_CHECK(WITH_LOCK(fx.wallet->cs_wallet, return fx.wallet->IsSpent(COutPoint{stale, 0})));
+}
+
+BOOST_AUTO_TEST_CASE(cleanup_keeps_a_stale_attestation_with_an_indirect_pending_descendant)
+{
+    KeyDecisionFixture fx(*this);
+    const COutPoint fee_input = fx.FeeInput(*this);
+    const uint256 stale = fx.AddPending(fee_input, fx.dead_target, /*automatic=*/true);
+    // stale -> ordinary wallet transaction -> pending attestation of the same key.
+    CMutableTransaction ordinary;
+    ordinary.nVersion = 2;
+    ordinary.vin.emplace_back(COutPoint{stale, 0});
+    ordinary.vout.emplace_back(COIN / 2, CScript{} << OP_TRUE);
+    const CTransactionRef ordinary_tx = MakeTransactionRef(std::move(ordinary));
+    {
+        LOCK(fx.wallet->cs_wallet);
+        BOOST_REQUIRE(fx.wallet->AddToWallet(ordinary_tx, TxStateInactive{}));
+    }
+    const uint256 tail = fx.AddPending(COutPoint{ordinary_tx->GetHash(), 0}, fx.live_target, /*automatic=*/false);
+
+    const std::set<uint256> listed = DecideAndCleanUp(*this, *fx.wallet, {{fx.f.key_script, {stale, tail}}});
+    BOOST_CHECK(listed.count(stale));
+    BOOST_CHECK(!Abandoned(*fx.wallet, stale));
+    BOOST_CHECK(!Abandoned(*fx.wallet, ordinary_tx->GetHash()));
+    BOOST_CHECK(!Abandoned(*fx.wallet, tail));
+    BOOST_CHECK(WITH_LOCK(fx.wallet->cs_wallet, return fx.wallet->IsSpent(fee_input)));
+    BOOST_CHECK(WITH_LOCK(fx.wallet->cs_wallet, return fx.wallet->IsSpent(COutPoint{ordinary_tx->GetHash(), 0})));
+}
+
+BOOST_AUTO_TEST_CASE(cleanup_keeps_a_stale_attestation_with_a_descendant_of_a_key_whose_local_state_is_invalid)
+{
+    KeyDecisionFixture fx(*this);
+    SecondKey other(*this);
+    const COutPoint fee_input = fx.FeeInput(*this);
+    const uint256 stale = fx.AddPending(fee_input, fx.dead_target, /*automatic=*/true);
+    const CTransactionRef child_tx = AttestationTransaction(other.f, COutPoint{stale, 0}, other.live_target, std::nullopt);
+    {
+        LOCK(fx.wallet->cs_wallet);
+        BOOST_REQUIRE(fx.wallet->AddToWallet(child_tx, TxStateInactive{}));
+    }
+    const uint256 child = child_tx->GetHash();
+    {
+        // The other key's marker coin is malformed: its decision lists nothing and keeps everything.
+        LOCK(cs_main);
+        m_node.chainman->ActiveChainstate().CoinsTip().AddCoin(
+            Consensus::DemurrageLatestAttestationOutpoint(other.f.key_hash),
+            Coin{CTxOut{0, CScript{} << OP_TRUE}, 10, /*fCoinBaseIn=*/true, false, 0}, /*possible_overwrite=*/false);
+        BOOST_REQUIRE(!Consensus::IsDemurrageStateSaneForScript(m_node.chainman->ActiveChainstate().CoinsTip(), other.f.key_script));
+    }
+
+    const std::set<uint256> listed = DecideAndCleanUp(*this, *fx.wallet,
+        {{fx.f.key_script, {stale}}, {other.f.key_script, {child}}});
+    BOOST_CHECK(listed.count(stale));
+    BOOST_CHECK(!listed.count(child));
+    BOOST_CHECK(!Abandoned(*fx.wallet, stale));
+    BOOST_CHECK(!Abandoned(*fx.wallet, child));
+    BOOST_CHECK(WITH_LOCK(fx.wallet->cs_wallet, return fx.wallet->IsSpent(fee_input)));
+    BOOST_CHECK(WITH_LOCK(fx.wallet->cs_wallet, return fx.wallet->IsSpent(COutPoint{stale, 0})));
 }
 
 BOOST_AUTO_TEST_CASE(a_malformed_local_attestation_state_is_not_an_absent_record_and_abandons_nothing)

@@ -986,7 +986,6 @@ KeyPendingDecision DecidePendingAttestationsForKey(const CWallet& wallet, const 
     const std::optional<Consensus::DemurrageAttestationRecord> record =
         Consensus::LatestDemurrageAttestationRecord(view, *key_hash);
     std::vector<const PendingWalletAttestation*> unusable_automatic;
-    std::set<uint256> usable_parents; // transactions that a usable entry spends from
     const PendingWalletAttestation* resubmit{nullptr};
     bool usable_in_mempool{false};
     for (const PendingWalletAttestation* entry : key_pending) {
@@ -1008,16 +1007,45 @@ KeyPendingDecision DecidePendingAttestationsForKey(const CWallet& wallet, const 
         } else if (use == PendingAttestationUse::REUSABLE && !resubmit) {
             resubmit = entry;
         }
-        const auto wtx_it = wallet.mapWallet.find(entry->txid);
-        if (wtx_it != wallet.mapWallet.end() && wtx_it->second.tx) {
-            for (const CTxIn& txin : wtx_it->second.tx->vin) usable_parents.insert(txin.prevout.hash);
-        }
     }
     if (resubmit && !usable_in_mempool) decision.to_resubmit.push_back(resubmit->txid);
-    for (const PendingWalletAttestation* entry : unusable_automatic) {
-        if (!usable_parents.count(entry->txid)) decision.to_abandon.push_back(entry->txid);
-    }
+    // Whether a candidate has an unconfirmed descendant anywhere in the wallet is decided at execution
+    // (AbandonStaleAutomaticAttestations), across all keys.
+    for (const PendingWalletAttestation* entry : unusable_automatic) decision.to_abandon.push_back(entry->txid);
     return decision;
+}
+
+size_t AbandonStaleAutomaticAttestations(CWallet& wallet, const std::set<uint256>& candidates)
+{
+    size_t abandoned{0};
+    LOCK(wallet.cs_wallet);
+    for (const uint256& txid : candidates) {
+        // Abandoning a transaction abandons everything in the wallet that spends it, whatever key it
+        // belongs to and whatever its local state. A candidate with any unconfirmed, not abandoned
+        // descendant is left for a later pass.
+        bool has_descendant{false};
+        for (const auto& [other_txid, other] : wallet.mapWallet) {
+            if (other_txid == txid || !other.tx || !other.isUnconfirmed()) continue;
+            for (const CTxIn& txin : other.tx->vin) {
+                if (txin.prevout.hash == txid) {
+                    has_descendant = true;
+                    break;
+                }
+            }
+            if (has_descendant) break;
+        }
+        if (has_descendant) {
+            wallet.WalletLogPrintf("Demurrage auto-attest: stale pending attestation %s kept for now: an unconfirmed transaction of this wallet spends it\n", txid.ToString());
+            continue;
+        }
+        if (wallet.AbandonTransaction(txid)) {
+            ++abandoned;
+            wallet.WalletLogPrintf("Demurrage auto-attest: pending attestation %s can no longer confirm (its state, target or an input is gone); abandoned\n", txid.ToString());
+        } else {
+            wallet.WalletLogPrintf("Demurrage auto-attest: pending attestation %s could not be abandoned\n", txid.ToString());
+        }
+    }
+    return abandoned;
 }
 
 
@@ -1728,13 +1756,7 @@ int MaybeAutoDemurrageAttest(CWallet& wallet)
     }
     // Clean up: a transaction of the automatic path whose referenced state, target or inputs are gone cannot
     // confirm and would otherwise keep its inputs reserved.
-    for (const uint256& txid : to_abandon) {
-        if (wallet.AbandonTransaction(txid)) {
-            wallet.WalletLogPrintf("Demurrage auto-attest: pending attestation %s can no longer confirm (its state, target or an input is gone); abandoned\n", txid.ToString());
-        } else {
-            wallet.WalletLogPrintf("Demurrage auto-attest: pending attestation %s could not be abandoned\n", txid.ToString());
-        }
-    }
+    AbandonStaleAutomaticAttestations(wallet, to_abandon);
 
     CCoinControl automatic_change_control;
     if (!candidates.empty()) {

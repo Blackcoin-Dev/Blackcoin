@@ -301,17 +301,81 @@ BOOST_AUTO_TEST_CASE(continuation_needs_an_anchor_when_the_output_cannot_anchor)
     BOOST_CHECK_EQUAL(none.batches, 0U);
 }
 
-BOOST_AUTO_TEST_CASE(continuation_far_beyond_the_simulation_bound_is_checked_conservatively)
+namespace {
+MigrationContinuationParams CheapParams(size_t max_inputs, CAmount first_output, bool output_can_anchor)
 {
+    MigrationContinuationParams p = ContParams(max_inputs, first_output);
+    p.fee_rate_per_kvb = 1000; // cheap enough that funding never limits these cases
+    p.output_can_anchor = output_can_anchor;
+    return p;
+}
+} // namespace
+
+BOOST_AUTO_TEST_CASE(continuation_fails_closed_when_anchors_run_out_exactly_at_the_simulation_cap)
+{
+    // The reviewer's counterexample: a tiered destination (its outputs cannot anchor), max_inputs=1,
+    // one legacy anchor for each of the first cap batches and one witness-only input after them. The
+    // aggregate estimate that replaced the simulation past the cap saw ample funds and said feasible;
+    // the next real batch has no anchor.
     std::vector<MigrationBatchInput> rest;
-    for (uint32_t i = 0; i < 1500; ++i) rest.push_back(Input(i + 10, 100000000, 600));
-    // max_inputs=1: 1,500 later batches, beyond the simulated bound; funded generously.
-    BOOST_CHECK(PlanMigrationContinuation(rest, ContParams(1, 50000000)).feasible);
-    // Legacy value too small for the worst-case fees of every batch that is left.
-    std::vector<MigrationBatchInput> poor;
-    for (uint32_t i = 0; i < 1500; ++i) poor.push_back(Input(i + 10, 3000, 600));
-    // The output survives the simulated batches but not the worst-case fee of the ones beyond them.
-    BOOST_CHECK(!PlanMigrationContinuation(poor, ContParams(1, 900000000)).feasible);
+    for (uint32_t i = 0; i < MAX_SIMULATED_MIGRATION_CONTINUATION_BATCHES; ++i) {
+        rest.push_back(Input(10 + i, 100000000, 600, /*anchor=*/true));
+    }
+    rest.push_back(Input(5000, 100000000, 600, /*anchor=*/false));
+    const MigrationContinuation c = PlanMigrationContinuation(rest, CheapParams(1, 50000000, /*output_can_anchor=*/false));
+    BOOST_CHECK(!c.feasible);
+    BOOST_CHECK(c.reason.find("max_inputs") != std::string::npos);
+    BOOST_CHECK(c.reason.find("smaller explicit steps") != std::string::npos);
+}
+
+BOOST_AUTO_TEST_CASE(continuation_refuses_what_it_cannot_simulate_even_when_funded_and_anchored)
+{
+    // Exactly the cap in later batches is simulated in full and feasible; one more is refused though
+    // every batch would be anchored by the previous output and the funds are ample.
+    std::vector<MigrationBatchInput> rest;
+    for (uint32_t i = 0; i < MAX_SIMULATED_MIGRATION_CONTINUATION_BATCHES; ++i) {
+        rest.push_back(Input(10 + i, 100000000, 600));
+    }
+    const MigrationContinuation at_cap = PlanMigrationContinuation(rest, CheapParams(1, 50000000, true));
+    BOOST_CHECK(at_cap.feasible);
+    BOOST_CHECK_EQUAL(at_cap.batches, MAX_SIMULATED_MIGRATION_CONTINUATION_BATCHES);
+    rest.push_back(Input(9000, 100000000, 600));
+    const MigrationContinuation over = PlanMigrationContinuation(rest, CheapParams(1, 50000000, true));
+    BOOST_CHECK(!over.feasible);
+    BOOST_CHECK(!over.reason.empty());
+}
+
+BOOST_AUTO_TEST_CASE(continuation_funding_claim_is_checked_per_batch_not_in_aggregate)
+{
+    // Aggregate value is ample, but the last input is too small to pay its own batch fee and leave
+    // dust and nothing else can fund it (the destination cannot anchor, no auxiliary output): refused.
+    std::vector<MigrationBatchInput> rest;
+    rest.push_back(Input(10, 100000000, 600, /*anchor=*/true));
+    rest.push_back(Input(11, 100000000, 600, /*anchor=*/true));
+    rest.push_back(Input(12, 100, 600, /*anchor=*/true));
+    const MigrationContinuation c = PlanMigrationContinuation(rest, CheapParams(1, 50000000, false));
+    BOOST_CHECK(!c.feasible);
+    // With a funding quantum output from this batch that can anchor and fund, it is feasible.
+    BOOST_CHECK(PlanMigrationContinuation(rest, CheapParams(1, 50000000, true)).feasible);
+}
+
+BOOST_AUTO_TEST_CASE(continuation_minimum_blocks_is_a_lower_bound_on_dependencies_only)
+{
+    // Independent batches (each has its own legacy anchor, nothing is spent from an earlier batch)
+    // can share a block: three later batches, minimum still one block (the first batch's).
+    std::vector<MigrationBatchInput> rest;
+    for (uint32_t i = 0; i < 3; ++i) rest.push_back(Input(10 + i, 100000000, 600, /*anchor=*/true));
+    const MigrationContinuation independent = PlanMigrationContinuation(rest, CheapParams(1, 50000000, false));
+    BOOST_REQUIRE(independent.feasible);
+    BOOST_CHECK_EQUAL(independent.batches, 3U);
+    BOOST_CHECK_EQUAL(independent.min_blocks, 1U);
+    // A chain (each batch spends the previous output) needs one block per link.
+    std::vector<MigrationBatchInput> chain;
+    for (uint32_t i = 0; i < 3; ++i) chain.push_back(Input(10 + i, 100000000, 600));
+    const MigrationContinuation linked = PlanMigrationContinuation(chain, CheapParams(1, 50000000, true));
+    BOOST_REQUIRE(linked.feasible);
+    BOOST_CHECK_EQUAL(linked.batches, 3U);
+    BOOST_CHECK_EQUAL(linked.min_blocks, 4U);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

@@ -132,12 +132,19 @@ struct MigrationContinuationParams {
     bool output_can_anchor{false};
 };
 
+//! Later batches the continuation plan simulates before it refuses to vouch for the rest.
+constexpr unsigned int MAX_SIMULATED_MIGRATION_CONTINUATION_BATCHES{512};
+
 struct MigrationContinuation {
     bool feasible{true};
-    //! Later batches needed, counting a conservative estimate beyond the simulated ones.
+    //! Later batches the simulation needed (each one simulated with the real planner; exact for
+    //! the plan it simulated, not an estimate). Meaningful only when feasible.
     unsigned int batches{0};
+    //! Fees of exactly those simulated batches.
     CAmount fees{0};
-    //! Fewest blocks, counting the first batch's, in which the migration can finish.
+    //! A lower bound: the longest chain of batches that each spend the quantum output of the one
+    //! before, counting the first batch's. Independent batches can share a block, so this is the
+    //! fewest blocks the migration can take, never a prediction or an upper bound.
     unsigned int min_blocks{1};
     //! Why it is infeasible (empty when feasible).
     std::string reason;
@@ -149,8 +156,9 @@ struct MigrationContinuation {
  * auxiliary input weight, and the fee each batch pays at the given rate (plus its rounding
  * unit). Each batch is funded by the legacy inputs it takes and, when it uses one, by the
  * quantum output of the batch before it. Infeasible when a batch has no anchor, when no input
- * fits, or when a batch's output would fall below dust. Beyond a bounded number of simulated
- * batches the rest is checked with a conservative whole-budget fee per batch.
+ * fits, or when a batch's output would fall below dust. It also fails closed when the rest needs
+ * more than MAX_SIMULATED_MIGRATION_CONTINUATION_BATCHES batches: no aggregate estimate is
+ * accepted in place of simulating anchors, fit and funding for each batch.
  * remaining holds the legacy inputs the first batch did not take plus any unused auxiliary
  * quantum outputs.
  */

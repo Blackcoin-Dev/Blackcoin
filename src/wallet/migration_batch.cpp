@@ -102,7 +102,6 @@ CAmount ContinuationFee(int64_t fee_rate_per_kvb, int64_t weight)
 {
     return fee_rate_per_kvb * ((weight + WITNESS_SCALE_FACTOR - 1) / WITNESS_SCALE_FACTOR) / 1000 + 1;
 }
-constexpr unsigned int MAX_SIMULATED_CONTINUATION_BATCHES{512};
 } // namespace
 
 MigrationContinuation PlanMigrationContinuation(std::vector<MigrationBatchInput> pool,
@@ -132,24 +131,13 @@ MigrationContinuation PlanMigrationContinuation(std::vector<MigrationBatchInput>
 
     result.min_blocks = 1;
     while (legacy_left > 0) {
-        if (result.batches >= MAX_SIMULATED_CONTINUATION_BATCHES) {
-            // Whole-budget fee for every batch that is left: a bound that cannot be too low.
-            CAmount value{0};
-            int64_t weight{0};
-            for (const MigrationBatchInput& c : pool) {
-                value += c.effective_value;
-                if (!c.auxiliary) weight += std::max<int64_t>(1, c.input_weight);
-            }
-            const int64_t room = std::max<int64_t>(1, p.weight_budget - p.fixed_weight - std::max<int64_t>(1, p.auxiliary_input_weight));
-            const int64_t by_weight = (weight + room - 1) / room;
-            const int64_t by_count = (static_cast<int64_t>(legacy_left) + static_cast<int64_t>(p.max_inputs) - 1) / static_cast<int64_t>(p.max_inputs);
-            const int64_t left = std::max(by_weight, by_count);
-            const CAmount worst = ContinuationFee(p.fee_rate_per_kvb, p.weight_budget) * left + p.dust;
-            result.batches += static_cast<unsigned int>(left);
-            result.fees += worst - p.dust;
-            result.min_blocks += static_cast<unsigned int>(left);
-            if (value < worst) return fail("the rest of the legacy value cannot pay for the batches it still needs");
-            return result;
+        if (result.batches >= MAX_SIMULATED_MIGRATION_CONTINUATION_BATCHES) {
+            // Fail closed: past the simulated bound nothing proves that the next batch has an
+            // anchor, fits, or can be reached by funds, and an aggregate estimate over the rest
+            // would hide exactly those cases (a tiered destination whose outputs cannot anchor
+            // runs out of anchors at any batch). The user can raise max_inputs or migrate in
+            // smaller explicit steps.
+            return fail(strprintf("the rest needs more than %u later batches, which the wallet cannot prove feasible; raise max_inputs or migrate in smaller explicit steps", MAX_SIMULATED_MIGRATION_CONTINUATION_BATCHES));
         }
         MigrationBatchPlan plan = PlanMigrationBatch(pool, p.max_inputs, p.fixed_weight, p.weight_budget, p.require_anchor, false);
         if (plan.blocked_no_anchor) return fail("a later batch would have no anchor");

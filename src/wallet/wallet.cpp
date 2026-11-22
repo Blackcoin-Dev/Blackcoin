@@ -10780,6 +10780,25 @@ bool CWallet::BackupWallet(const std::string& strDest, bilingual_str* error_out,
         return commit_stage(/*marked_stage=*/false);
     };
 
+    // The wallet's encryption state and quantum key inventory are what the verified copy was made from. Called with
+    // cs_wallet held, and only for a short check: no file system work runs under the lock.
+    const auto quantum_snapshot_unchanged = [&]() EXCLUSIVE_LOCKS_REQUIRED(cs_wallet) {
+        AssertLockHeld(cs_wallet);
+        if (IsCrypted() != source_was_crypted || m_quantum_keys.size() != expected_keys.size()) {
+            local_error = _("Quantum key inventory changed while finalizing the wallet backup");
+            return false;
+        }
+        for (const auto& [witness_program, expected_public_key] : expected_keys) {
+            const auto it = m_quantum_keys.find(witness_program);
+            if (it == m_quantum_keys.end() || it->second.public_key != expected_public_key ||
+                !it->second.durably_stored) {
+                local_error = _("Quantum key inventory changed while finalizing the wallet backup");
+                return false;
+            }
+        }
+        return true;
+    };
+
     const auto promote_stage = [&](const WalletBackupFileIdentity& verified_identity, bool require_unchanged_quantum_snapshot = false) {
         if (failpoint("before_final_identity_revalidation")) return false;
         WalletBackupFileIdentity current_identity;
@@ -10789,22 +10808,15 @@ bool CWallet::BackupWallet(const std::string& strDest, bilingual_str* error_out,
             return false;
         }
 
-        std::unique_lock<RecursiveMutex> wallet_lock;
         if (require_unchanged_quantum_snapshot) {
-            wallet_lock = std::unique_lock<RecursiveMutex>{cs_wallet};
-            if (IsCrypted() != source_was_crypted || m_quantum_keys.size() != expected_keys.size()) {
-                local_error = _("Quantum key inventory changed while finalizing the wallet backup");
-                return false;
-            }
-            for (const auto& [witness_program, expected_public_key] : expected_keys) {
-                const auto it = m_quantum_keys.find(witness_program);
-                if (it == m_quantum_keys.end() || it->second.public_key != expected_public_key ||
-                    !it->second.durably_stored) {
-                    local_error = _("Quantum key inventory changed while finalizing the wallet backup");
-                    return false;
-                }
-            }
+            // Before anything is installed: a wallet whose keys changed since the copy was made gets no backup
+            // installed at all. A brief look under the wallet lock, no file system work.
+            LOCK(cs_wallet);
+            if (!quantum_snapshot_unchanged()) return false;
         }
+        // The rename, the directory commits and the inspection of the installed file are file system work on a
+        // destination that can be slow or stalled (a removable or network disk). They run WITHOUT cs_wallet, so
+        // wallet operations and the threads waiting behind them are never held up by that disk.
         if (failpoint("fail_rename") || !RenameOver(staged_path, backup_path)) {
             local_error = _("Unable to atomically install the verified wallet backup");
             return false;
@@ -10825,13 +10837,20 @@ bool CWallet::BackupWallet(const std::string& strDest, bilingual_str* error_out,
             local_error = _("The installed wallet backup changed during atomic promotion");
             return false;
         }
-        if (require_unchanged_quantum_snapshot &&
-            (failpoint("before_source_marker_commit") ||
-             !SetQuantumKeyBackupState(expected_keys, /*verified=*/true, local_error))) {
-            // The promoted file is complete and independently verified. A
-            // source-marker failure remains conservative and is reported so
-            // the caller can retry; it must never delete the good backup.
-            return false;
+        if (require_unchanged_quantum_snapshot) {
+            // Success is published only after the wallet is checked again, under the lock that the marker write
+            // takes: the keys and the encryption state may have changed while the file was being installed. The
+            // installed file is complete and verified for the inventory it was made from; if the wallet moved on,
+            // no marker is written and the caller is told, so it can back up again. It is never deleted here.
+            LOCK(cs_wallet);
+            if (!quantum_snapshot_unchanged()) return false;
+            if (failpoint("before_source_marker_commit") ||
+                !SetQuantumKeyBackupState(expected_keys, /*verified=*/true, local_error)) {
+                // The promoted file is complete and independently verified. A
+                // source-marker failure remains conservative and is reported so
+                // the caller can retry; it must never delete the good backup.
+                return false;
+            }
         }
         return true;
     };

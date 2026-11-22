@@ -11,7 +11,9 @@
 #include <atomic>
 #include <future>
 #include <iterator>
+#include <map>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <stdint.h>
 #include <string_view>
@@ -9046,6 +9048,108 @@ BOOST_AUTO_TEST_CASE(QuantumWalletVerifiedBackupsAreCompleteAndRestorable)
             CheckQuantumKeyChallenge(*restored, first_destination);
             CheckQuantumKeyChallenge(*restored, second_destination);
             CheckQuantumKeyChallenge(*restored, third_destination);
+        }
+    }
+}
+
+// The rename, the directory commits and the inspection of the installed file run on the backup destination, which
+// can be slow or stalled. They must not hold cs_wallet. The wallet is still checked again before success is published.
+BOOST_AUTO_TEST_CASE(QuantumWalletBackupDestinationWorkRunsWithoutTheWalletLock)
+{
+    for (DatabaseFormat format : DATABASE_FORMATS) {
+        const std::string name{strprintf("quantum-wallet-backup-unlocked-%i", format)};
+        const fs::path backup_dir = m_path_root / fs::PathFromString(strprintf("quantum-unlocked-backup-%i", format));
+        BOOST_REQUIRE(fs::create_directory(backup_dir));
+        auto wallet{TestLoadQuantumWallet(name, format)};
+        const std::string wallet_filename = fs::PathToString(fs::PathFromString(wallet->GetDatabase().Filename()).filename());
+        const fs::path backup_path = backup_dir / fs::PathFromString(wallet_filename);
+        auto first = wallet->GetNewQuantumDestination("unlocked-first");
+        BOOST_REQUIRE(first);
+
+        // Whether another thread can take the wallet lock right now.
+        const auto wallet_lock_is_free = [&] {
+            std::atomic<bool> free{false};
+            std::thread other{[&] {
+                TRY_LOCK(wallet->cs_wallet, lock);
+                free = static_cast<bool>(lock);
+            }};
+            other.join();
+            return free.load();
+        };
+
+        std::map<std::string, bool> free_at;
+        wallet->m_quantum_backup_failpoint = [&](std::string_view point) {
+            if (point == "fail_rename" || point == "before_final_directory_commit" ||
+                point == "before_final_stage_directory_commit" || point == "before_installed_identity_revalidation") {
+                free_at[std::string{point}] = wallet_lock_is_free();
+            }
+            return false;
+        };
+        bilingual_str error;
+        BOOST_REQUIRE_MESSAGE(wallet->BackupWallet(fs::PathToString(backup_dir), &error), error.original);
+        wallet->m_quantum_backup_failpoint = {};
+        BOOST_CHECK_EQUAL(free_at.size(), size_t{4});
+        for (const auto& [point, free] : free_at) BOOST_CHECK_MESSAGE(free, "cs_wallet is held at " << point);
+        {
+            LOCK(wallet->cs_wallet);
+            const auto info = wallet->GetQuantumKeyInfo(*first);
+            BOOST_REQUIRE(info.has_value());
+            BOOST_CHECK(info->backup_verified);
+        }
+
+        // A key made before the file is installed: nothing is installed, the earlier backup stays as it was.
+        const auto [before_ok, before] = ReadBinaryFile(backup_path);
+        BOOST_REQUIRE(before_ok);
+        std::optional<CTxDestination> early;
+        wallet->m_quantum_backup_failpoint = [&](std::string_view point) {
+            if (point == "before_final_identity_revalidation" && !early) early = *wallet->GetNewQuantumDestination("unlocked-early");
+            return false;
+        };
+        error.clear();
+        BOOST_CHECK(!wallet->BackupWallet(fs::PathToString(backup_dir), &error));
+        wallet->m_quantum_backup_failpoint = {};
+        BOOST_CHECK_MESSAGE(error.original.find("inventory changed while finalizing") != std::string::npos, error.original);
+        BOOST_REQUIRE(early.has_value());
+        const auto [early_after_ok, early_after] = ReadBinaryFile(backup_path);
+        BOOST_REQUIRE(early_after_ok);
+        BOOST_CHECK_EQUAL_COLLECTIONS(before.begin(), before.end(), early_after.begin(), early_after.end());
+        {
+            LOCK(wallet->cs_wallet);
+            const auto info = wallet->GetQuantumKeyInfo(*early);
+            BOOST_REQUIRE(info.has_value());
+            BOOST_CHECK(!info->backup_verified);
+        }
+
+        // A key made while the file is being installed (the lock is free then, so the wallet can change): the check
+        // before success is published sees it, no marker is written for the key the copy does not hold, and the
+        // installed copy is not deleted.
+        std::optional<CTxDestination> late;
+        wallet->m_quantum_backup_failpoint = [&](std::string_view point) {
+            if (point == "before_installed_identity_revalidation" && !late) late = *wallet->GetNewQuantumDestination("unlocked-late");
+            return false;
+        };
+        error.clear();
+        BOOST_CHECK(!wallet->BackupWallet(fs::PathToString(backup_dir), &error));
+        wallet->m_quantum_backup_failpoint = {};
+        BOOST_CHECK_MESSAGE(error.original.find("inventory changed while finalizing") != std::string::npos, error.original);
+        BOOST_REQUIRE(late.has_value());
+        BOOST_CHECK(fs::is_regular_file(backup_path));
+        {
+            LOCK(wallet->cs_wallet);
+            const auto infos = wallet->ListQuantumKeyInfos();
+            BOOST_REQUIRE_EQUAL(infos.size(), 3U);
+            const auto late_info = wallet->GetQuantumKeyInfo(*late);
+            BOOST_REQUIRE(late_info.has_value());
+            BOOST_CHECK(!late_info->backup_verified);
+        }
+        // The next backup covers all three and marks them.
+        error.clear();
+        BOOST_REQUIRE_MESSAGE(wallet->BackupWallet(fs::PathToString(backup_dir), &error), error.original);
+        {
+            LOCK(wallet->cs_wallet);
+            const auto infos = wallet->ListQuantumKeyInfos();
+            BOOST_REQUIRE_EQUAL(infos.size(), 3U);
+            BOOST_CHECK(std::all_of(infos.begin(), infos.end(), [](const QuantumKeyInfo& info) { return info.backup_verified; }));
         }
     }
 }

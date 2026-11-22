@@ -11,6 +11,7 @@
 #include <primitives/transaction.h>
 #include <script/script.h>
 #include <test/util/setup_common.h>
+#include <txmempool.h>
 #include <validation.h>
 #include <wallet/coincontrol.h>
 #include <wallet/context.h>
@@ -23,8 +24,8 @@
 
 #include <util/time.h>
 
-#include <set>
 #include <memory>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -650,14 +651,22 @@ BOOST_FIXTURE_TEST_CASE(a_stored_but_unrelayed_commit_still_reports_the_reserve_
     ReserveWallet rw = MakeReserveWallet(*this, coinbaseKey);
     ReserveInterface gui{*this, rw};
     gui.wallet->SetBroadcastTransactions(true);
-    // The mempool already holds a transaction that spends the same output, so the relay of ours is refused for a
-    // reason that is not terminal.
+    // The mempool already holds another transaction that spends the same output, so the relay of ours is refused for
+    // a reason that is not terminal: the wallet keeps ours and relays it later.
+    const CTransactionRef rival = gui.Prepare(rw, 14 * COIN, /*explicit_big=*/true);
     const CTransactionRef tx = gui.Prepare(rw, 15 * COIN, /*explicit_big=*/true);
     BOOST_REQUIRE_EQUAL(tx->vin.size(), 1U);
+    BOOST_REQUIRE(rival->GetHash() != tx->GetHash());
+    {
+        LOCK(::cs_main);
+        const MempoolAcceptResult accepted = m_node.chainman->ProcessTransaction(rival);
+        BOOST_REQUIRE_MESSAGE(accepted.m_result_type == MempoolAcceptResult::ResultType::VALID, accepted.m_state.ToString());
+    }
     gArgs.ForceSetArg("-finalstakereserve", "1");
     std::string warning;
     BOOST_CHECK_NO_THROW(warning = gui.iface->commitTransaction(tx, {}, {}));
     BOOST_CHECK(WITH_LOCK(gui.wallet->cs_wallet, return gui.wallet->mapWallet.count(tx->GetHash()) > 0));
+    BOOST_CHECK_MESSAGE(!WITH_LOCK(m_node.mempool->cs, return m_node.mempool->exists(GenTxid::Txid(tx->GetHash()))), "the relay was not refused: the test does not reach the stored-but-unrelayed disposition");
     BOOST_CHECK_MESSAGE(warning.find("final stake reserve") != std::string::npos, "warning: " + warning);
 }
 

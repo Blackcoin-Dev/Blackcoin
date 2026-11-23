@@ -38,19 +38,35 @@ constexpr std::string_view QUANTUM_BACKUP_VERIFY_FOLDER_PREFIX{".blackcoin-quant
 constexpr std::string_view QUANTUM_BACKUP_COPY_FILE_NAME{"wallet.dat"};
 //! GetUniquePath's random part: eight random bytes as sixteen hexadecimal characters.
 constexpr size_t QUANTUM_BACKUP_UNIQUE_NAME_CHARS{16};
+/** What the database code opens next to the verification copy's `wallet.dat` while the copy is open for writing, the
+ *  longest of which sets the deepest path:
+ *   - SQLite (the wallet uses its default rollback-journal mode, journal_mode DELETE, and never WAL): `wallet.dat-journal`
+ *     beside the file, 8 units more than the file;
+ *   - Berkeley DB (a legacy wallet): the environment opens in the verification folder with its log directory
+ *     `database` and creates `database\log.0000000001` there (and `.walletlock` and `db.log` directly in the folder, both
+ *     shorter). With DB_PRIVATE no `__db.*` files are made. */
+constexpr std::string_view QUANTUM_BACKUP_SQLITE_JOURNAL_SUFFIX{"-journal"};
+constexpr std::string_view QUANTUM_BACKUP_BDB_LOG_PATH{"database\\log.0000000001"};
 /** The UTF-16 code units the deepest path of a backup in progress adds to the wallet's backup directory: a separator
- *  and the staging folder, a separator and the verification folder, a separator and the copy's file name. */
+ *  and the staging folder, a separator and the verification folder, and then the longer of the SQLite journal beside the
+ *  copy (separator, `wallet.dat`, `-journal`) and the Berkeley DB log below it (separator, `database\log.0000000001`). */
+constexpr size_t QUANTUM_BACKUP_SIDECAR_UNITS{
+    1 + (QUANTUM_BACKUP_BDB_LOG_PATH.size() > QUANTUM_BACKUP_COPY_FILE_NAME.size() + QUANTUM_BACKUP_SQLITE_JOURNAL_SUFFIX.size()
+             ? QUANTUM_BACKUP_BDB_LOG_PATH.size()
+             : QUANTUM_BACKUP_COPY_FILE_NAME.size() + QUANTUM_BACKUP_SQLITE_JOURNAL_SUFFIX.size())};
 constexpr size_t QUANTUM_BACKUP_WORK_PATH_UNITS{
     (1 + QUANTUM_BACKUP_STAGE_FOLDER_PREFIX.size() + QUANTUM_BACKUP_UNIQUE_NAME_CHARS) +
     (1 + QUANTUM_BACKUP_VERIFY_FOLDER_PREFIX.size() + QUANTUM_BACKUP_UNIQUE_NAME_CHARS) +
-    (1 + QUANTUM_BACKUP_COPY_FILE_NAME.size())};
-static_assert(QUANTUM_BACKUP_WORK_PATH_UNITS == 109, "the deepest path of a backup in progress adds 109 units to the directory");
+    QUANTUM_BACKUP_SIDECAR_UNITS};
+static_assert(QUANTUM_BACKUP_SIDECAR_UNITS == 24, "the longest file a verification opens is database\\log.0000000001, 24 units below the folder");
+static_assert(QUANTUM_BACKUP_WORK_PATH_UNITS == 122, "the deepest path of a backup in progress adds 122 units to the directory");
 /** Windows' MAX_PATH counts the terminating null, so 259 UTF-16 code units remain for a path without the extended-length
  *  prefix, which this feature does not use. */
 constexpr size_t QUANTUM_BACKUP_WINDOWS_MAX_PATH_UNITS{259};
 /** The longest wallet backup directory, in UTF-16 code units, that still leaves room for QUANTUM_BACKUP_WORK_PATH_UNITS
- *  below it: 150. */
+ *  below it: 137. */
 constexpr size_t QUANTUM_BACKUP_WINDOWS_MAX_DIRECTORY_UNITS{QUANTUM_BACKUP_WINDOWS_MAX_PATH_UNITS - QUANTUM_BACKUP_WORK_PATH_UNITS};
+static_assert(QUANTUM_BACKUP_WINDOWS_MAX_DIRECTORY_UNITS == 137, "a wallet backup directory may be at most 137 UTF-16 units");
 
 /** The length of a UTF-8 string in UTF-16 code units: a character outside the Basic Multilingual Plane counts two.
  *  Pure, so it is tested on every platform. */
@@ -114,9 +130,10 @@ std::optional<std::string> QuantumKeyBackupWalletPathRejection(const std::string
  *  wallet's name, or "default_wallet" for the unnamed wallet. */
 std::vector<std::string> QuantumKeyBackupMigrationNames(const std::string& wallet_name, bool watchonly_wallet, bool solvables_wallet);
 
-/** Checked before a migration converts anything or creates a database: the first name of that publication plan whose
- *  configured backup directory breaks a rule (an `error` naming it), and the first warning for a name on a default path.
- *  Call it with both flags false for the wallet's own name alone, and again with the plan once it is known. */
+/** The first name of a migration's publication plan whose configured backup directory breaks a rule (an `error` naming
+ *  it), and the first warning for a name on a default path. The migration calls it with both flags false for the wallet's
+ *  own name alone before the wallet is unloaded (before any change), and again with the plan once the descriptors are
+ *  produced, which is after the wallet's database was converted and before any auxiliary wallet is created. */
 QuantumKeyBackupPathCheck CheckQuantumKeyBackupMigrationPaths(const std::string& wallet_name, bool watchonly_wallet, bool solvables_wallet);
 
 /** The identity of a directory as Windows reports it for an open handle: the volume's serial number and the file

@@ -12188,15 +12188,16 @@ util::Result<MigrationResult> MigrateLegacyToDescriptor(const std::string& walle
 
         // The descriptors are produced now. The wallets this migration creates are exactly the ones these descriptors need,
         // and their names are checked against the quantum key backup directory policy before any of them is created. The
-        // wallet's own name was checked before it was unloaded; by this point the wallet's database has been converted, so
-        // a refusal here, like any other failure, goes through the rollback below, which restores the wallet from the
-        // safety copy (as a loaded wallet, whether or not it was loaded before).
+        // wallet's own name was checked before it was unloaded (before any change); by this point the wallet's database has
+        // been converted. A refusal here leaves success false, like a failure inside DoMigration or while the migrated
+        // wallets are reloaded, and those go through the rollback below, which restores the wallet from the safety copy and
+        // loads it (whether or not it was loaded before). A failed conversion above and an exception do not.
         std::optional<MigrationData> plan = local_wallet->GetDescriptorsForLegacy(error);
         if (plan) {
             const QuantumKeyBackupPathCheck backup_paths = CheckQuantumKeyBackupMigrationPaths(
                 wallet_name, !plan->watch_descs.empty(), !plan->solvable_descs.empty());
             if (backup_paths.error) {
-                error = Untranslated(strprintf("Wallet migration refused before any auxiliary wallet was created: %s. The wallet is restored from its safety copy.", *backup_paths.error));
+                error = Untranslated(strprintf("Wallet migration refused before any auxiliary wallet was created: %s. The wallet will be restored from its safety copy.", *backup_paths.error));
                 plan.reset();
             } else if (backup_paths.warning) {
                 res.warnings.push_back(Untranslated(*backup_paths.warning));

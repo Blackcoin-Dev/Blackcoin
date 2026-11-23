@@ -2885,18 +2885,20 @@ QuantumStakeReturnPreparation PrepareQuantumStakeReturn(CWallet& wallet, Quantum
             prep.detail = "Gold Rush has not ended; the explicit command is available";
             return prep;
         }
-        if (!WITH_LOCK(wallet.cs_wallet, return WalletHoldsLegacyStakableCoin(wallet))) {
-            prep.detail = "this wallet holds no legacy coin the staker could stake";
-            return prep;
-        }
     }
     QuantumReturnChoice choice;
     {
         LOCK(wallet.cs_wallet);
+        // A ready return address ends the preparation before the wallet is scanned for legacy coins: the scan is
+        // needed only when an automatic preparation still has to decide whether to choose or create a key.
         const LegacyStakeQuantumReturn current = ResolveLegacyStakeQuantumReturn(wallet);
         if (current.available) {
             prep.address = current.address;
             prep.detail = "a quantum stake return address is already saved";
+            return prep;
+        }
+        if (trigger == QuantumStakeReturnTrigger::AUTOMATIC && !WalletHoldsLegacyStakableCoin(wallet)) {
+            prep.detail = "this wallet holds no legacy coin the staker could stake";
             return prep;
         }
         CTxDestination configured_dest;

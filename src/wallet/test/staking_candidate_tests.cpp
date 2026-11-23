@@ -906,6 +906,62 @@ BOOST_FIXTURE_TEST_CASE(the_automatic_return_address_needs_a_legacy_coin_to_retu
     BOOST_CHECK(prep.key_created);
 }
 
+// A return address that is already ready ends the automatic preparation before the wallet is scanned for legacy
+// coins: for a wallet that holds none, the answer is "already saved", not "no legacy coin".
+BOOST_FIXTURE_TEST_CASE(a_ready_return_address_ends_the_automatic_preparation_before_the_legacy_coin_scan, LegacyStakeWindowSetup)
+{
+    using Outcome = QuantumStakeReturnPreparation::Outcome;
+    ScopedQuantumBackupDir backups{m_path_root / "qkb-ready-early"};
+    CKey nobody;
+    nobody.MakeNewKey(/*fCompressed=*/true);
+    auto wallet = CreateSyncedDiskWallet(*this, nobody, "ready-early");
+    BOOST_REQUIRE(WITH_LOCK(wallet->cs_wallet, return wallet->GetLiveUnspentStakeCandidateOutpoints().empty()));
+    gArgs.ForceSetArg("-qqallowautokeycreation", "1");
+    // Nothing saved yet: the legacy coin check is what decides.
+    QuantumStakeReturnPreparation prep = PrepareQuantumStakeReturn(*wallet, QuantumStakeReturnTrigger::AUTOMATIC);
+    BOOST_CHECK(prep.outcome == Outcome::NO_ACTION);
+    BOOST_CHECK_MESSAGE(prep.detail.find("no legacy coin") != std::string::npos, prep.detail);
+    // Saved and ready (made by the explicit command).
+    prep = PrepareQuantumStakeReturn(*wallet, QuantumStakeReturnTrigger::EXPLICIT, /*allow_new_key=*/true);
+    BOOST_REQUIRE(prep.outcome == Outcome::CREATED_ADDRESS);
+    const std::string saved = prep.address;
+    // The same call now ends at the saved address.
+    prep = PrepareQuantumStakeReturn(*wallet, QuantumStakeReturnTrigger::AUTOMATIC);
+    gArgs.ForceSetArg("-qqallowautokeycreation", "0");
+    BOOST_CHECK(prep.outcome == Outcome::NO_ACTION);
+    BOOST_CHECK_EQUAL(prep.address, saved);
+    BOOST_CHECK_MESSAGE(prep.detail.find("already saved") != std::string::npos, prep.detail);
+}
+
+// A valid saved destination does not bypass the work on an outstanding pending record: the pending key is still
+// retried first.
+BOOST_FIXTURE_TEST_CASE(a_ready_return_address_does_not_bypass_an_outstanding_pending_record, LegacyStakeWindowSetup)
+{
+    using Outcome = QuantumStakeReturnPreparation::Outcome;
+    ScopedQuantumBackupDir backups{m_path_root / "qkb-ready-pending"};
+    // The mock database writes no file, so the backup of a new key always fails and the key stays pending.
+    auto wallet = CreateSyncedWallet(*m_node.chain,
+        WITH_LOCK(Assert(m_node.chainman)->GetMutex(), return m_node.chainman->ActiveChain()), coinbaseKey);
+    // A new key whose backup failed is pending; then an ordinary key of the wallet is saved as the return address.
+    QuantumStakeReturnPreparation prep = PrepareQuantumStakeReturn(*wallet, QuantumStakeReturnTrigger::EXPLICIT, /*allow_new_key=*/true);
+    BOOST_REQUIRE(prep.outcome == Outcome::PENDING_BACKUP);
+    const std::string pending_address = prep.address;
+    const auto existing = wallet->GetNewQuantumDestination("receive");
+    BOOST_REQUIRE(existing);
+    bilingual_str error;
+    BOOST_REQUIRE_MESSAGE(SetQuantumStakeReturn(*wallet, *existing, error), error.original);
+    BOOST_REQUIRE(WITH_LOCK(wallet->cs_wallet, return ResolveLegacyStakeQuantumReturn(*wallet).available));
+    BOOST_REQUIRE(WITH_LOCK(wallet->cs_wallet, return wallet->m_quantum_return_pending.has_value()));
+    // Both triggers work on the pending record rather than returning at the ready address.
+    for (const auto trigger : {QuantumStakeReturnTrigger::EXPLICIT, QuantumStakeReturnTrigger::AUTOMATIC}) {
+        WITH_LOCK(wallet->m_quantum_return_prepare_mutex, wallet->m_quantum_return_retry_at = SteadyClock::time_point{});
+        prep = PrepareQuantumStakeReturn(*wallet, trigger);
+        BOOST_CHECK_MESSAGE(prep.outcome == Outcome::PENDING_BACKUP, prep.detail);
+        BOOST_CHECK_EQUAL(prep.address, pending_address);
+        BOOST_CHECK(WITH_LOCK(wallet->cs_wallet, return wallet->m_quantum_return_pending.has_value()));
+    }
+}
+
 BOOST_FIXTURE_TEST_CASE(a_coinbase_exactly_maturity_deep_is_a_candidate_for_the_next_block, LegacyStakeOpenSetup)
 {
     auto wallet = CreateSyncedWallet(*m_node.chain,

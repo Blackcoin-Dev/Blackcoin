@@ -11,6 +11,9 @@ from pathlib import Path
 import re
 import sys
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import validate_reproducibility_report as report_validator  # noqa: E402
+
 
 EXPECTED_REPOSITORY = "Blackcoin-Dev/Blackcoin"
 FULL_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -135,6 +138,21 @@ def generate_manifest(
     for required in required_reproducibility_text:
         if required not in reproducibility_text:
             raise RuntimeError(f"reproducibility report is missing required text: {required}")
+    header, report_targets, report_commit = report_validator.parse_report(reproducibility_text)
+    report_validator.check_header(
+        header,
+        report_commit,
+        package_label=package_label,
+        prerelease_channel=label_match.group("channel"),
+        configured_version=configured_version,
+        source_sha=source_sha,
+    )
+    compared_artifacts = {
+        path.name: sha256(path)
+        for path in artifacts.iterdir()
+        if path not in (marker, reproducibility)
+    }
+    report_validator.check_flat_artifacts(report_targets, compared_artifacts)
     if not subjects:
         raise RuntimeError("no canary artifacts were found")
 

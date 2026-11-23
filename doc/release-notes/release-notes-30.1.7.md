@@ -8,8 +8,8 @@ outputs, the Final phase and the end of Gold Rush.
 
 Consensus and reward rules, activation heights, the wire protocol and the wallet
 file format are unchanged. None of the changes below alters which blocks or
-transactions are valid. A wallet file written by 30.1.7 stays readable by 30.1.6
-and earlier.
+transactions are valid. A wallet file written by 30.1.7 opens in 30.1.6, the release
+this one was tested against. Older releases were not tested.
 
 This candidate has `CLIENT_VERSION_IS_RELEASE=false`.
 Release qualification is pending.
@@ -142,8 +142,9 @@ address were never affected. Transaction and block validation rules are unchange
   in the last 500 blocks of Migration cannot stake again before the first Final block, so a wallet
   that stakes all its quantum outputs there can have nothing mature when Final starts. For the
   candidate heights 6,921,500 to 6,921,999 (inclusive; released for 6,922,000) the wallet now
-  holds back R = min(32, (N + 1) / 2) of its N qualifying quantum outputs, the largest effective
-  value at the first Final block first. N counts the outputs that are unspent and will be able to
+  holds back R = min(32, (N + 1) / 2) of its N qualifying quantum outputs when N is two or more
+  (N = 1 is described below), the largest effective value at the first Final block first. N
+  counts the outputs that are unspent and will be able to
   stake at the first Final block (a v16 output the wallet holds the key for, or a v14 cold-stake
   output it holds the staker key for, created at or before height 6,921,500, not locked by the
   user), plus those its confirmed coinstakes consumed since 6,921,500, so the reserve does not
@@ -161,8 +162,11 @@ address were never affected. Transaction and block validation rules are unchange
   their inputs through the same filter. Explicit coin control can still spend a reserved output,
   and `send` and `sendall` then report which reserved outputs were consumed and the reduction of
   the reserve and of the eligibility for the first Final block (`final_stake_reserve_spent`); the
-  readiness report shows the reduction as well. The readiness for the next block and the staking
-  weight leave the reserved outputs out (an N = 1 wallet inside the guard reports no stakeable
+  readiness report shows the reduction as well. An explicit withdrawal of a reserved output from
+  a cold-stake delegation or a tiered stake (the output the user names in the withdrawal
+  command) is allowed in the same way and reports the consumed reserve. A fee input that the
+  wallet adds by itself stays subject to the reserve. The readiness for the next block and the
+  staking weight leave the reserved outputs out (an N = 1 wallet whose output is held reports no stakeable
   output now and one at the first Final block; `reserve_withheld_outputs` and
   `reserve_withheld_nominal` say how many and what they are worth), and for the first Final block
   itself, where the guard is released, the eligibility is still reported.
@@ -173,9 +177,24 @@ address were never affected. Transaction and block validation rules are unchange
   `final_stake_reserve`: whether it is enabled and active, N, the target R, the reserved
   outpoints and their weight, the outputs and weight eligible at the first Final block, any
   shortfall, and what excluded an output (a missing key is told apart from a locked wallet).
-  `-finalstakereserve=0` turns it off. A wallet with a single output withholds it for the 500
-  candidate heights and stakes it again from the first Final block. Winning the first Final block
-  stays a matter of chance. Wallet policy only; no consensus rule changes.
+  `-finalstakereserve` accepts only 0, 1, true or false (any case) or the bare flag, and
+  `-nofinalstakereserve` turns it off; any other value stops the node at startup instead of
+  silently turning the reserve off. A wallet with exactly one eligible quantum output (N = 1)
+  does not always hold it. Whether it holds that output for the first Final block or keeps
+  staking it is decided by a fixed property of the output itself, one bit of a SHA-256 hash of
+  its transaction id and output index, so the same output always gets the same answer, across
+  restarts and reorganisations. `final_stake_reserve` reports the answer as `single_output_rule`,
+  `held` or `released`, when N is one. A held output is withheld for the 500 candidate heights
+  and stakes again from the first Final block; a released one keeps staking. The rule spreads
+  single-output wallets over both choices, so they do not all hold back, or all stake their only
+  output away, together. `single_output_rule` is the assignment only: `active`, `reserved_count`
+  and `reserved_outpoints` show what is actually withheld. For N of two or more nothing changes. The reserve is a distribution rule, not a guarantee of block
+  production (see Known limitations). Winning the first Final block stays a matter of chance.
+  Wallet policy only; no consensus rule changes.
+- **The window says when a payment was stored but not sent.** When the wallet stored a
+  transaction but could not relay it, the Qt window now shows a warning that says so and gives
+  the reason when there is one, together with the reserve warning when both apply. The warning
+  does not promise that the transaction will be relayed or confirmed.
 - **A new quantum stake return key is backed up before it becomes the return address.**
   Quantum keys are random, so a wallet backup made before a key existed cannot recover coins paid
   to it. A key made for the legacy-stake return address is now written to the wallet together
@@ -187,31 +206,45 @@ address were never affected. Transaction and block validation rules are unchange
   stays in use, the error is reported, and the same key is retried, by the next
   `setquantumstakereturn`, by the wallet's own maintenance, and after a restart. A pending key
   cannot be used as the return address in the meantime, including through `existing_address`.
+  It also cannot be chosen as the destination of a migration (`migratetoquantum` with
+  `existing_address`, or the Staking page), of a Gold Rush reward consolidation
+  (`migrategoldrushrewards`), of change, or of an automatic return. Funds that already sit on it
+  can still be spent and staked.
   Concurrent callers produce one key, and no backup work is done while the chain or staking lock
   is held. `getstakinginfo`, `getmigrationstatus`, `getquantumstakereadiness`, the Staking page
   notice and the log report the pending key (`legacy_stake_return_pending`, `..._pending_address`,
   `..._pending_error`; `stake_return.pending` and friends) apart from the readiness of the
   active address. A wallet that holds a pending record opens in v30.1.6, which ignores the
-  record, and in this version again with the pending state intact. A reused key whose
-  verified-backup flag is unset keeps the existing "make a fresh backup" prompt.
+  record, and in this version again with the pending state intact. A reused return key
+  without a verified-backup flag keeps the backup reminder. A newly created return key stays
+  pending until its backup succeeds. Without another ready return address, legacy staking is
+  unavailable from height 6,921,499 while that key remains pending.
 - **`-quantumkeybackupdir`.** Where those backups go. The default is
   `<network datadir>/quantum-key-backups/<wallet>/`; with the option, `<dir>/<wallet>/`. The wallet
   name becomes one safe path component (`default` for the unnamed wallet; anything else is `n_`
-  and its lower case letters, digits and `-`, every other byte escaped, so no two names share a
-  folder, even on a file system that ignores case; a very long name is shortened with a hash of
-  the whole name). A file is named `quantum-wallet-<UTC time>-h<height>-<random>.dat` with a
+  and its lower case letters, digits and `-`, every other byte escaped, so names that differ only
+  in case get different folders, even on a file system that ignores case; an encoded name longer
+  than 80 characters keeps its first 50 characters, then `~` and 32 hexadecimal digits that are
+  the first 16 bytes of the SHA-256 hash of the whole name, so long names are told apart by a
+  truncated hash, which can in theory collide). A file is named
+  `quantum-wallet-<UTC time>-h<height>-<random>.dat` with a
   manifest of the keys it holds next to it, keeps the wallet's encryption, and is private:
   directory 0700 and files 0600 on POSIX. The three newest verified backups are kept, plus any
-  older one that is the only backup of a key the wallet still holds. Pruning happens after the
-  new return address is durable, never touches a file this feature did not write and never counts
-  a failed attempt as a backup.
+  older one that is the only backup of a key the wallet still holds, plus any generation that
+  holds a key this wallet does not have. Pruning happens after the new return address is durable,
+  looks only at files with a recognised backup name and a manifest that reads back correctly (it
+  does not check who made them) and never counts a failed attempt as a backup. Give each node its
+  own backup folder. Nodes that share one folder and one wallet name each keep the generations
+  that hold the other nodes' keys, so such generations can pile up beyond the usual three.
 - **Windows: the backup folder must be on a local NTFS volume of a fixed disk.** A new return key
   becomes active only after the backup folder, and every folder above it up to the data directory (or
   the volume root for a folder outside it), has been flushed to disk, and Windows vouches for that
   flush only on a local NTFS volume. The wallet opens each folder and takes both the volume and the
   file system name from that one open handle: the volume must have a local volume GUID path (a
-  network share has none), the drive of that volume must be a fixed disk (a removable drive is
-  refused, because it can be unplugged), and the file system must be NTFS. It needs permission to
+  network share has none), the drive of that volume must be one Windows reports as a fixed
+  disk (a drive it reports as
+  removable is refused; a drive it reports as fixed can still be an external disk that is
+  unplugged), and the file system must be NTFS. It needs permission to
   open each folder for writing. On a network share, a removable drive, ReFS, FAT32, exFAT or any
   other file system, or when a folder cannot be opened for writing, the key stays pending: the
   Staking page notice, the log and `legacy_stake_return_pending_error` name the folder and the
@@ -219,9 +252,22 @@ address were never affected. Transaction and block validation rules are unchange
   folder on a local NTFS volume"), and nothing is pruned. A `-quantumkeybackupdir` that starts with
   two separators (`\\server\share\...`, `\\?\...`, `\\.\...`) is refused as written ("a network or
   device path is not supported"), before any folder is looked up or created; so is a default backup
-  folder whose path keeps such a prefix from the data directory. Point
+  folder whose path keeps such a prefix from the data directory. A `-quantumkeybackupdir` that
+  names a drive without a folder separator (`D:dir`) or starts at the root of the current drive
+  (`\dir`) is refused as written too, because its meaning depends on the process's current
+  directory. Write `D:\dir` or `D:/dir`. A backup folder whose full per-wallet path is longer
+  than 150 characters (counted in UTF-16 code units, wallet component included) is refused, so
+  that the files inside it stay under the 260-character Windows path limit. These spelling and
+  length checks do not show that the folder is writable, that the disk has space or that the
+  volume is supported. Point
   `-quantumkeybackupdir` at a folder on a fixed local NTFS disk, named by its drive letter, and run
-  `setquantumstakereturn` again. This Windows code was written without a
+  `setquantumstakereturn` again. Windows backup files inherit the destination directory's
+  permissions. Use a private local NTFS folder whose access is restricted to the intended account
+  and administrators. Do not use shared-user or cloud-synchronized folders, and do not retarget
+  junctions or other reparse points while backup preparation is running. The fixed-drive check
+  does not prove that a device cannot be disconnected. Volume validation is not bound to every
+  later path-based operation. These are limits of this release, not qualified storage
+  configurations. This Windows code was written without a
   Windows build or test machine and has not been run.
 - **A better order for choosing the return address.** With no address saved, the wallet takes, in
   this order: the one `-qqpospayoutaddress`, the wallet's recorded Gold Rush claim payout key (the
@@ -229,8 +275,10 @@ address were never affected. Transaction and block validation rules are unchange
   Gold Rush payouts were paid to; an address-book label alone does not identify it), another
   quantum receive address of the wallet (the existing label ranking, then the oldest, then the
   address), and only then a new key, with the existing consent (`allow_new_quantum_key`, or
-  `-qqallowautokeycreation`). A key that is already in every old backup is therefore reused before
-  one is made. A wallet unlocked for staking only still cannot choose or create a key, and can
+  `-qqallowautokeycreation`). An existing key is reused before a new key is created. Reuse does not
+  establish that an older backup contains it. The wallet prefers a usable recorded claim payout
+  key. An older backup can recover that key only if the backup contains it. A wallet unlocked
+  for staking only still cannot choose or create a key, and can
   still bind an existing one with `existing_address`.
 
 ## Staking readiness for the first Final block
@@ -293,9 +341,11 @@ outputs the wallet stakes, what it reports, and what it tells the user to do.
   value, lock state or remaining fee over the minimum changed because of
   demurrage at the next block. The transaction is still rejected and is not
   relayed; only the penalty for the sender is gone. Blocks are validated exactly
-  as before, and genuinely malformed transactions, bad signatures, a fee that was
-  already below the minimum and every rejection that does not depend on the
-  lifecycle phase still penalize the sender. A bad signature is punished when its
+  as before. Whether a rejected transaction penalizes the sender depends on the class
+  of the validation result. A consensus-invalid transaction (a malformed one, a bad
+  signature) still penalizes the sender. A rejection classed as mempool policy, such as
+  an ordinary fee below the minimum, and several other classes never did and still do
+  not. Only the three lifecycle cases above change class. A bad signature is punished when its
   verification is reached; an earlier rejection that does not penalize (see the
   attestation check below) can end the admission first.
 - The missing-FORKID case is identified by a distinct internal script error
@@ -361,7 +411,7 @@ outputs the wallet stakes, what it reports, and what it tells the user to do.
   redelegation scan now remember the block they last scanned, not only its
   height, so a competing block at the same height is scanned too. Retry state
   recorded on a disconnected block is dropped. The wallet file stays readable by
-  30.1.6 and earlier; an older record without a block hash means scan again.
+  30.1.6; an older record without a block hash means scan again.
 - **Operator note: staking power drops at the first Migration block, and blocks can be slower for a
   while.** This describes the consensus rules as they have always been; 30.1.7 does not change
   them. The last Gold Rush block is 6,192,999 (G). From block G+1 the stake weight of an ordinary
@@ -386,7 +436,8 @@ outputs the wallet stakes, what it reports, and what it tells the user to do.
 
 ## Behaviour that changes before the end of Gold Rush
 
-Gold Rush is still running on mainnet and nodes are mining claims. Nothing below changes a
+Until the last Gold Rush block (height 6,192,999) is connected, Gold Rush is running on
+mainnet and nodes are mining claims. Nothing below changes a
 consensus rule or which blocks are valid, and the claim reward, the proof calculation and the
 acceptance of a valid manual claim are untouched. These are the remaining differences a node
 operator can see before the last Gold Rush block (height 6,192,999), in plain language:
@@ -413,12 +464,16 @@ operator can see before the last Gold Rush block (height 6,192,999), in plain la
   its automatic path.
 - **New status fields and commands exist now.** `getquantumstakereadiness`,
   `setquantumstakereturn` and the `legacy_*` status fields are available before the end. The
-  readiness report is read-only and short: 0.01 to 0.05 seconds on a wallet with 20,000 legacy
-  outputs, and 0.07 seconds (0.12 seconds once demurrage is active) on a wallet with 20,000 quantum
+  readiness report is read-only and short (the timings here were measured during development,
+  not in the release audit, and are not a guarantee): 0.01 to 0.05 seconds on a wallet with 20,000
+  legacy outputs, and 0.07 seconds (0.12 seconds once demurrage is active) on a wallet with 20,000 quantum
   outputs. It holds the chain and wallet locks for that time, which is shorter than
   `getdemurragewalletinfo` takes on the same wallet (0.2 to 0.27 seconds), so it is not sliced.
 - **A backup prompt appears for the return key** once one is selected (by the explicit command
-  before the end, by the wallet itself after it). It never blocks staking.
+  before the end, by the wallet itself after it). The reminder for a reused return key does
+  not block staking. A newly created key is different: it stays pending until its backup
+  succeeds, and with no other ready return address legacy staking is unavailable from height
+  6,921,499 while it is pending.
 - **Automatic Gold Rush signal and attestation rescans** react to competing blocks at the same
   height and are rate-limited across a run of reorganisations, so the timing of a fee-paying
   automatic signal after a reorganisation can differ from before. An automatic demurrage attestation
@@ -435,8 +490,62 @@ operator can see before the last Gold Rush block (height 6,192,999), in plain la
 - **Less database and index work** while loading a wallet and recording spends, and no stake weight
   refresh in the Qt window; PSBT signing no longer copies the PSBT per input.
 
+## Operator checks before the transition
+
+- Before height 6,193,000, keep a current verified `backupwallet` result and the public key
+  inventory (`getquantumkeyinventory`) outside the wallet's own failure domain, and rehearse a
+  restore in an isolated copy with staking off. Do not treat `all_backed_up` alone as proof that
+  the external copy exists.
+- Settle the return address early. Binding an existing backed-up quantum address with
+  `setquantumstakereturn {"existing_address": ...}` works with a staking-only unlock. A new key
+  needs a normal unlock and the key-creation consent, and stays pending until its backup
+  succeeds. Check `legacy_stake_return_ready`, the address and `legacy_stake_return_pending`.
+- A fully unlocked loaded wallet can prepare a return address even with staking switched off
+  (`-staking=0` does not stop it; `-disablewallet` does).
+- Check the numeric option values (`-finalstakereserve`, `-quantumkeybackupdir`) and set an
+  unlock timeout that covers the whole observation window.
+- On one canary node, confirm the exact candidate artifact, that the node is synchronised, that
+  `getstakinginfo` reports a searching worker, and that a stake it finds is accepted (check the
+  block, not only the log line). A canary run before a boundary height says nothing about the
+  later transition.
+
 ## Known limitations
 
+- **The final stake reserve reduces one transition risk but does not guarantee uninterrupted
+  block production.** Maintain multiple eligible quantum outputs per staking wallet, prepared
+  early enough to be mature before height 6,921,500. Maintain independently funded staking
+  capacity on another machine and monitor both currently usable outputs and Final-ready outputs.
+  A second machine using the same outpoints does not increase the available kernel inventory.
+  The single-output rule is a distribution heuristic: every single-output producer can fall into
+  the held class, released producers can run out before the first Final block, held producers can
+  be offline then, and a wallet with several outputs can have outputs that are eligible at the
+  first Final block but not usable now. Neither more hashing nor a second machine creates
+  more mature outputs, and enough kernels do not bound the time to the next successful stake.
+  For outputs created by splitting, "mature before height 6,921,500" means confirmed early
+  enough for another full maturity interval; splitting shortly before that height does not do it.
+- **Confirm ordinary payments before heights 6,193,000 and 6,922,000.** If a transaction becomes
+  invalid at a phase change, inspect its confirmation and mempool status before abandoning it.
+  After Migration activation, an eligible payment can be rebuilt under the current signing
+  rules. After Final activation, abandoning a transaction does not restore spendability to its
+  legacy inputs. Do not resend blindly while the transaction is still confirmed or can still
+  confirm. The wallet does not abandon or rebuild such a payment by itself.
+- **An interrupted chainstate flush needs the protected rebuild.** If the node stops in the
+  middle of a multi-batch chainstate flush whose old or new tip is at or beyond the shadow
+  whitelist height (this includes a flush around the Migration and Final heights), it refuses to
+  replay the flush by itself and stops with a rebuild-required error. Staking and validation do
+  not resume until the protected chainstate rebuild has succeeded. This is a deliberate safe
+  stop, not an automatic restart recovery, and the authenticated-state check is not bypassed.
+  Rehearse the rebuild in an isolated copy before the heights.
+- **A backup destination that stalls can stall staking.** Use a responsive local backup
+  destination and watch the pending-error fields. Backup preparation runs on the staking worker
+  and in wallet maintenance, so backup I/O that blocks can hold up both, and the maintenance of
+  other loaded wallets, even though the wallet and chain locks are released while it waits. A
+  local disk lowers this exposure but does not remove stalls from hardware or the file system.
+- **An older backup cannot recover a key it never held.** A rescan cannot recreate a random
+  quantum key created after the backup. Backup flags describe keys present in the restored
+  wallet and do not prove that later keys are present. `getquantumkeyinventory` lists only keys
+  that wallet holds, and its backup flags do not check that an external backup file still
+  exists. The wallet does not detect every receipt to a key it lacks.
 - **Quantum transaction hex without the witness.** `getrawtransaction` and `gettransaction` return
   the transaction without its witness under the default `-rpcserialversion=0`, so the hex of a
   quantum transaction (about 137 bytes for a one-input transaction against about 3,880 with the
@@ -484,13 +593,15 @@ operator can see before the last Gold Rush block (height 6,192,999), in plain la
   6,921,500 on matures too late and can never be spent. Switch legacy staking off from height
   6,921,499, or stay on 30.1.7.
   Likewise 30.1.6 does not know the opportunistic window (from 6,917,000) or the final stake
-  reserve: it pays legacy stakes to legacy outputs in that window, and it stakes every quantum
-  output in the last 500 blocks of Migration.
+  reserve: it pays legacy stakes to legacy outputs in that window, and it does not keep any
+  quantum output back for the first Final block (its other eligibility, locking and
+  reserve-balance rules still apply).
   Record compatibility is not command-line compatibility. `-finalstakereserve` and
-  `-quantumkeybackupdir` are new in 30.1.7, and 30.1.6 refuses to start with an option it does
-  not know: remove both from the command line and from the configuration file before starting
-  30.1.6, and put them back when you upgrade again (the wallet keeps working without them; the
-  backup directory then falls back to its default, and the reserve to its default, on). While
+  `-quantumkeybackupdir` are new in 30.1.7. Remove `-finalstakereserve` and `-quantumkeybackupdir`
+  from the command line before starting 30.1.6, which does not recognize those options. Unknown
+  configuration-file values are logged and ignored. Preserve the settings for the next upgrade
+  (the wallet keeps working without them; the backup directory then falls back to its default,
+  and the reserve to its default, on). While
   30.1.6 is running it also cannot enforce the pending-key quarantine: it does not know the
   pending record, so it may treat a new quantum key that is still waiting for its first verified
   backup like any other key. Finish the pending backup (`setquantumstakereturn`) before

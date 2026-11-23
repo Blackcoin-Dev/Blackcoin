@@ -216,8 +216,12 @@ address were never affected. Transaction and block validation rules are unchange
   other file system, or when a folder cannot be opened for writing, the key stays pending: the
   Staking page notice, the log and `legacy_stake_return_pending_error` name the folder and the
   reason (for example "the backup directory is on a volume with file system exfat ... use a
-  folder on a local NTFS volume"), and nothing is pruned. Point `-quantumkeybackupdir` at a folder on a
-  fixed local NTFS disk and run `setquantumstakereturn` again. This Windows code was written without a
+  folder on a local NTFS volume"), and nothing is pruned. A `-quantumkeybackupdir` that starts with
+  two separators (`\\server\share\...`, `\\?\...`, `\\.\...`) is refused as written ("a network or
+  device path is not supported"), before any folder is looked up or created; so is a default backup
+  folder whose path keeps such a prefix from the data directory. Point
+  `-quantumkeybackupdir` at a folder on a fixed local NTFS disk, named by its drive letter, and run
+  `setquantumstakereturn` again. This Windows code was written without a
   Windows build or test machine and has not been run.
 - **A better order for choosing the return address.** With no address saved, the wallet takes, in
   this order: the one `-qqpospayoutaddress`, the wallet's recorded Gold Rush claim payout key (the

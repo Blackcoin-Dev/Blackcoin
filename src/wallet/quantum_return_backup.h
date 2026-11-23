@@ -26,7 +26,17 @@ namespace wallet {
  *  ends in "~" and 32 hex digits of the SHA-256 of the whole name. Distinct names never share a component. */
 std::string QuantumKeyBackupWalletComponent(const std::string& wallet_name);
 
-/** The base directory: -quantumkeybackupdir (relative to the data directory) or <network datadir>/quantum-key-backups. */
+/** Whether a configured backup directory starts with two separators (each `\` or `/`): on Windows a network share
+ *  (`\\host\share`), an extended-length path (`\\?\C:\dir`, `\\?\UNC\host\share`) or a device path (`\\.\`). The Windows
+ *  build's std::filesystem does not take such a prefix for a root name, so the value would count as relative and be
+ *  joined to the data directory's drive, naming a local folder nobody asked for. Pure, so it is tested on every
+ *  platform. */
+bool QuantumBackupPathHasWindowsDoubleSeparatorPrefix(std::string_view value);
+
+/** The base directory: -quantumkeybackupdir (relative to the data directory) or <network datadir>/quantum-key-backups.
+ *  On Windows a value with a double separator prefix (see above) is returned as it was given, never joined to the
+ *  data directory; EnsureQuantumKeyBackupDirectory and PruneQuantumKeyBackups then refuse it before touching the file
+ *  system. */
 fs::path QuantumKeyBackupBaseDirectory();
 
 /** The directory one wallet's backups go to: QuantumKeyBackupBaseDirectory() / the wallet's component. */
@@ -39,7 +49,8 @@ fs::path QuantumKeyBackupDirectory(const std::string& wallet_name);
  *  committed is a failure (the key it protects stays pending). On Windows the directories are flushed through a
  *  directory handle (FlushFileBuffers), and only on an NTFS volume of a fixed local disk, with the file system name and the
  *  drive type both taken from that handle (see QuantumBackupVolumeRejection); that
- *  code is compiled for the Windows target only and has not been run. */
+ *  code is compiled for the Windows target only and has not been run. On Windows a directory whose path starts with
+ *  two separators (a network or device path) is refused before anything is looked up, created or committed. */
 bool EnsureQuantumKeyBackupDirectory(const fs::path& directory, std::string& error);
 
 /** GetDriveTypeW's results, kept here so the classification below is the same function on every platform. */
@@ -66,6 +77,10 @@ std::optional<std::string> QuantumBackupVolumeRejection(std::string_view file_sy
  *  local GUID path: a network share (`\\?\UNC\...`), a path that names a device or something else, an empty or
  *  truncated answer), and the caller then refuses the directory. Pure, so it is tested on every platform. */
 std::optional<std::wstring> QuantumBackupLocalVolumeRoot(std::wstring_view final_path);
+
+/** Tests only: apply (true) or do not apply (false) the Windows rule for a double separator prefix whatever the
+ *  platform; nullopt restores the platform's own answer (applied on Windows only). */
+void SetQuantumKeyBackupWindowsPathRulesForTest(std::optional<bool> rules);
 
 /** Tests only: replace the commit of a directory (an empty function restores the real one). */
 void SetQuantumKeyBackupDirectoryCommitForTest(std::function<bool(const fs::path&)> hook);

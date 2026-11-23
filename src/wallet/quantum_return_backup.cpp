@@ -60,6 +60,30 @@ bool IsLowerHex(std::string_view s)
 //! Test seam: replaces the commit of a directory (see SetQuantumKeyBackupDirectoryCommitForTest).
 std::function<bool(const fs::path&)> g_directory_commit_hook;
 
+//! Test seam: the Windows path rule on any platform (see SetQuantumKeyBackupWindowsPathRulesForTest).
+std::optional<bool> g_windows_path_rules_for_test;
+
+bool WindowsPathRulesApply()
+{
+    if (g_windows_path_rules_for_test) return *g_windows_path_rules_for_test;
+#ifdef WIN32
+    return true;
+#else
+    return false;
+#endif
+}
+
+/** Why a backup directory given by the caller is refused for its spelling alone, before the file system is touched:
+ *  on Windows, a path that starts with two separators. Never applied to the volume GUID path Windows reports for an
+ *  open handle, which is how a local volume is recognised. */
+std::optional<std::string> BackupDirectorySpellingRejection(const fs::path& directory)
+{
+    if (WindowsPathRulesApply() && QuantumBackupPathHasWindowsDoubleSeparatorPrefix(fs::PathToString(directory))) {
+        return "a network or device path is not supported; use a folder on a local NTFS volume";
+    }
+    return std::nullopt;
+}
+
 std::string DriveTypeName(unsigned drive_type)
 {
     switch (drive_type) {
@@ -243,11 +267,25 @@ std::string QuantumKeyBackupWalletComponent(const std::string& wallet_name)
     return out;
 }
 
+bool QuantumBackupPathHasWindowsDoubleSeparatorPrefix(std::string_view value)
+{
+    const auto separator = [](char c) { return c == '\\' || c == '/'; };
+    return value.size() >= 2 && separator(value[0]) && separator(value[1]);
+}
+
+void SetQuantumKeyBackupWindowsPathRulesForTest(std::optional<bool> rules)
+{
+    g_windows_path_rules_for_test = rules;
+}
+
 fs::path QuantumKeyBackupBaseDirectory()
 {
     const std::string configured = gArgs.GetArg("-quantumkeybackupdir", "");
     if (!configured.empty()) {
         fs::path path = fs::PathFromString(configured);
+        // A network or device path keeps its spelling, so it is refused as what it is and never becomes a folder
+        // on the data directory's drive.
+        if (WindowsPathRulesApply() && QuantumBackupPathHasWindowsDoubleSeparatorPrefix(configured)) return path;
         if (path.is_relative()) path = gArgs.GetDataDirNet() / path;
         return path;
     }
@@ -304,6 +342,10 @@ void SetQuantumKeyBackupDirectoryCommitForTest(std::function<bool(const fs::path
 
 bool EnsureQuantumKeyBackupDirectory(const fs::path& directory, std::string& error)
 {
+    if (const std::optional<std::string> rejection = BackupDirectorySpellingRejection(directory)) {
+        error = strprintf("cannot make the backup directory %s durable: %s", fs::PathToString(directory), *rejection);
+        return false;
+    }
     try {
         // Create what is missing from the top down, each with mode 0700, so no part of the path is ever
         // readable by others, and tighten the wallet's own directory when it already exists and is wider.
@@ -517,6 +559,10 @@ bool WriteQuantumKeyBackupManifest(const fs::path& directory, const std::string&
 
 size_t PruneQuantumKeyBackups(const fs::path& directory, const QuantumKeyBackupKeySet& live_keys, size_t keep_newest)
 {
+    if (const std::optional<std::string> rejection = BackupDirectorySpellingRejection(directory)) {
+        LogPrintf("Not pruning the wallet backups in %s: %s\n", fs::PathToString(directory), *rejection);
+        return 0;
+    }
     const std::set<std::string> doomed = SelectQuantumKeyBackupsToPrune(ListQuantumKeyBackupGenerations(directory), live_keys, keep_newest);
     size_t removed{0};
     for (const std::string& name : doomed) {

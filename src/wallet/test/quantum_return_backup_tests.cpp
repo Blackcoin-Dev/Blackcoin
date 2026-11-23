@@ -458,5 +458,102 @@ BOOST_AUTO_TEST_CASE(the_backup_directory_defaults_under_the_network_data_direct
     BOOST_CHECK_EQUAL(QuantumKeyBackupBaseDirectory(), args.GetDataDirNet() / "quantum-key-backups");
 }
 
+BOOST_AUTO_TEST_CASE(a_double_separator_prefix_is_recognised_in_every_spelling)
+{
+    for (const std::string value : {
+             R"(\\host\share\dir)", "//host/share/dir", R"(\/host\share)", R"(/\host/share)", R"(\\?\C:\dir)",
+             R"(\\?\UNC\host\share)", R"(\\.\)", R"(\\.\PhysicalDrive0)", R"(\\)", "//", R"(\\\host\share)", "///dir"}) {
+        BOOST_CHECK_MESSAGE(QuantumBackupPathHasWindowsDoubleSeparatorPrefix(value), value);
+    }
+    for (const std::string value : {
+             "", R"(\)", "/", "a", "elsewhere", R"(relative\dir)", "relative/dir", R"(C:\dir)", "C:/dir", "C:dir", "D:dir",
+             R"(\dir)", "/dir", R"(C:\\dir)", R"(dir\\sub)", "dir//sub", R"(a\\)", R"(.\\host\share)"}) {
+        BOOST_CHECK_MESSAGE(!QuantumBackupPathHasWindowsDoubleSeparatorPrefix(value), value);
+    }
+}
+
+namespace {
+/** The Windows rule for a double separator prefix on whatever platform runs the test, and the platform's own again. */
+class ScopedWindowsPathRules
+{
+public:
+    explicit ScopedWindowsPathRules(bool rules) { SetQuantumKeyBackupWindowsPathRulesForTest(rules); }
+    ~ScopedWindowsPathRules() { SetQuantumKeyBackupWindowsPathRulesForTest(std::nullopt); }
+};
+} // namespace
+
+// The Windows build's std::filesystem takes `\\host\share` for a relative path, so joining it to the data directory
+// made a local folder on that drive. Under the Windows rule the value keeps its spelling.
+BOOST_AUTO_TEST_CASE(a_network_or_device_backup_path_is_never_joined_to_the_data_directory)
+{
+    ArgsManager& args = *Assert(m_node.args);
+    const ScopedWindowsPathRules windows{true};
+    for (const std::string value : {R"(\\host\share\backups)", "//host/share/backups", R"(\\?\C:\backups)", R"(\\?\UNC\host\share)", R"(\\.\)"}) {
+        args.ForceSetArg("-quantumkeybackupdir", value);
+        BOOST_CHECK_EQUAL(fs::PathToString(QuantumKeyBackupBaseDirectory()), value);
+        const std::string wallet_directory = fs::PathToString(QuantumKeyBackupDirectory("w"));
+        BOOST_CHECK_MESSAGE(wallet_directory.compare(0, value.size(), value) == 0, wallet_directory);
+        BOOST_CHECK_MESSAGE(QuantumBackupPathHasWindowsDoubleSeparatorPrefix(wallet_directory), wallet_directory);
+    }
+    // everything else resolves as before
+    args.ForceSetArg("-quantumkeybackupdir", "elsewhere");
+    BOOST_CHECK_EQUAL(QuantumKeyBackupBaseDirectory(), args.GetDataDirNet() / "elsewhere");
+    const fs::path absolute = m_path_root / "absolute-backups";
+    args.ForceSetArg("-quantumkeybackupdir", fs::PathToString(absolute));
+    BOOST_CHECK_EQUAL(QuantumKeyBackupDirectory("w"), absolute / "n_w");
+    args.ForceSetArg("-quantumkeybackupdir", "");
+    BOOST_CHECK_EQUAL(QuantumKeyBackupBaseDirectory(), args.GetDataDirNet() / "quantum-key-backups");
+}
+
+#ifndef WIN32
+// On POSIX `//dir` names the same directory as `/dir`, which lets these tests show on a real directory that the
+// refusal comes before anything is looked up, created, committed or removed.
+BOOST_AUTO_TEST_CASE(a_network_or_device_backup_path_is_refused_before_the_file_system_is_touched)
+{
+    const fs::path real = m_path_root / "share-root" / "backups" / "n_w";
+    const fs::path spelled = fs::PathFromString("/" + fs::PathToString(real));
+    BOOST_REQUIRE(QuantumBackupPathHasWindowsDoubleSeparatorPrefix(fs::PathToString(spelled)));
+    ScopedCommitRecorder recorder;
+    std::string error;
+    {
+        const ScopedWindowsPathRules windows{true};
+        BOOST_CHECK(!EnsureQuantumKeyBackupDirectory(spelled, error));
+        BOOST_CHECK_MESSAGE(error.find("cannot make the backup directory " + fs::PathToString(spelled) + " durable: a network or device path is not supported; use a folder on a local NTFS volume") == 0, error);
+        BOOST_CHECK(recorder.committed.empty());
+        BOOST_CHECK(!fs::exists(m_path_root / "share-root"));
+    }
+    // without the rule the same spelling is an ordinary directory, so the refusal above was the rule's
+    error.clear();
+    BOOST_REQUIRE_MESSAGE(EnsureQuantumKeyBackupDirectory(spelled, error), error);
+    BOOST_CHECK(fs::is_directory(real));
+    BOOST_CHECK(!recorder.committed.empty());
+}
+
+BOOST_AUTO_TEST_CASE(a_network_or_device_backup_path_is_never_pruned)
+{
+    const fs::path real = m_path_root / "share-prune";
+    const fs::path spelled = fs::PathFromString("/" + fs::PathToString(real));
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(EnsureQuantumKeyBackupDirectory(real, error), error);
+    std::vector<std::string> names;
+    for (int i = 1; i <= 5; ++i) {
+        const std::string name = QuantumKeyBackupFileName(1'798'000'000 + i, 100 + i, NewQuantumKeyBackupSuffix());
+        names.push_back(name);
+        std::ofstream{real / fs::PathFromString(name), std::ios::binary} << "wallet";
+        BOOST_REQUIRE_MESSAGE(WriteQuantumKeyBackupManifest(real, name, static_cast<uint64_t>(i), Keys({1, 2}), error), error);
+    }
+    {
+        const ScopedWindowsPathRules windows{true};
+        BOOST_CHECK_EQUAL(PruneQuantumKeyBackups(spelled, Keys({1, 2}), 3), size_t{0});
+        for (const std::string& name : names) {
+            BOOST_CHECK(fs::exists(real / fs::PathFromString(name)));
+            BOOST_CHECK(fs::exists(real / fs::PathFromString(name + ".keys")));
+        }
+    }
+    // without the rule the same call prunes, so the generations above were kept by the rule
+    BOOST_CHECK_EQUAL(PruneQuantumKeyBackups(spelled, Keys({1, 2}), 3), size_t{2});
+}
+#endif
+
 BOOST_AUTO_TEST_SUITE_END()
 } // namespace wallet

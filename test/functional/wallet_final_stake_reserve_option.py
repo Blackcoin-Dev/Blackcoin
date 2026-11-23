@@ -9,6 +9,7 @@ file, in the positive form and in the negated form (-nofinalstakereserve=true me
 assignment included, stops the start with an error that names the option. Unset, the reserve is on.
 """
 from test_framework.test_framework import BitcoinTestFramework
+from test_framework.test_node import ErrorMatch
 from test_framework.util import assert_equal
 
 INVALID = ["maybe", "2", "-1", "yes", "no", "on", "off", "01", "t", "abc", "", " 1"]
@@ -85,6 +86,47 @@ class FinalStakeReserveOptionTest(BitcoinTestFramework):
         conf.write_text(base + "finalstakereserve=0\n", encoding="utf-8")
         self.start_node(0, extra_args=["-finalstakereserve=1"])
         assert_equal(self.enabled(), True)
+        self.stop_node(0)
+
+        self.log.info("Repeated assignments in the configuration file keep their ordinary precedence: the first positive one wins")
+        for lines, expected in [("finalstakereserve=0\nfinalstakereserve=1\n", False), ("finalstakereserve=1\nfinalstakereserve=0\n", True),
+                                ("finalstakereserve=false\nfinalstakereserve=true\n", False),
+                                ("[regtest]\nfinalstakereserve=0\n", False)]:
+            conf.write_text(base + lines, encoding="utf-8")
+            self.start_node(0)
+            assert_equal(self.enabled(), expected)
+            self.stop_node(0)
+        conf.write_text(base + "finalstakereserve=1\nfinalstakereserve=maybe\n", encoding="utf-8")
+        node.assert_start_raises_init_error(expected_msg="Invalid value 'maybe' for -finalstakereserve", match=ErrorMatch.PARTIAL_REGEX)
+        conf.write_text(base, encoding="utf-8")
+
+        self.log.info("settings.json is checked before the wallet starts")
+        settings = node.chain_path / "settings.json"
+        # The wallets that load at startup are kept in the same file.
+        wallets_key = '"wallet": ["%s"],' % self.default_wallet_name
+        for text, expected in [("false", False), ("true", True), ("0", False), ("1", True), ('"false"', False), ('"TRUE"', True)]:
+            settings.write_text('{%s "finalstakereserve": %s}' % (wallets_key, text), encoding="utf-8")
+            self.start_node(0)
+            assert_equal(self.enabled(), expected)
+            self.stop_node(0)
+        for text in ['"maybe"', '""', "2", "-1", "0.5", "[]", "[1]", "{}", "null", '"yes"']:
+            settings.write_text('{%s "finalstakereserve": %s}' % (wallets_key, text), encoding="utf-8")
+            node.assert_start_raises_init_error(expected_msg="Settings file could not be read", match=ErrorMatch.PARTIAL_REGEX)
+        settings.write_text('{%s "nofinalstakereserve": true}' % wallets_key, encoding="utf-8")
+        node.assert_start_raises_init_error(expected_msg="Settings file could not be read", match=ErrorMatch.PARTIAL_REGEX)
+        self.log.info("settings.json against the configuration file and the command line")
+        conf.write_text(base + "finalstakereserve=1\n", encoding="utf-8")
+        settings.write_text('{%s "finalstakereserve": false}' % wallets_key, encoding="utf-8")
+        self.start_node(0)
+        assert_equal(self.enabled(), False)  # a persistent setting overrides the configuration file
+        self.stop_node(0)
+        self.start_node(0, extra_args=["-finalstakereserve=1"])
+        assert_equal(self.enabled(), True)  # the command line overrides both
+        self.stop_node(0)
+        settings.write_text('{%s "x": 0}' % wallets_key, encoding="utf-8")
+        conf.write_text(base, encoding="utf-8")
+        self.start_node(0)
+        assert_equal(self.enabled(), True)  # absent everywhere: the default
 
 
 if __name__ == '__main__':

@@ -3386,9 +3386,11 @@ bool FinalStakeReserveOptionEnabled()
 {
     const common::SettingsValue value = gArgs.GetSetting("-finalstakereserve");
     if (value.isNull()) return DEFAULT_FINAL_STAKE_RESERVE;
-    // A command line or configuration value reaches here as a boolean, already checked by the argument parser
-    // (ArgsManager::STRICT_BOOL). A string comes from a programmatic setting.
+    // The argument parser (ArgsManager::STRICT_BOOL) and the settings file check have already refused every value but
+    // a boolean (the negation marker), 0, 1, "0", "1", "true" and "false". Programmatic settings (ForceSetArg) may also
+    // be the empty string, a bare flag.
     if (value.isBool()) return value.get_bool();
+    if (value.isNum()) return value.write() != "0";
     if (value.isStr()) {
         const std::string text = ToLower(value.get_str());
         if (text.empty() || text == "1" || text == "true") return true;

@@ -124,7 +124,10 @@ public:
         COMMAND = 0x800,
         /* A boolean option that accepts only the bare flag (-foo, -nofoo) and the values 0, 1, true and false in any
          * letter case, in the positive form and in the negated form (-nofoo=true means false). Any other
-         * assignment, including an empty one, is a startup error; accepted values are stored as booleans. */
+         * assignment, including an empty one, is a startup error, and so is an invalid value in the settings file.
+         * A positive assignment is stored as the string "1" or "0", so precedence is the ordinary one; only a
+         * negated key is stored as a boolean (the settings system's negation marker). It composes with
+         * DISALLOW_NEGATION and DISALLOW_ELISION, which are checked first. */
         STRICT_BOOL = 0x1000,
     };
 

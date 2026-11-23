@@ -17,6 +17,7 @@ before:
 The chain is taken back to height 80 between the cases (invalidateblock), so each starts the same way.
 """
 from decimal import Decimal
+from math import ceil
 from threading import Thread
 from urllib.parse import quote
 
@@ -36,13 +37,21 @@ from transition_t_final_util import (
 BEFORE_GUARD = F - MATURITY - 2  # 80: the candidate 81 is outside the guard
 K_OUTPUTS = 2
 REFUSED = "held back as the final stake reserve"
+# The pause the node takes at the start of a commit is clamped to 10000 ms by the node.
+MAX_COMMIT_DELAY_MS = 10000
+BASE_COMMIT_DELAY_MS = 2000
 
 
 class FinalStakeReserveCommitTest(TransitionTFinalTestBase, BitcoinTestFramework):
     def set_test_params(self):
         self.num_nodes = 1
         self.setup_clean_chain = True
-        self.extra_args = [LIFECYCLE_ARGS + ["-finalstakereservecommitdelaymillis=2000"]]
+        # A slow machine (a larger timeout factor) needs a longer pause for the chain to move while the commit waits, up
+        # to the node's own cap of 10000 ms.
+        wanted = ceil(BASE_COMMIT_DELAY_MS * self.options.timeout_factor)
+        self.commit_delay_ms = min(MAX_COMMIT_DELAY_MS, max(BASE_COMMIT_DELAY_MS, wanted))
+        self.delay_capped = wanted > MAX_COMMIT_DELAY_MS
+        self.extra_args = [LIFECYCLE_ARGS + [f"-finalstakereservecommitdelaymillis={self.commit_delay_ms}"]]
 
     def skip_test_if_missing_module(self):
         self.skip_if_no_wallet()
@@ -50,8 +59,16 @@ class FinalStakeReserveCommitTest(TransitionTFinalTestBase, BitcoinTestFramework
     def key(self, outpoint):
         return (outpoint["txid"], outpoint["vout"])
 
+    def scaled(self, seconds):
+        """A wait budget in seconds, scaled by the timeout factor where the framework does not do it itself."""
+        return ceil(seconds * self.options.timeout_factor)
+
     def run_test(self):
         node = self.nodes[0]
+        if self.delay_capped:
+            self.log.warning("The commit pause is capped at %d ms by the node; the timeout factor %s is not fully applied to it",
+                             MAX_COMMIT_DELAY_MS, self.options.timeout_factor)
+        self.log.info("Commit pause: %d ms (timeout factor %s)", self.commit_delay_ms, self.options.timeout_factor)
         default = node.get_wallet_rpc(self.default_wallet_name)
         default.staking(False)
         self.set_initial_mt()
@@ -172,7 +189,7 @@ class FinalStakeReserveCommitTest(TransitionTFinalTestBase, BitcoinTestFramework
         outcome = {}
 
         def run():
-            rpc = get_rpc_proxy(self.wallet_url, 91, timeout=300, coveragedir=node.coverage_dir)
+            rpc = get_rpc_proxy(self.wallet_url, 91, timeout=self.scaled(300), coveragedir=node.coverage_dir)
             try:
                 outcome["value"] = call(rpc)
             except Exception as e:  # noqa: BLE001
@@ -180,13 +197,13 @@ class FinalStakeReserveCommitTest(TransitionTFinalTestBase, BitcoinTestFramework
 
         thread = Thread(target=run, name="commit-in-flight", daemon=True)
         try:
-            with node.wait_for_debug_log([b"Wallet commit test pause reached"], timeout=30):
+            with node.wait_for_debug_log([b"Wallet commit test pause reached"], timeout=30):  # the node scales it itself
                 thread.start()
         except AssertionError:
-            thread.join(timeout=5)
+            thread.join(timeout=self.scaled(5))
             raise AssertionError("the commit never paused: %s" % outcome)
         during()
-        thread.join(timeout=60)
+        thread.join(timeout=self.scaled(60))
         assert not thread.is_alive(), "the commit did not finish"
         if result is not None and "value" in outcome:
             result["value"] = outcome["value"]

@@ -49,6 +49,8 @@ BASE_ARGS = [
 PASSPHRASE = "correct horse battery"
 # The test-only crash point ends the daemon with TerminateProcess(7) on Windows (src/wallet/staking.cpp).
 WINDOWS_CRASH_EXIT = 7
+# The daemon's own startup failure (InitError returns false, bitcoind exits with EXIT_FAILURE).
+STARTUP_REFUSAL_EXIT = 1
 CRASH_POINTS = ("after_key_insertion", "after_backup_install", "before_activation", "after_activation")
 LOG_INTEREST = re.compile(r"quantum|backup|durab|flush|Unable to|not active|FlushFileBuffers", re.IGNORECASE)
 
@@ -402,6 +404,7 @@ class Node:
         self.process = None
         self.stdout = None
         self.console_path = None
+        self.console_offset = 0
         self.forced_kill = False
         #: the exit code of an intentional crash (a crash point) that a case verified, until the next start
         self.intentional_exit_code = None
@@ -425,6 +428,8 @@ class Node:
             "-datadir=" + self.datadir, "-port=%d" % self.port, "-rpcport=%d" % self.rpc_port] + self.extra_args
         console_path = os.path.join(self.env.logs, "%s-%s.out" % (safe_name(self.env.case), self.label))
         self.console_path = console_path
+        # the console file is appended to by every start with this label: what a start wrote begins here
+        self.console_offset = os.path.getsize(console_path) if os.path.exists(console_path) else 0
         self.stdout = open(console_path, "ab")
         self.process = subprocess.Popen(arguments, stdout=self.stdout, stderr=subprocess.STDOUT)
         if self not in self.env.nodes:
@@ -449,16 +454,27 @@ class Node:
         raise CheckFailed("the daemon was not ready after %d seconds" % timeout)
 
     def refused_at_startup(self, extra_args, timeout=90):
-        """Start the daemon with options it must refuse: it ends with a nonzero exit code before it serves anything.
-        Returns (exit code, the text it wrote to the console). A daemon that is still running after the timeout, or that
-        ended with 0, fails the check. The process is a refusal, not a clean shutdown: the code is recorded as intentional."""
+        """Start the daemon with options it must refuse. The daemon's own startup failure ends with exit code exactly 1
+        (InitError); any other code, 0 or a crash (a Windows exception status included), fails the check even when the
+        expected text was printed before it. Returns (exit code, the text THIS start wrote to the console): the console
+        file is appended to by every start with this label, so only what follows the offset saved before the start is read."""
         self._spawn(extra_args)
         code = self.wait_exit(timeout)
-        check(code != 0, "the daemon was expected to refuse these options but exited with code 0")
-        self.intentional_exit_code = code
         self.stdout.flush()
-        with open(self.console_path, "r", encoding="utf-8", errors="replace") as handle:
-            return code, handle.read()
+        with open(self.console_path, "rb") as handle:
+            handle.seek(self.console_offset)
+            text = handle.read().decode("utf-8", "replace")
+        check(code == STARTUP_REFUSAL_EXIT, "the daemon was expected to refuse these options with exit code %d but exited with "
+                                            "code %s: %s" % (STARTUP_REFUSAL_EXIT, code, text.strip()[-300:]))
+        return code, text
+
+    def restart_after_crash(self, extra_args=None):
+        """Start again after a crash that a case verified with wait_crash (the process ended with exactly the code that
+        crash point produces). It is not a clean restart and does not stop anything: stop(clean=True) never accepts a crash."""
+        check(self.process is not None and self.process.poll() is not None and self.intentional_exit_code is not None
+              and self.process.returncode == self.intentional_exit_code,
+              "restart_after_crash needs a process that ended with the exit code a case verified")
+        return self.start(extra_args)
 
     def rpc(self, wallet=None):
         return Rpc(self.rpc_port, self.cookie, wallet=wallet)
@@ -482,8 +498,8 @@ class Node:
 
     def wait_crash(self, expected_code, point, timeout=90):
         """Wait for the daemon to end at a crash point and require exactly the exit code that point produces (the abrupt
-        end of TerminateProcess). This is an intentional crash, never a clean shutdown: the verified code is what lets a
-        later stop() of this process pass, and any other code, or a clean exit, fails here."""
+        end of TerminateProcess). This is an intentional crash, never a clean shutdown: the verified code only lets
+        restart_after_crash start the daemon again; stop(clean=True) never accepts it. Any other code, or a clean exit, fails here."""
         code = self.wait_exit(timeout)
         check(code == expected_code, "crash point %s: exit code %s, expected %s" % (point, code, expected_code))
         self.intentional_exit_code = code
@@ -511,8 +527,7 @@ class Node:
                 self.env.forced_kills.append("%s/%s after %d s" % (self.env.case, self.label, timeout))
                 self.process.kill()
                 self.process.wait(timeout=30)
-        if clean and not (self.intentional_exit_code is not None and self.process.returncode == self.intentional_exit_code
-                          and not self.forced_kill):
+        if clean:
             problem = clean_stop_problem(self.process.returncode, self.forced_kill, self.label, timeout)
             if problem:
                 raise CheckFailed(problem)
@@ -1086,15 +1101,22 @@ def case_unc_share(env, rec):
     rec["observed"]["default_after_refusal"] = exercise_success(default, default_backup_root(datadir), "wunc", None)
 
 
+def utf16_units(value):
+    """The length of a string in UTF-16 code units, which is what Windows counts for a path (Python's len counts code
+    points, so a character outside the Basic Multilingual Plane would count one instead of two)."""
+    return len(value.encode("utf-16-le", "surrogatepass")) // 2
+
+
 def swapped_case(path):
-    """The same folder spelled with every letter's case swapped (Windows file names ignore case)."""
-    return path.swapcase()
+    """The same folder spelled with the case of every ASCII letter swapped (a Windows file name ignores the case of ASCII
+    letters; other characters are left alone, because their case equivalence is not a rule this can state)."""
+    return "".join(character.swapcase() if character.isascii() else character for character in path)
 
 
 def backup_root_for_length(base, wallet_name, length):
     """A -quantumkeybackupdir value (base plus one padding folder) whose per-wallet directory, <base>\\<pad>\\<component>,
-    is exactly `length` characters long."""
-    pad = length - len(base) - 2 - len(component(wallet_name))
+    is exactly `length` UTF-16 code units long."""
+    pad = length - utf16_units(base) - 2 - utf16_units(component(wallet_name))
     precondition(1 <= pad <= 200, "the base %r leaves no room to build a %d character backup directory" % (base, length))
     return base + "\\" + "p" * pad
 
@@ -1107,11 +1129,16 @@ def case_datadir_case(env, rec):
     shutil.rmtree(datadir, ignore_errors=True)
     os.makedirs(datadir)
     other = swapped_case(datadir)
-    precondition(other != datadir, "the data directory %r has no letters to change the case of" % datadir)
-    check(os.path.samefile(datadir, other), "the spellings %r and %r do not name one folder" % (datadir, other))
+    precondition(other != datadir, "the data directory %r has no ASCII letters to change the case of" % datadir)
+    try:
+        equivalent = os.path.samefile(datadir, other)
+    except OSError:
+        equivalent = False
+    precondition(equivalent, "the spellings %r and %r do not name one folder (a case-sensitive directory?)" % (datadir, other))
     for label, given, backup_base, wallet in (("datadir-as-created", datadir, other, "wcasea"),
                                                ("datadir-swapped", other, datadir, "wcaseb")):
-        root = backup_base + "\\qb-" + label
+        # below the network data directory (<datadir>\regtest), where the product's walk ends
+        root = os.path.join(backup_base, "regtest", "qb-" + label)
         node = env.node(given, ["-quantumkeybackupdir=" + root], label=label).start()
         rec["observed"][label] = {"datadir": given, "backup_directory": root,
                                   "result": exercise_success(node, root, wallet, None)}
@@ -1149,33 +1176,43 @@ def case_relative_path(env, rec):
         watched_absent(watched, "%s: the refused backup path created" % label)
         rec["observed"][label] = {"value": value, "exit_code": code}
     # the daemon starts on the default path afterwards, and a full-path value with a drive and a separator is accepted
-    node = env.node(datadir, ["-quantumkeybackupdir=" + os.path.join(datadir, "full-path-ok")], label="full-path").start()
-    rec["observed"]["full_path"] = exercise_success(node, os.path.join(datadir, "full-path-ok"), "wrelok", None)
+    full_path = os.path.join(datadir, "regtest", "full-path-ok")  # below the network data directory
+    node = env.node(datadir, ["-quantumkeybackupdir=" + full_path], label="full-path").start()
+    rec["observed"]["full_path"] = exercise_success(node, full_path, "wrelok", None)
 
 
 def case_long_path(env, rec):
     """The resolved per-wallet backup directory is at most 150 UTF-16 characters: 150 and 149 work end to end (a backup in
-    progress needs 109 more characters below it, up to the 259 Windows allows), 151 and longer are refused when the wallet
-    is created, with the length message, and nothing is created. Each length has its own data directory, so a wallet made
-    for one backup directory is never loaded under another."""
-    base = os.path.join(env.case_dir("long-path"), "backups")
+    progress needs 109 more characters below it, up to the 259 Windows allows) and restore on a node whose default path is
+    short; 151 and longer are refused when the wallet is created, when it is loaded at startup and by loadwallet, with the
+    length message, and nothing is created. Each length has its own data directory, so a wallet made for one backup
+    directory is never loaded under another. The backup directories are below <datadir>\\regtest, where the product's walk
+    up ends, so no permission above the data directory is involved."""
+    case_root = env.case_dir("long-path")
     for length in (150, 149):
         wallet = "wlong%d" % length
-        datadir = os.path.join(env.case_dir("long-path"), "data%d" % length)
+        datadir = os.path.join(case_root, "data%d" % length)
         shutil.rmtree(datadir, ignore_errors=True)
         os.makedirs(datadir)
-        root = backup_root_for_length(base, wallet, length)
-        check(len(os.path.join(root, component(wallet))) == length, "the directory built for %d is not that long" % length)
+        root = backup_root_for_length(os.path.join(datadir, "regtest", "backups"), wallet, length)
+        check(utf16_units(os.path.join(root, component(wallet))) == length, "the directory built for %d is not that long" % length)
         node = env.node(datadir, ["-quantumkeybackupdir=" + root], label="accept%d" % length).start()
-        rec["observed"]["accepted_%d" % length] = {"backup_directory": os.path.join(root, component(wallet)),
-                                                   "result": exercise_success(node, root, wallet, None)}
+        # the restored wallet's own backup directory would be nine characters longer, so it is restored on a node with a
+        # short default path
+        restore_dir = os.path.join(case_root, "restore%d" % length, "data")
+        shutil.rmtree(os.path.dirname(restore_dir), ignore_errors=True)
+        restore_node = env.node(restore_dir, label="restore%d" % length).start()
+        rec["observed"]["accepted_%d" % length] = {
+            "backup_directory": os.path.join(root, component(wallet)),
+            "result": exercise_success(node, root, wallet, None, restore_node=restore_node)}
         node.stop()
+        restore_node.stop()
     for length in (151, 190):
         wallet = "wlong%d" % length
-        datadir = os.path.join(env.case_dir("long-path"), "data%d" % length)
+        datadir = os.path.join(case_root, "data%d" % length)
         shutil.rmtree(datadir, ignore_errors=True)
         os.makedirs(datadir)
-        root = backup_root_for_length(base, wallet, length)
+        root = backup_root_for_length(os.path.join(datadir, "regtest", "backups"), wallet, length)
         node = env.node(datadir, ["-quantumkeybackupdir=" + root], label="refuse%d" % length).start()
         message = expect_rpc_error(lambda: node.rpc().createwallet(wallet_name=wallet, load_on_startup=True))
         record_error(rec, "length %d: %s" % (length, message))
@@ -1188,6 +1225,35 @@ def case_long_path(env, rec):
         check(not os.path.exists(root), "length %d: the refused backup directory was created: %s" % (length, root))
         rec["observed"]["refused_%d" % length] = message
         node.stop()
+    # a wallet that already exists is refused too, when it is loaded at startup and by loadwallet
+    length = 151
+    wallet = "wlongload"
+    datadir = os.path.join(case_root, "data-load")
+    shutil.rmtree(datadir, ignore_errors=True)
+    os.makedirs(datadir)
+    root = backup_root_for_length(os.path.join(datadir, "regtest", "backups"), wallet, length)
+    setup = env.node(datadir, label="load-setup").start()
+    make_wallet(setup, wallet, None)  # on the default path, which is short
+    setup.stop()
+    startup = env.node(datadir, label="load-startup")
+    code, output = startup.refused_at_startup(["-quantumkeybackupdir=" + root])
+    found = LENGTH_RE.search(output)
+    check(found and int(found.group(1)) == length and int(found.group(2)) == 150,
+          "startup: the refusal does not give the length and the limit: %s" % output.strip()[-400:])
+    check(not os.path.exists(root), "startup: the refused backup directory was created: %s" % root)
+    rec["observed"]["startup_refusal"] = output.strip()[-400:]
+    again = env.node(datadir, label="load-unload").start()
+    again.rpc().unloadwallet(wallet_name=wallet, load_on_startup=False)
+    again.stop()
+    loading = env.node(datadir, ["-quantumkeybackupdir=" + root], label="load-rpc").start()
+    message = expect_rpc_error(lambda: loading.rpc().loadwallet(filename=wallet))
+    found = LENGTH_RE.search(message)
+    check(found and int(found.group(1)) == length and int(found.group(2)) == 150,
+          "loadwallet: the refusal does not give the length and the limit: %s" % message)
+    check(wallet not in loading.rpc().listwallets(), "loadwallet: the refused wallet was loaded")
+    check(not os.path.exists(root), "loadwallet: the refused backup directory was created: %s" % root)
+    rec["observed"]["loadwallet_refusal"] = message
+    loading.stop()
 
 
 def case_mapped_drive(env, rec):
@@ -1253,7 +1319,11 @@ def case_denied_ancestor(env, rec):
 def crash_cycle(node, base_args, point, name, passphrase):
     """Restart the node with a crash point, make it reach the point through setquantumstakereturn, and require the
     abrupt exit (TerminateProcess, exit code 7). The wallet and the files stay as the daemon itself left them."""
-    node.restart(extra_args=list(base_args) + ["-quantumreturncrashpoint=" + point])
+    arguments = list(base_args) + ["-quantumreturncrashpoint=" + point]
+    if node.process is not None and node.process.poll() is not None and node.intentional_exit_code is not None:
+        node.restart_after_crash(extra_args=arguments)  # the previous round ended at its crash point, as verified
+    else:
+        node.restart(extra_args=arguments)
     wallet = node.wait_wallet(name)
     unlock(wallet, passphrase)
     try:
@@ -1298,7 +1368,7 @@ def case_affected_wallet(env, rec):
 
     # 1. a key becomes pending: the daemon ends right after the key was stored, before any backup
     crash_cycle(node, arguments, "after_key_insertion", name, passphrase)
-    node.restart(extra_args=arguments)
+    node.restart_after_crash(extra_args=arguments)
     wallet = node.wait_wallet(name)
     unlock(wallet, passphrase)
     state = pending_checks(wallet, with_error=False)  # no backup attempt has failed yet, so there is no error
@@ -1326,7 +1396,7 @@ def case_affected_wallet(env, rec):
         check(len(found) == round_number, "expected %d verified generations after round %d, found %s" % (round_number, round_number, found))
         sequences = {n: read_generation(leaf, n)["sequence"] for n in found}
         check(len(set(sequences.values())) == len(sequences), "two generations share a sequence number: %s" % sequences)
-    node.restart(extra_args=arguments)
+    node.restart_after_crash(extra_args=arguments)
     wallet = node.wait_wallet(name)
     unlock(wallet, passphrase)
     old_generations = generations(leaf)
@@ -1702,13 +1772,20 @@ def selftest():
         for wallet in ("wlong150", "wlong149", "w"):
             for length in (149, 150, 151, 190):
                 built = backup_root_for_length(base, wallet, length)
-                assert len(built + "\\" + component(wallet)) == length and built.startswith(base + "\\p")
+                assert utf16_units(built + "\\" + component(wallet)) == length and built.startswith(base + "\\p")
     try:
         backup_root_for_length("C:\\" + "x" * 140, "wlong150", 150)
         raise AssertionError("a base that leaves no room must be unresolved")
     except Unresolved:
         pass
     assert swapped_case("C:\\Qual\\data") == "c:\\qUAL\\DATA" and swapped_case(swapped_case("C:\\Qual")) == "C:\\Qual"
+    assert swapped_case("C:\\Qu\u00e9l") == "c:\\qU\u00e9L"  # only ASCII letters change
+    assert utf16_units("abc") == 3 and utf16_units("a\U0001F600") == 3 and utf16_units("\u00e9") == 1
+    # a non-BMP character in the base counts two units, so the built directory is exactly the length asked for
+    for base in ("C:\\qual\\\U0001F600\\backups", "C:\\qual\\caf\u00e9"):
+        for length in (149, 150, 151):
+            built = backup_root_for_length(base, "wlong150", length)
+            assert utf16_units(built + "\\" + component("wlong150")) == length
     assert DURABLE_RE.search(unc) and NETWORK_PATH_RE.search(unc) and UNSUPPORTED_VOLUME_RE.search(unc)
     assert NOT_DENIED_RE.search(unc) and not DENIED_RE.search(unc)
     mapped = ("cannot make the backup directory R:\\backups\\n_wmap durable: its volume cannot be identified: The system "
@@ -1871,32 +1948,68 @@ def selftest():
         except CheckFailed as error:
             assert "was killed" in str(error)
         assert node.forced_kill
-        # an intentional crash passes only with the exact code the case verified, and a node that was never started
-        # has nothing to stop
+        # a verified crash is never a clean stop: stop(clean=True) rejects it with or without the verified code, and
+        # restart_after_crash needs exactly that code; a node that was never started has nothing to stop
         done = fake_process(7)
         done.wait()
-        assert stop_outcome(done, intentional=7) is None
-        assert "exit code 7" in stop_outcome(done, intentional=9)
+        assert "exit code 7" in stop_outcome(done, intentional=7)
         assert "exit code 7" in stop_outcome(done, intentional=None)
+        assert stop_outcome(done, intentional=7, clean=False) is None
         node.process = None
         node.stop()
         node.process = fake_process(7)
         node.intentional_exit_code = None
         assert node.wait_crash(7, "fake_point") == 7 and node.intentional_exit_code == 7
+        assert "exit code 7" in stop_outcome(node.process, intentional=7)
         node.process = fake_process(0)
         try:
             node.wait_crash(7, "fake_point")
             raise AssertionError("a clean exit is not the crash that was expected")
         except CheckFailed:
             pass
+        for code in (3, 1):
+            node.process = fake_process(code)
+            node.process.wait()
+            node.intentional_exit_code = 7
+            try:
+                node.restart_after_crash([])
+                raise AssertionError("restart_after_crash needs the verified code")
+            except CheckFailed:
+                pass
         assert clean_stop_problem(0, False) is None
-        # a daemon that refuses its options ends nonzero before it serves anything; the text it wrote is returned
+        # a daemon that refuses its options ends with exit code exactly 1; any other code (0, 2, a Windows exception status)
+        # fails even when the expected text was printed, and only this start's output is returned
         refusing = Env({"cases": temporary}, os.path.join(temporary, "refusing-results"), sys.executable, "probe")
         refusing.case = "selftest-refusal"
-        refused_node = Node(refusing, os.path.join(temporary, "refusing-data"), label="refused")
-        refusal_code, refusal_text = refused_node.refused_at_startup([])
-        assert refusal_code != 0 and refusal_text.strip() and refused_node.intentional_exit_code == refusal_code
-        assert refused_node.stop() is None  # an intentional, verified exit code is not a failed clean stop
+
+        class FakeStart(Node):
+            script = ""
+
+            def _spawn(self, extra_args=None):
+                self.forced_kill = False
+                self.intentional_exit_code = None
+                self.console_path = os.path.join(self.env.logs, "fake.out")
+                self.console_offset = os.path.getsize(self.console_path) if os.path.exists(self.console_path) else 0
+                self.stdout = open(self.console_path, "ab")
+                self.process = subprocess.Popen([sys.executable, "-c", self.script], stdout=self.stdout, stderr=subprocess.STDOUT)
+
+        refused_node = FakeStart(refusing, os.path.join(temporary, "refusing-data"), label="refused")
+        refused_node.script = "import sys; print('Error: first start'); sys.exit(1)"
+        code_one, text_one = refused_node.refused_at_startup([])
+        assert code_one == 1 and "first start" in text_one
+        refused_node.script = "import sys; print('Error: second start'); sys.exit(1)"
+        code_two, text_two = refused_node.refused_at_startup([])
+        assert code_two == 1 and "second start" in text_two and "first start" not in text_two
+        for bad_code in (0, 2, 3221225477 % 256, 7):
+            refused_node.script = "import sys; print('Error: refused, then ends oddly'); sys.exit(%d)" % bad_code
+            try:
+                refused_node.refused_at_startup([])
+                raise AssertionError("exit code %d is not a startup refusal" % bad_code)
+            except CheckFailed as error:
+                assert "exit code 1" in str(error)
+        # a Windows exception status is not 1
+        assert STARTUP_REFUSAL_EXIT == 1 and 0xC0000005 != STARTUP_REFUSAL_EXIT
+        assert refused_node.stop(clean=False) is None
         assert clean_stop_problem(1, False) and clean_stop_problem(0, True)
         # starting a process resets the termination state of the previous one
         node.forced_kill = True

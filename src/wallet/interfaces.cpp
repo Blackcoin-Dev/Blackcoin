@@ -2045,6 +2045,9 @@ util::Result<WalletQuantumActionTx> CreateQuantumMigrationSweep(
         if (!wallet.GetQuantumKeyInfo(destination).has_value()) {
             return util::Error{_("The destination is not wallet-backed (no ML-DSA private key in this wallet). No transaction was created.")};
         }
+        if (wallet.IsQuantumStakeReturnPendingKey(destination)) {
+            return util::Error{_("The destination is the quantum stake return key, a new key still waiting for its first verified wallet backup. It cannot receive funds until that backup succeeds. No transaction was created.")};
+        }
     }
     const CScript destination_script = GetScriptForDestination(destination);
     const std::string destination_address = EncodeDestination(destination);

@@ -6280,6 +6280,9 @@ static RPCHelpMan sweepdemurragedecay()
             if (!pwallet->GetQuantumKeyInfo(dest).has_value()) {
                 throw JSONRPCError(RPC_WALLET_ERROR, "destination_address is not wallet-backed");
             }
+            if (WITH_LOCK(pwallet->cs_wallet, return pwallet->IsQuantumStakeReturnPendingKey(dest))) {
+                throw JSONRPCError(RPC_WALLET_ERROR, "destination_address is the quantum stake return key, a new key still waiting for its first verified wallet backup; it cannot receive funds until that backup succeeds");
+            }
         } else {
             auto op_dest = pwallet->GetNewQuantumDestination(label);
             if (!op_dest) throw JSONRPCError(RPC_WALLET_ERROR, util::ErrorString(op_dest).original);

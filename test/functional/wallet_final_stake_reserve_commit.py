@@ -32,10 +32,12 @@ from transition_t_final_util import (
     LIFECYCLE_ARGS,
     MATURITY,
     TransitionTFinalTestBase,
+    single_output_reserve_bit,
 )
 
 BEFORE_GUARD = F - MATURITY - 2  # 80: the candidate 81 is outside the guard
 K_OUTPUTS = 2
+K_CANDIDATES = 12
 REFUSED = "held back as the final stake reserve"
 # The pause the node takes at the start of a commit is clamped to 10000 ms by the node.
 MAX_COMMIT_DELAY_MS = 10000
@@ -74,21 +76,38 @@ class FinalStakeReserveCommitTest(TransitionTFinalTestBase, BitcoinTestFramework
         self.set_initial_mt()
         pow_addr = default.getnewaddress("", "legacy")
 
-        self.log.info("A wallet with two quantum outputs, each migrated from its own coinbase")
-        node.createwallet("wc")
-        wallet = node.get_wallet_rpc("wc")
-        wallet.staking(False)
+        self.log.info("Candidate wallets with two quantum outputs each, migrated from their own coinbases")
+        # A user lock takes an output out of the count, so in the case with lock_unspents below the reserved output is
+        # alone, and a lone output is held back only when the singleton rule says so: the test keeps a candidate whose
+        # reserved output the rule holds.
+        names = [f"wc{i}" for i in range(K_CANDIDATES)]
+        wallets = []
+        for name in names:
+            node.createwallet(name)
+            wallets.append(node.get_wallet_rpc(name))
+            wallets[-1].staking(False)
         for _ in range(K_OUTPUTS):
-            self.generatetoaddress(node, 1, wallet.getnewaddress("", "legacy"), sync_fun=self.no_op)
-            self.bump()
+            for candidate in wallets:
+                self.generatetoaddress(node, 1, candidate.getnewaddress("", "legacy"), sync_fun=self.no_op)
+                self.bump()
         self.pow_blocks(node, G - node.getblockcount(), pow_addr)
-        for _ in range(K_OUTPUTS):
-            address = wallet.getnewquantumaddress()["address"]
-            wallet.migratetoquantum({"existing_address": address, "max_inputs": 1})
+        for candidate in wallets:
+            for _ in range(K_OUTPUTS):
+                candidate.migratetoquantum({"existing_address": candidate.getnewquantumaddress()["address"], "max_inputs": 1})
             self.pow_blocks(node, 1, pow_addr)
         self.pow_blocks(node, BEFORE_GUARD - node.getblockcount(), pow_addr)
         assert_equal(node.getblockcount(), BEFORE_GUARD)
         self.sync_mt_tip()
+        chosen = None
+        for name, candidate in zip(names, wallets):
+            planned = candidate.getquantumstakereadiness()["final_stake_reserve"]
+            assert_equal(planned["n"], K_OUTPUTS)
+            if single_output_reserve_bit(*self.key(planned["reserved_outpoints"][0])):
+                chosen = (name, candidate)
+                break
+        assert chosen is not None, "none of the %d candidates has a reserved output the singleton rule holds" % K_CANDIDATES
+        wallet_name, wallet = chosen
+        self.log.info("Using %s", wallet_name)
 
         info = wallet.getquantumstakereadiness()["final_stake_reserve"]
         assert_equal(info["active"], False)
@@ -102,7 +121,7 @@ class FinalStakeReserveCommitTest(TransitionTFinalTestBase, BitcoinTestFramework
         self.total = sum(Decimal(str(u["amount"])) for u in outputs.values())
         self.base_hash = node.getbestblockhash()
         self.destination = wallet.getnewquantumaddress()["address"]
-        self.wallet_url = f"{node.url}/wallet/{quote('wc', safe='')}"
+        self.wallet_url = f"{node.url}/wallet/{quote(wallet_name, safe='')}"
 
         records = wallet.getwalletinfo()["txcount"]
 

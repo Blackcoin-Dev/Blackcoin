@@ -7112,7 +7112,7 @@ void WalletTests::finalStakeReservePreparedTransactions()
     const auto guard_on = [] { gArgs.ForceSetArg("-finalstakereserve", "1"); };
     const auto prepare = [&](wallet::CCoinControl coin_control, CAmount amount) -> CTransactionRef {
         guard_off();
-        coin_control.destChange = *dest_small; // quantum inputs need quantum change; fixed, so equal inputs give an equal txid
+        coin_control.destChange = *dest_small; // quantum inputs need quantum change; fixed, so the id varies only with the input order and the lock time
         int change_pos{1};
         CAmount fee{0};
         auto created = iface.createTransaction({wallet::CRecipient{*payee, amount, false}}, coin_control, /*sign=*/true, change_pos, fee);
@@ -7156,15 +7156,26 @@ void WalletTests::finalStakeReservePreparedTransactions()
         both.Select(big);
         both.Select(small);
         both.m_allow_other_inputs = false;
-        const CTransactionRef cancelled = prepare(both, 25 * COIN);
-        QVERIFY(cancelled);
-        // The wallet orders the two inputs at random: prepare again until the order, and so the id, is the same.
+        // One preparation in ten takes a random earlier lock time, which an automatic preparation would match only by
+        // chance: prepare the explicit one again until it carries the usual lock time, the wallet's tip height.
+        const uint32_t usual_lock_time{static_cast<uint32_t>(WITH_LOCK(wallet->cs_wallet, return wallet->GetLastBlockHeight()))};
+        CTransactionRef cancelled;
+        for (int attempt = 0; attempt < 60 && !(cancelled && cancelled->nLockTime == usual_lock_time); ++attempt) {
+            cancelled = prepare(both, 25 * COIN);
+            QVERIFY(cancelled);
+        }
+        QCOMPARE(cancelled->nLockTime, usual_lock_time);
+        // The wallet orders the two inputs at random: prepare again until the order and the lock time, and so the id,
+        // are the same.
         CTransactionRef automatic;
         for (int attempt = 0; attempt < 60 && !(automatic && automatic->GetHash() == cancelled->GetHash()); ++attempt) {
             automatic = prepare({}, 25 * COIN);
             QVERIFY(automatic);
         }
-        QVERIFY2(automatic->GetHash() == cancelled->GetHash(), "the two preparations must give one transaction id");
+        QVERIFY2(automatic->GetHash() == cancelled->GetHash(),
+                 qPrintable(QStringLiteral("the two preparations must give one transaction id (lock times %1 and %2, first inputs %3 and %4)")
+                     .arg(cancelled->nLockTime).arg(automatic->nLockTime)
+                     .arg(QString::fromStdString(cancelled->vin.at(0).prevout.ToString()), QString::fromStdString(automatic->vin.at(0).prevout.ToString()))));
         QVERIFY(cancelled.get() != automatic.get());
         guard_on();
         QCOMPARE(QString::fromStdString(CommitFailure(iface, automatic)), refused_text);

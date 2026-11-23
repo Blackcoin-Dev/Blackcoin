@@ -24,6 +24,8 @@ DEAD_LEGACY = 300
 # dead legacy addresses when the bound expires.
 DEAD_DIAL_DELAY = 2
 DIAL_BOUND = 45
+# Spare /16 groups for a reachable hint the address manager refuses on a slot collision.
+SPARE_HINT_GROUPS = 20
 
 
 class QQHintTurnTest(QQPursuitTest):
@@ -76,6 +78,26 @@ class QQHintTurnTest(QQPursuitTest):
             announcement.addrs.append(hint)
             publisher.send_and_ping(announcement)
             self.wait_until(lambda: len(node.getnodeaddresses(0)) >= DEAD_LEGACY // 2)
+
+            # The address manager refuses an address whose slot another one holds, and the node stores the addresses of
+            # a message in shuffled order, so a dead address may have taken the hint's slot. The publisher then gossips
+            # a reachable QQ hint from another /16 group, which changes the bucket and slot hash inputs, until one is stored.
+            def known(ip):
+                return any(entry["address"] == ip for entry in node.getnodeaddresses(0))
+            for group in range(2, 2 + SPARE_HINT_GROUPS):
+                if known(hint_peer.fixture_ip):
+                    break
+                self.log.info("The address manager had no free slot for %s; gossiping another hint", hint_peer.fixture_ip)
+                hint_peer = self.endpoint(f"26.{group}.0.1", header, qq=True)
+                peers.append(hint_peer)
+                replacement = CAddress()
+                replacement.ip, replacement.port = hint_peer.fixture_ip, 15714
+                replacement.time = node.mocktime
+                replacement.nServices = NODE_NETWORK | NODE_QUANTUM_QUASAR
+                again = msg_addr()
+                again.addrs.append(replacement)
+                publisher.send_and_ping(again)
+            assert known(hint_peer.fixture_ip), "no reachable QQ hint is in the address manager"
 
             # Zero peers: the publisher leaves and cannot be redialed.
             publisher.retire()

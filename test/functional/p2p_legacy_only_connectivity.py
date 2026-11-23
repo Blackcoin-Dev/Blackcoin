@@ -25,6 +25,8 @@ from test_framework.util import assert_equal
 
 DEAD_QQ_HINTS = 300
 LEGACY_PEERS = 5
+# Spare /16 groups for legacy addresses the address manager refuses on a slot collision.
+SPARE_LEGACY_GROUPS = 20
 FLOOR = 4
 # Four peers need three more dials after the publisher. RC5 spends two ~3 s dead
 # dials per legacy attempt, so it needs about 25 s; legacy-first needs a few seconds.
@@ -80,11 +82,20 @@ class LegacyOnlyConnectivityTest(QQPursuitTest):
             self.wait_until(lambda: len(node.getnodeaddresses(0)) >= DEAD_QQ_HINTS // 2)
 
             # A few reachable legacy peers become known.
-            legacy = [self.endpoint(f"23.{i}.0.1", header) for i in range(1, LEGACY_PEERS + 1)]
-            peers.extend(legacy)
+            # The address manager refuses a new address whose slot one of the gossiped hints already holds (the slot
+            # depends on the node's random key), so a refused address is replaced by one from the next /16 group.
             started = time.monotonic()
-            for peer in legacy:
-                assert node.addpeeraddress(peer.fixture_ip, 15714, True)["success"]
+            known = 0
+            for i in range(1, LEGACY_PEERS + SPARE_LEGACY_GROUPS + 1):
+                peer = self.endpoint(f"23.{i}.0.1", header)
+                peers.append(peer)
+                if node.addpeeraddress(peer.fixture_ip, 15714, True)["success"]:
+                    known += 1
+                    if known == LEGACY_PEERS:
+                        break
+                else:
+                    self.log.info("The address manager had no free slot for %s; using another group", peer.fixture_ip)
+            assert_equal(known, LEGACY_PEERS)
 
             try:
                 self.wait_until(lambda: len(self.outbound()) >= FLOOR, timeout=CONNECT_BOUND)

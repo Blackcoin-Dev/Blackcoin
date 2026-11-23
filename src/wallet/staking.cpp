@@ -3571,10 +3571,10 @@ FinalStakeReserve ComputeFinalStakeReserve(const CWallet& wallet, const std::set
     FinalStakeReservePlan plan = PlanFinalStakeReserve(std::move(unspent), consumed);
     reserve.n = plan.n;
     reserve.target = plan.target;
-    // Released at F: n, R and the eligibility are reported, nothing is held back and nothing is short.
-    if (int64_t{reserve.candidate_height} >= reserve.final_height) return reserve;
     reserve.single_output = plan.single_output;
     reserve.single_output_held = plan.single_output_held;
+    // Released at F: n, R and the eligibility are reported, nothing is held back and nothing is short.
+    if (int64_t{reserve.candidate_height} >= reserve.final_height) return reserve;
     reserve.shortfall = plan.shortfall;
     reserve.reserved = std::move(plan.reserved);
     for (const FinalStakeReserveSource& source : reserve.reserved) {

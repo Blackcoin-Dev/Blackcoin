@@ -59,6 +59,10 @@ LOG_INTEREST = re.compile(r"quantum|backup|durab|flush|Unable to|not active|Flus
 #                                             has a volume GUID path (a network share, ...)"
 #  - BackupDirectorySpellingRejection:        "a network or device path is not supported; use a folder on a local NTFS volume"
 #                                             (a path that starts with two separators, refused before any file system call)
+#  - QuantumKeyBackupSpellingRejection:      "a path that is relative to a drive or to the root of a drive (such as D:dir or \dir) is not
+#                                             supported; ..." (also refused at startup with the option's name and value)
+#  - QuantumKeyBackupLengthRejection:         "the path is too long: it has <n> characters and at most 150 are allowed ..." (a wallet whose
+#                                             backup directory is longer is refused when it is created or loaded)
 #  - QuantumBackupVolumeRejection, l.265-268: "... network share (file system X) ..." / "... file system fat32 ..."
 #  - CommitOfEntryIsInjectedToFail, l.363:    "cannot make the entry of the backup directory <path> durable"
 DURABLE_RE = re.compile(r"cannot make the backup directory .* durable", re.IGNORECASE | re.DOTALL)
@@ -66,6 +70,8 @@ DENIED_RE = re.compile(r"access is denied", re.IGNORECASE)
 UNSUPPORTED_VOLUME_RE = re.compile(
     r"network share|volume GUID path|volume cannot be identified|local NTFS volume", re.IGNORECASE)
 NETWORK_PATH_RE = re.compile(r"a network or device path is not supported", re.IGNORECASE)
+RELATIVE_PATH_RE = re.compile(r"relative to a drive or to the root of a drive", re.IGNORECASE)
+LENGTH_RE = re.compile(r"the path is too long: it has (\d+) characters and at most (\d+) are allowed", re.IGNORECASE)
 NOT_DENIED_RE = re.compile(r"\A(?!.*access is denied)", re.IGNORECASE | re.DOTALL)
 FAT32_RE = re.compile(r"file system fat32", re.IGNORECASE)
 ENTRY_FAIL_RE = re.compile(r"cannot make the entry of the backup directory .* durable", re.IGNORECASE | re.DOTALL)
@@ -373,6 +379,18 @@ def run_checked(what, arguments, timeout=120):
 
 
 # ----- a daemon -----
+def clean_stop_problem(returncode, forced_kill, label="node", timeout=0):
+    """Why a stopped daemon was not a clean shutdown, or None: a clean stop is an exit with code 0 that this harness did
+    not force. Pure, so the self-test covers it."""
+    if forced_kill:
+        return ("the daemon %s did not stop within %d seconds and was killed: the restart that follows would not test a "
+                "clean shutdown" % (label, timeout))
+    if returncode != 0:
+        return ("the daemon %s ended with exit code %s, not 0: it did not shut down cleanly, and the restart that follows "
+                "would not test a clean shutdown" % (label, returncode))
+    return None
+
+
 class Node:
     def __init__(self, env, datadir, extra_args=(), label="node"):
         self.env = env
@@ -383,26 +401,37 @@ class Node:
         self.rpc_port = free_port()
         self.process = None
         self.stdout = None
+        self.console_path = None
         self.forced_kill = False
+        #: the exit code of an intentional crash (a crash point) that a case verified, until the next start
+        self.intentional_exit_code = None
         self.cookie = os.path.join(datadir, "regtest", ".cookie")
 
     @property
     def log_file(self):
         return os.path.join(self.datadir, "regtest", "debug.log")
 
-    def start(self, extra_args=None, timeout=240):
+    def _spawn(self, extra_args=None):
+        """Start the daemon process (no wait for readiness)."""
         if extra_args is not None:
             self.extra_args = list(extra_args)
+        # the termination state of the process about to start, not of an earlier one
+        self.forced_kill = False
+        self.intentional_exit_code = None
         os.makedirs(self.datadir, exist_ok=True)
         if os.path.exists(self.cookie):
             os.remove(self.cookie)
         arguments = [self.env.daemon] + BASE_ARGS + LIFECYCLE_ARGS + [
             "-datadir=" + self.datadir, "-port=%d" % self.port, "-rpcport=%d" % self.rpc_port] + self.extra_args
         console_path = os.path.join(self.env.logs, "%s-%s.out" % (safe_name(self.env.case), self.label))
+        self.console_path = console_path
         self.stdout = open(console_path, "ab")
         self.process = subprocess.Popen(arguments, stdout=self.stdout, stderr=subprocess.STDOUT)
         if self not in self.env.nodes:
             self.env.nodes.append(self)
+
+    def start(self, extra_args=None, timeout=240):
+        self._spawn(extra_args)
         deadline = time.time() + timeout
         while time.time() < deadline:
             if self.process.poll() is not None:
@@ -418,6 +447,18 @@ class Node:
                     raise
             time.sleep(0.5)
         raise CheckFailed("the daemon was not ready after %d seconds" % timeout)
+
+    def refused_at_startup(self, extra_args, timeout=90):
+        """Start the daemon with options it must refuse: it ends with a nonzero exit code before it serves anything.
+        Returns (exit code, the text it wrote to the console). A daemon that is still running after the timeout, or that
+        ended with 0, fails the check. The process is a refusal, not a clean shutdown: the code is recorded as intentional."""
+        self._spawn(extra_args)
+        code = self.wait_exit(timeout)
+        check(code != 0, "the daemon was expected to refuse these options but exited with code 0")
+        self.intentional_exit_code = code
+        self.stdout.flush()
+        with open(self.console_path, "r", encoding="utf-8", errors="replace") as handle:
+            return code, handle.read()
 
     def rpc(self, wallet=None):
         return Rpc(self.rpc_port, self.cookie, wallet=wallet)
@@ -439,26 +480,42 @@ class Node:
         except subprocess.TimeoutExpired:
             raise CheckFailed("the daemon did not exit within %d seconds" % timeout)
 
+    def wait_crash(self, expected_code, point, timeout=90):
+        """Wait for the daemon to end at a crash point and require exactly the exit code that point produces (the abrupt
+        end of TerminateProcess). This is an intentional crash, never a clean shutdown: the verified code is what lets a
+        later stop() of this process pass, and any other code, or a clean exit, fails here."""
+        code = self.wait_exit(timeout)
+        check(code == expected_code, "crash point %s: exit code %s, expected %s" % (point, code, expected_code))
+        self.intentional_exit_code = code
+        return code
+
     def stop(self, timeout=120, clean=True):
         """Ask the daemon to stop. A stop that does not finish within the timeout ends in a kill of this harness's own
-        child (by its handle); that is recorded, and with clean=True it fails the case, because every case that restarts
-        a node relies on the previous run having shut down normally."""
-        if self.process is None or self.process.poll() is not None:
+        child (by its handle); that is recorded. With clean=True the stop must be a clean shutdown of the process this
+        instance started: the process has exited, with exit code 0, and was not killed by this harness. That holds for a
+        process that had already exited as well as for one that exited after the request, so a daemon that crashed
+        (a nonzero code, including a Windows exception status) or was killed fails the case, because every case that
+        restarts a node relies on the previous run having shut down normally. An instance that was never started has
+        nothing to stop."""
+        if self.process is None:
             return
-        try:
-            self.rpc().stop()
-        except (RpcUnavailable, RpcError):
-            pass
-        try:
-            self.process.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            self.forced_kill = True
-            self.env.forced_kills.append("%s/%s after %d s" % (self.env.case, self.label, timeout))
-            self.process.kill()
-            self.process.wait(timeout=30)
-            if clean:
-                raise CheckFailed("the daemon %s did not stop within %d seconds and was killed: the restart that follows "
-                                  "would not test a clean shutdown" % (self.label, timeout))
+        if self.process.poll() is None:
+            try:
+                self.rpc().stop()
+            except (RpcUnavailable, RpcError):
+                pass
+            try:
+                self.process.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                self.forced_kill = True
+                self.env.forced_kills.append("%s/%s after %d s" % (self.env.case, self.label, timeout))
+                self.process.kill()
+                self.process.wait(timeout=30)
+        if clean and not (self.intentional_exit_code is not None and self.process.returncode == self.intentional_exit_code
+                          and not self.forced_kill):
+            problem = clean_stop_problem(self.process.returncode, self.forced_kill, self.label, timeout)
+            if problem:
+                raise CheckFailed(problem)
 
     def restart(self, extra_args=None):
         self.stop()
@@ -974,18 +1031,39 @@ def unsupported_case(env, rec, case, backup_dir_arg, directory, wallet_name, lab
     return node
 
 
+def watched_absent(paths, label):
+    """Every path must not exist: a refused backup directory never becomes a folder anywhere."""
+    for name, path in paths.items():
+        check(not os.path.exists(path), "%s: %s exists: %s" % (label, name, path))
+
+
 def case_unc_share(env, rec):
+    """A UNC value is refused by its spelling when the daemon starts, before anything is looked up, created or pruned: the
+    daemon ends with the 'network or device path' message (never access denied), the generations already on the share
+    are untouched, and nothing appears at the share or at the local folder the value was once mistaken for."""
     require_infra(env, "share", "the SMB share")
     unc = env.layout["share_unc"]
     network_path = ("say a network or device path is not supported", NETWORK_PATH_RE)
-    node = unsupported_case(env, rec, "unc", unc + "\\backups", unc + "\\backups", "wunc", "unc", network_path)
-    node.stop()
-    # A share folder that does not exist yet: the refusal comes before anything is created, at the share and at the
-    # local folder the value used to be mistaken for (the data directory's drive, then the host and share names).
-    unique = "absent-" + uuid.uuid4().hex
-    datadir = os.path.join(env.case_dir("unc-absent"), "data")
+    datadir = os.path.join(env.case_dir("unc"), "data")
     shutil.rmtree(datadir, ignore_errors=True)
     os.makedirs(datadir)
+    directory = unc + "\\backups"
+    try:
+        share_precondition(env, os.path.dirname(directory.rstrip("\\")))
+    except (OSError, CheckFailed) as error:
+        raise Unresolved("ordinary file creation through the share does not work: %s" % error)
+    seed_generation(os.path.join(directory, component("wunc")))
+    before = snapshot(os.path.join(directory, component("wunc")))
+    node = env.node(datadir, label="unc")
+    code, output = node.refused_at_startup(["-quantumkeybackupdir=" + directory])
+    record_error(rec, "unc: " + output.strip()[-400:])
+    for description, pattern in [network_path, ("stay clear of an access-denied error", NOT_DENIED_RE)]:
+        check(pattern.search(output), "unc: the refusal does not %s: %s" % (description, output.strip()[-400:]))
+    check(snapshot(os.path.join(directory, component("wunc"))) == before, "unc: existing generations on the share changed")
+    rec["observed"]["unc_exit_code"] = code
+    # a share folder that does not exist yet: nothing is created at the share or at the local folder the value used to be
+    # mistaken for (the data directory's drive, then the host and share names)
+    unique = "absent-" + uuid.uuid4().hex
     drive = os.path.splitdrive(os.path.abspath(datadir))[0]
     mistaken_host = drive + "\\" + unc.lstrip("\\").split("\\")[0]
     watched = {
@@ -993,19 +1071,123 @@ def case_unc_share(env, rec):
         "share_folder_by_unc": unc + "\\" + unique,
         "mistaken_local_folder": drive + "\\" + unc.lstrip("\\") + "\\" + unique,
     }
-    for name, path in watched.items():
-        check(not os.path.exists(path), "unc-absent: %s exists before the test: %s" % (name, path))
+    watched_absent(watched, "unc-absent (before)")
     host_before = os.path.exists(mistaken_host)
-    node = env.node(datadir, ["-quantumkeybackupdir=" + unc + "\\" + unique]).start()
-    refused_and_recovered(
-        env, rec, node, "wuncabs", None,
-        [("name a missing durable commit", DURABLE_RE), network_path, ("stay clear of an access-denied error", NOT_DENIED_RE)],
-        None, None, datadir, "unc-absent")
-    for name, path in watched.items():
-        check(not os.path.exists(path), "unc-absent: the refused backup path created %s: %s" % (name, path))
+    absent = env.node(datadir, label="unc-absent")
+    code, output = absent.refused_at_startup(["-quantumkeybackupdir=" + unc + "\\" + unique])
+    record_error(rec, "unc-absent: " + output.strip()[-400:])
+    check(NETWORK_PATH_RE.search(output) and NOT_DENIED_RE.search(output), "unc-absent: wrong refusal: %s" % output.strip()[-400:])
+    watched_absent(watched, "unc-absent: the refused backup path created")
     check(os.path.exists(mistaken_host) == host_before,
           "unc-absent: %s appeared on the data directory's drive" % mistaken_host)
     rec["observed"]["unc_absent_watched"] = dict(watched, mistaken_host=mistaken_host, mistaken_host_existed=host_before)
+    # the daemon is fine on the default path after the refusals
+    default = env.node(datadir, label="unc-default").start()
+    rec["observed"]["default_after_refusal"] = exercise_success(default, default_backup_root(datadir), "wunc", None)
+
+
+def swapped_case(path):
+    """The same folder spelled with every letter's case swapped (Windows file names ignore case)."""
+    return path.swapcase()
+
+
+def backup_root_for_length(base, wallet_name, length):
+    """A -quantumkeybackupdir value (base plus one padding folder) whose per-wallet directory, <base>\\<pad>\\<component>,
+    is exactly `length` characters long."""
+    pad = length - len(base) - 2 - len(component(wallet_name))
+    precondition(1 <= pad <= 200, "the base %r leaves no room to build a %d character backup directory" % (base, length))
+    return base + "\\" + "p" * pad
+
+
+def case_datadir_case(env, rec):
+    """The data directory and the backup directory under it are spelled in different letter case: the ancestor walk ends at
+    the data directory by its identity, so the backup succeeds (it would otherwise go on above the data directory, to
+    folders a standard user cannot flush)."""
+    datadir = os.path.join(env.case_dir("datadir-case"), "data")
+    shutil.rmtree(datadir, ignore_errors=True)
+    os.makedirs(datadir)
+    other = swapped_case(datadir)
+    precondition(other != datadir, "the data directory %r has no letters to change the case of" % datadir)
+    check(os.path.samefile(datadir, other), "the spellings %r and %r do not name one folder" % (datadir, other))
+    for label, given, backup_base, wallet in (("datadir-as-created", datadir, other, "wcasea"),
+                                               ("datadir-swapped", other, datadir, "wcaseb")):
+        root = backup_base + "\\qb-" + label
+        node = env.node(given, ["-quantumkeybackupdir=" + root], label=label).start()
+        rec["observed"][label] = {"datadir": given, "backup_directory": root,
+                                  "result": exercise_success(node, root, wallet, None)}
+        node.stop()
+
+
+def case_relative_path(env, rec):
+    """A drive-relative (D:dir) and a root-relative (\\dir, /dir) backup directory are refused by the daemon when it starts,
+    with the 'relative to a drive or to the root of a drive' message, and nothing is created at any folder the value could
+    have been resolved to."""
+    datadir = os.path.join(env.case_dir("relative-path"), "data")
+    shutil.rmtree(datadir, ignore_errors=True)
+    os.makedirs(datadir)
+    drive = os.path.splitdrive(os.path.abspath(datadir))[0]
+    unique = "qb-rel-" + uuid.uuid4().hex[:12]
+    values = {"drive-relative": drive + unique, "drive-relative-subfolder": drive + unique + "\\sub",
+              "root-relative": "\\" + unique, "root-relative-slash": "/" + unique}
+    watched = {
+        "current directory": os.path.abspath(unique),
+        "data directory": os.path.join(datadir, unique),
+        "regtest directory": os.path.join(datadir, "regtest", unique),
+        "root of the data directory's drive": drive + "\\" + unique,
+        "drive-relative resolution": os.path.abspath(drive + unique),
+        "root-relative resolution": os.path.abspath("\\" + unique),
+    }
+    watched_absent(watched, "relative-path (before)")
+    for label, value in values.items():
+        node = env.node(datadir, label=label)
+        code, output = node.refused_at_startup(["-quantumkeybackupdir=" + value])
+        record_error(rec, "%s: %s" % (label, output.strip()[-400:]))
+        for description, pattern in [("say the path is relative to a drive or its root", RELATIVE_PATH_RE),
+                                     ("not call it a network or device path", re.compile(r"\A(?!.*network or device path)", re.I | re.S)),
+                                     ("stay clear of an access-denied error", NOT_DENIED_RE)]:
+            check(pattern.search(output), "%s: the refusal does not %s: %s" % (label, description, output.strip()[-400:]))
+        watched_absent(watched, "%s: the refused backup path created" % label)
+        rec["observed"][label] = {"value": value, "exit_code": code}
+    # the daemon starts on the default path afterwards, and a full-path value with a drive and a separator is accepted
+    node = env.node(datadir, ["-quantumkeybackupdir=" + os.path.join(datadir, "full-path-ok")], label="full-path").start()
+    rec["observed"]["full_path"] = exercise_success(node, os.path.join(datadir, "full-path-ok"), "wrelok", None)
+
+
+def case_long_path(env, rec):
+    """The resolved per-wallet backup directory is at most 150 UTF-16 characters: 150 and 149 work end to end (a backup in
+    progress needs 109 more characters below it, up to the 259 Windows allows), 151 and longer are refused when the wallet
+    is created, with the length message, and nothing is created. Each length has its own data directory, so a wallet made
+    for one backup directory is never loaded under another."""
+    base = os.path.join(env.case_dir("long-path"), "backups")
+    for length in (150, 149):
+        wallet = "wlong%d" % length
+        datadir = os.path.join(env.case_dir("long-path"), "data%d" % length)
+        shutil.rmtree(datadir, ignore_errors=True)
+        os.makedirs(datadir)
+        root = backup_root_for_length(base, wallet, length)
+        check(len(os.path.join(root, component(wallet))) == length, "the directory built for %d is not that long" % length)
+        node = env.node(datadir, ["-quantumkeybackupdir=" + root], label="accept%d" % length).start()
+        rec["observed"]["accepted_%d" % length] = {"backup_directory": os.path.join(root, component(wallet)),
+                                                   "result": exercise_success(node, root, wallet, None)}
+        node.stop()
+    for length in (151, 190):
+        wallet = "wlong%d" % length
+        datadir = os.path.join(env.case_dir("long-path"), "data%d" % length)
+        shutil.rmtree(datadir, ignore_errors=True)
+        os.makedirs(datadir)
+        root = backup_root_for_length(base, wallet, length)
+        node = env.node(datadir, ["-quantumkeybackupdir=" + root], label="refuse%d" % length).start()
+        message = expect_rpc_error(lambda: node.rpc().createwallet(wallet_name=wallet, load_on_startup=True))
+        record_error(rec, "length %d: %s" % (length, message))
+        found = LENGTH_RE.search(message)
+        check(found and int(found.group(1)) == length and int(found.group(2)) == 150,
+              "length %d: the refusal does not give the length and the limit: %s" % (length, message))
+        check(NOT_DENIED_RE.search(message), "length %d: the refusal is an access-denied error: %s" % (length, message))
+        check(wallet not in [entry["name"] for entry in node.rpc().listwalletdir()["wallets"]],
+              "length %d: the refused wallet was created" % length)
+        check(not os.path.exists(root), "length %d: the refused backup directory was created: %s" % (length, root))
+        rec["observed"]["refused_%d" % length] = message
+        node.stop()
 
 
 def case_mapped_drive(env, rec):
@@ -1080,9 +1262,7 @@ def crash_cycle(node, base_args, point, name, passphrase):
         pass  # the connection closes with the process
     else:
         raise CheckFailed("the daemon did not stop at %s" % point)
-    code = node.wait_exit(90)
-    check(code == WINDOWS_CRASH_EXIT, "crash point %s: exit code %s, expected %s" % (point, code, WINDOWS_CRASH_EXIT))
-    return code
+    return node.wait_crash(WINDOWS_CRASH_EXIT, point)
 
 
 def case_affected_wallet(env, rec):
@@ -1315,8 +1495,7 @@ def crash_at(node, point, name, passphrase):
         pass  # the connection closes with the process
     else:
         raise CheckFailed("the daemon did not stop at %s" % point)
-    code = node.wait_exit(90)
-    check(code == WINDOWS_CRASH_EXIT, "crash point %s: exit code %s, expected %s" % (point, code, WINDOWS_CRASH_EXIT))
+    code = node.wait_crash(WINDOWS_CRASH_EXIT, point)
     node.start(extra_args=[])
     wallet = node.wait_wallet(name)
     unlock(wallet, passphrase)
@@ -1381,8 +1560,15 @@ CASES = [
     ("subst-drive", "a subst drive in the child's own session as the datadir: success, files under the underlying folder", case_subst),
     ("outside-denied", "an outside path whose ancestors reach C:\\ is refused with an accurate pending error, the earlier destination is "
      "untouched, the same key activates on the default path; a writable test-volume root succeeds", case_outside_denied),
-    ("unc-share", "a UNC share is refused as unsupported, the key stays pending, existing generations are untouched, the same key "
-     "activates on the default path", case_unc_share),
+    ("unc-share", "a UNC value is refused at startup as a network or device path (never access denied), existing generations on the "
+     "share are untouched, nothing appears at the share or at the local folder the value was once mistaken for, the default path works",
+     case_unc_share),
+    ("datadir-case", "the data directory and the backup directory under it spelled in different letter case, in both orders: the backup "
+     "succeeds and restores (the walk ends at the data directory by its identity)", case_datadir_case),
+    ("relative-path", "drive-relative (D:dir) and root-relative (\\dir, /dir) backup directories are refused at startup with the relative-to-"
+     "a-drive message and nothing is created; a full path is accepted", case_relative_path),
+    ("long-path", "a per-wallet backup directory of 150 and 149 characters works end to end, 151 and longer is refused when the wallet is "
+     "created with the length message and nothing is created", case_long_path),
     ("mapped-drive", "a mapped drive is refused as unsupported, with the same pending and recovery behaviour", case_mapped_drive),
     ("denied-ancestor", "a denied ancestor gives an ancestor-specific refusal; after the denial is removed and the node restarted the "
      "same key activates", case_denied_ancestor),
@@ -1502,6 +1688,27 @@ def selftest():
     assert DURABLE_RE.search(durable) and DENIED_RE.search(durable)
     unc = ("cannot make the backup directory \\\\localhost\\QBackup\\backups\\n_wunc durable: a network or device path is "
            "not supported; use a folder on a local NTFS volume")
+    relative = ("-quantumkeybackupdir=D:dir: a path that is relative to a drive or to the root of a drive (such as D:dir or \\dir) "
+                "is not supported; give the full path with its drive and a separator (such as D:\\dir), or a path relative to the "
+                "data directory")
+    assert RELATIVE_PATH_RE.search(relative) and not NETWORK_PATH_RE.search(relative) and NOT_DENIED_RE.search(relative)
+    too_long = ("Wallet creation failed. the quantum key backup directory C:\\x\\n_w: the path is too long: it has 151 characters and at "
+                "most 150 are allowed, because each backup is staged and verified in folders inside it; use a shorter path")
+    found_length = LENGTH_RE.search(too_long)
+    assert found_length and found_length.group(1) == "151" and found_length.group(2) == "150"
+    assert not LENGTH_RE.search("the path is too long: it has 150 characters and at most 160 are allowed") is None
+    # the long-path cases build a per-wallet directory of exactly the length they name, for any base that leaves room
+    for base in ("C:\\qual\\cases\\long-path\\backups", "D:\\b", "C:\\" + "x" * 60):
+        for wallet in ("wlong150", "wlong149", "w"):
+            for length in (149, 150, 151, 190):
+                built = backup_root_for_length(base, wallet, length)
+                assert len(built + "\\" + component(wallet)) == length and built.startswith(base + "\\p")
+    try:
+        backup_root_for_length("C:\\" + "x" * 140, "wlong150", 150)
+        raise AssertionError("a base that leaves no room must be unresolved")
+    except Unresolved:
+        pass
+    assert swapped_case("C:\\Qual\\data") == "c:\\qUAL\\DATA" and swapped_case(swapped_case("C:\\Qual")) == "C:\\Qual"
     assert DURABLE_RE.search(unc) and NETWORK_PATH_RE.search(unc) and UNSUPPORTED_VOLUME_RE.search(unc)
     assert NOT_DENIED_RE.search(unc) and not DENIED_RE.search(unc)
     mapped = ("cannot make the backup directory R:\\backups\\n_wmap durable: its volume cannot be identified: The system "
@@ -1625,6 +1832,80 @@ def selftest():
         except CheckFailed:
             pass
         assert node.forced_kill and env.forced_kills and node.process.poll() is not None
+
+        def fake_process(code, delay=0.0):
+            process = subprocess.Popen([sys.executable, "-c", "import sys, time; time.sleep(%r); sys.exit(%d)" % (delay, code)])
+            return process
+
+        def stop_outcome(process, intentional=None, clean=True):
+            node.process = process
+            node.forced_kill = False
+            node.intentional_exit_code = intentional
+            try:
+                node.stop(timeout=30, clean=clean)
+            except CheckFailed as error:
+                return str(error)
+            return None
+        # a process that already exited: only code 0 is a clean stop; a nonzero code (a crash, a Windows exception status)
+        # fails, and clean=False never raises
+        done = fake_process(0)
+        done.wait()
+        assert stop_outcome(done) is None
+        done = fake_process(3)
+        done.wait()
+        assert "exit code 3" in stop_outcome(done)
+        done = fake_process(0xC0000005)
+        done.wait()
+        assert "exit code" in stop_outcome(done)
+        assert stop_outcome(done, clean=False) is None
+        # a process that ends nonzero while it shuts down fails; one that ends with 0 passes
+        assert "exit code 5" in stop_outcome(fake_process(5, delay=0.5))
+        assert stop_outcome(fake_process(0, delay=0.5)) is None
+        # a stop that had to be forced is not clean even if the killed process then reports a code
+        node.process = fake_process(0, delay=60)
+        node.forced_kill = False
+        node.intentional_exit_code = None
+        try:
+            node.stop(timeout=1)
+            raise AssertionError("a killed daemon must fail a clean stop")
+        except CheckFailed as error:
+            assert "was killed" in str(error)
+        assert node.forced_kill
+        # an intentional crash passes only with the exact code the case verified, and a node that was never started
+        # has nothing to stop
+        done = fake_process(7)
+        done.wait()
+        assert stop_outcome(done, intentional=7) is None
+        assert "exit code 7" in stop_outcome(done, intentional=9)
+        assert "exit code 7" in stop_outcome(done, intentional=None)
+        node.process = None
+        node.stop()
+        node.process = fake_process(7)
+        node.intentional_exit_code = None
+        assert node.wait_crash(7, "fake_point") == 7 and node.intentional_exit_code == 7
+        node.process = fake_process(0)
+        try:
+            node.wait_crash(7, "fake_point")
+            raise AssertionError("a clean exit is not the crash that was expected")
+        except CheckFailed:
+            pass
+        assert clean_stop_problem(0, False) is None
+        # a daemon that refuses its options ends nonzero before it serves anything; the text it wrote is returned
+        refusing = Env({"cases": temporary}, os.path.join(temporary, "refusing-results"), sys.executable, "probe")
+        refusing.case = "selftest-refusal"
+        refused_node = Node(refusing, os.path.join(temporary, "refusing-data"), label="refused")
+        refusal_code, refusal_text = refused_node.refused_at_startup([])
+        assert refusal_code != 0 and refusal_text.strip() and refused_node.intentional_exit_code == refusal_code
+        assert refused_node.stop() is None  # an intentional, verified exit code is not a failed clean stop
+        assert clean_stop_problem(1, False) and clean_stop_problem(0, True)
+        # starting a process resets the termination state of the previous one
+        node.forced_kill = True
+        node.intentional_exit_code = 7
+        try:
+            node.start()
+        except (CheckFailed, OSError):
+            pass  # no daemon here: only the reset is under test
+        assert not node.forced_kill and node.intentional_exit_code is None
         node.process = subprocess.Popen([sys.executable, "-c", "pass"])
         node.process.wait()
         env.cleanups.append(lambda: (3, "boom"))

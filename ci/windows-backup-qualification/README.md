@@ -17,12 +17,16 @@ wallets:
 | `junction` | a junction to another NTFS volume inside the datadir works |
 | `subst-drive` | `subst` drive in the child's own session as the datadir works |
 | `outside-denied` | an outside path whose ancestors reach `C:\` is refused with an accurate pending error naming `C:\`; the earlier destination is untouched; the same key activates on the default path; a writable test-volume root works |
-| `unc-share` / `mapped-drive` | ordinary file creation works first; the backup is refused as unsupported; the key stays pending; existing generations are untouched; the same key activates on the default path. A UNC value must be refused as "a network or device path is not supported", never with access denied, and a second UNC value that names a folder that does not exist must leave nothing behind, at the share or at the local folder `<data directory drive>:\<host>\<share>\...` the value was once mistaken for |
+| `unc-share` | ordinary file creation works through the share first. A UNC value (`\\host\share\...`) is refused when the daemon starts, with "a network or device path is not supported", never with access denied; the generations already on the share are untouched; a second UNC value that names a folder that does not exist leaves nothing behind, at the share or at the local folder `<data directory drive>:\<host>\<share>\...` the value was once mistaken for; the daemon then works on the default path |
+| `mapped-drive` | ordinary file creation works first; the backup is refused as unsupported; the key stays pending; existing generations are untouched; the same key activates on the default path |
+| `datadir-case` | the data directory and the backup directory under it are spelled in different letter case, in both orders (`-datadir` as created with the backup directory under the case-swapped spelling, and the reverse): the backup succeeds and restores, because the walk up from the wallet's directory ends at the data directory by its identity (volume serial number and file index), not by its path text |
+| `relative-path` | a drive-relative value (`C:dir`, `C:dir\sub`) and a root-relative value (`\dir`, `/dir`) are refused when the daemon starts, with "relative to a drive or to the root of a drive" (not the network or device message, not access denied); nothing is created in the current directory, the data directory, the drive root or any other folder the value could resolve to; a full path with a drive and a separator is accepted and works |
+| `long-path` | the per-wallet backup directory (the resolved base, the separator and the wallet's component) of exactly 150 and 149 characters works end to end (a backup in progress needs 109 more characters below it, 259 in all); 151 and 190 characters are refused when the wallet is created, with "the path is too long: it has N characters and at most 150 are allowed", the wallet is not made and no folder is created |
 | `denied-ancestor` | `icacls /deny` on an ancestor gives an ancestor-specific refusal; after the denial is removed and the node restarted the same key activates |
 | `affected-wallet` | the AFFECTED wallet has an active return address and a second key pending; four real generations (written by the daemon, using the `before_activation` crash point) sit in the path that then fails (denied ancestor); the repeated call, a restart and the recovery leave the active address, the full key inventory and every file of the failing path unchanged; only the success prunes, to exactly the newest three |
 | `fat32` | FAT32 mounted volume: refused naming the file system although ordinary writes succeed |
 | `failcommit` | `-quantumreturnfailcommit=<directory-name>`: the key stays pending, a restart without it activates the same key |
-| `crash-points` | the four `-quantumreturncrashpoint` values end the daemon with exit code 7 (`TerminateProcess`); after a restart the pending or active state is the expected one and the key is recoverable from a backup |
+| `crash-points` | the four `-quantumreturncrashpoint` values end the daemon with exit code 7 (`TerminateProcess`; an intentional crash, verified by its code, never counted as a clean shutdown); after a restart the pending or active state is the expected one and the key is recoverable from a backup |
 | `flush-probe` | `flush_probe.exe` compiles the real `quantum_return_backup.cpp` with `FlushFileBuffers` shimmed: real success; injected `ERROR_WRITE_FAULT` on a directory handle fails `EnsureQuantumKeyBackupDirectory` with the flush error (leaf and ancestor); the retry on the existing directories succeeds |
 
 Each case writes `case-<name>.json` (name, expected, observed, status, `daemon_error`, relevant `debug.log` lines).
@@ -82,7 +86,10 @@ details and `sha256-harness-probe-payload.txt`, `diskpart/` with every diskpart 
 `artifact-verification.json`, `build-run-verification.json`, `build-artifacts.json` (the build artifacts' expiry),
 `daemon-version.txt`, the probe's provenance, `tested/` with the exact probe and portable payload that ran and their
 SHA-256, `logs/` with each daemon's console output and its full `debug.log`). A daemon that had to be killed after a stop
-timeout is recorded in its case file and fails the case.
+timeout is recorded in its case file and fails the case. A stop that the harness expects to be clean (every restart of a node) requires that the
+process has exited with code 0 and was not killed by the harness: a daemon that crashed, or ended with any nonzero code (a Windows
+exception status included), fails the case, whether it had already exited or ended while it was asked to stop. A crash point or a startup
+refusal is the only exception, and only with the exit code the case verified.
 
 ## Files
 
@@ -91,6 +98,6 @@ timeout is recorded in its case file and fails the case.
   any form (deny-only included), is elevated, or has `SeBackupPrivilege`/`SeRestorePrivilege` enabled; sets its profile and
   temporary folders from its own identity, checks them against the profile registered for its SID and proves a temporary
   file can be created; runs the harness.
-- `harness.py`: standard library only; `--selftest` tests its pure helpers on any platform, `--list` lists the cases.
+- `harness.py`: standard library only; `--selftest` tests its pure helpers (and the clean-stop rule with fake processes) on any platform, `--list` lists the cases.
 - `flush_probe.cpp`, `build-probe.sh`: the probe and its build (`PROBE_TARGET=native` is a link check on a POSIX host).
 - `verify_inputs.py`: fail-closed checks of the run, the artifact names and the hashes (`selftest` included).

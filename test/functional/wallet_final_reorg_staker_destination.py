@@ -19,7 +19,7 @@ labelled "Staking Legacy Address") in its own loop, after its waits and before i
    worker reports the fault and retries, and nothing crashes.
 """
 from test_framework.descriptors import descsum_create
-from test_framework.test_framework import BitcoinTestFramework
+from test_framework.test_framework import BitcoinTestFramework, SkipTest
 from test_framework.util import assert_equal
 from transition_t_final_util import (
     G,
@@ -38,6 +38,15 @@ class FinalReorgStakerDestinationTest(TransitionTFinalTestBase, BitcoinTestFrame
         self.setup_clean_chain = True
         self.extra_args = [LIFECYCLE_ARGS + ["-donatetodevfund=0", "-debug=coinstake"]]
 
+    def add_options(self, parser):
+        self.add_wallet_options(parser)
+
+    def skip_test_if_missing_module(self):
+        self.skip_if_no_wallet()
+        # The wallet that can make no legacy address is a blank wallet with one imported bech32 descriptor.
+        if not self.options.descriptors:
+            raise SkipTest("this test needs descriptor wallets (it imports a descriptor to make a wallet without a legacy address manager)")
+
     def log_text(self):
         with open(self.nodes[0].debug_log_path, encoding="utf-8", errors="replace") as log:
             return log.read()
@@ -55,10 +64,10 @@ class FinalReorgStakerDestinationTest(TransitionTFinalTestBase, BitcoinTestFrame
 
         self.log.info("Three wallets, each with a mature bech32 (witness v0) coinbase kernel and a ready quantum return")
         for name in ("w", "wi"):
-            node.createwallet(name)
-        node.createwallet("tmp")
+            node.createwallet(name, descriptors=True)
+        node.createwallet("tmp", descriptors=True)
         # wk: only a bech32 descriptor, so it can make no legacy address.
-        node.createwallet(wallet_name="wk", blank=True)
+        node.createwallet(wallet_name="wk", blank=True, descriptors=True)
         tmp = node.get_wallet_rpc("tmp")
         private = [d for d in tmp.listdescriptors(True)["descriptors"] if d["desc"].startswith("wpkh(") and not d["internal"]][0]["desc"]
         wk = node.get_wallet_rpc("wk")
@@ -97,25 +106,16 @@ class FinalReorgStakerDestinationTest(TransitionTFinalTestBase, BitcoinTestFrame
         self.sync_mt_tip()
         w.staking(True)
         self.wait_until(lambda: self.log_text().count(STARTED) == started_before + 1, timeout=30)
-        self.bump()
+        # The worker's "started" line comes before its startup initialisation: wait until it has searched at the tip M
+        # (state searching, snapshot current, M blocks), so that the startup is over and nothing is made at M - 1 by it.
+        self.wait_worker_at(w, M)
         assert LABEL not in w.listlabels(), "the destination was made although the next block is Final"
         tip_hash = node.getbestblockhash()
         node.invalidateblock(tip_hash)
         assert_equal(node.getblockcount(), M - 1)
         # The kernel's slot, found with the staker running: it takes the first slot it can.
         self.arrive_at_slot(w, kernels["w"])
-        try:
-            self.wait_until(lambda: node.getblockcount() == M, timeout=20)
-        except AssertionError:
-            self.log.error("DEBUG %s", {k: v for k, v in w.getstakinginfo().items() if k in ("weight", "eligible", "staking_state", "staking_reason")})
-            self.log.error("DEBUG readiness %s", w.getquantumstakereadiness()["next_block"])
-            w.staking(False)
-            self.log.error("DEBUG unspent %s", w.listunspent(0, 9999999))
-            self.log.error("DEBUG kernel %s", kernels["w"])
-            self.log.error("DEBUG balances %s", w.getbalances())
-            self.log.error("DEBUG try plain stake_outpoint")
-            self.stake_outpoint(w, node, kernels["w"])
-            raise
+        self.wait_until(lambda: node.getblockcount() == M, timeout=60)
         w.staking(False)
         coinstake = node.getblock(node.getbestblockhash(), 2)["tx"][1]
         assert_equal((coinstake["vin"][0]["txid"], coinstake["vin"][0]["vout"]), (kernels["w"]["txid"], kernels["w"]["vout"]))
@@ -131,7 +131,7 @@ class FinalReorgStakerDestinationTest(TransitionTFinalTestBase, BitcoinTestFrame
         wi = wallets["wi"]
         bad = wi.getnewquantumaddress()["address"]
         wi.setlabel(bad, LABEL)
-        self.back_to_tip_and_reorg(wi, M)
+        self.back_to_tip_and_reorg(wi, M, labelled=True)
         with node.assert_debug_log(["the staking destination is not a key-hash address"], timeout=30):
             self.arrive_at_slot(wi, kernels["wi"])
         height = node.getblockcount()
@@ -148,13 +148,29 @@ class FinalReorgStakerDestinationTest(TransitionTFinalTestBase, BitcoinTestFrame
         assert LABEL not in wk.listlabels()
         self.back_to_tip_and_reorg(wk, M, expect_log="Keypool ran out")
         height = node.getblockcount()
+        started = self.log_text().count(STARTED)
+        # The failure is reported as the worker's error state at the current tip, and retried (a growing back-off) without
+        # a new worker or a restart.
+        self.wait_worker_at(wk, M - 1, states=("error",))
+        self.wait_until(lambda: self.log_text().count("PoSMiner: Error: Keypool ran out") >= 3, timeout=30)
         self.arrive_at_slot(wk, kernels["wk"])
         for _ in range(3):
             self.bump()
         assert_equal(node.getblockcount(), height)
+        assert_equal(self.log_text().count(STARTED), started)
+        assert wk.getstakinginfo()["worker_running"]
         assert LABEL not in wk.listlabels()
         wk.staking(False)
         self.assert_alive()
+
+    def wait_worker_at(self, wallet, height, states=("searching", "no_eligible_coins")):
+        """The worker of `wallet` is running and has finished its startup: its telemetry for the current tip, `height`
+        blocks, shows a post-startup state."""
+        def settled():
+            info = wallet.getstakinginfo()
+            return (info["worker_running"] and info["staking_state"] in states and info["staking_snapshot_current"]
+                    and info["active_blocks"] == height)
+        self.wait_until(settled, timeout=30)
 
     def arrive_at_slot(self, wallet, outpoint):
         """Move the mock clock to the first slot at which this kernel is valid, through the slot before it, so that the
@@ -164,7 +180,7 @@ class FinalReorgStakerDestinationTest(TransitionTFinalTestBase, BitcoinTestFrame
         self.wait_until(lambda: wallet.getstakinginfo()["staking_snapshot_current"], timeout=60)
         self.set_mt(slot)
 
-    def back_to_tip_and_reorg(self, wallet, tip, expect_log=None):
+    def back_to_tip_and_reorg(self, wallet, tip, expect_log=None, labelled=False):
         """Bring the chain to `tip` (the block invalidated by the previous step is reconsidered when the chain is a block
         short), start the wallet's worker there (the next block is Final), then reorganise to tip - 1."""
         node = self.nodes[0]
@@ -173,7 +189,8 @@ class FinalReorgStakerDestinationTest(TransitionTFinalTestBase, BitcoinTestFrame
         assert_equal(node.getblockcount(), tip)
         self.sync_mt_tip()
         wallet.staking(True)
-        self.bump()
+        self.wait_worker_at(wallet, tip)
+        assert LABEL not in wallet.listlabels() or labelled, "the destination was made although the next block is Final"
         self.invalidated = node.getbestblockhash()
         if expect_log:
             with node.assert_debug_log([expect_log], timeout=30):

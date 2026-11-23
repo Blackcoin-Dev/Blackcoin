@@ -16,6 +16,8 @@
 #include <algorithm>
 #include <fstream>
 #include <functional>
+#include <map>
+#include <optional>
 #include <set>
 #include <string>
 #include <vector>
@@ -127,9 +129,10 @@ BOOST_AUTO_TEST_CASE(retention_keeps_three_and_every_sole_protector)
         };
         auto doomed = SelectQuantumKeyBackupsToPrune(generations, Keys({0, 1, 2, 3, 4, 5}), 3);
         BOOST_CHECK(doomed == std::set<std::string>{"g2"});
-        // when key 0 is no longer a live key the oldest may go too
+        // when key 0 is no longer a live key, the oldest generation still holds a key this wallet does not know, which
+        // another generation may be the only protector of for another process: it stays, and the redundant g2 goes
         doomed = SelectQuantumKeyBackupsToPrune(generations, Keys({1, 2, 3, 4, 5}), 3);
-        BOOST_CHECK((doomed == std::set<std::string>{"g1", "g2"}));
+        BOOST_CHECK(doomed == std::set<std::string>{"g2"});
         // a chain of sole protectors: g1 holds key 0 alone, g2 holds key 1 alone, and the newest three hold neither
         generations = {Generation("g1", 1, {0}), Generation("g2", 2, {1}), Generation("g3", 3, {2}),
                        Generation("g4", 4, {2}), Generation("g5", 5, {2})};
@@ -154,6 +157,63 @@ BOOST_AUTO_TEST_CASE(retention_keeps_three_and_every_sole_protector)
                        Generation("failed-1", 4, {1}, false), Generation("failed-2", 5, {1}, false)};
         BOOST_CHECK(SelectQuantumKeyBackupsToPrune(generations, Keys({1}), 3).empty());
     }
+}
+
+// Four processes share one directory and each makes generations that hold its own key and the others it has seen.
+// A generation that holds a key this wallet does not know is never doomed on this wallet's word, so every
+// generation holding another clone's unique key survives, and the generations this wallet alone covers still go.
+BOOST_AUTO_TEST_CASE(a_generation_holding_a_key_the_wallet_does_not_know_survives_pruning)
+{
+    // this wallet holds key 1; clones 2, 3 and 4 made keys of their own
+    std::vector<QuantumKeyBackupGeneration> generations{
+        Generation("own1", 1, {1}),    Generation("clone2", 2, {1, 2}), Generation("clone3", 3, {1, 3}),
+        Generation("clone4", 4, {1, 4}), Generation("own2", 5, {1}),      Generation("own3", 6, {1}),
+        Generation("own4", 7, {1}),
+    };
+    auto doomed = SelectQuantumKeyBackupsToPrune(generations, Keys({1}), 3);
+    // own4, own3 and own2 are the newest three; each clone generation holds a foreign key; own1 holds only key 1,
+    // which the newer retained generations cover
+    BOOST_CHECK(doomed == std::set<std::string>{"own1"});
+
+    // a foreign key a newer retained generation already holds does not protect the older generation: only a key that
+    // the newer retained generations do not hold, or that the wallet does not know, does. Here the foreign key 9 is
+    // not live, so it is "unknown to the wallet" and keeps g2 anyway.
+    generations = {Generation("g1", 1, {1, 9}), Generation("g2", 2, {1, 9}), Generation("g3", 3, {1, 9}),
+                   Generation("g4", 4, {1, 9}), Generation("g5", 5, {1, 9})};
+    doomed = SelectQuantumKeyBackupsToPrune(generations, Keys({1}), 3);
+    BOOST_CHECK(doomed.empty());
+    // the same generations when the wallet does know key 9 (both live): the redundant ones go
+    doomed = SelectQuantumKeyBackupsToPrune(generations, Keys({1, 9}), 3);
+    BOOST_CHECK((doomed == std::set<std::string>{"g1", "g2"}));
+
+    // a key since removed from the wallet keeps only the generations that hold it
+    generations = {Generation("old", 1, {1, 2}), Generation("a", 2, {1}), Generation("b", 3, {1}), Generation("c", 4, {1}),
+                   Generation("d", 5, {1})};
+    doomed = SelectQuantumKeyBackupsToPrune(generations, Keys({1}), 3);
+    BOOST_CHECK(doomed == std::set<std::string>{"a"});
+
+    // keep_newest of zero keeps nothing for its own sake: only the live-key and unknown-key rules protect
+    generations = {Generation("g1", 1, {1}), Generation("g2", 2, {1}), Generation("g3", 3, {1, 2})};
+    doomed = SelectQuantumKeyBackupsToPrune(generations, Keys({1, 2}), 0);
+    // g3 holds live keys 1 and 2 that no newer generation holds: kept; g2 and g1 hold only key 1, covered by g3
+    BOOST_CHECK((doomed == std::set<std::string>{"g1", "g2"}));
+    generations = {Generation("g1", 1, {1}), Generation("g2", 2, {1})};
+    doomed = SelectQuantumKeyBackupsToPrune(generations, Keys({1}), 0);
+    // the newest holds a live key nothing newer holds, so it stays; the older one is covered by it
+    BOOST_CHECK(doomed == std::set<std::string>{"g1"});
+
+    // equal sequences are ordered by file name, descending; only retained generations cover
+    generations = {Generation("a", 5, {1}), Generation("b", 5, {1}), Generation("c", 5, {1}), Generation("d", 5, {1}),
+                   Generation("e", 5, {1, 2})};
+    doomed = SelectQuantumKeyBackupsToPrune(generations, Keys({1, 2}), 3);
+    // order: e, d, c, b, a; the newest three are e, d, c; b and a hold only key 1, covered by the retained ones
+    BOOST_CHECK((doomed == std::set<std::string>{"a", "b"}));
+
+    // an unverified generation neither protects nor is chosen, and a generation with no keys is covered by anything
+    generations = {Generation("v1", 1, {}), Generation("v2", 2, {1}), Generation("v3", 3, {1}), Generation("v4", 4, {1}),
+                   Generation("u", 5, {7}, /*verified=*/false)};
+    doomed = SelectQuantumKeyBackupsToPrune(generations, Keys({1}), 3);
+    BOOST_CHECK(doomed == std::set<std::string>{"v1"});
 }
 
 BOOST_AUTO_TEST_CASE(a_generation_on_disk_needs_its_manifest_and_only_generations_are_pruned)
@@ -552,6 +612,329 @@ BOOST_AUTO_TEST_CASE(a_network_or_device_backup_path_is_never_pruned)
     }
     // without the rule the same call prunes, so the generations above were kept by the rule
     BOOST_CHECK_EQUAL(PruneQuantumKeyBackups(spelled, Keys({1, 2}), 3), size_t{2});
+}
+#endif
+
+// A drive-relative path (`D:dir`) and a root-relative one (`\dir`) are resolved by Windows against the current directory
+// of that drive or the drive of the current directory, never against the data directory.
+BOOST_AUTO_TEST_CASE(a_drive_or_root_relative_path_is_recognised)
+{
+    for (const std::string value : {"D:", "d:", "Z:", "D:dir", "D:dir/sub", R"(D:dir\sub)", "D:.", "D:..", R"(\dir)", "/dir",
+                                    R"(\)", "/", R"(\dir\sub)", "/dir/sub", R"(\x:)"}) {
+        BOOST_CHECK_MESSAGE(QuantumBackupPathIsWindowsDriveOrRootRelative(value), value);
+    }
+    for (const std::string value : {R"(D:\dir)", "D:/dir", R"(D:\)", "D:/", R"(D:\\dir)", "d:/a/b", "", "dir", "relative/dir",
+                                    R"(relative\dir)", "backups", ".", "..", "./dir", R"(.\dir)", "1:dir", "D", "DD:dir",
+                                    R"(\\host\share)", "//host/share", R"(\\?\C:\dir)", "d"}) {
+        BOOST_CHECK_MESSAGE(!QuantumBackupPathIsWindowsDriveOrRootRelative(value), value);
+    }
+    // the double separator rule is unchanged and separate: those values are caught by it, not by this one
+    for (const std::string value : {R"(\\host\share)", "//host/share", R"(\\?\C:\dir)"}) {
+        BOOST_CHECK(QuantumBackupPathHasWindowsDoubleSeparatorPrefix(value));
+    }
+}
+
+BOOST_AUTO_TEST_CASE(a_drive_or_root_relative_backup_path_is_refused_with_its_own_message_and_never_joined)
+{
+    ArgsManager& args = *Assert(m_node.args);
+    const std::string network = "a network or device path is not supported";
+    const std::string relative = "relative to a drive or to the root of a drive";
+    {
+        // off Windows the spelling is not examined at all
+        for (const std::string value : {"D:", "D:dir", R"(\dir)", "/dir", R"(\\host\share)"}) {
+            BOOST_CHECK(!QuantumKeyBackupSpellingRejection(value));
+        }
+    }
+    const ScopedWindowsPathRules windows{true};
+    for (const std::string value : {"D:", "D:dir", R"(D:dir\sub)", R"(\dir)", "/dir", R"(\)", "/"}) {
+        const auto rejection = QuantumKeyBackupSpellingRejection(value);
+        BOOST_REQUIRE_MESSAGE(rejection, value);
+        BOOST_CHECK_MESSAGE(rejection->find(relative) != std::string::npos, *rejection);
+        BOOST_CHECK_MESSAGE(rejection->find(network) == std::string::npos, *rejection);
+        // the spelling is kept, so the refusal is of what was written and the data directory is not prefixed
+        args.ForceSetArg("-quantumkeybackupdir", value);
+        BOOST_CHECK_EQUAL(fs::PathToString(QuantumKeyBackupBaseDirectory()), value);
+    }
+    for (const std::string value : {R"(\\host\share)", "//host/share", R"(\\?\C:\dir)"}) {
+        const auto rejection = QuantumKeyBackupSpellingRejection(value);
+        BOOST_REQUIRE_MESSAGE(rejection, value);
+        BOOST_CHECK_MESSAGE(rejection->find(network) != std::string::npos, *rejection);
+    }
+    // valid spellings are accepted and resolve as before
+    for (const std::string value : {R"(D:\dir)", "D:/dir", R"(D:\)", "elsewhere", "a/b", R"(a\b)"}) {
+        BOOST_CHECK_MESSAGE(!QuantumKeyBackupSpellingRejection(value), value);
+    }
+    args.ForceSetArg("-quantumkeybackupdir", "elsewhere");
+    BOOST_CHECK_EQUAL(QuantumKeyBackupBaseDirectory(), args.GetDataDirNet() / "elsewhere");
+    args.ForceSetArg("-quantumkeybackupdir", "");
+}
+
+#ifndef WIN32
+BOOST_AUTO_TEST_CASE(a_drive_or_root_relative_backup_path_is_refused_before_the_file_system_is_touched)
+{
+    ArgsManager& args = *Assert(m_node.args);
+    const ScopedWindowsPathRules windows{true};
+    ScopedCommitRecorder recorder;
+    for (const std::string value : {"D:dir", R"(\dir)", "/dir-qkb-d7"}) {
+        args.ForceSetArg("-quantumkeybackupdir", value);
+        const fs::path directory = QuantumKeyBackupDirectory("w");
+        std::string error;
+        BOOST_CHECK(!EnsureQuantumKeyBackupDirectory(directory, error));
+        BOOST_CHECK_MESSAGE(error.find("cannot make the backup directory " + fs::PathToString(directory) + " durable: a path that is relative to a drive") == 0, error);
+        BOOST_CHECK(recorder.committed.empty());
+        BOOST_CHECK(!fs::exists(directory));
+        // never pruned either
+        BOOST_CHECK_EQUAL(PruneQuantumKeyBackups(directory, Keys({1}), 3), size_t{0});
+    }
+    BOOST_CHECK(!fs::exists(fs::PathFromString("D:dir")));
+    args.ForceSetArg("-quantumkeybackupdir", "");
+}
+#endif
+
+// UTF-16 code units, which is what Windows counts: a character outside the Basic Multilingual Plane is two.
+BOOST_AUTO_TEST_CASE(utf16_length_counts_code_units_not_bytes_or_characters)
+{
+    BOOST_CHECK_EQUAL(QuantumBackupUtf16Length(""), size_t{0});
+    BOOST_CHECK_EQUAL(QuantumBackupUtf16Length("abc"), size_t{3});
+    BOOST_CHECK_EQUAL(QuantumBackupUtf16Length("\xC3\xA9"), size_t{1});         // U+00E9, two bytes
+    BOOST_CHECK_EQUAL(QuantumBackupUtf16Length("\xE2\x82\xAC"), size_t{1});     // U+20AC, three bytes
+    BOOST_CHECK_EQUAL(QuantumBackupUtf16Length("\xF0\x9F\x98\x80"), size_t{2}); // U+1F600, four bytes: a surrogate pair
+    BOOST_CHECK_EQUAL(QuantumBackupUtf16Length("a\xF0\x9F\x98\x80" "b\xC3\xA9"), size_t{5});
+}
+
+BOOST_AUTO_TEST_CASE(the_length_bound_ties_to_the_staging_and_verification_names)
+{
+    // `\.blackcoin-wallet-backup-stage-<16>` and `\.blackcoin-quantum-backup-verify-<16>` and `\wallet.dat`
+    BOOST_CHECK_EQUAL(QUANTUM_BACKUP_STAGE_FOLDER_PREFIX.size(), size_t{31});
+    BOOST_CHECK_EQUAL(QUANTUM_BACKUP_VERIFY_FOLDER_PREFIX.size(), size_t{33});
+    BOOST_CHECK_EQUAL(QUANTUM_BACKUP_WORK_PATH_UNITS, size_t{109});
+    BOOST_CHECK_EQUAL(QUANTUM_BACKUP_WINDOWS_MAX_DIRECTORY_UNITS, size_t{150});
+    // the folders the backup code makes are exactly that long
+    const fs::path unique = GetUniquePath(fs::path{});
+    BOOST_CHECK_EQUAL(fs::PathToString(unique.filename()).size(), QUANTUM_BACKUP_UNIQUE_NAME_CHARS);
+    // 98 units for the deepest directory below the wallet's directory, and the copy's file name inside it
+    BOOST_CHECK_EQUAL(QUANTUM_BACKUP_WORK_PATH_UNITS - (1 + QUANTUM_BACKUP_COPY_FILE_NAME.size()), size_t{98});
+}
+
+BOOST_AUTO_TEST_CASE(a_wallet_backup_directory_longer_than_150_units_is_refused)
+{
+    const auto path_of = [](size_t length, const std::string& tail = "") {
+        std::string value = "x";
+        value.resize(length - tail.size(), 'x');
+        return fs::PathFromString(value + tail);
+    };
+    {
+        // off Windows the length is not limited
+        BOOST_CHECK(!QuantumKeyBackupLengthRejection(path_of(500)));
+    }
+    const ScopedWindowsPathRules windows{true};
+    BOOST_CHECK(!QuantumKeyBackupLengthRejection(path_of(1)));
+    BOOST_CHECK(!QuantumKeyBackupLengthRejection(path_of(149)));
+    BOOST_CHECK(!QuantumKeyBackupLengthRejection(path_of(150)));
+    const auto rejection = QuantumKeyBackupLengthRejection(path_of(151));
+    BOOST_REQUIRE(rejection);
+    BOOST_CHECK_MESSAGE(rejection->find("the path is too long: it has 151 characters and at most 150 are allowed") == 0, *rejection);
+    BOOST_CHECK(QuantumKeyBackupLengthRejection(path_of(152)));
+    BOOST_CHECK(QuantumKeyBackupLengthRejection(path_of(1000)));
+    // a character outside the Basic Multilingual Plane counts two: 148 + 2 = 150 passes, 149 + 2 = 151 does not
+    const std::string pair = "\xF0\x9F\x98\x80";
+    BOOST_CHECK(!QuantumKeyBackupLengthRejection(fs::PathFromString(std::string(148, 'x') + pair)));
+    BOOST_CHECK(QuantumKeyBackupLengthRejection(fs::PathFromString(std::string(149, 'x') + pair)));
+    // a character of two or three bytes counts one, however many bytes the path has
+    BOOST_CHECK(!QuantumKeyBackupLengthRejection(fs::PathFromString(std::string(75, 'x') + "\xC3\xA9\xC3\xA9" + std::string(71, 'x'))));
+}
+
+// The bound is on the resolved per-wallet directory: the base (the data directory with a relative option), the wallet's
+// component and the separators. A long wallet name is shortened by its component, so it counts at most 83 characters.
+BOOST_AUTO_TEST_CASE(the_length_check_counts_the_resolved_wallet_directory)
+{
+    ArgsManager& args = *Assert(m_node.args);
+    const ScopedWindowsPathRules windows{true};
+    const size_t datadir_units = QuantumBackupUtf16Length(fs::PathToString(args.GetDataDirNet()));
+    const std::string wallet_name{};
+    const size_t component_units = QuantumKeyBackupWalletComponent(wallet_name).size(); // "default"
+    BOOST_REQUIRE_EQUAL(component_units, size_t{7});
+    // the resolved directory is <datadir><sep><relative option><sep><component>
+    const auto option_of_total = [&](size_t total) {
+        BOOST_REQUIRE(total > datadir_units + 1 + component_units + 2);
+        return std::string(total - datadir_units - 1 - 1 - component_units, 'r');
+    };
+    for (const size_t total : {size_t{149}, size_t{150}, size_t{151}}) {
+        if (datadir_units + 1 + 1 + 1 + component_units >= total) continue; // a data directory too long to build the case
+        args.ForceSetArg("-quantumkeybackupdir", option_of_total(total));
+        BOOST_REQUIRE_EQUAL(QuantumBackupUtf16Length(fs::PathToString(QuantumKeyBackupDirectory(wallet_name))), total);
+        const auto rejection = QuantumKeyBackupWalletPathRejection(wallet_name);
+        BOOST_CHECK_MESSAGE(static_cast<bool>(rejection) == (total > 150), total << ": " << (rejection ? *rejection : std::string{"accepted"}));
+    }
+    // a long wallet name has a component of 83 characters at most; its resolved directory is what is counted
+    const std::string long_name(200, 'W');
+    BOOST_CHECK_EQUAL(QuantumKeyBackupWalletComponent(long_name).size(), size_t{83});
+    const std::string option(20, 'r');
+    args.ForceSetArg("-quantumkeybackupdir", option);
+    BOOST_CHECK_EQUAL(QuantumBackupUtf16Length(fs::PathToString(QuantumKeyBackupDirectory(long_name))), datadir_units + 1 + option.size() + 1 + 83);
+    // a spelling the rules refuse is reported first
+    args.ForceSetArg("-quantumkeybackupdir", "D:dir");
+    const auto spelling = QuantumKeyBackupWalletPathRejection("w");
+    BOOST_REQUIRE(spelling);
+    BOOST_CHECK(spelling->find("-quantumkeybackupdir: ") == 0);
+    args.ForceSetArg("-quantumkeybackupdir", "");
+}
+
+#ifndef WIN32
+BOOST_AUTO_TEST_CASE(a_backup_directory_that_is_too_long_is_refused_before_the_file_system_is_touched)
+{
+    const ScopedWindowsPathRules windows{true};
+    ScopedCommitRecorder recorder;
+    // a relative spelling passes the spelling rule, so it is the length that refuses it
+    const std::string name(151, 'x');
+    const fs::path directory = fs::PathFromString("qkb-d8-top/" + name.substr(11));
+    BOOST_REQUIRE_EQUAL(QuantumBackupUtf16Length(fs::PathToString(directory)), size_t{151});
+    std::string error;
+    BOOST_CHECK(!EnsureQuantumKeyBackupDirectory(directory, error));
+    BOOST_CHECK_MESSAGE(error.find("cannot make the backup directory " + fs::PathToString(directory) + " durable: the path is too long: it has 151 characters and at most 150 are allowed") == 0, error);
+    BOOST_CHECK(recorder.committed.empty());
+    BOOST_CHECK(!fs::exists(fs::PathFromString("qkb-d8-top")));
+}
+#endif
+
+// The walk up from the wallet's directory stops at the data directory by its identity (volume and file index), so a
+// spelling of the data directory that is not the lexical one still ends the walk there, and nothing above it is flushed.
+BOOST_AUTO_TEST_CASE(the_walk_stops_at_the_data_directory_by_identity)
+{
+    const QuantumBackupDirectoryIdentity a{1, 2, 3};
+    const QuantumBackupDirectoryIdentity same{1, 2, 3};
+    const QuantumBackupDirectoryIdentity other_volume{9, 2, 3};
+    const QuantumBackupDirectoryIdentity other_high{1, 9, 3};
+    const QuantumBackupDirectoryIdentity other_low{1, 2, 9};
+    BOOST_CHECK(a == same);
+    BOOST_CHECK(!(a == other_volume));
+    BOOST_CHECK(!(a == other_high));
+    BOOST_CHECK(!(a == other_low));
+    // both identities known: only equal identities stop the walk, whatever the paths say
+    BOOST_CHECK(QuantumBackupWalkReachedDataDirectory(a, same, /*same_path=*/false));
+    BOOST_CHECK(QuantumBackupWalkReachedDataDirectory(a, same, /*same_path=*/true));
+    BOOST_CHECK(!QuantumBackupWalkReachedDataDirectory(a, other_volume, /*same_path=*/true));
+    BOOST_CHECK(!QuantumBackupWalkReachedDataDirectory(a, other_high, /*same_path=*/false));
+    BOOST_CHECK(!QuantumBackupWalkReachedDataDirectory(a, other_low, /*same_path=*/true));
+    // either identity missing: the lexical comparison decides
+    BOOST_CHECK(QuantumBackupWalkReachedDataDirectory(std::nullopt, a, /*same_path=*/true));
+    BOOST_CHECK(!QuantumBackupWalkReachedDataDirectory(std::nullopt, a, /*same_path=*/false));
+    BOOST_CHECK(QuantumBackupWalkReachedDataDirectory(a, std::nullopt, /*same_path=*/true));
+    BOOST_CHECK(!QuantumBackupWalkReachedDataDirectory(a, std::nullopt, /*same_path=*/false));
+    BOOST_CHECK(QuantumBackupWalkReachedDataDirectory(std::nullopt, std::nullopt, /*same_path=*/true));
+    BOOST_CHECK(!QuantumBackupWalkReachedDataDirectory(std::nullopt, std::nullopt, /*same_path=*/false));
+}
+
+namespace {
+/** Identities of directories by path, and the real commit restored afterwards. */
+class ScopedDirectoryIdentities
+{
+public:
+    explicit ScopedDirectoryIdentities(std::map<fs::path, QuantumBackupDirectoryIdentity> identities) : m_identities(std::move(identities))
+    {
+        SetQuantumKeyBackupDirectoryIdentityForTest([this](const fs::path& path) -> std::optional<QuantumBackupDirectoryIdentity> {
+            const auto it = m_identities.find(path);
+            if (it == m_identities.end()) return std::nullopt;
+            return it->second;
+        });
+    }
+    ~ScopedDirectoryIdentities() { SetQuantumKeyBackupDirectoryIdentityForTest({}); }
+
+private:
+    std::map<fs::path, QuantumBackupDirectoryIdentity> m_identities;
+};
+} // namespace
+
+BOOST_AUTO_TEST_CASE(a_spelling_of_the_data_directory_ends_the_walk_by_identity)
+{
+    const fs::path datadir = gArgs.GetDataDirNet();
+    // another spelling of the data directory (a different case, a short name): a different path to the same directory
+    const fs::path spelled = m_path_root / "SPELLED-DATADIR";
+    const fs::path directory = spelled / "backups" / "n_w";
+    const QuantumBackupDirectoryIdentity identity{7, 8, 9};
+    ScopedCommitRecorder recorder;
+    {
+        ScopedDirectoryIdentities identities{{{datadir, identity}, {spelled, identity}, {spelled / "backups", {7, 8, 10}}, {directory, {7, 8, 11}}}};
+        std::string error;
+        BOOST_REQUIRE_MESSAGE(EnsureQuantumKeyBackupDirectory(directory, error), error);
+    }
+    // the directory, its parent and the other spelling of the data directory were flushed, and nothing above it
+    BOOST_CHECK(recorder.Committed(directory));
+    BOOST_CHECK(recorder.Committed(spelled / "backups"));
+    BOOST_CHECK(recorder.Committed(spelled));
+    BOOST_CHECK(!recorder.Committed(m_path_root) || datadir == m_path_root);
+    BOOST_CHECK(!recorder.Committed(spelled.parent_path()) || datadir == spelled.parent_path());
+    BOOST_CHECK_EQUAL(recorder.committed.back(), spelled);
+}
+
+BOOST_AUTO_TEST_CASE(the_walk_does_not_stop_at_the_same_path_with_a_different_identity_and_falls_back_without_one)
+{
+    const fs::path datadir = gArgs.GetDataDirNet();
+    {
+        // two identities that differ override the lexical match: the walk goes on above the data directory. The
+        // reference identity of the data directory is read once, first; the walk then reads the identity of the
+        // same path and is given another one.
+        const fs::path directory = datadir / "qkb-walk-a" / "n_w";
+        ScopedCommitRecorder recorder;
+        int datadir_reads{0};
+        SetQuantumKeyBackupDirectoryIdentityForTest([&](const fs::path& path) -> std::optional<QuantumBackupDirectoryIdentity> {
+            if (path == datadir) return QuantumBackupDirectoryIdentity{1, 1, ++datadir_reads == 1 ? 1U : 99U};
+            return QuantumBackupDirectoryIdentity{1, 1, 3};
+        });
+        std::string error;
+        const bool made = EnsureQuantumKeyBackupDirectory(directory, error);
+        SetQuantumKeyBackupDirectoryIdentityForTest({});
+        BOOST_REQUIRE_MESSAGE(made, error);
+        BOOST_CHECK_EQUAL(datadir_reads, 2);
+        BOOST_CHECK(recorder.Committed(datadir));
+        BOOST_CHECK(recorder.Committed(datadir.parent_path()));
+    }
+    {
+        // the data directory's identity is known but the walked directories give none: the path decides, as before, and
+        // the walk ends at the data directory
+        const fs::path directory = datadir / "qkb-walk-b" / "n_w";
+        ScopedCommitRecorder recorder;
+        int reads{0};
+        SetQuantumKeyBackupDirectoryIdentityForTest([&](const fs::path&) -> std::optional<QuantumBackupDirectoryIdentity> {
+            if (++reads == 1) return QuantumBackupDirectoryIdentity{1, 1, 1};
+            return std::nullopt;
+        });
+        std::string error;
+        const bool made = EnsureQuantumKeyBackupDirectory(directory, error);
+        SetQuantumKeyBackupDirectoryIdentityForTest({});
+        BOOST_REQUIRE_MESSAGE(made, error);
+        BOOST_CHECK(recorder.Committed(datadir));
+        BOOST_CHECK(!recorder.Committed(datadir.parent_path()));
+    }
+    {
+        // no identity at all (the platform gives none): the same lexical walk
+        const fs::path directory = datadir / "qkb-walk-c" / "n_w";
+        ScopedCommitRecorder recorder;
+        std::string error;
+        BOOST_REQUIRE_MESSAGE(EnsureQuantumKeyBackupDirectory(directory, error), error);
+        BOOST_CHECK(recorder.Committed(datadir));
+        BOOST_CHECK(!recorder.Committed(datadir.parent_path()));
+    }
+}
+
+// The manifest's rename and its directory commit are different failures with different messages, and the operating
+// system's reason for a failed rename is kept.
+#ifndef WIN32
+BOOST_AUTO_TEST_CASE(a_manifest_that_cannot_be_installed_reports_the_systems_reason)
+{
+    const fs::path directory = m_path_root / "manifest-rename";
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(EnsureQuantumKeyBackupDirectory(directory, error), error);
+    const std::string name = QuantumKeyBackupFileName(1'798'000'000, 100, NewQuantumKeyBackupSuffix());
+    // a directory with a file in it where the manifest goes: the rename of a file over it fails
+    const fs::path blocker = directory / fs::PathFromString(name + ".keys");
+    BOOST_REQUIRE(fs::create_directory(blocker));
+    std::ofstream{blocker / "occupied", std::ios::binary} << "x";
+    BOOST_CHECK(!WriteQuantumKeyBackupManifest(directory, name, 1, Keys({1}), error));
+    BOOST_CHECK_MESSAGE(error.find("cannot install the backup manifest " + fs::PathToString(blocker) + ": ") == 0, error);
+    BOOST_CHECK_MESSAGE(error.size() > std::string{"cannot install the backup manifest " + fs::PathToString(blocker) + ": "}.size(), error);
+    // the temporary file is gone
+    BOOST_CHECK(!fs::exists(directory / fs::PathFromString("." + name + ".keys.tmp")));
 }
 #endif
 

@@ -29,6 +29,7 @@
 #endif
 #include <wallet/coincontrol.h>
 #include <wallet/display_balance.h>
+#include <wallet/quantum_return_backup.h>
 #include <wallet/scheduler_stats.h>
 #include <wallet/shadow_pow_claim_recovery_args.h>
 #include <wallet/staking.h>
@@ -180,6 +181,13 @@ bool WalletInit::ParameterInteraction() const
         }
 
         return true;
+    }
+
+    // The spelling of the quantum key backup directory is checked here, from the option's text alone: nothing is
+    // looked up, created or written, so this does not show that the directory is writable, has room, is on a
+    // supported volume or that a backup will be durable. The length is checked for each wallet when it is loaded.
+    if (const std::optional<std::string> rejection = wallet::QuantumKeyBackupSpellingRejection(gArgs.GetArg("-quantumkeybackupdir", ""))) {
+        return InitError(Untranslated(strprintf("-quantumkeybackupdir=%s: %s", gArgs.GetArg("-quantumkeybackupdir", ""), *rejection)));
     }
 
     if (gArgs.GetBoolArg("-blocksonly", DEFAULT_BLOCKSONLY) && gArgs.SoftSetBoolArg("-walletbroadcast", false)) {

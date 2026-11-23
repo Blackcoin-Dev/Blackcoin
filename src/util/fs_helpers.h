@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <iosfwd>
 #include <limits>
+#include <string>
 
 /**
  * Ensure file contents are fully committed to disk, using a platform-specific
@@ -34,9 +35,11 @@ void AllocateFileRange(FILE* file, unsigned int offset, unsigned int length);
 
 /**
  * Rename src to dest.
+ * @param[out] error If not null and the rename failed, the operating system's reason, taken at the failed call
+ *                   (on Windows the MoveFileExW error with its numeric code, elsewhere the errno text).
  * @return true if the rename was successful.
  */
-[[nodiscard]] bool RenameOver(fs::path src, fs::path dest);
+[[nodiscard]] bool RenameOver(fs::path src, fs::path dest, std::string* error = nullptr);
 
 /**
  * Rename src to a destination that must not already exist.

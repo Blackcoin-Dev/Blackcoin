@@ -155,6 +155,28 @@ BOOST_AUTO_TEST_CASE(rename)
     fs::remove(path2);
 }
 
+BOOST_AUTO_TEST_CASE(rename_over_reports_the_systems_reason)
+{
+    const fs::path tmpfolder{m_args.GetDataDirBase()};
+    const fs::path missing{GetUniquePath(tmpfolder)};
+    const fs::path destination{GetUniquePath(tmpfolder)};
+
+    // a failed rename leaves the reason in the optional out-parameter, and a successful one leaves it alone
+    std::string reason;
+    BOOST_CHECK(!RenameOver(missing, destination, &reason));
+    BOOST_CHECK(!reason.empty());
+    BOOST_CHECK(!RenameOver(missing, destination)); // without the out-parameter it is the same call
+
+    {
+        std::ofstream file{missing};
+        file << "1";
+    }
+    reason = "untouched";
+    BOOST_CHECK(RenameOver(missing, destination, &reason));
+    BOOST_CHECK_EQUAL(reason, "untouched");
+    fs::remove(destination);
+}
+
 BOOST_AUTO_TEST_CASE(rename_no_replace_preserves_destination)
 {
     const fs::path tmpfolder{m_args.GetDataDirBase()};

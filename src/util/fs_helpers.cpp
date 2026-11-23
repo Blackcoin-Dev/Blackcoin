@@ -278,7 +278,7 @@ fs::path GetSpecialFolderPath(int nFolder, bool fCreate)
 }
 #endif
 
-bool RenameOver(fs::path src, fs::path dest)
+bool RenameOver(fs::path src, fs::path dest, std::string* error)
 {
 #ifdef WIN32
     // Use the native write-through replacement on every supported Windows
@@ -286,12 +286,19 @@ bool RenameOver(fs::path src, fs::path dest)
     // directory handle, so falling back to std::filesystem::rename here would
     // allow callers to report a durable replacement without any durability
     // barrier.
-    return MoveFileExW(src.wstring().c_str(), dest.wstring().c_str(),
-                       MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+    if (MoveFileExW(src.wstring().c_str(), dest.wstring().c_str(),
+                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0) {
+        return true;
+    }
+    // The code is taken before anything else can change it.
+    const DWORD move_error = ::GetLastError();
+    if (error) *error = Win32ErrorString(static_cast<int>(move_error));
+    return false;
 #else
-    std::error_code error;
-    fs::rename(src, dest, error);
-    return !error;
+    std::error_code rename_error;
+    fs::rename(src, dest, rename_error);
+    if (rename_error && error) *error = SysErrorString(rename_error.value());
+    return !rename_error;
 #endif
 }
 

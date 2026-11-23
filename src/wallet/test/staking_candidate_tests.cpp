@@ -19,6 +19,7 @@
 #include <validation.h>
 #include <wallet/coincontrol.h>
 #include <wallet/spend.h>
+#include <wallet/quantum_stake_ops.h>
 #include <wallet/staking.h>
 #include <wallet/quantum_return_backup.h>
 #include <wallet/test/util.h>
@@ -1453,6 +1454,31 @@ BOOST_FIXTURE_TEST_CASE(a_new_key_whose_backup_fails_stays_pending_and_is_retrie
     CWallet without_key(m_node.chain.get(), "", CreateMockableWalletDatabase(orphaned));
     BOOST_REQUIRE_EQUAL(without_key.LoadWallet(), DBErrors::LOAD_OK);
     BOOST_CHECK(!WITH_LOCK(without_key.cs_wallet, return without_key.m_quantum_return_pending.has_value()));
+}
+
+// A key made for the return address whose backup failed is not a destination the GUI sweep adopts either.
+BOOST_FIXTURE_TEST_CASE(a_pending_return_key_is_refused_as_a_sweep_destination, LegacyStakeWindowSetup)
+{
+    using Outcome = QuantumStakeReturnPreparation::Outcome;
+    ScopedQuantumBackupDir backups{m_path_root / "qkb-sweep"};
+    auto wallet = CreateSyncedWallet(*m_node.chain,
+        WITH_LOCK(Assert(m_node.chainman)->GetMutex(), return m_node.chainman->ActiveChain()), coinbaseKey);
+    const QuantumStakeReturnPreparation prep = PrepareQuantumStakeReturn(*wallet, QuantumStakeReturnTrigger::EXPLICIT, /*allow_new_key=*/true);
+    BOOST_REQUIRE(prep.outcome == Outcome::PENDING_BACKUP);
+    const size_t transactions_before = WITH_LOCK(wallet->cs_wallet, return wallet->mapWallet.size());
+    const auto sweep = CreateQuantumMigrationSweep(*wallet, /*goldrush_rewards_only=*/false, /*allow_goldrush_epoch=*/false,
+                                                   /*destination_label=*/"", /*comment_override=*/"", /*allow_new_quantum_key=*/false,
+                                                   /*existing_address=*/prep.address);
+    BOOST_REQUIRE(!sweep);
+    BOOST_CHECK_MESSAGE(util::ErrorString(sweep).original.find("waiting for its first verified wallet backup") != std::string::npos,
+                        util::ErrorString(sweep).original);
+    BOOST_CHECK_EQUAL(WITH_LOCK(wallet->cs_wallet, return wallet->mapWallet.size()), transactions_before);
+    // An ordinary key of the wallet is still a fine destination for the same call (it fails later, for lack of nothing
+    // to sweep or of a coin the test did not make, but not for its destination).
+    const auto ordinary = wallet->GetNewQuantumDestination("ordinary");
+    BOOST_REQUIRE(ordinary);
+    const auto other = CreateQuantumMigrationSweep(*wallet, false, false, "", "", false, EncodeDestination(*ordinary));
+    if (!other) BOOST_CHECK_MESSAGE(util::ErrorString(other).original.find("waiting for its first verified wallet backup") == std::string::npos, util::ErrorString(other).original);
 }
 
 // A key made for the return address whose backup failed carries the PoS label and sits in the address book. No

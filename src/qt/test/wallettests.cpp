@@ -55,6 +55,7 @@
 #include <univalue.h>
 #include <wallet/test/util.h>
 #include <wallet/spend.h>
+#include <wallet/staking.h>
 #include <wallet/scriptpubkeyman.h>
 #include <wallet/wallet.h>
 #include <wallet/walletdb.h>
@@ -7022,12 +7023,22 @@ QList<TransactionRecord> SyntheticHistory(size_t first, size_t count, size_t tot
 
 namespace {
 //! A quantum stake source of `value` for `dest`, confirmed at `height` in the wallet and present in the coin view.
-COutPoint AddReserveSource(TestChain100Setup& test, CWallet& wallet, const CTxDestination& dest, CAmount value, int height, uint32_t salt)
+COutPoint AddReserveSource(TestChain100Setup& test, CWallet& wallet, const CTxDestination& dest, CAmount value, int height, uint32_t salt,
+                           std::optional<bool> held = std::nullopt)
 {
-    CMutableTransaction mtx;
-    mtx.vin.emplace_back(COutPoint{uint256{static_cast<uint8_t>(salt)}, salt});
-    mtx.vout.emplace_back(value, GetScriptForDestination(dest));
-    const CTransactionRef tx = MakeTransactionRef(std::move(mtx));
+    // With `held` given, the transaction is varied until the singleton rule gives that answer for the source's
+    // outpoint (the rule is by outpoint, and the outpoint depends on the wallet's random key).
+    CTransactionRef tx;
+    for (uint32_t extra = 0; extra < 4000; ++extra) {
+        CMutableTransaction mtx;
+        const uint32_t varied = salt + 256 * extra;
+        mtx.vin.emplace_back(COutPoint{uint256{static_cast<uint8_t>(salt)}, varied});
+        mtx.vout.emplace_back(value, GetScriptForDestination(dest));
+        tx = MakeTransactionRef(std::move(mtx));
+        if (!held || wallet::SingleOutputReserveBit(COutPoint{tx->GetHash(), 0}) == *held) break;
+    }
+    assert(tx);
+    assert(!held || wallet::SingleOutputReserveBit(COutPoint{tx->GetHash(), 0}) == *held);
     const CBlockIndex* index = WITH_LOCK(::cs_main, return test.m_node.chainman->ActiveChain()[height]);
     assert(index);
     LOCK2(::cs_main, wallet.cs_wallet);
@@ -7097,7 +7108,9 @@ void WalletTests::finalStakeReservePreparedTransactions()
     QVERIFY(dest_big && dest_small && payee);
     // N = 2, R = 1: the larger source is the reserve once the guard is on.
     const COutPoint big = AddReserveSource(test, *wallet, *dest_big, 20 * COIN, 70, 1);
-    const COutPoint small = AddReserveSource(test, *wallet, *dest_small, 10 * COIN, 71, 2);
+    // Once the larger source is spent (step 5) the smaller one is the wallet's only source (N = 1); the singleton rule holds
+    // it back only when its outpoint says so, so it is made one the rule holds.
+    const COutPoint small = AddReserveSource(test, *wallet, *dest_small, 10 * COIN, 71, 2, /*held=*/true);
 
     MiniGUI gui(m_node, style.get());
     gui.initModelForWallet(m_node, wallet, style.get());

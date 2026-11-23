@@ -511,7 +511,7 @@ namespace {
 CTransactionRef BuildBeforeTheGuard(ReserveWallet& rw, CAmount amount, CCoinControl coin_control = {})
 {
     gArgs.ForceSetArg("-finalstakereserve", "0");
-    coin_control.destChange = rw.dest_small; // a fixed change output: the same inputs give the same transaction id
+    coin_control.destChange = rw.dest_small; // a fixed change output, so the id varies only with the input order and the lock time
     const auto created = CreateTransaction(*rw.wallet, {CRecipient{rw.recipient, amount, false}}, /*change_pos=*/1, coin_control);
     BOOST_REQUIRE_MESSAGE(created, util::ErrorString(created).original);
     return created->tx;

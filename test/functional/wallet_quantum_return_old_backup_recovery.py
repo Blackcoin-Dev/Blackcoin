@@ -2,13 +2,13 @@
 # Copyright (c) 2026 The Blackcoin developers
 # Distributed under the MIT software license, see the accompanying
 # file COPYING or http://www.opensource.org/licenses/mit-license.php.
-"""A wallet backup made BEFORE the return address was configured still recovers the legacy stake payout.
+"""A wallet backup made after the Gold Rush claim payout key exists still recovers a legacy stake payout made to that key.
 
-Quantum keys are random, so a backup recovers only the keys that existed when it was made. The
-wallet therefore prefers a key every old backup already holds: the Gold Rush claim payout key.
-This test makes that permanent, on regtest (Gold Rush ends at 61, Migration at 91, the legacy
-stake window starts at 81, maturity 10), for an unencrypted and an encrypted wallet of the wallet
-type the run uses (--descriptors or --legacy-wallet):
+Quantum keys are random and a rescan cannot recreate one that was made after a backup, so a backup recovers only
+the keys it holds. The wallet therefore prefers a usable recorded claim payout key when it chooses the return
+destination itself, and an older backup recovers that key only if the backup contains it. This test checks both
+sides on regtest (Gold Rush ends at 61, Migration at 91, the legacy stake window starts at 81, maturity 10), for an
+unencrypted and an encrypted wallet of the wallet type the run uses (--descriptors or --legacy-wallet):
 
  * the wallet holds a claim payout key (the one its claim miner is bound to, configured with
    -qqpowpayoutaddress) when the OLD backup is made; after the backup a second key labelled as the
@@ -18,6 +18,14 @@ type the run uses (--descriptors or --legacy-wallet):
  * the chain runs to Final and past maturity; ONLY the old backup is restored into an isolated
    wallet of a fresh node, which finds the payout, signs a spend of it and has it accepted by the
    node and confirmed.
+
+The limit is tested as well, with a third wallet whose return key is made after its backup:
+
+ * the old backup B0 holds one verified key K0; the return key K1 is made after B0 and chosen explicitly;
+ * a legacy stake in the window pays its principal to K1;
+ * ONLY B0 is restored: the restored wallet lacks K1, does not see the payout and cannot sign a spend of it,
+   although K0, the key it does hold, reports itself backed up. Backup flags describe the keys present in
+   the restored wallet and do not prove that keys made later are present.
 """
 import os
 from decimal import Decimal
@@ -35,7 +43,8 @@ from transition_t_final_util import (
 
 POS_LABEL = "PoS - Quantum Stake Address"
 CLAIM_LABEL = "PoW - Quantum Claim Address"
-VARIANTS = [("plain", None), ("encrypted", "open sesame")]
+# (kind, passphrase, the return key is made after the backup and chosen explicitly)
+VARIANTS = [("plain", None, False), ("encrypted", "open sesame", False), ("late", None, True)]
 
 
 class OldBackupRecoveryTest(TransitionTFinalTestBase, BitcoinTestFramework):
@@ -76,8 +85,8 @@ class OldBackupRecoveryTest(TransitionTFinalTestBase, BitcoinTestFramework):
 
         variants = VARIANTS
         records = []  # one dict per variant
-        self.log.info("Two wallets, each with one legacy coinbase to stake in the window")
-        for index, (kind, passphrase) in enumerate(variants):
+        self.log.info("Three wallets, each with one legacy coinbase to stake in the window")
+        for index, (kind, passphrase, late) in enumerate(variants):
             name = "ret-" + kind
             if passphrase:
                 n0.createwallet(name, passphrase=passphrase, load_on_startup=True)
@@ -94,7 +103,7 @@ class OldBackupRecoveryTest(TransitionTFinalTestBase, BitcoinTestFramework):
             n0.syncwithvalidationinterfacequeue()
             assert_equal(wallet.getwalletinfo()["txcount"], 1)
             coinbase = n0.getblock(n0.getblockhash(index + 1), 2)["tx"][0]
-            records.append({"name": name, "kind": kind, "passphrase": passphrase,
+            records.append({"name": name, "kind": kind, "passphrase": passphrase, "late": late,
                             "kernel": {"txid": coinbase["txid"], "vout": 0}, "coinbase_value": coinbase["vout"][0]["value"]})
         self.pow_blocks(n0, 40 - n0.getblockcount(), pow_addr, sync=True)
 
@@ -117,6 +126,16 @@ class OldBackupRecoveryTest(TransitionTFinalTestBase, BitcoinTestFramework):
             distractor = wallet.getnewquantumaddress(POS_LABEL)["address"]
             keys_before = set(wallet.getaddressesbylabel(POS_LABEL))
             assert_equal(keys_before, {distractor})
+            if record["late"]:
+                # the return key is one the old backup does not hold
+                chosen = wallet.setquantumstakereturn({"existing_address": distractor})
+                self.log.info("%s: the return key %s was made after the backup and chosen explicitly", record["kind"], distractor)
+                assert_equal(chosen["address"], distractor)
+                record["return_key"] = distractor
+                info = wallet.getstakinginfo()
+                assert_equal(info["legacy_stake_return_ready"], True)
+                assert_equal(info["legacy_stake_return_address"], distractor)
+                continue
             chosen = wallet.setquantumstakereturn()
             self.log.info("%s: setquantumstakereturn() chose %s, created=%s", record["kind"], chosen["address"], chosen["created"])
             assert_equal(chosen["address"], claim)
@@ -142,7 +161,7 @@ class OldBackupRecoveryTest(TransitionTFinalTestBase, BitcoinTestFramework):
             coinstake = n0.getblock(block_hash, 2)["tx"][1]
             valued = [o for o in coinstake["vout"] if o["value"] > 0]
             assert_equal(len(valued), 1)
-            assert_equal(valued[0]["scriptPubKey"]["address"], record["claim"])
+            assert_equal(valued[0]["scriptPubKey"]["address"], record.get("return_key", record["claim"]))
             assert valued[0]["value"] > record["coinbase_value"]
             record["payout"] = {"txid": coinstake["txid"], "vout": valued[0]["n"]}
             record["payout_value"] = valued[0]["value"]
@@ -167,6 +186,19 @@ class OldBackupRecoveryTest(TransitionTFinalTestBase, BitcoinTestFramework):
             info = restored.getaddressinfo(record["claim"])
             assert_equal(info["ismine"], True)
             payout = record["payout"]
+            if record["late"]:
+                # B0 holds K0, which reports itself backed up; K1 was made after B0, so it is not in the restored
+                # wallet, the payout to it is not seen and cannot be signed
+                assert_equal(info["quantum_key_backup_verified"], True)
+                assert_equal(restored.getaddressinfo(record["return_key"])["ismine"], False)
+                # the stake spent one of the wallet's own legacy outputs, so the restored wallet knows the transaction;
+                # the output to K1 is not one of its own
+                assert_equal([u for u in restored.listunspent(0) if (u["txid"], u["vout"]) == (payout["txid"], payout["vout"])], [])
+                raw = n1.createrawtransaction([payout], [{destination: record["payout_value"] - Decimal("0.02")}])
+                signed = restored.signrawtransactionwithwallet(raw)
+                assert_equal(signed["complete"], False)
+                self.log.info("%s: the old backup holds K0 (backed up) but not K1; the payout to K1 cannot be signed", record["kind"])
+                continue
             assert payout["txid"] in [tx["txid"] for tx in restored.listtransactions("*", 1000)]
             unspent = [u for u in restored.listunspent(0) if (u["txid"], u["vout"]) == (payout["txid"], payout["vout"])]
             assert_equal(len(unspent), 1)

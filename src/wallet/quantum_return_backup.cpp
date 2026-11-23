@@ -225,7 +225,8 @@ std::string QuantumKeyBackupWalletComponent(const std::string& wallet_name)
     if (wallet_name.empty()) return "default";
     static constexpr char HEX[] = "0123456789abcdef";
     std::string out{"n_"};
-    for (const unsigned char c : wallet_name) {
+    for (const char ch : wallet_name) {
+        const auto c{static_cast<unsigned char>(ch)};
         if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-') {
             out += static_cast<char>(c);
         } else {

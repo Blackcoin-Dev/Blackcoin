@@ -209,6 +209,11 @@ void SetQuantumKeyBackupDataDirectoryForTest(std::optional<fs::path> data_direct
  *  platform; nullopt restores the platform's own answer (applied on Windows only). */
 void SetQuantumKeyBackupWindowsPathRulesForTest(std::optional<bool> rules);
 
+/** Tests only: on Windows, take a drive whose type the system reports as unknown for a fixed disk. The Wine emulator
+ *  the cross-built unit tests run under reports its drives that way; a removable, network, optical or RAM drive and
+ *  a file system other than NTFS are still refused. Off by default and never set outside the test binary. */
+void SetQuantumKeyBackupUnknownDriveIsFixedForTest(bool unknown_is_fixed);
+
 /** Tests only: replace the commit of a directory (an empty function restores the real one). */
 void SetQuantumKeyBackupDirectoryCommitForTest(std::function<bool(const fs::path&)> hook);
 

@@ -60,6 +60,9 @@ bool IsLowerHex(std::string_view s)
 //! Test seam: replaces the commit of a directory (see SetQuantumKeyBackupDirectoryCommitForTest).
 std::function<bool(const fs::path&)> g_directory_commit_hook;
 
+//! Test seam: an unknown drive type counts as a fixed disk (see SetQuantumKeyBackupUnknownDriveIsFixedForTest).
+bool g_unknown_drive_is_fixed_for_test{false};
+
 //! Test seam: the Windows path rule on any platform (see SetQuantumKeyBackupWindowsPathRulesForTest).
 std::optional<bool> g_windows_path_rules_for_test;
 
@@ -244,7 +247,9 @@ bool FlushDirectoryWindows(const fs::path& directory, std::string& reason, std::
     } else {
         std::string narrow_file_system;
         for (const wchar_t* c = file_system; *c != L'\0'; ++c) narrow_file_system.push_back(*c < 0x80 ? static_cast<char>(*c) : '?');
-        const unsigned drive_type = ::GetDriveTypeW(volume_root->c_str());
+        unsigned drive_type = ::GetDriveTypeW(volume_root->c_str());
+        // Tests under an emulator only: every other answer, the file system name included, is still the real one.
+        if (g_unknown_drive_is_fixed_for_test && drive_type == QUANTUM_BACKUP_DRIVE_UNKNOWN) drive_type = QUANTUM_BACKUP_DRIVE_FIXED;
         if (const std::optional<std::string> rejection = QuantumBackupVolumeRejection(narrow_file_system, drive_type)) {
             reason = *rejection;
             committed = false;
@@ -575,6 +580,11 @@ std::optional<std::wstring> QuantumBackupLocalVolumeRoot(std::wstring_view final
     }
     if (final_path[PREFIX.size() + GUID_CHARS] != L'}' || final_path[PREFIX.size() + GUID_CHARS + 1] != L'\\') return std::nullopt;
     return std::wstring{final_path.substr(0, ROOT_CHARS)};
+}
+
+void SetQuantumKeyBackupUnknownDriveIsFixedForTest(bool unknown_is_fixed)
+{
+    g_unknown_drive_is_fixed_for_test = unknown_is_fixed;
 }
 
 void SetQuantumKeyBackupDirectoryCommitForTest(std::function<bool(const fs::path&)> hook)

@@ -27,6 +27,23 @@
 #include <sys/stat.h>
 #endif
 
+#ifdef WIN32
+#include <windows.h>
+
+/** The cross-built unit tests run under the Wine emulator, which reports the type of its drives as unknown, so
+ *  every test that makes a real backup directory would be refused there. For the whole test binary, and under Wine
+ *  only, an unknown drive type counts as a fixed disk; on Windows itself nothing changes. */
+struct WineUnknownDriveIsFixed {
+    WineUnknownDriveIsFixed()
+    {
+        const HMODULE ntdll{::GetModuleHandleA("ntdll.dll")};
+        if (ntdll && ::GetProcAddress(ntdll, "wine_get_version")) wallet::SetQuantumKeyBackupUnknownDriveIsFixedForTest(true);
+    }
+    ~WineUnknownDriveIsFixed() { wallet::SetQuantumKeyBackupUnknownDriveIsFixedForTest(false); }
+};
+BOOST_TEST_GLOBAL_FIXTURE(WineUnknownDriveIsFixed);
+#endif
+
 namespace wallet {
 namespace {
 

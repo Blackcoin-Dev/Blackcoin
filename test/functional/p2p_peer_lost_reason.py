@@ -24,9 +24,9 @@ from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import (
     assert_equal,
     assert_greater_than,
+    p2p_port,
 )
 
-REGTEST_PORT = 35714
 NO_PEERS_WAIT = 150
 BASE_ARGS = ["-dnsseed=0", "-fixedseeds=0", "-listen=1"]
 
@@ -108,9 +108,10 @@ class PeerLostReasonTest(BitcoinTestFramework):
         self.log.info("No peers: dial failures are classified, a hang-up before verack is counted")
         hangups = []
         stop = threading.Event()
+        dial_port = p2p_port(1)
         listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        listener.bind(("127.0.0.1", REGTEST_PORT))
+        listener.bind(("127.0.0.1", dial_port))
         listener.listen(8)
         listener.settimeout(0.2)
 
@@ -132,7 +133,7 @@ class PeerLostReasonTest(BitcoinTestFramework):
             # 127.0.0.1 accepts and hangs up; nothing listens on 127.0.0.2; 192.0.2.1 is unroutable.
             # addrman refuses unroutable addresses, so they are dialed as added nodes.
             for address in ("127.0.0.1", "127.0.0.2", "192.0.2.1"):
-                node.addnode(f"{address}:{REGTEST_PORT}", "add")
+                node.addnode(f"{address}:{dial_port}", "add")
             deadline = time.time() + NO_PEERS_WAIT * self.options.timeout_factor
             while line is None and time.time() < deadline:
                 found = [ln for ln in self.log_text().splitlines() if "No peers for" in ln]

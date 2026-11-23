@@ -937,9 +937,12 @@ BOOST_FIXTURE_TEST_CASE(the_commit_warning_names_both_when_both_apply, Candidate
 {
     // With a translator that marks every string, the whole text is translated, template by template, and the original
     // stays the English one.
-    g_test_translation = [](const char* psz) { return std::string{"[T] "} + psz; };
-    const bilingual_str warning = CommitWithWarning(*this, /*pending_relay=*/true, /*consume_reserve=*/true);
-    g_test_translation = nullptr;
+    bilingual_str warning;
+    {
+        // Established before the helper, which can stop the test with a fatal assertion.
+        const ScopedTestTranslation translation;
+        warning = CommitWithWarning(*this, /*pending_relay=*/true, /*consume_reserve=*/true);
+    }
     BOOST_CHECK_MESSAGE(MentionsReserve(warning) && MentionsRelay(warning), "warning: " + warning.original);
     BOOST_CHECK_EQUAL(warning.original.find("[T]"), std::string::npos);
     BOOST_CHECK(warning.translated.rfind("[T] The transaction was stored", 0) == 0);

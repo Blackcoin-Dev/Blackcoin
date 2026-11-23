@@ -7089,8 +7089,9 @@ void WalletTests::finalStakeReserveWithdrawalStatus()
     auto restore = interfaces::MakeCleanupHandler([&] {
         m_node.setContext(previous);
         gArgs.ForceSetArg("-finalstakereserve", "1");
-        g_test_translation = nullptr;
     });
+    // Before anything that can stop the test: the hook is restored on every exit.
+    const ScopedTestTranslation translation;
     auto loader = interfaces::MakeWalletLoader(*test.m_node.chain, *Assert(test.m_node.args));
     test.m_node.wallet_loader = loader.get();
     m_node.setContext(&test.m_node);
@@ -7140,7 +7141,6 @@ void WalletTests::finalStakeReserveWithdrawalStatus()
     QVERIFY2(find_output() >= 0, "the staking output did not appear in the output selector");
     output_selector->setCurrentIndex(find_output());
 
-    g_test_translation = [](const char* psz) { return std::string{"[T] "} + psz; };
     const auto confirm_yes = [] {
         QTimer::singleShot(0, [] {
             for (QWidget* widget : QApplication::topLevelWidgets()) {
@@ -7332,8 +7332,7 @@ void WalletTests::finalStakeReservePreparedTransactions()
         int sent_count{0};
         const QMetaObject::Connection sent_connection = QObject::connect(&dialog, &SendCoinsDialog::coinsSent, &dialog, [&sent_count](const uint256&) { ++sent_count; });
         // A translator that marks every translated string: the text the dialog shows must be the translated one.
-        g_test_translation = [](const char* psz) { return std::string{"[T] "} + psz; };
-        auto clear_translation = interfaces::MakeCleanupHandler([] { g_test_translation = nullptr; });
+        const ScopedTestTranslation translation;
         ConfirmSendAfter(guard_on);
         QVERIFY(QMetaObject::invokeMethod(&dialog, "sendButtonClicked", Q_ARG(bool, false)));
         QObject::disconnect(sent_connection);

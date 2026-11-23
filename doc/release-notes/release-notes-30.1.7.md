@@ -179,7 +179,9 @@ address were never affected. Transaction and block validation rules are unchange
   shortfall, and what excluded an output (a missing key is told apart from a locked wallet).
   `-finalstakereserve` accepts only 0, 1, true or false (any case) or the bare flag, and
   `-nofinalstakereserve` turns it off; any other value stops the node at startup instead of
-  silently turning the reserve off. A wallet with exactly one eligible quantum output (N = 1)
+  silently turning the reserve off. The same values are checked in `settings.json` (a boolean,
+  0, 1 or one of the four words); a `settings.json` with any other value for it, or with a
+  `nofinalstakereserve` key, is refused as a whole and nothing from it is loaded. A wallet with exactly one eligible quantum output (N = 1)
   does not always hold it. Whether it holds that output for the first Final block or keeps
   staking it is decided by a fixed property of the output itself, one bit of a SHA-256 hash of
   its transaction id and output index, so the same output always gets the same answer, across
@@ -256,8 +258,19 @@ address were never affected. Transaction and block validation rules are unchange
   names a drive without a folder separator (`D:dir`) or starts at the root of the current drive
   (`\dir`) is refused as written too, because its meaning depends on the process's current
   directory. Write `D:\dir` or `D:/dir`. A backup folder whose full per-wallet path is longer
-  than 150 characters (counted in UTF-16 code units, wallet component included) is refused, so
-  that the files inside it stay under the 260-character Windows path limit. These spelling and
+  than 137 characters (counted in UTF-16 code units, wallet component included) is refused, so
+  that the temporary files made inside it while a backup is verified stay under the
+  260-character Windows path limit. With an explicit `-quantumkeybackupdir`, a path that is
+  misspelled in one of these ways stops the node at startup, and a wallet whose folder would be
+  too long is not loaded or created. With the default folder, a path that is too long only
+  produces a warning: the wallet loads and works, the automatic backup is refused until a
+  shorter `-quantumkeybackupdir` is set, and a pending key and the active return address are
+  kept. A wallet migration (`migratewallet`) applies the same rule to the wallet's own name
+  before it changes anything, and to the watch-only and solvables wallets it needs to create
+  before it creates them; a refusal at that second point restores the wallet from the safety
+  copy the migration made and loads it, also when it was not loaded before. A default-folder
+  warning from a migration is returned in the new `warnings` field of `migratewallet` and shown
+  by the GUI. These spelling and
   length checks do not show that the folder is writable, that the disk has space or that the
   volume is supported. Point
   `-quantumkeybackupdir` at a folder on a fixed local NTFS disk, named by its drive letter, and run

@@ -11970,8 +11970,8 @@ void SetWalletMigrationFailpointForTest(std::function<bool(std::string_view)> fa
 }
 
 //! Carry out a migration whose descriptors (the plan) were produced, and whose auxiliary wallet names were checked against
-//! the quantum key backup directory policy, before anything was converted: the wallets created here are exactly the ones
-//! that were checked.
+//! the quantum key backup directory policy, before any auxiliary wallet is created: the wallets created here are exactly the
+//! ones that were checked.
 bool DoMigration(CWallet& wallet, WalletContext& context, bilingual_str& error, MigrationResult& res, MigrationData& plan) EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet)
 {
     AssertLockHeld(wallet.cs_wallet);
@@ -12179,29 +12179,32 @@ util::Result<MigrationResult> MigrateLegacyToDescriptor(const std::string& walle
             }
         }
 
-        // The descriptors are produced now, after the safety copy and before anything is converted (producing them writes
-        // descriptor records into this wallet's database), so that the wallets this migration creates can be checked
-        // against the quantum key backup directory policy first: the wallet's own name was checked before it was
-        // unloaded, and the auxiliary wallets are the ones these descriptors need. A refusal, like any other failure,
-        // goes through the rollback below, which restores the wallet from the safety copy.
+        // First change to using SQLite. This comes before the descriptors are produced (producing them writes descriptor
+        // records into this wallet's database), so that a failure here leaves the database without any.
+        if (g_migration_failpoint && g_migration_failpoint("fail_sqlite_conversion")) {
+            return util::Error{Untranslated("Injected wallet migration failure in the conversion to SQLite")};
+        }
+        if (!local_wallet->MigrateToSQLite(error)) return util::Error{error};
+
+        // The descriptors are produced now. The wallets this migration creates are exactly the ones these descriptors need,
+        // and their names are checked against the quantum key backup directory policy before any of them is created. The
+        // wallet's own name was checked before it was unloaded; by this point the wallet's database has been converted, so
+        // a refusal here, like any other failure, goes through the rollback below, which restores the wallet from the
+        // safety copy (as a loaded wallet, whether or not it was loaded before).
         std::optional<MigrationData> plan = local_wallet->GetDescriptorsForLegacy(error);
         if (plan) {
             const QuantumKeyBackupPathCheck backup_paths = CheckQuantumKeyBackupMigrationPaths(
                 wallet_name, !plan->watch_descs.empty(), !plan->solvable_descs.empty());
             if (backup_paths.error) {
-                error = Untranslated(strprintf("Wallet migration refused before any wallet was converted or created: %s", *backup_paths.error));
+                error = Untranslated(strprintf("Wallet migration refused before any auxiliary wallet was created: %s. The wallet is restored from its safety copy.", *backup_paths.error));
                 plan.reset();
             } else if (backup_paths.warning) {
                 res.warnings.push_back(Untranslated(*backup_paths.warning));
             }
         }
-        if (plan) {
-            // First change to using SQLite
-            if (!local_wallet->MigrateToSQLite(error)) return util::Error{error};
 
-            // Do the migration, and cleanup if it fails
-            success = DoMigration(*local_wallet, context, error, res, *plan);
-        }
+        // Do the migration, and cleanup if it fails
+        if (plan) success = DoMigration(*local_wallet, context, error, res, *plan);
     }
 
     // In case of loading failure, we need to remember the wallet files we have created to remove.

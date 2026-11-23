@@ -9537,9 +9537,10 @@ size_t CountDescriptorRecords(const std::map<std::string, std::string>& records)
 
 // Migration under the Windows backup-path policy (the rules are applied through the test seam, with a short data directory
 // so that exact lengths can be built), on real BDB legacy wallets, unencrypted and encrypted. The wallet's own name is
-// checked before it is unloaded, and the auxiliary wallets its descriptors need are checked once those are produced, before
-// anything is converted or created: producing them writes descriptor records into the wallet, which the safety copy
-// (made first) and the rollback from it undo.
+// checked before it is unloaded. The migration then runs as it always did: private load, safety copy, unlock, conversion to
+// SQLite, descriptors, and only then, with the descriptors known, the auxiliary wallets they need are checked before any of
+// them is created. A refusal there, like any failure, is rolled back from the safety copy: the wallet is restored and loaded
+// again (whether or not it was loaded before), and the records the descriptors wrote are gone.
 BOOST_AUTO_TEST_CASE(MigrationHonoursTheQuantumBackupPathPolicyForExactlyTheWalletsItPublishes)
 {
     struct PolicyGuard {
@@ -9638,11 +9639,11 @@ BOOST_AUTO_TEST_CASE(MigrationHonoursTheQuantumBackupPathPolicyForExactlyTheWall
             const std::string name = "mga-" + tag;
             make_legacy(name, /*watch_only=*/false, encrypted);
             set_option_for(name, 151);
-            const auto before = GetWallet(context, name);
+            auto before = GetWallet(context, name);
             BOOST_REQUIRE(before != nullptr);
             const auto records_before = DumpWalletRecords(before->GetDatabase());
             const CWallet* instance = before.get();
-            const_cast<std::shared_ptr<CWallet>&>(before).reset();
+            before.reset(); // the migration waits for the last reference to a loaded wallet
             auto result = MigrateLegacyToDescriptor(name, passphrase, context);
             BOOST_REQUIRE(!result);
             BOOST_CHECK_MESSAGE(util::ErrorString(result).original.find("refused before any change was made") != std::string::npos, util::ErrorString(result).original);
@@ -9654,9 +9655,12 @@ BOOST_AUTO_TEST_CASE(MigrationHonoursTheQuantumBackupPathPolicyForExactlyTheWall
             no_auxiliary_wallet_exists(name);
         }
 
-        // (b) The wallet's name fits and it needs a watch-only wallet whose name does not: nothing is converted or created,
-        // the wallet is restored from the safety copy and available again with no descriptor record, and after the path is
+        // (b) The wallet's name fits and it needs a watch-only wallet whose name does not: no auxiliary wallet is created, the
+        // wallet is restored from the safety copy and loaded again with no descriptor record, and after the path is
         // shortened the same wallet migrates.
+        // The second round clears the key-origin flag of an encrypted wallet first, so the flag the unlock sets is absent on
+        // disk before the migration. This tests that the flag is restored with the rest of the wallet; it is not a wallet
+        // with old key metadata that the unlock rewrites (no such fixture is built).
         for (const bool old_key_metadata : {false, true}) {
             if (old_key_metadata && !encrypted) continue;
             const std::string name = std::string{"mgb-"} + tag + (old_key_metadata ? "-old" : "");
@@ -9674,7 +9678,7 @@ BOOST_AUTO_TEST_CASE(MigrationHonoursTheQuantumBackupPathPolicyForExactlyTheWall
             auto result = MigrateLegacyToDescriptor(name, passphrase, context);
             BOOST_REQUIRE(!result);
             const std::string message = util::ErrorString(result).original;
-            BOOST_CHECK_MESSAGE(message.find("refused before any wallet was converted or created") != std::string::npos &&
+            BOOST_CHECK_MESSAGE(message.find("refused before any auxiliary wallet was created") != std::string::npos &&
                                 message.find("\"" + name + "_watchonly\"") != std::string::npos, message);
             require_original_available(name, encrypted, keypool);
             // what the unlock wrote to the wallet was undone with everything else
@@ -9745,6 +9749,42 @@ BOOST_AUTO_TEST_CASE(MigrationHonoursTheQuantumBackupPathPolicyForExactlyTheWall
                                 result->warnings[0].original.find("-quantumkeybackupdir") != std::string::npos, result->warnings[0].original);
             SetQuantumKeyBackupDataDirectoryForTest(fs::PathFromString("/d"));
         }
+    }
+
+    // (g) The conversion to SQLite fails: no descriptor record has been written, so the wallet's records are exactly what they
+    // were (the conversion comes first), and the wallet, unloaded for the migration as it always was, migrates when the
+    // failure is gone.
+    for (const bool encrypted : {false, true}) {
+        const std::string name = std::string{"mgg-"} + (encrypted ? "e" : "p");
+        const SecureString passphrase{std::string_view{encrypted ? passphrase_text : std::string{}}};
+        make_legacy(name, /*watch_only=*/true, encrypted);
+        gArgs.ForceSetArg("-quantumkeybackupdir", "");
+        std::map<std::string, std::string> records_before;
+        {
+            const auto wallet = GetWallet(context, name);
+            BOOST_REQUIRE(wallet != nullptr);
+            records_before = DumpWalletRecords(wallet->GetDatabase());
+        }
+        SetWalletMigrationFailpointForTest([](std::string_view point) { return point == "fail_sqlite_conversion"; });
+        auto result = MigrateLegacyToDescriptor(name, passphrase, context);
+        SetWalletMigrationFailpointForTest({});
+        BOOST_REQUIRE(!result);
+        BOOST_CHECK_MESSAGE(util::ErrorString(result).original.find("Injected wallet migration failure in the conversion") != std::string::npos, util::ErrorString(result).original);
+        BOOST_CHECK(GetWallet(context, name) == nullptr);
+        DatabaseOptions options;
+        options.require_existing = true;
+        DatabaseStatus status;
+        bilingual_str error;
+        {
+            auto database = MakeWalletDatabase(name, options, status, error);
+            BOOST_REQUIRE_MESSAGE(database, error.original);
+            const auto records_after = DumpWalletRecords(*database);
+            BOOST_CHECK_EQUAL(CountDescriptorRecords(records_after), size_t{0});
+            BOOST_CHECK_EQUAL(records_after.size(), records_before.size());
+        }
+        result = MigrateLegacyToDescriptor(name, passphrase, context);
+        BOOST_REQUIRE_MESSAGE(result, util::ErrorString(result).original);
+        BOOST_CHECK(result->watchonly_wallet);
     }
 
     // (f) A wrong passphrase for an encrypted legacy wallet leaves its database as it was (the wallet stays unloaded, as it

@@ -7,6 +7,9 @@
 Regtest lifecycle used by these tests (coinbase and coinstake maturity is 10):
     G = last Gold Rush block, M = last Migration block, F = M + 1 = first Final block.
 """
+import hashlib
+import struct
+
 BLOCKS = 60
 G = 1 + BLOCKS
 M = G + 30
@@ -33,6 +36,15 @@ LIFECYCLE_ARGS = [
     f"-qqgoldrushendheight={G}",
     f"-qqmigrationendheight={M}",
 ]
+
+
+def single_output_reserve_bit(txid, vout):
+    """The final stake reserve's rule for a wallet with exactly one qualifying output: True when that output is held
+    back (reserved) for the first Final block, False when it is released. One SHA-256 over the ASCII tag, the 32
+    transaction hash bytes in serialization order (the displayed txid reversed) and the output index as four
+    little-endian bytes; held when the last digest byte is odd."""
+    digest = hashlib.sha256(b"BLK final stake reserve v1" + bytes.fromhex(txid)[::-1] + struct.pack("<I", vout)).digest()
+    return bool(digest[31] & 1)
 
 
 class TransitionTFinalTestBase:
@@ -132,3 +144,18 @@ class TransitionTFinalTestBase:
         assert block["tx"][1]["vin"][0]["txid"] == outpoint["txid"]
         assert block["tx"][1]["vin"][0]["vout"] == outpoint["vout"]
         return block_hash
+
+    def migrate_singleton_candidates(self, node, pow_addr, wallets):
+        """Migrate the one legacy coin of each wallet into a new quantum address of the same wallet, all in one block.
+        Returns [(wallet, address, outpoint)], the outpoint known from the unconfirmed transaction. The final stake
+        reserve's singleton rule depends on the outpoint, so a test that needs a wallet of a given parity migrates
+        several candidates and keeps the ones that fit (see single_output_reserve_bit)."""
+        found = []
+        for wallet in wallets:
+            address = wallet.getnewquantumaddress()["address"]
+            wallet.migratetoquantum({"existing_address": address, "max_inputs": 1})
+            outputs = [u for u in wallet.listunspent(0, 9999999, [address]) if u["amount"] > 0]
+            assert len(outputs) == 1, outputs
+            found.append((wallet, address, {"txid": outputs[0]["txid"], "vout": outputs[0]["vout"]}))
+        self.pow_blocks(node, 1, pow_addr)
+        return found

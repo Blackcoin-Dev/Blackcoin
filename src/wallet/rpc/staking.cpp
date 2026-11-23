@@ -967,7 +967,8 @@ static std::vector<RPCResult> FinalStakeReserveDoc()
         {RPCResult::Type::NUM, "guard_first_height", /*optional=*/true, "first block at which the guard holds outputs back (absent when schedule_known is false)"},
         {RPCResult::Type::NUM, "final_height", /*optional=*/true, "the first Final block, for which the reserve is kept (absent when schedule_known is false)"},
         {RPCResult::Type::NUM, "n", "N: the wallet's qualifying quantum stake sources, unspent and able to stake at the first Final block, plus those its confirmed coinstakes consumed since the guard began"},
-        {RPCResult::Type::NUM, "target", "R: the number of outputs to hold back, min(32, (N + 1) / 2)."},
+        {RPCResult::Type::NUM, "target", "R: the number of outputs to hold back: min(32, ceil(N / 2)) for two or more sources; for exactly one source, 1 when its outpoint is assigned to the reserve and 0 when released (see single_output_rule); 0 for none."},
+        {RPCResult::Type::STR, "single_output_rule", /*optional=*/true, "present only when N is 1: \"held\" when the rule, a fixed hash of the one source's outpoint, assigns it to the reserve, \"released\" when it does not. This is the policy assignment only. Whether the output is actually withheld shows in active, reserved_count and reserved_outpoints (nothing is withheld outside the guard period, and from the first Final block on)"},
         {RPCResult::Type::NUM, "reserved_count", "outputs actually held back (R, or fewer when too few outputs are available)"},
         {RPCResult::Type::ARR, "reserved_outpoints", "the outputs held back, largest effective value at the first Final block first. Equal effective values are ordered by the outpoint's internal byte order (the transaction hash as stored, not the displayed transaction id text), then by output index, both ascending", {
             {RPCResult::Type::OBJ, "", "", {
@@ -1005,6 +1006,7 @@ static UniValue FinalStakeReserveToJSON(const FinalStakeReserve& reserve, bool w
     }
     obj.pushKV("n", reserve.n);
     obj.pushKV("target", reserve.target);
+    if (reserve.single_output) obj.pushKV("single_output_rule", reserve.single_output_held ? "held" : "released");
     obj.pushKV("reserved_count", static_cast<int64_t>(reserve.reserved.size()));
     UniValue outpoints(UniValue::VARR);
     for (const FinalStakeReserveSource& source : reserve.reserved) {

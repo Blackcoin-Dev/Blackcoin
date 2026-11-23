@@ -13,6 +13,8 @@
 #include <util/strencodings.h>
 
 #include <limits>
+#include <optional>
+#include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
@@ -453,6 +455,67 @@ BOOST_AUTO_TEST_CASE(logargs)
     BOOST_CHECK(str.find("Command-line arg: okaylog=\"public\"") != std::string::npos);
     BOOST_CHECK(str.find("dontlog=****") != std::string::npos);
     BOOST_CHECK(str.find("private42") == std::string::npos);
+}
+
+// A STRICT_BOOL option takes the bare flag and the values 0, 1, true and false in any letter case, positive and
+// negated, and refuses every other text (an empty assignment included) while the text is still known.
+BOOST_AUTO_TEST_CASE(strict_bool_option)
+{
+    const auto read_command_line = [](const std::string& arg, std::string& error) -> std::optional<common::SettingsValue> {
+        ArgsManager local_args;
+        SetupArgs(local_args, {{"-strict", ArgsManager::ALLOW_ANY | ArgsManager::STRICT_BOOL}});
+        const std::vector<const char*> argv{"testbitcoin", arg.c_str()};
+        if (!local_args.ParseParameters(argv.size(), argv.data(), error)) return std::nullopt;
+        return local_args.GetSetting("strict");
+    };
+    const auto read_config = [](const std::string& line, std::string& error) -> std::optional<common::SettingsValue> {
+        struct ConfigArgs : ArgsManager {
+            bool Read(std::istream& stream, std::string& error) { return ReadConfigStream(stream, "", error); }
+        } local_args;
+        SetupArgs(local_args, {{"-strict", ArgsManager::ALLOW_ANY | ArgsManager::STRICT_BOOL}});
+        std::istringstream stream{line + "\n"};
+        if (!local_args.Read(stream, error)) return std::nullopt;
+        return local_args.GetSetting("strict");
+    };
+
+    const std::vector<std::pair<std::string, bool>> accepted{
+        {"strict", true}, {"nostrict", false},
+        {"strict=1", true}, {"strict=0", false}, {"strict=true", true}, {"strict=false", false},
+        {"strict=TRUE", true}, {"strict=False", false}, {"strict=tRuE", true},
+        {"nostrict=1", false}, {"nostrict=0", true}, {"nostrict=true", false}, {"nostrict=false", true},
+        {"nostrict=TRUE", false}, {"nostrict=FALSE", true},
+    };
+    for (const auto& [text, expected] : accepted) {
+        std::string error;
+        const auto from_command_line = read_command_line("-" + text, error);
+        BOOST_REQUIRE_MESSAGE(from_command_line, text + ": " + error);
+        BOOST_CHECK_MESSAGE(from_command_line->isBool() && from_command_line->get_bool() == expected, text);
+        // A bare flag is not valid in a configuration file the way it is on the command line; the assignment forms are.
+        if (text.find('=') != std::string::npos) {
+            const auto from_config = read_config(text, error);
+            BOOST_REQUIRE_MESSAGE(from_config, text + ": " + error);
+            BOOST_CHECK_MESSAGE(from_config->isBool() && from_config->get_bool() == expected, text);
+        }
+    }
+    const std::vector<std::string> rejected{
+        "strict=", "nostrict=", "strict=2", "strict=-1", "strict=yes", "strict=no", "strict=on", "strict=off", "strict=01",
+        "strict=t", "strict= 1", "strict=1 ", "strict=abc", "nostrict=abc", "nostrict=2", "nostrict=yes", "nostrict=00",
+    };
+    for (const std::string& text : rejected) {
+        std::string error;
+        BOOST_CHECK_MESSAGE(!read_command_line("-" + text, error), "command line accepted " + text);
+        BOOST_CHECK_MESSAGE(error.find("-") != std::string::npos && error.find("only 0, 1, true or false") != std::string::npos, text + ": " + error);
+        error.clear();
+        // A configuration file trims the whitespace around a value, so a value that is only padded is the accepted one.
+        if (text == "strict= 1" || text == "strict=1 ") continue;
+        BOOST_CHECK_MESSAGE(!read_config(text, error), "configuration accepted " + text);
+    }
+    // Unset stays unset, and another option keeps the lenient reading it always had.
+    ArgsManager local_args;
+    SetupArgs(local_args, {{"-strict", ArgsManager::ALLOW_ANY | ArgsManager::STRICT_BOOL}, {"-lenient", ArgsManager::ALLOW_ANY}});
+    ResetArgs(local_args, "-nolenient=abc");
+    BOOST_CHECK(local_args.GetSetting("strict").isNull());
+    BOOST_CHECK(local_args.GetSetting("lenient").isTrue()); // the old double-negative reading of an unreadable value
 }
 
 BOOST_AUTO_TEST_SUITE_END()

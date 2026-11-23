@@ -122,6 +122,10 @@ public:
         // This argument's value is sensitive (such as a password).
         SENSITIVE = 0x400,
         COMMAND = 0x800,
+        /* A boolean option that accepts only the bare flag (-foo, -nofoo) and the values 0, 1, true and false in any
+         * letter case, in the positive form and in the negated form (-nofoo=true means false). Any other
+         * assignment, including an empty one, is a startup error; accepted values are stored as booleans. */
+        STRICT_BOOL = 0x1000,
     };
 
 protected:

@@ -7,6 +7,8 @@
 #include <chainparams.h>
 #include <common/args.h>
 #include <consensus/params.h>
+#include <crypto/sha256.h>
+#include <common/settings.h>
 #include <interfaces/wallet.h>
 #include <primitives/transaction.h>
 #include <script/script.h>
@@ -23,6 +25,8 @@
 #include <boost/test/unit_test.hpp>
 
 #include <util/time.h>
+#include <univalue.h>
+#include <util/strencodings.h>
 
 #include <memory>
 #include <set>
@@ -61,7 +65,8 @@ std::vector<FinalStakeReserveSource> Sources(size_t count, CAmount value = COIN)
 
 BOOST_FIXTURE_TEST_SUITE(final_stake_reserve_tests, TestChain100Setup)
 
-// R = min(32, (N + 1) / 2) by integer division.
+// The count-based part of the rule: R = min(32, ceil(N / 2)) for N >= 2. For N == 1 the helper's value 1 is the target
+// when the single source is held; whether it is held is the outpoint's rule (see the singleton tests below).
 BOOST_AUTO_TEST_CASE(the_target_is_half_rounded_up_and_capped_at_32)
 {
     BOOST_CHECK_EQUAL(FinalStakeReserveTarget(0), 0);
@@ -73,17 +78,147 @@ BOOST_AUTO_TEST_CASE(the_target_is_half_rounded_up_and_capped_at_32)
     BOOST_CHECK_EQUAL(FinalStakeReserveTarget(65), 32);
     BOOST_CHECK_EQUAL(FinalStakeReserveTarget(100000), 32);
     BOOST_CHECK_EQUAL(FinalStakeReserveTarget(-4), 0);
+    // No signed overflow at the top of the range.
+    BOOST_CHECK_EQUAL(FinalStakeReserveTarget(std::numeric_limits<int64_t>::max()), 32);
+    BOOST_CHECK_EQUAL(FinalStakeReserveTarget(std::numeric_limits<int64_t>::max() - 1), 32);
+}
+
+// The singleton rule: one SHA-256 over the tag, the 32 hash bytes and the output index as four little-endian bytes;
+// held when the last digest byte is odd.
+BOOST_AUTO_TEST_CASE(the_singleton_rule_matches_the_published_vectors)
+{
+    const auto digest_hex = [](const uint256& txid, uint32_t vout) {
+        static const std::string tag{"BLK final stake reserve v1"};
+        unsigned char out[CSHA256::OUTPUT_SIZE];
+        const unsigned char le[4] = {static_cast<unsigned char>(vout), static_cast<unsigned char>(vout >> 8),
+                                     static_cast<unsigned char>(vout >> 16), static_cast<unsigned char>(vout >> 24)};
+        CSHA256().Write(reinterpret_cast<const unsigned char*>(tag.data()), tag.size()).Write(txid.data(), 32).Write(le, 4).Finalize(out);
+        return HexStr(Span<const unsigned char>{out, sizeof(out)});
+    };
+    const uint256 zero;
+    BOOST_CHECK_EQUAL(digest_hex(zero, 0), "9162afdf0fe267f79b7ed75d96a048255f214b7e7d70fdba4fdab4800812ffcc");
+    BOOST_CHECK_EQUAL(digest_hex(zero, 3), "a951e84e54231b9430fecccde215c0c9b65602f36e56d643c4ce94ec7ba581e5");
+    BOOST_CHECK(!SingleOutputReserveBit(COutPoint{zero, 0})); // last byte 0xcc: released
+    BOOST_CHECK(SingleOutputReserveBit(COutPoint{zero, 3}));  // last byte 0xe5: held
+    // Pure and repeatable.
+    for (int i = 0; i < 3; ++i) {
+        BOOST_CHECK(!SingleOutputReserveBit(COutPoint{zero, 0}));
+        BOOST_CHECK(SingleOutputReserveBit(COutPoint{zero, 3}));
+    }
+    // The hash bytes are in serialization order, not displayed order: uint256{1} has its first byte set. The values below
+    // were computed independently of the code under test.
+    BOOST_CHECK(SingleOutputReserveBit(Out(1, 0)));
+    BOOST_CHECK(!SingleOutputReserveBit(Out(2, 0)));
+    BOOST_CHECK(SingleOutputReserveBit(Out(2, 7)));
+    BOOST_CHECK(!SingleOutputReserveBit(Out(3, 3)));
+    BOOST_CHECK(SingleOutputReserveBit(Out(3, 5)));
+    // The output index changes the digest.
+    bool differs{false};
+    for (uint32_t n = 1; n < 16; ++n) differs |= SingleOutputReserveBit(COutPoint{zero, n}) != SingleOutputReserveBit(COutPoint{zero, 0});
+    BOOST_CHECK(differs);
+}
+
+// The one reader of -finalstakereserve: the default when unset, the parsed boolean, or the text of a programmatic setting.
+BOOST_AUTO_TEST_CASE(the_option_reader_takes_the_stored_value_and_the_default_when_unset)
+{
+    const auto clear = [] { gArgs.LockSettings([](common::Settings& settings) { settings.forced_settings.erase("finalstakereserve"); }); };
+    clear();
+    BOOST_CHECK(DEFAULT_FINAL_STAKE_RESERVE);
+    BOOST_CHECK_EQUAL(FinalStakeReserveOptionEnabled(), DEFAULT_FINAL_STAKE_RESERVE);
+    const std::vector<std::pair<std::string, bool>> texts{{"", true}, {"1", true}, {"0", false}, {"true", true}, {"false", false}, {"TRUE", true}, {"False", false}};
+    for (const auto& [text, expected] : texts) {
+        gArgs.ForceSetArg("-finalstakereserve", text);
+        BOOST_CHECK_MESSAGE(FinalStakeReserveOptionEnabled() == expected, "text '" + text + "'");
+    }
+    for (const bool value : {true, false}) {
+        gArgs.LockSettings([&](common::Settings& settings) { settings.forced_settings["finalstakereserve"] = value; });
+        BOOST_CHECK_EQUAL(FinalStakeReserveOptionEnabled(), value);
+    }
+    clear();
+}
+
+BOOST_AUTO_TEST_CASE(a_single_source_is_held_or_released_by_its_outpoint)
+{
+    const COutPoint held{uint256{}, 3};
+    const COutPoint released{uint256{}, 0};
+    {
+        const FinalStakeReservePlan plan = PlanFinalStakeReserve({{held, COIN}}, {});
+        BOOST_CHECK_EQUAL(plan.n, 1);
+        BOOST_CHECK(plan.single_output);
+        BOOST_CHECK(plan.single_output_held);
+        BOOST_CHECK_EQUAL(plan.target, 1);
+        BOOST_REQUIRE_EQUAL(plan.reserved.size(), 1U);
+        BOOST_CHECK(plan.reserved[0].outpoint == held);
+        BOOST_CHECK_EQUAL(plan.shortfall, 0);
+    }
+    {
+        const FinalStakeReservePlan plan = PlanFinalStakeReserve({{released, COIN}}, {});
+        BOOST_CHECK_EQUAL(plan.n, 1);
+        BOOST_CHECK(plan.single_output);
+        BOOST_CHECK(!plan.single_output_held);
+        BOOST_CHECK_EQUAL(plan.target, 0);
+        BOOST_CHECK(plan.reserved.empty());
+        BOOST_CHECK_EQUAL(plan.shortfall, 0);
+    }
+    // A source consumed by the wallet's own coinstake with nothing unspent left is still the one source: a held one is a
+    // shortfall of one, a released one asks for nothing.
+    {
+        const FinalStakeReservePlan plan = PlanFinalStakeReserve({}, {held});
+        BOOST_CHECK_EQUAL(plan.n, 1);
+        BOOST_CHECK(plan.single_output_held);
+        BOOST_CHECK_EQUAL(plan.target, 1);
+        BOOST_CHECK(plan.reserved.empty());
+        BOOST_CHECK_EQUAL(plan.shortfall, 1);
+    }
+    {
+        const FinalStakeReservePlan plan = PlanFinalStakeReserve({}, {released});
+        BOOST_CHECK_EQUAL(plan.n, 1);
+        BOOST_CHECK(!plan.single_output_held);
+        BOOST_CHECK_EQUAL(plan.target, 0);
+        BOOST_CHECK_EQUAL(plan.shortfall, 0);
+    }
+    // The same outpoint in both sets, or repeated, is one source and takes the singleton rule.
+    {
+        const FinalStakeReservePlan plan = PlanFinalStakeReserve({{held, COIN}, {held, 2 * COIN}}, {held});
+        BOOST_CHECK_EQUAL(plan.n, 1);
+        BOOST_CHECK(plan.single_output);
+        BOOST_CHECK_EQUAL(plan.target, 1);
+        BOOST_CHECK_EQUAL(plan.reserved.size(), 1U);
+        BOOST_CHECK_EQUAL(plan.shortfall, 0);
+    }
+    // Two distinct sources are never decided by the singleton rule, whatever their own bits are.
+    for (const COutPoint& a : {held, released}) {
+        for (const COutPoint& b : {COutPoint{uint256{}, 1}, COutPoint{uint256{}, 2}}) {
+            const FinalStakeReservePlan plan = PlanFinalStakeReserve({{a, COIN}, {b, COIN}}, {});
+            BOOST_CHECK_EQUAL(plan.n, 2);
+            BOOST_CHECK(!plan.single_output);
+            BOOST_CHECK_EQUAL(plan.target, 1);
+            BOOST_CHECK_EQUAL(plan.reserved.size(), 1U);
+        }
+    }
+    // A released source that staked, with its new return mature at F: the new output is unspent, the old is consumed.
+    {
+        const FinalStakeReservePlan plan = PlanFinalStakeReserve({{COutPoint{uint256{}, 1}, COIN}}, {released});
+        BOOST_CHECK_EQUAL(plan.n, 2);
+        BOOST_CHECK(!plan.single_output);
+        BOOST_CHECK_EQUAL(plan.target, 1);
+        BOOST_CHECK_EQUAL(plan.reserved.size(), 1U);
+    }
 }
 
 BOOST_AUTO_TEST_CASE(the_plan_for_the_boundary_source_counts)
 {
-    const std::vector<std::pair<size_t, int64_t>> expected{{0, 0}, {1, 1}, {2, 1}, {63, 32}, {64, 32}, {65, 32}};
+    // Sources(1) is the outpoint (uint256{1}, 0), whose singleton bit is set (held): target 1. The other counts follow the
+    // count rule.
+    BOOST_REQUIRE(SingleOutputReserveBit(Sources(1).front().outpoint));
+    const std::vector<std::pair<size_t, int64_t>> expected{{0, 0}, {1, 1}, {2, 1}, {3, 2}, {63, 32}, {64, 32}, {65, 32}};
     for (const auto& [n, target] : expected) {
         const FinalStakeReservePlan plan = PlanFinalStakeReserve(Sources(n), {});
         BOOST_CHECK_EQUAL(plan.n, static_cast<int64_t>(n));
         BOOST_CHECK_EQUAL(plan.target, target);
         BOOST_CHECK_EQUAL(static_cast<int64_t>(plan.reserved.size()), target);
         BOOST_CHECK_EQUAL(plan.shortfall, 0);
+        BOOST_CHECK_EQUAL(plan.single_output, n == 1);
     }
 }
 
@@ -462,10 +597,17 @@ BOOST_FIXTURE_TEST_CASE(a_policy_change_invalidates_the_cached_selection, Candid
 }
 
 namespace {
-/** Put a quantum stake source of `value` for `dest` into the wallet as confirmed at `height`, and into the coin view. */
-COutPoint AddQuantumStakeSource(TestChain100Setup& setup, CWallet& wallet, const CTxDestination& dest, CAmount value, int height, uint32_t salt)
+/** Put a quantum stake source of `value` for `dest` into the wallet as confirmed at `height`, and into the coin view.
+ *  With `held` given, the transaction is varied (its salt) until the singleton rule gives that answer for the source's
+ *  outpoint: the rule depends on the transaction id, which depends on the wallet's random key. */
+COutPoint AddQuantumStakeSource(TestChain100Setup& setup, CWallet& wallet, const CTxDestination& dest, CAmount value, int height, uint32_t salt,
+                                std::optional<bool> held = std::nullopt)
 {
-    const CTransactionRef tx = Paying({CTxOut{value, GetScriptForDestination(dest)}}, salt);
+    CTransactionRef tx = Paying({CTxOut{value, GetScriptForDestination(dest)}}, salt);
+    for (uint32_t extra = 1; held && SingleOutputReserveBit(COutPoint{tx->GetHash(), 0}) != *held; ++extra) {
+        BOOST_REQUIRE_LT(extra, 4000U);
+        tx = Paying({CTxOut{value, GetScriptForDestination(dest)}}, salt + 256 * extra);
+    }
     const CBlockIndex* index = WITH_LOCK(::cs_main, return setup.m_node.chainman->ActiveChain()[height]);
     BOOST_REQUIRE(index);
     {
@@ -496,7 +638,9 @@ ReserveWallet MakeReserveWallet(TestChain100Setup& setup, const CKey& key)
     BOOST_REQUIRE(a && b);
     rw.dest_big = *a;
     rw.dest_small = *b;
-    rw.big = AddQuantumStakeSource(setup, *rw.wallet, *a, 20 * COIN, 70, 1);
+    // The larger source is the one that is held when the other is out of the count (a user lock, say): as a lone source
+    // its outpoint must give "held" under the singleton rule.
+    rw.big = AddQuantumStakeSource(setup, *rw.wallet, *a, 20 * COIN, 70, 1, /*held=*/true);
     rw.small = AddQuantumStakeSource(setup, *rw.wallet, *b, 10 * COIN, 71, 2);
     // Quantum inputs may only pay quantum outputs: the payee is a third key of the wallet.
     const auto payee = rw.wallet->GetNewQuantumDestination("payee");
@@ -579,12 +723,73 @@ BOOST_FIXTURE_TEST_CASE(an_explicit_spend_of_the_reserve_is_reported_from_the_co
     BOOST_REQUIRE_EQUAL(report.spent.size(), 1U);
     BOOST_CHECK(report.spent[0].outpoint == rw.big);
     BOOST_CHECK_EQUAL(report.reserved_before, 1);
-    BOOST_CHECK_EQUAL(report.reserved_after, 1); // the other source is the whole reserve now (N = 1, R = 1)
+    // The other source is the only one left (N = 1): the singleton rule decides whether it is the reserve.
+    BOOST_CHECK_EQUAL(report.reserved_after, SingleOutputReserveBit(rw.small) ? 1 : 0);
     BOOST_CHECK_EQUAL(report.eligible_before, 2);
     BOOST_CHECK_EQUAL(report.eligible_after, 1);
     BOOST_CHECK_GT(report.eligible_weight_before, report.eligible_weight_after);
     BOOST_CHECK_EQUAL(report.spent_effective_value, report.spent[0].effective_value);
 }
+
+// A wallet with one quantum source: the outpoint decides whether it is the reserve, and the reserve report names the
+// rule. Sources of both parities are made by varying the transaction until the rule gives each answer.
+BOOST_FIXTURE_TEST_CASE(a_single_source_wallet_reports_and_applies_the_singleton_rule, CandidateAtGuardStart)
+{
+    std::optional<COutPoint> held, released;
+    CKey key;
+    key.MakeNewKey(/*fCompressed=*/true);
+    const auto source_for = [&](uint32_t salt, std::unique_ptr<CWallet>& wallet) {
+        wallet = CreateSyncedWallet(*m_node.chain, WITH_LOCK(Assert(m_node.chainman)->GetMutex(), return m_node.chainman->ActiveChain()), key);
+        const auto dest = wallet->GetNewQuantumDestination("only");
+        BOOST_REQUIRE(dest);
+        return AddQuantumStakeSource(*this, *wallet, *dest, 10 * COIN + salt, 70, salt);
+    };
+    std::unique_ptr<CWallet> held_wallet, released_wallet, trial;
+    for (uint32_t salt = 1; salt <= 200 && !(held && released); ++salt) {
+        // Each trial wallet is discarded unless its source has the wanted parity: a wallet keeps what it is given.
+        const COutPoint outpoint = source_for(salt, trial);
+        if (SingleOutputReserveBit(outpoint) && !held) {
+            held = outpoint;
+            held_wallet = std::move(trial);
+        } else if (!SingleOutputReserveBit(outpoint) && !released) {
+            released = outpoint;
+            released_wallet = std::move(trial);
+        }
+    }
+    BOOST_REQUIRE_MESSAGE(held && released, "no source of one of the parities found");
+
+    gArgs.ForceSetArg("-finalstakereserve", "1");
+    {
+        const FinalStakeReserve reserve = ReserveOf(*held_wallet);
+        BOOST_CHECK(reserve.active);
+        BOOST_CHECK_EQUAL(reserve.n, 1);
+        BOOST_CHECK(reserve.single_output);
+        BOOST_CHECK(reserve.single_output_held);
+        BOOST_CHECK_EQUAL(reserve.target, 1);
+        BOOST_REQUIRE_EQUAL(reserve.reserved.size(), 1U);
+        BOOST_CHECK(reserve.reserved[0].outpoint == *held);
+        BOOST_CHECK(reserve.enforced == (std::set<COutPoint>{*held}));
+        CMutableTransaction spend;
+        spend.vin.emplace_back(*held);
+        BOOST_CHECK(SpendsFinalStakeReserve(*held_wallet, CTransaction{spend}));
+    }
+    {
+        const FinalStakeReserve reserve = ReserveOf(*released_wallet);
+        BOOST_CHECK(reserve.active);
+        BOOST_CHECK_EQUAL(reserve.n, 1);
+        BOOST_CHECK(reserve.single_output);
+        BOOST_CHECK(!reserve.single_output_held);
+        BOOST_CHECK_EQUAL(reserve.target, 0);
+        BOOST_CHECK_EQUAL(reserve.eligible_count, 1);
+        BOOST_CHECK(reserve.reserved.empty());
+        BOOST_CHECK(reserve.enforced.empty());
+        BOOST_CHECK_EQUAL(reserve.shortfall, 0);
+        CMutableTransaction spend;
+        spend.vin.emplace_back(*released);
+        BOOST_CHECK(!SpendsFinalStakeReserve(*released_wallet, CTransaction{spend}));
+    }
+}
+
 
 // Explicit and automatic inputs in one transaction: the explicit one keeps its right, the automatic one is checked.
 BOOST_FIXTURE_TEST_CASE(a_mixed_transaction_is_refused_when_its_automatic_input_is_in_the_reserve, CandidateAtGuardStart)

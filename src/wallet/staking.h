@@ -276,8 +276,20 @@ struct FinalStakeReserveSource
     CAmount effective_value{0};
 };
 
-/** The reserve target R for N sources: min(32, (N + 1) / 2) by integer division. */
+/** The value of -finalstakereserve: its default when unset, otherwise the value the argument parser accepted (the bare
+ *  flag, 0, 1, true or false in any letter case; the parser rejects every other text at startup). */
+bool FinalStakeReserveOptionEnabled();
+
+/** The count-based reserve target R for N sources: 0 for N <= 0, min(32, ceil(N / 2)) otherwise. It is the whole
+ *  rule for N >= 2 only. For N == 1 the value 1 is the target when the single source is held; whether it is held is
+ *  decided by the outpoint (SingleOutputReserveBit), and PlanFinalStakeReserve applies that rule. */
 int64_t FinalStakeReserveTarget(int64_t n);
+
+/** The singleton rule for a wallet whose distinct qualifying sources number exactly one: true (held) or false (released).
+ *  One SHA-256 over the ASCII tag "BLK final stake reserve v1" (no terminator, no length prefix), the 32 transaction
+ *  hash bytes in COutPoint serialization order and the output index as four little-endian bytes; held when the last
+ *  digest byte is odd. */
+bool SingleOutputReserveBit(const COutPoint& outpoint);
 
 /** True when the reserve guard is on for the candidate height h: F - maturity <= h <= M, with M the last Migration
  *  block and F = M + 1. It is released for candidate F. False without a known height schedule. */
@@ -285,7 +297,8 @@ bool IsFinalStakeReserveGuardActive(const Consensus::Params& consensus, int cand
 
 /** The reserve choice as a pure function. `unspent` is U, the sources that are unspent and can stake at the first
  *  Final block; `consumed` is S, the sources already consumed by the wallet's confirmed coinstakes since the guard
- *  began. N = |U union S|, R = FinalStakeReserveTarget(N), and the reserve is the first min(R, |U|) members of U
+ *  began. N = |U union S|; R = FinalStakeReserveTarget(N) for N != 1, and for N == 1 R is 1 when
+ *  SingleOutputReserveBit holds for the only member of the union and 0 otherwise. The reserve is the first min(R, |U|) members of U
  *  ordered by effective value descending, then transaction hash ascending, then output index ascending. */
 struct FinalStakeReservePlan
 {
@@ -293,6 +306,8 @@ struct FinalStakeReservePlan
     int64_t target{0};
     std::vector<FinalStakeReserveSource> reserved;
     int64_t shortfall{0}; //! target less what is reserved, when U has fewer members than R
+    bool single_output{false};      //! N == 1: the singleton rule decided the target
+    bool single_output_held{false}; //! with single_output: the rule assigns the output to the reserve
 };
 FinalStakeReservePlan PlanFinalStakeReserve(std::vector<FinalStakeReserveSource> unspent, const std::set<COutPoint>& consumed);
 
@@ -311,6 +326,8 @@ struct FinalStakeReserve
     CAmount eligible_weight{0};  //! their effective value at F
     int64_t n{0};                //! |U union S|
     int64_t target{0};           //! R
+    bool single_output{false};      //! N == 1: the singleton rule decided R
+    bool single_output_held{false}; //! with single_output: the rule assigns the only output to the reserve (a policy assignment, not proof of enforcement)
     int64_t shortfall{0};
     std::vector<FinalStakeReserveSource> reserved; //! in reserve order
     CAmount reserved_weight{0};

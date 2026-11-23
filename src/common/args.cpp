@@ -111,6 +111,23 @@ KeyInfo InterpretKey(std::string key)
 std::optional<common::SettingsValue> InterpretValue(const KeyInfo& key, const std::string* value,
                                                   unsigned int flags, std::string& error)
 {
+    if (flags & ArgsManager::STRICT_BOOL) {
+        // An option-specific parse, done before the lenient one below discards the text of the value.
+        bool parsed{true};
+        if (value) {
+            const std::string lower = ToLower(*value);
+            if (lower == "1" || lower == "true") {
+                parsed = true;
+            } else if (lower == "0" || lower == "false") {
+                parsed = false;
+            } else {
+                error = strprintf("Invalid value '%s' for -%s%s: only 0, 1, true or false is accepted (or no value)",
+                                  *value, key.negated ? "no" : "", key.name);
+                return std::nullopt;
+            }
+        }
+        return key.negated ? !parsed : parsed;
+    }
     // Return negated settings as false values.
     if (key.negated) {
         if (flags & ArgsManager::DISALLOW_NEGATION) {

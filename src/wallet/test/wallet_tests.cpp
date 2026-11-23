@@ -9624,7 +9624,7 @@ BOOST_AUTO_TEST_CASE(MigrationHonoursTheQuantumBackupPathPolicyForExactlyTheWall
         BOOST_CHECK(WITH_LOCK(wallet->cs_wallet, return wallet->GetLegacyScriptPubKeyMan() != nullptr));
         BOOST_CHECK(!wallet->IsWalletFlagSet(WALLET_FLAG_DESCRIPTORS));
         BOOST_CHECK_EQUAL(wallet->IsCrypted(), encrypted);
-        BOOST_CHECK_EQUAL(wallet->GetKeyPoolSize(), keypool);
+        BOOST_CHECK_EQUAL(WITH_LOCK(wallet->cs_wallet, return wallet->GetKeyPoolSize()), keypool);
         BOOST_CHECK_EQUAL(CountDescriptorRecords(DumpWalletRecords(wallet->GetDatabase())), size_t{0});
     };
 
@@ -9672,7 +9672,7 @@ BOOST_AUTO_TEST_CASE(MigrationHonoursTheQuantumBackupPathPolicyForExactlyTheWall
             {
                 const auto wallet = GetWallet(context, name);
                 BOOST_REQUIRE(wallet != nullptr);
-                keypool = wallet->GetKeyPoolSize();
+                keypool = WITH_LOCK(wallet->cs_wallet, return wallet->GetKeyPoolSize());
                 flag_before = wallet->IsWalletFlagSet(WALLET_FLAG_KEY_ORIGIN_METADATA);
             }
             auto result = MigrateLegacyToDescriptor(name, passphrase, context);
@@ -9704,7 +9704,10 @@ BOOST_AUTO_TEST_CASE(MigrationHonoursTheQuantumBackupPathPolicyForExactlyTheWall
             gArgs.ForceSetArg("-quantumkeybackupdir", "");
             SetQuantumKeyBackupDataDirectoryForTest(fs::PathFromString("/d"));
             size_t keypool{0};
-            keypool = GetWallet(context, name)->GetKeyPoolSize();
+            {
+                const std::shared_ptr<CWallet> loaded = GetWallet(context, name);
+                keypool = WITH_LOCK(loaded->cs_wallet, return loaded->GetKeyPoolSize());
+            }
             SetWalletMigrationFailpointForTest([](std::string_view point) { return point == "before_apply_migration_data"; });
             auto result = MigrateLegacyToDescriptor(name, passphrase, context);
             SetWalletMigrationFailpointForTest({});

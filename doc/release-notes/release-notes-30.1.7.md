@@ -31,6 +31,14 @@ Release qualification is pending.
   missed blocks were rescanned with `rescanblockchain`. The wallet now records the time when it
   creates the keys. This was present in 30.1.6. Descriptor wallets were not affected.
 
+## Legacy addresses that begin with BLK
+
+Fixed recognition of valid legacy BlackCoin addresses beginning with `BLK` or `BLk` (about one legacy
+address in 700), which could previously be rejected or loaded incorrectly in the wallet address book.
+Existing address-book records stored under their original address recover when the wallet is reloaded;
+edits made while an entry was misidentified may need to be reapplied. The coins and keys of such an
+address were never affected. Transaction and block validation rules are unchanged.
+
 ## Migration and the Final transition
 
 - **Legacy stakes in the last blocks of Migration are paid out as quantum coins.** A legacy

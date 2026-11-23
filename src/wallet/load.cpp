@@ -350,9 +350,13 @@ bool LoadWallets(WalletContext& context)
             if (!database && status == DatabaseStatus::FAILED_NOT_FOUND) {
                 continue;
             }
-            if (const std::optional<std::string> rejection = QuantumKeyBackupWalletPathRejection(name)) {
-                chain.initError(Untranslated(strprintf("Wallet %s cannot be loaded: %s", name, *rejection)));
-                return false;
+            {
+                const QuantumKeyBackupPathCheck backup_path = CheckQuantumKeyBackupWalletPath(name);
+                if (backup_path.error) {
+                    chain.initError(Untranslated(strprintf("Wallet %s cannot be loaded: %s", name, *backup_path.error)));
+                    return false;
+                }
+                if (backup_path.warning) chain.initWarning(Untranslated(*backup_path.warning));
             }
             chain.initMessage(_("Loading wallet…").translated);
             std::shared_ptr<CWallet> pwallet = database ? CWallet::Create(context, name, std::move(database), options.create_flags, error, warnings) : nullptr;

@@ -73,6 +73,14 @@ bool WindowsPathRulesApply()
 #endif
 }
 
+//! Test seam: the data directory the backup directory is resolved against (see SetQuantumKeyBackupDataDirectoryForTest).
+std::optional<fs::path> g_data_directory_for_test;
+
+fs::path BackupDataDirectory()
+{
+    return g_data_directory_for_test ? *g_data_directory_for_test : gArgs.GetDataDirNet();
+}
+
 //! Test seam: the identity of a directory (see SetQuantumKeyBackupDirectoryIdentityForTest).
 std::function<std::optional<QuantumBackupDirectoryIdentity>(const fs::path&)> g_directory_identity_hook;
 
@@ -151,7 +159,7 @@ bool DirectoryIdentityOfHandle(HANDLE handle, QuantumBackupDirectoryIdentity& id
 /** The identity of a directory, from a handle opened for its attributes only (no write access is needed to compare). */
 bool DirectoryIdentityWindows(const fs::path& directory, QuantumBackupDirectoryIdentity& identity, std::string& error)
 {
-    ScopedWindowsHandle handle{::CreateFileW(directory.wstring().c_str(), FILE_READ_ATTRIBUTES,
+    ScopedWindowsHandle handle{::CreateFileW(directory.c_str(), FILE_READ_ATTRIBUTES,
                                              FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
                                              FILE_FLAG_BACKUP_SEMANTICS, nullptr)};
     if (!handle.valid()) {
@@ -212,7 +220,7 @@ bool FinalPathByVolumeGuid(HANDLE handle, std::wstring& final_path, std::string&
 bool FlushDirectoryWindows(const fs::path& directory, std::string& reason, std::optional<QuantumBackupDirectoryIdentity>& identity,
                            std::string& identity_error)
 {
-    ScopedWindowsHandle handle{::CreateFileW(directory.wstring().c_str(), GENERIC_WRITE,
+    ScopedWindowsHandle handle{::CreateFileW(directory.c_str(), GENERIC_WRITE,
                                              FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
                                              FILE_FLAG_BACKUP_SEMANTICS, nullptr)};
     if (!handle.valid()) {
@@ -343,7 +351,9 @@ std::optional<QuantumKeyBackupGeneration> ReadManifest(const fs::path& directory
     if (!named || *named != file_name || !sequence || !count) return std::nullopt;
     const auto sequence_value = ToIntegral<uint64_t>(*sequence);
     const auto count_value = ToIntegral<uint64_t>(*count);
-    if (!sequence_value || !count_value || lines.size() != 4 + *count_value + 2) return std::nullopt;
+    // A generation made by this feature holds at least the key it protects: a manifest with no key is not evidence of
+    // an empty wallet file, so it is not a verified generation.
+    if (!sequence_value || !count_value || *count_value == 0 || lines.size() != 4 + *count_value + 2) return std::nullopt;
     if (lines[4 + *count_value] != "end" || !lines.back().empty()) return std::nullopt;
 
     QuantumKeyBackupGeneration generation;
@@ -430,23 +440,58 @@ std::optional<std::string> QuantumKeyBackupLengthRejection(const fs::path& walle
     const size_t units = QuantumBackupUtf16Length(fs::PathToString(wallet_directory));
     if (units > QUANTUM_BACKUP_WINDOWS_MAX_DIRECTORY_UNITS) {
         return strprintf("the path is too long: it has %d characters and at most %d are allowed, because each backup is staged "
-                         "and verified in folders inside it; use a shorter path",
+                         "and verified in folders inside it; use a shorter path (set -quantumkeybackupdir to a shorter folder "
+                         "on a local NTFS volume)",
                          units, QUANTUM_BACKUP_WINDOWS_MAX_DIRECTORY_UNITS);
     }
     return std::nullopt;
 }
 
-std::optional<std::string> QuantumKeyBackupWalletPathRejection(const std::string& wallet_name)
+QuantumKeyBackupPathCheck CheckQuantumKeyBackupWalletPath(const std::string& wallet_name)
 {
-    if (!WindowsPathRulesApply()) return std::nullopt;
-    if (const auto rejection = QuantumKeyBackupSpellingRejection(gArgs.GetArg("-quantumkeybackupdir", ""))) {
-        return strprintf("-quantumkeybackupdir: %s", *rejection);
+    QuantumKeyBackupPathCheck check;
+    if (!WindowsPathRulesApply()) return check;
+    const std::string configured = gArgs.GetArg("-quantumkeybackupdir", "");
+    if (const auto rejection = QuantumKeyBackupSpellingRejection(configured)) {
+        check.error = strprintf("-quantumkeybackupdir: %s", *rejection);
+        return check;
     }
     const fs::path directory = QuantumKeyBackupDirectory(wallet_name);
     if (const auto rejection = QuantumKeyBackupLengthRejection(directory)) {
-        return strprintf("the quantum key backup directory %s: %s", fs::PathToString(directory), *rejection);
+        if (!configured.empty()) {
+            check.error = strprintf("the quantum key backup directory %s: %s", fs::PathToString(directory), *rejection);
+        } else {
+            check.warning = strprintf("the default quantum key backup directory %s: %s. The wallet loads, but a backup of a new "
+                                      "quantum stake return key is refused, and the key stays pending, until the option is set",
+                                      fs::PathToString(directory), *rejection);
+        }
     }
-    return std::nullopt;
+    return check;
+}
+
+std::optional<std::string> QuantumKeyBackupWalletPathRejection(const std::string& wallet_name)
+{
+    return CheckQuantumKeyBackupWalletPath(wallet_name).error;
+}
+
+std::vector<std::string> QuantumKeyBackupMigrationNames(const std::string& wallet_name)
+{
+    const std::string prefix = wallet_name.empty() ? "default_wallet" : wallet_name;
+    return {wallet_name, prefix + "_watchonly", prefix + "_solvables"};
+}
+
+QuantumKeyBackupPathCheck CheckQuantumKeyBackupMigrationPaths(const std::string& wallet_name)
+{
+    QuantumKeyBackupPathCheck result;
+    for (const std::string& name : QuantumKeyBackupMigrationNames(wallet_name)) {
+        const QuantumKeyBackupPathCheck one = CheckQuantumKeyBackupWalletPath(name);
+        if (one.error) {
+            result.error = strprintf("the migration would publish the wallet \"%s\", whose %s", name, *one.error);
+            return result;
+        }
+        if (one.warning && !result.warning) result.warning = one.warning;
+    }
+    return result;
 }
 
 bool QuantumBackupWalkReachedDataDirectory(const std::optional<QuantumBackupDirectoryIdentity>& walked,
@@ -462,6 +507,11 @@ void SetQuantumKeyBackupDirectoryIdentityForTest(std::function<std::optional<Qua
     g_directory_identity_hook = std::move(hook);
 }
 
+void SetQuantumKeyBackupDataDirectoryForTest(std::optional<fs::path> data_directory)
+{
+    g_data_directory_for_test = std::move(data_directory);
+}
+
 void SetQuantumKeyBackupWindowsPathRulesForTest(std::optional<bool> rules)
 {
     g_windows_path_rules_for_test = rules;
@@ -475,10 +525,10 @@ fs::path QuantumKeyBackupBaseDirectory()
         // A network or device path, and a path relative to a drive or to a drive's root, keep their spelling, so
         // each is refused as what it is and never becomes a folder below the data directory.
         if (QuantumKeyBackupSpellingRejection(configured)) return path;
-        if (path.is_relative()) path = gArgs.GetDataDirNet() / path;
+        if (path.is_relative()) path = BackupDataDirectory() / path;
         return path;
     }
-    return gArgs.GetDataDirNet() / "quantum-key-backups";
+    return BackupDataDirectory() / "quantum-key-backups";
 }
 
 fs::path QuantumKeyBackupDirectory(const std::string& wallet_name)

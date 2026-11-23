@@ -1623,6 +1623,40 @@ BOOST_FIXTURE_TEST_CASE(concurrent_preparations_make_one_key_and_one_backup, Leg
 }
 
 
+// Another caller makes a quantum key after the return key's preparation has begun and before the backup takes its
+// inventory snapshot. The file holds both keys, so the manifest must list both: a manifest written from an inventory
+// read earlier would list one, and a clone that lacks the second key would then take the generation for redundant.
+BOOST_FIXTURE_TEST_CASE(the_manifest_lists_the_inventory_the_verified_backup_holds, LegacyStakeWindowSetup)
+{
+    ScopedQuantumBackupDir backups{m_path_root / "qkb-manifest-inventory"};
+    auto wallet = CreateSyncedDiskWallet(*this, coinbaseKey, "manifest-inventory-wallet");
+    std::optional<CTxDestination> late;
+    wallet->m_quantum_backup_failpoint = [&](std::string_view point) {
+        if (point == "before_inventory_snapshot" && !late) {
+            auto made = wallet->GetNewQuantumDestination("made-between-preparation-and-snapshot");
+            if (made) late = *made;
+        }
+        return false;
+    };
+    const QuantumStakeReturnPreparation prep = PrepareQuantumStakeReturn(*wallet, QuantumStakeReturnTrigger::EXPLICIT, true);
+    wallet->m_quantum_backup_failpoint = {};
+    BOOST_REQUIRE(prep.outcome == QuantumStakeReturnPreparation::Outcome::CREATED_ADDRESS);
+    BOOST_REQUIRE(late.has_value());
+    const std::vector<unsigned char> late_program = WITH_LOCK(wallet->cs_wallet, return wallet->GetQuantumKeyInfo(*late)->witness_program);
+    const QuantumKeyBackupKeySet inventory = WITH_LOCK(wallet->cs_wallet, return wallet->GetQuantumKeyPrograms());
+    BOOST_REQUIRE_EQUAL(inventory.size(), size_t{2});
+    const fs::path directory = m_path_root / "qkb-manifest-inventory" / fs::PathFromString(QuantumKeyBackupWalletComponent("manifest-inventory-wallet"));
+    const auto generations = ListQuantumKeyBackupGenerations(directory);
+    BOOST_REQUIRE_EQUAL(generations.size(), size_t{1});
+    BOOST_REQUIRE(generations[0].verified);
+    BOOST_CHECK(generations[0].keys == inventory);
+    BOOST_CHECK(generations[0].keys.count(late_program));
+    // a clone that knows every key but the late one keeps the generation, however many newer ones there are
+    QuantumKeyBackupKeySet clone_keys = inventory;
+    clone_keys.erase(late_program);
+    BOOST_CHECK(SelectQuantumKeyBackupsToPrune(generations, clone_keys, 0).empty());
+}
+
 BOOST_AUTO_TEST_SUITE_END()
 } // namespace
 } // namespace wallet

@@ -90,11 +90,32 @@ std::optional<std::string> QuantumKeyBackupSpellingRejection(std::string_view co
  *  the file system. */
 std::optional<std::string> QuantumKeyBackupLengthRejection(const fs::path& wallet_directory);
 
-/** The spelling and length rules for the named wallet as the node is configured now: the reason the wallet's backups
- *  could never be made, or nullopt. Reads the arguments only, never the file system, so it is run when a wallet is
- *  loaded or created, before a quantum key can be made for it. It does not establish that the directory is writable,
- *  has room, is on a supported volume or that a backup will be durable. */
+/** What the spelling and length rules say about the named wallet's backup directory as the node is configured now, from
+ *  the arguments only (the file system is never read), so it can run when a wallet is loaded or created, before a quantum
+ *  key can be made for it. A backup directory that was configured (a non-empty -quantumkeybackupdir, which is the user's
+ *  own choice) that breaks a rule is an `error`: the wallet is refused. An option that is unset or empty means the default
+ *  path under the data directory, which the user did not choose and which ordinary wallet use does not need: a default
+ *  path that is too long is only a `warning` and the wallet loads; the automatic backup is then refused at the time it
+ *  would be made (EnsureQuantumKeyBackupDirectory) and a pending key and the active destination are left as they are. The
+ *  check does not establish that the directory is writable, has room, is on a supported volume or that a backup will be
+ *  durable. */
+struct QuantumKeyBackupPathCheck
+{
+    std::optional<std::string> error;
+    std::optional<std::string> warning;
+};
+QuantumKeyBackupPathCheck CheckQuantumKeyBackupWalletPath(const std::string& wallet_name);
+
+/** The `error` of CheckQuantumKeyBackupWalletPath alone. */
 std::optional<std::string> QuantumKeyBackupWalletPathRejection(const std::string& wallet_name);
+
+/** The names a migration of a legacy wallet publishes: the wallet itself, `<prefix>_watchonly` and `<prefix>_solvables`
+ *  (the prefix is the wallet's name, or "default_wallet" for the unnamed wallet). */
+std::vector<std::string> QuantumKeyBackupMigrationNames(const std::string& wallet_name);
+
+/** Checked before a migration converts anything or creates a database: the first name that migration would publish whose
+ *  configured backup directory breaks a rule (an `error` naming it), and the warnings for default-path names. */
+QuantumKeyBackupPathCheck CheckQuantumKeyBackupMigrationPaths(const std::string& wallet_name);
 
 /** The identity of a directory as Windows reports it for an open handle: the volume's serial number and the file
  *  index, which together name one directory whatever the spelling or case of the path that reached it. */
@@ -160,6 +181,10 @@ std::optional<std::string> QuantumBackupVolumeRejection(std::string_view file_sy
  *  local GUID path: a network share (`\\?\UNC\...`), a path that names a device or something else, an empty or
  *  truncated answer), and the caller then refuses the directory. Pure, so it is tested on every platform. */
 std::optional<std::wstring> QuantumBackupLocalVolumeRoot(std::wstring_view final_path);
+
+/** Tests only: resolve the backup directory against this data directory instead of the node's, so a test can build a
+ *  directory of an exact length whatever the length of the test run's own paths; nullopt restores the node's. */
+void SetQuantumKeyBackupDataDirectoryForTest(std::optional<fs::path> data_directory);
 
 /** Tests only: apply (true) or do not apply (false) the Windows rule for a double separator prefix whatever the
  *  platform; nullopt restores the platform's own answer (applied on Windows only). */

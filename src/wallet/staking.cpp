@@ -2725,12 +2725,14 @@ bool BackupQuantumReturnKey(CWallet& wallet, std::string& error)
     AssertLockNotHeld(wallet.cs_wallet);
     const fs::path directory = QuantumKeyBackupDirectory(wallet.GetName());
     if (!EnsureQuantumKeyBackupDirectory(directory, error)) return false;
-    const QuantumKeyBackupKeySet keys = WITH_LOCK(wallet.cs_wallet, return wallet.GetQuantumKeyPrograms());
     const std::optional<int> height = wallet.HaveChain() ? wallet.chain().getHeight() : std::nullopt;
     const std::string file_name = QuantumKeyBackupFileName(GetTime(), height.value_or(0), NewQuantumKeyBackupSuffix());
     const uint64_t sequence = NextQuantumKeyBackupSequence(directory);
     bilingual_str backup_error;
-    if (!wallet.BackupWallet(fs::PathToString(directory / fs::PathFromString(file_name)), &backup_error, /*verify_quantum_keys=*/true)) {
+    // The manifest records what the verified file holds, as BackupWallet reports it from the snapshot the copy was
+    // made from: an inventory read before or after the call could differ from the file's.
+    QuantumKeyBackupKeySet keys;
+    if (!wallet.BackupWallet(fs::PathToString(directory / fs::PathFromString(file_name)), &backup_error, /*verify_quantum_keys=*/true, &keys)) {
         error = backup_error.original.empty() ? "the wallet backup failed" : backup_error.original;
         return false;
     }

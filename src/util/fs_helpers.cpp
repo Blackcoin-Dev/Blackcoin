@@ -286,8 +286,8 @@ bool RenameOver(fs::path src, fs::path dest, std::string* error)
     // directory handle, so falling back to std::filesystem::rename here would
     // allow callers to report a durable replacement without any durability
     // barrier.
-    if (MoveFileExW(src.wstring().c_str(), dest.wstring().c_str(),
-                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0) {
+    // fs::path holds native wide characters here, so no temporary string is made between the call and the error.
+    if (::MoveFileExW(src.c_str(), dest.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
         return true;
     }
     // The code is taken before anything else can change it.

@@ -23,7 +23,7 @@ The limit is tested as well, with a third wallet whose return key is made after 
 
  * the old backup B0 holds one verified key K0; the return key K1 is made after B0 and chosen explicitly;
  * a legacy stake in the window pays its principal to K1;
- * ONLY B0 is restored: the restored wallet lacks K1, does not see the payout and cannot sign a spend of it,
+ * ONLY B0 is restored: the restored wallet lacks K1, does not own the K1 payout output and cannot sign a spend of it,
    although K0, the key it does hold, reports itself backed up. Backup flags describe the keys present in
    the restored wallet and do not prove that keys made later are present.
 """
@@ -154,7 +154,8 @@ class OldBackupRecoveryTest(TransitionTFinalTestBase, BitcoinTestFramework):
         for index, record in enumerate(records):
             wallet = n0.get_wallet_rpc(record["name"])
             self.unlock(wallet, record["passphrase"])
-            self.log.info("%s: a legacy stake in the mandatory window is paid to the claim key", record["kind"])
+            self.log.info("%s: a legacy stake in the mandatory window is paid to %s", record["kind"],
+                          "the return key made after the backup" if record["late"] else "the claim key")
             block_hash = self.stake_outpoint(wallet, n0, record["kernel"])
             self.sync_tips()
             assert_equal(n0.getblock(block_hash)["height"], LAST_LEGACY_STAKE_HEIGHT + 1 + index)
@@ -188,15 +189,18 @@ class OldBackupRecoveryTest(TransitionTFinalTestBase, BitcoinTestFramework):
             payout = record["payout"]
             if record["late"]:
                 # B0 holds K0, which reports itself backed up; K1 was made after B0, so it is not in the restored
-                # wallet, the payout to it is not seen and cannot be signed
+                # wallet, the wallet does not own the K1 payout output and cannot sign it
                 assert_equal(info["quantum_key_backup_verified"], True)
                 assert_equal(restored.getaddressinfo(record["return_key"])["ismine"], False)
                 # the stake spent one of the wallet's own legacy outputs, so the restored wallet knows the transaction;
                 # the output to K1 is not one of its own
                 assert_equal([u for u in restored.listunspent(0) if (u["txid"], u["vout"]) == (payout["txid"], payout["vout"])], [])
+                # the payout is in the node's UTXO set, so the failure to sign is the wallet's, not a missing input
+                assert n1.gettxout(payout["txid"], payout["vout"]) is not None
                 raw = n1.createrawtransaction([payout], [{destination: record["payout_value"] - Decimal("0.02")}])
                 signed = restored.signrawtransactionwithwallet(raw)
                 assert_equal(signed["complete"], False)
+                assert any((e["txid"], e["vout"]) == (payout["txid"], payout["vout"]) for e in signed.get("errors", [])), signed
                 self.log.info("%s: the old backup holds K0 (backed up) but not K1; the payout to K1 cannot be signed", record["kind"])
                 continue
             assert payout["txid"] in [tx["txid"] for tx in restored.listtransactions("*", 1000)]

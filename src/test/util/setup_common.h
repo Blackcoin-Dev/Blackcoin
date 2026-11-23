@@ -46,6 +46,10 @@ std::ostream& operator<<(typename std::enable_if<std::is_enum<T>::value, std::os
 // Blackcoin
 // static constexpr CAmount CENT{1000000};
 
+/** A test may set this to translate every string that goes through _() (see G_TRANSLATION_FUN in setup_common.cpp);
+ *  it must restore it to an empty function. */
+extern std::function<std::string(const char*)> g_test_translation;
+
 /** Basic testing setup.
  * This just configures logging, data dir and chain parameters.
  */

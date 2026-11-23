@@ -607,7 +607,7 @@ static UniValue QuantumStakeTxToJSON(const interfaces::WalletQuantumOperatorBond
     if (!tx.migration_address.empty()) obj.pushKV("migration_address", tx.migration_address);
     if (tx.migration_amount > 0) obj.pushKV("migration_amount", ValueFromAmount(tx.migration_amount));
     if (tx.migration_fee > 0) obj.pushKV("migration_fee", ValueFromAmount(tx.migration_fee));
-    if (!tx.warning.empty()) obj.pushKV("warning", tx.warning);
+    if (!tx.warning.empty()) obj.pushKV("warning", tx.warning.original);
     return obj;
 }
 
@@ -968,9 +968,9 @@ static std::vector<RPCResult> FinalStakeReserveDoc()
         {RPCResult::Type::NUM, "final_height", /*optional=*/true, "the first Final block, for which the reserve is kept (absent when schedule_known is false)"},
         {RPCResult::Type::NUM, "n", "N: the wallet's qualifying quantum stake sources, unspent and able to stake at the first Final block, plus those its confirmed coinstakes consumed since the guard began"},
         {RPCResult::Type::NUM, "target", "R: the number of outputs to hold back: min(32, ceil(N / 2)) for two or more sources; for exactly one source, 1 when its outpoint is assigned to the reserve and 0 when released (see single_output_rule); 0 for none."},
-        {RPCResult::Type::STR, "single_output_rule", /*optional=*/true, "present only when N is 1: \"held\" when the rule, a fixed hash of the one source's outpoint, assigns it to the reserve, \"released\" when it does not. This is the policy assignment only. Whether the output is actually withheld shows in active, reserved_count and reserved_outpoints (nothing is withheld outside the guard period, and from the first Final block on)"},
-        {RPCResult::Type::NUM, "reserved_count", "outputs actually held back (R, or fewer when too few outputs are available)"},
-        {RPCResult::Type::ARR, "reserved_outpoints", "the outputs held back, largest effective value at the first Final block first. Equal effective values are ordered by the outpoint's internal byte order (the transaction hash as stored, not the displayed transaction id text), then by output index, both ascending", {
+        {RPCResult::Type::STR, "single_output_rule", /*optional=*/true, "present only when N is 1: \"held\" when the rule, a fixed hash of the one source's outpoint, assigns it to the reserve, \"released\" when it does not. This is the policy assignment only. Whether the output is actually withheld shows only in active together with reserved_count and reserved_outpoints (nothing is withheld before the guard starts or from the first Final block on)"},
+        {RPCResult::Type::NUM, "reserved_count", "outputs in the reserve plan (R, or fewer when too few outputs are available). Before the guard starts this is the plan only; the outputs are held back only while active is true. It is 0 for candidate F and later, where nothing is held back"},
+        {RPCResult::Type::ARR, "reserved_outpoints", "the outputs of the reserve plan, enforced (held back from staking and automatic spending) only while active is true and empty for candidate F and later, largest effective value at the first Final block first. Equal effective values are ordered by the outpoint's internal byte order (the transaction hash as stored, not the displayed transaction id text), then by output index, both ascending", {
             {RPCResult::Type::OBJ, "", "", {
                 {RPCResult::Type::STR_HEX, "txid", "transaction id"},
                 {RPCResult::Type::NUM, "vout", "output index"},
@@ -6281,7 +6281,7 @@ static RPCHelpMan sweepdemurragedecay()
                 throw JSONRPCError(RPC_WALLET_ERROR, "destination_address is not wallet-backed");
             }
             if (WITH_LOCK(pwallet->cs_wallet, return pwallet->IsQuantumStakeReturnPendingKey(dest))) {
-                throw JSONRPCError(RPC_WALLET_ERROR, "destination_address is the quantum stake return key, a new key still waiting for its first verified wallet backup; it cannot receive funds until that backup succeeds");
+                throw JSONRPCError(RPC_WALLET_ERROR, "destination_address is the quantum stake return key, a new key still waiting for its first verified wallet backup; it cannot be selected as this sweep destination until that backup succeeds");
             }
         } else {
             auto op_dest = pwallet->GetNewQuantumDestination(label);

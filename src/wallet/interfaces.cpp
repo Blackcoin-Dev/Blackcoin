@@ -1337,7 +1337,7 @@ util::Result<WalletQuantumOperatorBondTx> FundTieredStakeAddress(
     result.address = address;
     result.amount = amount;
     result.fee = fee;
-    result.warning = "A new non-HD ML-DSA quantum change key was created during transaction construction. Back up this wallet now; an older backup cannot recover it.";
+    result.warning = _("A new non-HD ML-DSA quantum change key was created during transaction construction. Back up this wallet now; an older backup cannot recover it.");
     return result;
 }
 
@@ -1508,10 +1508,10 @@ util::Result<WalletQuantumOperatorBondTx> WithdrawTieredStakeAddress(
     result.started_unbonding = started_unbonding;
     result.completed_withdrawal = completed_withdrawal;
     result.warning = started_unbonding
-        ? "A new non-HD ML-DSA quantum change key was created while starting unbonding. Back up this wallet now; an older backup cannot recover it."
-        : "A new non-HD ML-DSA quantum withdrawal key was created. Back up this wallet now; an older backup cannot recover it.";
-    if (const bilingual_str reserve_warning = FinalStakeReserveSpendWarning(reserve_report); !reserve_warning.original.empty()) {
-        result.warning += " " + reserve_warning.original;
+        ? _("A new non-HD ML-DSA quantum change key was created while starting unbonding. Back up this wallet now; an older backup cannot recover it.")
+        : _("A new non-HD ML-DSA quantum withdrawal key was created. Back up this wallet now; an older backup cannot recover it.");
+    if (const bilingual_str reserve_warning = FinalStakeReserveSpendWarning(reserve_report); !reserve_warning.empty()) {
+        result.warning += Untranslated(" ") + reserve_warning;
     }
     return result;
 }
@@ -1618,7 +1618,7 @@ util::Result<WalletQuantumOperatorBondTx> FundColdStakeDelegationAddress(
     result.address = address;
     result.amount = amount;
     result.fee = fee;
-    result.warning = "A new non-HD ML-DSA quantum change key was created during delegation funding. Back up this wallet now; an older backup cannot recover it.";
+    result.warning = _("A new non-HD ML-DSA quantum change key was created during delegation funding. Back up this wallet now; an older backup cannot recover it.");
     return result;
 }
 
@@ -1765,10 +1765,10 @@ util::Result<WalletQuantumOperatorBondTx> WithdrawColdStakeDelegationAddress(
     result.started_unbonding = started_unbonding;
     result.completed_withdrawal = completed_withdrawal;
     result.warning = started_unbonding
-        ? "A new non-HD ML-DSA quantum change key was created while starting delegation unbonding. Back up this wallet now; an older backup cannot recover it."
-        : "A new non-HD ML-DSA quantum withdrawal key was created. Back up this wallet now; an older backup cannot recover it.";
-    if (const bilingual_str reserve_warning = FinalStakeReserveSpendWarning(reserve_report); !reserve_warning.original.empty()) {
-        result.warning += " " + reserve_warning.original;
+        ? _("A new non-HD ML-DSA quantum change key was created while starting delegation unbonding. Back up this wallet now; an older backup cannot recover it.")
+        : _("A new non-HD ML-DSA quantum withdrawal key was created. Back up this wallet now; an older backup cannot recover it.");
+    if (const bilingual_str reserve_warning = FinalStakeReserveSpendWarning(reserve_report); !reserve_warning.empty()) {
+        result.warning += Untranslated(" ") + reserve_warning;
     }
     return result;
 }
@@ -2046,7 +2046,7 @@ util::Result<WalletQuantumActionTx> CreateQuantumMigrationSweep(
             return util::Error{_("The destination is not wallet-backed (no ML-DSA private key in this wallet). No transaction was created.")};
         }
         if (wallet.IsQuantumStakeReturnPendingKey(destination)) {
-            return util::Error{_("The destination is the quantum stake return key, a new key still waiting for its first verified wallet backup. It cannot receive funds until that backup succeeds. No transaction was created.")};
+            return util::Error{_("The destination is the quantum stake return key, a new key still waiting for its first verified wallet backup. It cannot be selected as this migration or consolidation destination until that backup succeeds. No transaction was created.")};
         }
     }
     const CScript destination_script = GetScriptForDestination(destination);

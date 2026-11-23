@@ -1264,7 +1264,7 @@ struct WalletQuantumOperatorBondTx
     std::string migration_address;
     CAmount migration_amount{0};
     CAmount migration_fee{0};
-    std::string warning;
+    bilingual_str warning; //! translated for a user interface; the RPC reports `original`
 };
 
 //! Result of a planned or executed Quantum Cold-Stake redelegation.

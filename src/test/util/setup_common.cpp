@@ -84,7 +84,11 @@ using node::LoadChainstate;
 using node::RegenerateCommitments;
 using node::VerifyLoadedChainstate;
 
-const std::function<std::string(const char*)> G_TRANSLATION_FUN = nullptr;
+std::function<std::string(const char*)> g_test_translation;
+// Untranslated unless a test installs g_test_translation (to see that translated text, not the original, reaches a caller).
+const std::function<std::string(const char*)> G_TRANSLATION_FUN = [](const char* psz) {
+    return g_test_translation ? g_test_translation(psz) : std::string{psz};
+};
 UrlDecodeFn* const URL_DECODE = nullptr;
 
 /** Random context to get unique temp data dirs. Separate from g_insecure_rand_ctx, which can be seeded from a const env var */

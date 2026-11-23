@@ -935,9 +935,15 @@ BOOST_FIXTURE_TEST_CASE(the_commit_warning_names_a_pending_relay_alone_and_promi
 
 BOOST_FIXTURE_TEST_CASE(the_commit_warning_names_both_when_both_apply, CandidateAtGuardStart)
 {
+    // With a translator that marks every string, the whole text is translated, template by template, and the original
+    // stays the English one.
+    g_test_translation = [](const char* psz) { return std::string{"[T] "} + psz; };
     const bilingual_str warning = CommitWithWarning(*this, /*pending_relay=*/true, /*consume_reserve=*/true);
+    g_test_translation = nullptr;
     BOOST_CHECK_MESSAGE(MentionsReserve(warning) && MentionsRelay(warning), "warning: " + warning.original);
-    BOOST_CHECK_EQUAL(warning.translated, warning.original);
+    BOOST_CHECK_EQUAL(warning.original.find("[T]"), std::string::npos);
+    BOOST_CHECK(warning.translated.rfind("[T] The transaction was stored", 0) == 0);
+    BOOST_CHECK_NE(warning.translated.find(" [T] This transaction spends"), std::string::npos);
 }
 
 namespace {
@@ -992,7 +998,8 @@ BOOST_FIXTURE_TEST_CASE(a_named_withdrawal_output_may_be_reserved_and_the_result
 
     const auto result = WithdrawBond(*wallet, *big_bond, big);
     BOOST_REQUIRE_MESSAGE(result, util::ErrorString(result).original);
-    BOOST_CHECK_MESSAGE(result->warning.find("final stake reserve") != std::string::npos, result->warning);
+    BOOST_CHECK_MESSAGE(result->warning.original.find("final stake reserve") != std::string::npos, result->warning.original);
+    BOOST_CHECK_MESSAGE(result->warning.original.find("Back up this wallet now") != std::string::npos, result->warning.original);
     // The transaction is in the wallet and spends the named output.
     LOCK(wallet->cs_wallet);
     const CWalletTx* wtx = wallet->GetWalletTx(uint256S(result->txid));

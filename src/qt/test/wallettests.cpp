@@ -7057,8 +7057,8 @@ void ConfirmSendAfter(std::function<void()> before_confirm)
 std::string CommitFailure(interfaces::Wallet& wallet, const CTransactionRef& tx, std::string* warning = nullptr)
 {
     try {
-        const std::string text = wallet.commitTransaction(tx, {}, {});
-        if (warning) *warning = text;
+        const bilingual_str text = wallet.commitTransaction(tx, {}, {});
+        if (warning) *warning = text.translated;
     } catch (const std::runtime_error& e) {
         return e.what();
     }

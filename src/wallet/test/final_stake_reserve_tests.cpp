@@ -10,6 +10,7 @@
 #include <crypto/sha256.h>
 #include <common/settings.h>
 #include <interfaces/wallet.h>
+#include <key_io.h>
 #include <primitives/transaction.h>
 #include <script/script.h>
 #include <test/util/setup_common.h>
@@ -17,6 +18,7 @@
 #include <validation.h>
 #include <wallet/coincontrol.h>
 #include <wallet/context.h>
+#include <wallet/quantum_stake_ops.h>
 #include <wallet/spend.h>
 #include <wallet/staking.h>
 #include <wallet/test/util.h>
@@ -868,11 +870,162 @@ BOOST_FIXTURE_TEST_CASE(a_stored_but_unrelayed_commit_still_reports_the_reserve_
         BOOST_REQUIRE_MESSAGE(accepted.m_result_type == MempoolAcceptResult::ResultType::VALID, accepted.m_state.ToString());
     }
     gArgs.ForceSetArg("-finalstakereserve", "1");
-    std::string warning;
-    BOOST_CHECK_NO_THROW(warning = gui.iface->commitTransaction(tx, {}, {}));
+    bilingual_str warning_text;
+    BOOST_CHECK_NO_THROW(warning_text = gui.iface->commitTransaction(tx, {}, {}));
+    const std::string warning = warning_text.original;
     BOOST_CHECK(WITH_LOCK(gui.wallet->cs_wallet, return gui.wallet->mapWallet.count(tx->GetHash()) > 0));
     BOOST_CHECK_MESSAGE(!WITH_LOCK(m_node.mempool->cs, return m_node.mempool->exists(GenTxid::Txid(tx->GetHash()))), "the relay was not refused: the test does not reach the stored-but-unrelayed disposition");
     BOOST_CHECK_MESSAGE(warning.find("final stake reserve") != std::string::npos, "warning: " + warning);
+    // Both situations apply here, so both are told, in one text that is translated as a whole.
+    BOOST_CHECK_MESSAGE(warning.find("could not be broadcast") != std::string::npos, "warning: " + warning);
+    BOOST_CHECK_EQUAL(warning_text.translated, warning_text.original);
+}
+
+namespace {
+//! Commit one prepared transaction through the interface and return its warning. `pending_relay` makes the relay
+//! refuse for a reason that is not terminal (a rival spends the same outputs in the mempool), so that the wallet keeps
+//! the transaction; `consume_reserve` makes it spend the reserved output on purpose with the guard on.
+bilingual_str CommitWithWarning(TestChain100Setup& setup, bool pending_relay, bool consume_reserve)
+{
+    ReserveWallet rw = MakeReserveWallet(setup, setup.coinbaseKey);
+    ReserveInterface gui{setup, rw};
+    gui.wallet->SetBroadcastTransactions(pending_relay);
+    const CTransactionRef tx = gui.Prepare(rw, consume_reserve ? 14 * COIN : 25 * COIN, /*explicit_big=*/consume_reserve);
+    if (pending_relay) {
+        const CTransactionRef rival = gui.Prepare(rw, consume_reserve ? 13 * COIN : 24 * COIN, /*explicit_big=*/consume_reserve);
+        BOOST_REQUIRE(rival->GetHash() != tx->GetHash());
+        LOCK(::cs_main);
+        const MempoolAcceptResult accepted = setup.m_node.chainman->ProcessTransaction(rival);
+        BOOST_REQUIRE_MESSAGE(accepted.m_result_type == MempoolAcceptResult::ResultType::VALID, accepted.m_state.ToString());
+    }
+    gArgs.ForceSetArg("-finalstakereserve", consume_reserve ? "1" : "0");
+    bilingual_str warning;
+    BOOST_CHECK_NO_THROW(warning = gui.iface->commitTransaction(tx, {}, {}));
+    BOOST_CHECK(WITH_LOCK(gui.wallet->cs_wallet, return gui.wallet->mapWallet.count(tx->GetHash()) > 0));
+    if (pending_relay) {
+        BOOST_CHECK_MESSAGE(!WITH_LOCK(setup.m_node.mempool->cs, return setup.m_node.mempool->exists(GenTxid::Txid(tx->GetHash()))), "the relay was not refused");
+    }
+    return warning;
+}
+bool MentionsRelay(const bilingual_str& w) { return w.original.find("could not be broadcast") != std::string::npos; }
+bool MentionsReserve(const bilingual_str& w) { return w.original.find("final stake reserve") != std::string::npos; }
+} // namespace
+
+// The four combinations of "stored but not relayed" and "spent the reserve": neither, each alone, both.
+BOOST_FIXTURE_TEST_CASE(the_commit_warning_is_empty_when_nothing_needs_saying, CandidateAtGuardStart)
+{
+    const bilingual_str warning = CommitWithWarning(*this, /*pending_relay=*/false, /*consume_reserve=*/false);
+    BOOST_CHECK_MESSAGE(warning.empty(), "warning: " + warning.original);
+}
+
+BOOST_FIXTURE_TEST_CASE(the_commit_warning_names_a_consumed_reserve_alone, CandidateAtGuardStart)
+{
+    const bilingual_str warning = CommitWithWarning(*this, /*pending_relay=*/false, /*consume_reserve=*/true);
+    BOOST_CHECK_MESSAGE(MentionsReserve(warning) && !MentionsRelay(warning), "warning: " + warning.original);
+    BOOST_CHECK_EQUAL(warning.translated, warning.original);
+}
+
+BOOST_FIXTURE_TEST_CASE(the_commit_warning_names_a_pending_relay_alone_and_promises_nothing, CandidateAtGuardStart)
+{
+    const bilingual_str warning = CommitWithWarning(*this, /*pending_relay=*/true, /*consume_reserve=*/false);
+    BOOST_CHECK_MESSAGE(MentionsRelay(warning) && !MentionsReserve(warning), "warning: " + warning.original);
+    BOOST_CHECK_MESSAGE(warning.original.find("not certain") != std::string::npos, warning.original);
+    BOOST_CHECK_EQUAL(warning.translated, warning.original);
+}
+
+BOOST_FIXTURE_TEST_CASE(the_commit_warning_names_both_when_both_apply, CandidateAtGuardStart)
+{
+    const bilingual_str warning = CommitWithWarning(*this, /*pending_relay=*/true, /*consume_reserve=*/true);
+    BOOST_CHECK_MESSAGE(MentionsReserve(warning) && MentionsRelay(warning), "warning: " + warning.original);
+    BOOST_CHECK_EQUAL(warning.translated, warning.original);
+}
+
+namespace {
+// The guard is on for the candidate 101 (as CandidateAtGuardStart) and bonded tiers exist.
+class TieredReserveSetup : public TestChain100Setup
+{
+public:
+    TieredReserveSetup()
+        : TestChain100Setup{ChainType::REGTEST, {
+              "-shadowwhitelistheight=20",
+              "-shadowgoldrushstartheight=30",
+              "-shadowgoldrushendheight=60",
+              "-qqgoldrushendheight=60",
+              "-qqmigrationendheight=110",
+              "-qqstaketierheight=61",
+          }}
+    {
+    }
+    ~TieredReserveSetup() { gArgs.ForceSetArg("-finalstakereserve", "1"); }
+};
+
+constexpr uint32_t TEST_UNBONDING_BLOCKS{9450};
+
+//! Withdraw a bonded staking output. Only the named output is the caller's own choice; the fee input is the wallet's.
+util::Result<interfaces::WalletQuantumOperatorBondTx> WithdrawBond(CWallet& wallet, const CTxDestination& bond, const COutPoint& selected)
+{
+    return WithdrawTieredStakeAddress(wallet, EncodeDestination(bond), /*require_operator_lock=*/false, "unbond", "withdraw",
+                                      "test unbond", "test withdraw", selected, /*allow_all_outputs=*/false,
+                                      /*allow_new_quantum_key=*/true);
+}
+} // namespace
+
+// A staking withdrawal names the output it takes. That output may be one the reserve holds back, and the result
+// reports it; the fee input the withdrawal adds itself is not named, so it may not be one.
+BOOST_FIXTURE_TEST_CASE(a_named_withdrawal_output_may_be_reserved_and_the_result_says_so, TieredReserveSetup)
+{
+    gArgs.ForceSetArg("-finalstakereserve", "1");
+    // The wallet holds the node's coinbases (legacy coins: the fee input) and two bonded outputs (N = 2, R = 1).
+    auto wallet = CreateSyncedWallet(*m_node.chain, WITH_LOCK(Assert(m_node.chainman)->GetMutex(), return m_node.chainman->ActiveChain()), coinbaseKey);
+    wallet->SetBroadcastTransactions(false);
+    const auto big_bond = wallet->GetNewTieredQuantumDestination("bond-big", TEST_UNBONDING_BLOCKS);
+    const auto small_bond = wallet->GetNewTieredQuantumDestination("bond-small", TEST_UNBONDING_BLOCKS);
+    BOOST_REQUIRE(big_bond && small_bond);
+    const COutPoint big = AddQuantumStakeSource(*this, *wallet, *big_bond, 20 * COIN, 70, 1);
+    const COutPoint small = AddQuantumStakeSource(*this, *wallet, *small_bond, 10 * COIN, 71, 2);
+    const FinalStakeReserve reserve = ReserveOf(*wallet);
+    BOOST_REQUIRE(reserve.active);
+    BOOST_REQUIRE_EQUAL(reserve.n, 2);
+    BOOST_REQUIRE_EQUAL(reserve.reserved.size(), 1U);
+    BOOST_REQUIRE(reserve.reserved[0].outpoint == big);
+    (void)small;
+
+    const auto result = WithdrawBond(*wallet, *big_bond, big);
+    BOOST_REQUIRE_MESSAGE(result, util::ErrorString(result).original);
+    BOOST_CHECK_MESSAGE(result->warning.find("final stake reserve") != std::string::npos, result->warning);
+    // The transaction is in the wallet and spends the named output.
+    LOCK(wallet->cs_wallet);
+    const CWalletTx* wtx = wallet->GetWalletTx(uint256S(result->txid));
+    BOOST_REQUIRE(wtx);
+    BOOST_CHECK(std::any_of(wtx->tx->vin.begin(), wtx->tx->vin.end(), [&](const CTxIn& in) { return in.prevout == big; }));
+}
+
+BOOST_FIXTURE_TEST_CASE(a_reserved_fee_input_the_withdrawal_chose_itself_is_refused, TieredReserveSetup)
+{
+    gArgs.ForceSetArg("-finalstakereserve", "1");
+    CKey key;
+    key.MakeNewKey(/*fCompressed=*/true);
+    auto wallet = CreateSyncedWallet(*m_node.chain, WITH_LOCK(Assert(m_node.chainman)->GetMutex(), return m_node.chainman->ActiveChain()), key);
+    wallet->SetBroadcastTransactions(false);
+    // No legacy coin: the only fee input is a direct quantum output, the largest of three sources (N = 3, R = 2), so it
+    // is reserved. The named bonded output is reserved too.
+    const auto fee_dest = wallet->GetNewQuantumDestination("fee");
+    const auto big_bond = wallet->GetNewTieredQuantumDestination("bond-big", TEST_UNBONDING_BLOCKS);
+    const auto small_bond = wallet->GetNewTieredQuantumDestination("bond-small", TEST_UNBONDING_BLOCKS);
+    BOOST_REQUIRE(fee_dest && big_bond && small_bond);
+    const COutPoint fee = AddQuantumStakeSource(*this, *wallet, *fee_dest, 30 * COIN, 70, 1);
+    const COutPoint big = AddQuantumStakeSource(*this, *wallet, *big_bond, 20 * COIN, 71, 2);
+    AddQuantumStakeSource(*this, *wallet, *small_bond, 10 * COIN, 72, 3);
+    const FinalStakeReserve reserve = ReserveOf(*wallet);
+    BOOST_REQUIRE_EQUAL(reserve.n, 3);
+    BOOST_REQUIRE(reserve.enforced.count(fee) > 0 && reserve.enforced.count(big) > 0);
+
+    const size_t transactions_before = WITH_LOCK(wallet->cs_wallet, return wallet->mapWallet.size());
+    const auto result = WithdrawBond(*wallet, *big_bond, big);
+    BOOST_REQUIRE_MESSAGE(!result, "the withdrawal took a reserved fee input without being asked to");
+    BOOST_CHECK_MESSAGE(util::ErrorString(result).original.find("held back as the final stake reserve") != std::string::npos, util::ErrorString(result).original);
+    // Nothing of the refused transaction is left in the wallet apart from the keys it made.
+    BOOST_CHECK_EQUAL(WITH_LOCK(wallet->cs_wallet, return wallet->mapWallet.size()), transactions_before);
 }
 
 // The reserve refusal is the typed, recoverable rejection: nothing was stored.

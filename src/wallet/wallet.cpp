@@ -93,6 +93,7 @@
 #include <wallet/external_signer_scriptpubkeyman.h>
 #include <wallet/fees.h>
 #include <wallet/scheduler_stats.h>
+#include <wallet/quantum_return_backup.h>
 #include <wallet/scriptpubkeyman.h>
 #include <wallet/shadow_pow_claim_recovery_args.h>
 #include <wallet/spend.h>
@@ -1584,6 +1585,12 @@ void PublishRuntimeWallet(
 
 std::shared_ptr<CWallet> LoadWalletInternal(WalletContext& context, const std::string& name, std::optional<bool> load_on_start, const DatabaseOptions& options, DatabaseStatus& status, bilingual_str& error, std::vector<bilingual_str>& warnings)
 {
+    // A wallet whose quantum key backups could never be made is refused before it can create a key.
+    if (const std::optional<std::string> rejection = QuantumKeyBackupWalletPathRejection(name)) {
+        error = Untranslated(strprintf("Wallet loading failed. %s", *rejection));
+        status = DatabaseStatus::FAILED_LOAD;
+        return nullptr;
+    }
     try {
         std::unique_ptr<WalletDatabase> database = MakeWalletDatabase(name, options, status, error);
         if (!database) {
@@ -1702,6 +1709,11 @@ std::shared_ptr<CWallet> LoadWallet(WalletContext& context, const std::string& n
 
 std::shared_ptr<CWallet> CreateWallet(WalletContext& context, const std::string& name, std::optional<bool> load_on_start, DatabaseOptions& options, DatabaseStatus& status, bilingual_str& error, std::vector<bilingual_str>& warnings)
 {
+    if (const std::optional<std::string> rejection = QuantumKeyBackupWalletPathRejection(name)) {
+        error = Untranslated(strprintf("Wallet creation failed. %s", *rejection));
+        status = DatabaseStatus::FAILED_CREATE;
+        return nullptr;
+    }
     uint64_t wallet_creation_flags = options.create_flags;
     const SecureString& passphrase = options.create_passphrase;
 
@@ -10528,13 +10540,13 @@ bool CWallet::VerifyQuantumBackup(const fs::path& backup_path, const QuantumKeyS
         const fs::path scratch_random = GetUniquePath(backup_path.parent_path());
         fs::path scratch_dir{backup_path.parent_path()};
         scratch_dir /= fs::PathFromString(
-            ".blackcoin-quantum-backup-verify-" + fs::PathToString(scratch_random.filename()));
+            std::string{QUANTUM_BACKUP_VERIFY_FOLDER_PREFIX} + fs::PathToString(scratch_random.filename()));
         if (!TryCreateDirectories(scratch_dir)) {
             error = _("Quantum-key backup verification could not create an isolated verification directory");
             return false;
         }
         ScopedDirectoryRemoval remove_scratch{scratch_dir};
-        const fs::path scratch_wallet = scratch_dir / "wallet.dat";
+        const fs::path scratch_wallet = scratch_dir / fs::PathFromString(std::string{QUANTUM_BACKUP_COPY_FILE_NAME});
         fs::copy_file(backup_path, scratch_wallet, fs::copy_options::none);
 
         DatabaseOptions options;
@@ -10667,6 +10679,9 @@ bool CWallet::SetQuantumKeyBackupState(const QuantumKeySnapshot& expected_keys, 
 
 bool CWallet::BackupWallet(const std::string& strDest, bilingual_str* error_out, bool verify_quantum_keys)
 {
+    // The promotion mutex comes before cs_wallet, so a caller that holds the wallet lock could deadlock with another
+    // backup of this wallet that holds the mutex and waits for the lock.
+    AssertLockNotHeld(cs_wallet);
     class ScopedDirectoryRemoval
     {
     public:
@@ -10748,7 +10763,7 @@ bool CWallet::BackupWallet(const std::string& strDest, bilingual_str* error_out,
     for (int attempt = 0; attempt < 10; ++attempt) {
         const fs::path random_path = GetUniquePath(backup_directory);
         const fs::path candidate = backup_directory / fs::PathFromString(
-            ".blackcoin-wallet-backup-stage-" + fs::PathToString(random_path.filename()));
+            std::string{QUANTUM_BACKUP_STAGE_FOLDER_PREFIX} + fs::PathToString(random_path.filename()));
         bool created{false};
 #ifndef WIN32
         // mkdir(0700) is one atomic operation. A create-then-chmod sequence
@@ -10774,7 +10789,7 @@ bool CWallet::BackupWallet(const std::string& strDest, bilingual_str* error_out,
 #endif
         if (created) {
             staged_directory = candidate;
-            staged_path = staged_directory / "wallet.dat";
+            staged_path = staged_directory / fs::PathFromString(std::string{QUANTUM_BACKUP_COPY_FILE_NAME});
             break;
         }
     }
@@ -10855,7 +10870,16 @@ bool CWallet::BackupWallet(const std::string& strDest, bilingual_str* error_out,
         return true;
     };
 
-    const auto promote_stage = [&](const WalletBackupFileIdentity& verified_identity, bool require_unchanged_quantum_snapshot = false) {
+    // Installs the verified stage as the destination file. The promotion mutex is taken before anything is
+    // decided about the wallet and is held through the check of the snapshot, the rename, both directory commits,
+    // the check of the installed file and the publication of the source markers, so no other backup of this wallet
+    // can install a file between this backup's check and its rename. A copy that is not of the wallet's current
+    // encryption state and exact quantum key inventory is never installed, whether or not it was verified and
+    // whether or not the inventory is empty. Only the markers are conditional: publish_verified_markers is true
+    // when the copy was verified key by key.
+    const auto promote_stage = [&](const WalletBackupFileIdentity& verified_identity, bool publish_verified_markers) {
+        if (failpoint("before_promotion_mutex")) return false;
+        LOCK(m_backup_promotion_mutex);
         if (failpoint("before_final_identity_revalidation")) return false;
         WalletBackupFileIdentity current_identity;
         if (!GetWalletBackupFileIdentity(staged_path, current_identity, local_error)) return false;
@@ -10864,7 +10888,7 @@ bool CWallet::BackupWallet(const std::string& strDest, bilingual_str* error_out,
             return false;
         }
 
-        if (require_unchanged_quantum_snapshot) {
+        {
             // Before anything is installed: a wallet whose keys changed since the copy was made gets no backup
             // installed at all. A brief look under the wallet lock, no file system work.
             LOCK(cs_wallet);
@@ -10873,8 +10897,12 @@ bool CWallet::BackupWallet(const std::string& strDest, bilingual_str* error_out,
         // The rename, the directory commits and the inspection of the installed file are file system work on a
         // destination that can be slow or stalled (a removable or network disk). They run WITHOUT cs_wallet, so
         // wallet operations and the threads waiting behind them are never held up by that disk.
-        if (failpoint("fail_rename") || !RenameOver(staged_path, backup_path)) {
+        std::string rename_error;
+        if (failpoint("fail_rename") || !RenameOver(staged_path, backup_path, &rename_error)) {
             local_error = _("Unable to atomically install the verified wallet backup");
+            if (!rename_error.empty()) {
+                local_error = local_error + Untranslated(strprintf(" (%s)", rename_error));
+            }
             return false;
         }
         const bool injected_destination_commit_failure = failpoint("before_final_directory_commit");
@@ -10893,7 +10921,7 @@ bool CWallet::BackupWallet(const std::string& strDest, bilingual_str* error_out,
             local_error = _("The installed wallet backup changed during atomic promotion");
             return false;
         }
-        if (require_unchanged_quantum_snapshot) {
+        if (publish_verified_markers) {
             // Success is published only after the wallet is checked again, under the lock that the marker write
             // takes: the keys and the encryption state may have changed while the file was being installed. The
             // installed file is complete and verified for the inventory it was made from; if the wallet moved on,
@@ -10921,7 +10949,7 @@ bool CWallet::BackupWallet(const std::string& strDest, bilingual_str* error_out,
             if (error_out) *error_out = local_error;
             return false;
         }
-        const bool promoted = promote_stage(staged_identity);
+        const bool promoted = promote_stage(staged_identity, /*publish_verified_markers=*/false);
         if (!promoted && error_out) *error_out = local_error;
         return promoted;
     }
@@ -10958,7 +10986,7 @@ bool CWallet::BackupWallet(const std::string& strDest, bilingual_str* error_out,
     WalletBackupFileIdentity verified_identity;
     if (!GetWalletBackupFileIdentity(staged_path, verified_identity, local_error) ||
         failpoint("before_promote") ||
-        !promote_stage(verified_identity, /*require_unchanged_quantum_snapshot=*/true)) {
+        !promote_stage(verified_identity, /*publish_verified_markers=*/true)) {
         if (local_error.empty()) local_error = _("Final verified wallet database copy failed");
         if (error_out) *error_out = local_error;
         return false;

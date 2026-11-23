@@ -2840,8 +2840,20 @@ public:
      * Internal pre-migration safety copies may opt out because they preserve
      * the exact source database and are not represented to the user as a
      * verified current-generation quantum-key backup.
+     *
+     * Every installation of a backup file takes m_backup_promotion_mutex and, under it, checks that the wallet's
+     * encryption state and quantum key inventory are still those the copy was made from (whatever
+     * verify_quantum_keys says, and for an empty inventory too), so a copy of an older inventory never replaces
+     * the file a later, complete backup installed. The lock order is that mutex, then cs_wallet: the caller must
+     * not hold cs_wallet.
      */
-    bool BackupWallet(const std::string& strDest, bilingual_str* error = nullptr, bool verify_quantum_keys = true);
+    bool BackupWallet(const std::string& strDest, bilingual_str* error = nullptr, bool verify_quantum_keys = true)
+        EXCLUSIVE_LOCKS_REQUIRED(!cs_wallet);
+
+    //! Serializes the installation of a wallet backup file by this wallet (the snapshot check, the rename, the
+    //! directory commits, the check of the installed file and the publication of the source markers). Taken
+    //! before cs_wallet, which is held only for short checks inside it and never across file system work.
+    Mutex m_backup_promotion_mutex;
 
     /** In-process fault injection for wallet backup tests. Never persisted or exposed through RPC. */
     std::function<bool(std::string_view)> m_quantum_backup_failpoint;

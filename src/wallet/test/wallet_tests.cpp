@@ -9,10 +9,13 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <future>
 #include <iterator>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <stdint.h>
@@ -9188,6 +9191,220 @@ BOOST_AUTO_TEST_CASE(QuantumWalletBackupDestinationWorkRunsWithoutTheWalletLock)
             LOCK(wallet->cs_wallet);
             const auto infos = wallet->ListQuantumKeyInfos();
             BOOST_REQUIRE_EQUAL(infos.size(), 3U);
+            BOOST_CHECK(std::all_of(infos.begin(), infos.end(), [](const QuantumKeyInfo& info) { return info.backup_verified; }));
+        }
+    }
+}
+
+namespace {
+/** Lets a test hold one backup of a wallet at a named failpoint while others run, without sleeps: the callback is
+ *  installed once, before any thread starts, and decides by the thread's own flag whether to pause. */
+struct BackupGate
+{
+    std::mutex mutex;
+    std::condition_variable condition;
+    std::string pause_point;     // the failpoint at which the paused thread waits
+    std::string observe_point;   // a failpoint the observed thread only reports
+    bool paused{false};
+    bool released{false};
+    bool observed{false};
+
+    template <typename Predicate>
+    bool WaitFor(Predicate predicate)
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        return condition.wait_for(lock, std::chrono::seconds{20}, predicate);
+    }
+    void Release()
+    {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            released = true;
+        }
+        condition.notify_all();
+    }
+};
+thread_local bool t_backup_is_paused_thread{false};
+thread_local bool t_backup_is_observed_thread{false};
+} // namespace
+
+// Two backups of one wallet install into the same file. The first one's copy was made from an older inventory: after a
+// second backup (made later, from a larger inventory) has installed its file, the first must not replace it, whether its
+// own inventory was empty, whether it verified its keys or not.
+BOOST_AUTO_TEST_CASE(QuantumWalletBackupPromotionNeverReplacesALaterBackupOfALargerInventory)
+{
+    struct Scenario {
+        const char* name;
+        bool first_has_key;
+        bool first_verifies;
+    };
+    for (DatabaseFormat format : DATABASE_FORMATS) {
+        for (const Scenario& scenario : {Scenario{"verified", true, true}, Scenario{"unverified", true, false},
+                                         Scenario{"empty", false, true}, Scenario{"empty-unverified", false, false}}) {
+            const std::string name{strprintf("quantum-backup-promotion-later-%s-%i", scenario.name, format)};
+            const fs::path backup_dir = m_path_root / fs::PathFromString(name + "-dest");
+            BOOST_REQUIRE(fs::create_directory(backup_dir));
+            auto wallet{TestLoadQuantumWallet(name, format)};
+            const std::string wallet_filename = fs::PathToString(fs::PathFromString(wallet->GetDatabase().Filename()).filename());
+            const fs::path backup_path = backup_dir / fs::PathFromString(wallet_filename);
+            std::optional<CTxDestination> k1;
+            if (scenario.first_has_key) {
+                auto made = wallet->GetNewQuantumDestination("promotion-k1");
+                BOOST_REQUIRE(made);
+                k1 = *made;
+            }
+
+            BackupGate gate;
+            gate.pause_point = "before_promotion_mutex";
+            wallet->m_quantum_backup_failpoint = [&gate](std::string_view point) {
+                if (t_backup_is_paused_thread && point == gate.pause_point) {
+                    std::unique_lock<std::mutex> lock(gate.mutex);
+                    gate.paused = true;
+                    gate.condition.notify_all();
+                    gate.condition.wait(lock, [&] { return gate.released; });
+                }
+                return false;
+            };
+
+            // A makes its copy from the inventory it sees now and stops just before the promotion mutex.
+            bool first_ok{true};
+            bilingual_str first_error;
+            std::thread first{[&] {
+                t_backup_is_paused_thread = true;
+                first_ok = wallet->BackupWallet(fs::PathToString(backup_dir), &first_error, scenario.first_verifies);
+            }};
+            if (!gate.WaitFor([&] { return gate.paused; })) {
+                gate.Release();
+                first.join();
+                BOOST_FAIL("the first backup did not reach the promotion mutex: ok=" << first_ok << " error=" << first_error.original);
+            }
+
+            // B: K2 is made, and a complete verified backup of the larger inventory is installed.
+            auto k2 = wallet->GetNewQuantumDestination("promotion-k2");
+            BOOST_REQUIRE(k2);
+            bilingual_str second_error;
+            BOOST_REQUIRE_MESSAGE(wallet->BackupWallet(fs::PathToString(backup_dir), &second_error), second_error.original);
+            const auto [second_read_ok, second_file] = ReadBinaryFile(backup_path);
+            BOOST_REQUIRE(second_read_ok);
+
+            // A resumes: it must fail on the inventory and leave B's file as it is.
+            gate.Release();
+            first.join();
+            BOOST_CHECK(!first_ok);
+            BOOST_CHECK_MESSAGE(first_error.original.find("inventory changed while finalizing") != std::string::npos, first_error.original);
+            const auto [after_ok, after_file] = ReadBinaryFile(backup_path);
+            BOOST_REQUIRE(after_ok);
+            BOOST_CHECK_EQUAL_COLLECTIONS(second_file.begin(), second_file.end(), after_file.begin(), after_file.end());
+
+            // B's installed backup holds K2 and can sign for it, and K2's marker in the source wallet is still true.
+            wallet->m_quantum_backup_failpoint = {};
+            {
+                auto restored{TestLoadQuantumWalletBackup(backup_path)};
+                LOCK(restored->cs_wallet);
+                const auto info = restored->GetQuantumKeyInfo(*k2);
+                BOOST_REQUIRE(info.has_value());
+                BOOST_CHECK(info->backup_verified);
+                CheckQuantumKeyChallenge(*restored, *k2);
+            }
+            {
+                LOCK(wallet->cs_wallet);
+                const auto info = wallet->GetQuantumKeyInfo(*k2);
+                BOOST_REQUIRE(info.has_value());
+                BOOST_CHECK(info->backup_verified);
+                if (k1) {
+                    const auto first_info = wallet->GetQuantumKeyInfo(*k1);
+                    BOOST_REQUIRE(first_info.has_value());
+                    BOOST_CHECK(first_info->backup_verified);
+                }
+            }
+            // no staging folder is left behind
+            for (const auto& entry : fs::directory_iterator(backup_dir)) {
+                BOOST_CHECK_MESSAGE(entry.path().filename() == fs::PathFromString(wallet_filename), fs::PathToString(entry.path()));
+            }
+        }
+    }
+}
+
+// The other order: the first backup owns the promotion mutex when the wallet gains a key, and the second waits for the
+// mutex. The first fails its final check of the inventory; the second, made from the larger inventory, then succeeds.
+BOOST_AUTO_TEST_CASE(QuantumWalletBackupPromotionWaitsForTheBackupThatOwnsTheMutex)
+{
+    for (DatabaseFormat format : DATABASE_FORMATS) {
+        const std::string name{strprintf("quantum-backup-promotion-owner-%i", format)};
+        const fs::path backup_dir = m_path_root / fs::PathFromString(name + "-dest");
+        BOOST_REQUIRE(fs::create_directory(backup_dir));
+        auto wallet{TestLoadQuantumWallet(name, format)};
+        const std::string wallet_filename = fs::PathToString(fs::PathFromString(wallet->GetDatabase().Filename()).filename());
+        const fs::path backup_path = backup_dir / fs::PathFromString(wallet_filename);
+        auto k1 = wallet->GetNewQuantumDestination("owner-k1");
+        BOOST_REQUIRE(k1);
+
+        BackupGate gate;
+        gate.pause_point = "before_final_identity_revalidation"; // inside the promotion mutex
+        gate.observe_point = "before_promotion_mutex";
+        wallet->m_quantum_backup_failpoint = [&gate](std::string_view point) {
+            if (t_backup_is_paused_thread && point == gate.pause_point) {
+                std::unique_lock<std::mutex> lock(gate.mutex);
+                gate.paused = true;
+                gate.condition.notify_all();
+                gate.condition.wait(lock, [&] { return gate.released; });
+            }
+            if (t_backup_is_observed_thread && point == gate.observe_point) {
+                {
+                    std::lock_guard<std::mutex> lock(gate.mutex);
+                    gate.observed = true;
+                }
+                gate.condition.notify_all();
+            }
+            return false;
+        };
+
+        bool first_ok{true};
+        bilingual_str first_error;
+        std::thread first{[&] {
+            t_backup_is_paused_thread = true;
+            first_ok = wallet->BackupWallet(fs::PathToString(backup_dir), &first_error);
+        }};
+        if (!gate.WaitFor([&] { return gate.paused; })) {
+            gate.Release();
+            first.join();
+            BOOST_FAIL("the first backup did not own the promotion mutex: ok=" << first_ok << " error=" << first_error.original);
+        }
+
+        // the wallet gains K2 while A owns the mutex, then B starts: its copy is of both keys
+        auto k2 = wallet->GetNewQuantumDestination("owner-k2");
+        BOOST_REQUIRE(k2);
+        bool second_ok{false};
+        bilingual_str second_error;
+        std::thread second{[&] {
+            t_backup_is_observed_thread = true;
+            second_ok = wallet->BackupWallet(fs::PathToString(backup_dir), &second_error);
+        }};
+        BOOST_REQUIRE(gate.WaitFor([&] { return gate.observed; }));
+        // B has made its copy and is at, or waiting for, the mutex that A owns: nothing is installed yet
+        BOOST_CHECK(!fs::exists(backup_path));
+        gate.Release();
+        first.join();
+        second.join();
+        wallet->m_quantum_backup_failpoint = {};
+
+        BOOST_CHECK(!first_ok);
+        BOOST_CHECK_MESSAGE(first_error.original.find("inventory changed while finalizing") != std::string::npos, first_error.original);
+        BOOST_CHECK_MESSAGE(second_ok, second_error.original);
+        auto restored{TestLoadQuantumWalletBackup(backup_path)};
+        {
+            LOCK(restored->cs_wallet);
+            for (const CTxDestination& key : {*k1, *k2}) {
+                const auto info = restored->GetQuantumKeyInfo(key);
+                BOOST_REQUIRE(info.has_value());
+                BOOST_CHECK(info->backup_verified);
+                CheckQuantumKeyChallenge(*restored, key);
+            }
+        }
+        {
+            LOCK(wallet->cs_wallet);
+            const auto infos = wallet->ListQuantumKeyInfos();
+            BOOST_REQUIRE_EQUAL(infos.size(), 2U);
             BOOST_CHECK(std::all_of(infos.begin(), infos.end(), [](const QuantumKeyInfo& info) { return info.backup_verified; }));
         }
     }

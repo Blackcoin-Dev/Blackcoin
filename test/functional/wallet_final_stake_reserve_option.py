@@ -112,6 +112,8 @@ class FinalStakeReserveOptionTest(BitcoinTestFramework):
         for text in ['"maybe"', '""', "2", "-1", "0.5", "[]", "[1]", "{}", "null", '"yes"']:
             settings.write_text('{%s "finalstakereserve": %s}' % (wallets_key, text), encoding="utf-8")
             node.assert_start_raises_init_error(expected_msg="Settings file could not be read", match=ErrorMatch.PARTIAL_REGEX)
+            # The refusal is an abort: the file on disk is left as it was.
+            assert_equal(settings.read_text(encoding="utf-8"), '{%s "finalstakereserve": %s}' % (wallets_key, text))
         settings.write_text('{%s "nofinalstakereserve": true}' % wallets_key, encoding="utf-8")
         node.assert_start_raises_init_error(expected_msg="Settings file could not be read", match=ErrorMatch.PARTIAL_REGEX)
         self.log.info("settings.json against the configuration file and the command line")

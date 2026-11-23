@@ -447,13 +447,17 @@ bool ArgsManager::ReadSettingsFile(std::vector<std::string>* errors)
     }
 
     LOCK(cs_args);
+    // Loading is transactional: the live map is cleared as before, the file is read and checked into a temporary map, and
+    // the map is installed only when the whole file is acceptable. A rejected file leaves no setting behind (as a malformed
+    // file does), so a caller that goes on after the error, and writes the settings back, writes none of it.
     m_settings.rw_settings.clear();
+    std::map<std::string, common::SettingsValue> loaded;
     std::vector<std::string> read_errors;
-    if (!common::ReadSettings(path, m_settings.rw_settings, read_errors)) {
+    if (!common::ReadSettings(path, loaded, read_errors)) {
         SaveErrors(read_errors, errors);
         return false;
     }
-    for (const auto& setting : m_settings.rw_settings) {
+    for (const auto& setting : loaded) {
         KeyInfo key = InterpretKey(setting.first); // Split setting key into section and argname
         const std::optional<unsigned int> flags = GetArgFlags('-' + key.name);
         if (!flags) {
@@ -477,6 +481,7 @@ bool ArgsManager::ReadSettingsFile(std::vector<std::string>* errors)
             }
         }
     }
+    m_settings.rw_settings = std::move(loaded);
     return true;
 }
 

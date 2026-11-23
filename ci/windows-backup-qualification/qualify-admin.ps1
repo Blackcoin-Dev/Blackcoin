@@ -73,6 +73,21 @@ function Invoke-Diskpart([string]$Name, [string[]]$Lines) {
     return $result
 }
 
+# Volume details for the evidence file. The file system is decided by the storage provider (Get-Volume by label),
+# which must report the expected one or the step ends. fsutil is recorded for each way of naming the volume, with
+# its exit code; a fsutil that cannot resolve a name is evidence, not a setup failure.
+function Get-VolumeEvidence([string]$What, [string]$Label, [string]$Expected, [string[]]$Names) {
+    $volume = Get-Volume -FileSystemLabel $Label
+    if ("$($volume.FileSystem)" -ne $Expected) { throw "the $What volume reports file system '$($volume.FileSystem)', not $Expected" }
+    $parts = New-Object System.Collections.ArrayList
+    $null = $parts.Add("--- volume details of the $What mount (storage provider)`r`n" + (($volume | Format-List FileSystemLabel, FileSystem, FileSystemType, DriveType, DriveLetter, Path, Size, SizeRemaining, AllocationUnitSize, HealthStatus | Out-String).Trim()))
+    foreach ($name in @($Names) + @("$($volume.Path)")) {
+        $r = Invoke-Native 'fsutil.exe' @('fsinfo', 'volumeinfo', $name)
+        $null = $parts.Add("--- fsutil fsinfo volumeinfo $name (exit code $($r.Code))`r`n$($r.Output)")
+    }
+    return ($parts -join "`r`n`r`n")
+}
+
 function Get-FreeLetter([string[]]$Preferred, [string[]]$Taken) {
     $used = @([System.IO.DriveInfo]::GetDrives() | ForEach-Object { $_.Name.Substring(0, 1).ToUpper() }) + $Taken
     foreach ($letter in $Preferred) {
@@ -326,7 +341,7 @@ try {
     Write-Utf8NoBom $LayoutPath ($layout | ConvertTo-Json -Depth 5)
     $null = Invoke-Checked "icacls read grant on $LayoutPath" 'icacls.exe' @($LayoutPath, '/grant', "${user}:R")
 
-    # ----- evidence recorded as the administrator (every command's exit code is checked) -----
+    # ----- evidence recorded as the administrator (required commands must succeed; diagnostic exit codes are recorded) -----
     $os = Get-CimInstance Win32_OperatingSystem
     $info = [ordered]@{
         image_os = $env:ImageOS; image_version = $env:ImageVersion; os_caption = $os.Caption; os_build = $os.BuildNumber
@@ -348,10 +363,10 @@ try {
     if ($infra.ntfs_vhd) {
         $acl = Invoke-Checked "icacls ${NtfsLetter}:\" 'icacls.exe' @("${NtfsLetter}:\")
         $null = $aclText.Add("--- ${NtfsLetter}:\`r`n$($acl.Output)")
-        $null = $aclText.Add("--- fsutil volumeinfo of the NTFS mount`r`n" + (Invoke-Checked 'fsutil volumeinfo (NTFS)' 'fsutil.exe' @('fsinfo', 'volumeinfo', "${NtfsLetter}:\")).Output)
+        $null = $aclText.Add((Get-VolumeEvidence 'NTFS' $NtfsLabel 'NTFS' @("${NtfsLetter}:\", "${NtfsLetter}:", "$NtfsMount\")))
     }
     if ($infra.fat32_vhd) {
-        $null = $aclText.Add("--- fsutil volumeinfo of the FAT32 mount`r`n" + (Invoke-Checked 'fsutil volumeinfo (FAT32)' 'fsutil.exe' @('fsinfo', 'volumeinfo', "$FatMount\")).Output)
+        $null = $aclText.Add((Get-VolumeEvidence 'FAT32' $FatLabel 'FAT32' @("$FatMount\")))
     }
     Write-Utf8NoBom (Join-Path $evidence 'icacls-and-volume-details.txt') (($aclText -join "`r`n`r`n") + "`r`n")
     Write-Utf8NoBom (Join-Path $evidence 'daemon-version.txt') ((Invoke-Checked 'blackcoind --version' $Daemon @('--version')).Output)

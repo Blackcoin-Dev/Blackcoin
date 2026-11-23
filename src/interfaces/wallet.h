@@ -786,6 +786,8 @@ struct WalletMigrationResult
     std::optional<std::string> watchonly_wallet_name;
     std::optional<std::string> solvables_wallet_name;
     fs::path backup_path;
+    //! Warnings to show with the result (see wallet::MigrationResult::warnings).
+    std::vector<std::string> warnings;
 };
 
 //! Status of the in-process (built-in) Gold Rush Proof-of-Work miner. No external miner exists.

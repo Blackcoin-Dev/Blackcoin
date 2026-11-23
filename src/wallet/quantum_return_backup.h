@@ -109,13 +109,15 @@ QuantumKeyBackupPathCheck CheckQuantumKeyBackupWalletPath(const std::string& wal
 /** The `error` of CheckQuantumKeyBackupWalletPath alone. */
 std::optional<std::string> QuantumKeyBackupWalletPathRejection(const std::string& wallet_name);
 
-/** The names a migration of a legacy wallet publishes: the wallet itself, `<prefix>_watchonly` and `<prefix>_solvables`
- *  (the prefix is the wallet's name, or "default_wallet" for the unnamed wallet). */
-std::vector<std::string> QuantumKeyBackupMigrationNames(const std::string& wallet_name);
+/** The names a migration of a legacy wallet publishes: the wallet itself, and, only when the migration needs them,
+ *  `<prefix>_watchonly` (watch-only scripts to keep) and `<prefix>_solvables` (solvable scripts to keep). The prefix is the
+ *  wallet's name, or "default_wallet" for the unnamed wallet. */
+std::vector<std::string> QuantumKeyBackupMigrationNames(const std::string& wallet_name, bool watchonly_wallet, bool solvables_wallet);
 
-/** Checked before a migration converts anything or creates a database: the first name that migration would publish whose
- *  configured backup directory breaks a rule (an `error` naming it), and the warnings for default-path names. */
-QuantumKeyBackupPathCheck CheckQuantumKeyBackupMigrationPaths(const std::string& wallet_name);
+/** Checked before a migration converts anything or creates a database: the first name of that publication plan whose
+ *  configured backup directory breaks a rule (an `error` naming it), and the first warning for a name on a default path.
+ *  Call it with both flags false for the wallet's own name alone, and again with the plan once it is known. */
+QuantumKeyBackupPathCheck CheckQuantumKeyBackupMigrationPaths(const std::string& wallet_name, bool watchonly_wallet, bool solvables_wallet);
 
 /** The identity of a directory as Windows reports it for an open handle: the volume's serial number and the file
  *  index, which together name one directory whatever the spelling or case of the path that reached it. */

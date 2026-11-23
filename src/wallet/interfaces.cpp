@@ -4293,6 +4293,7 @@ public:
             .solvables_wallet_name = res->solvables_wallet ? std::make_optional(res->solvables_wallet->GetName()) : std::nullopt,
             .backup_path = res->backup_path,
         };
+        for (const bilingual_str& warning : res->warnings) out.warnings.push_back(warning.translated);
         return {std::move(out)}; // std::move to work around clang bug
     }
     std::string getWalletDir() override

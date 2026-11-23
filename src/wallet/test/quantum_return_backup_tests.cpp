@@ -20,6 +20,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #ifndef WIN32
@@ -814,33 +815,31 @@ BOOST_AUTO_TEST_CASE(an_overlong_default_backup_path_warns_and_an_overlong_chose
 {
     ArgsManager& args = *Assert(m_node.args);
     const ScopedWindowsPathRules windows{true};
-    // D:\<n characters>/quantum-key-backups/default is 150 or 151 units
-    for (const bool explicit_empty : {false, true}) {
-        for (const size_t total : {size_t{150}, size_t{151}}) {
-            const ScopedBackupDataDirectory datadir{R"(D:\)" + std::string(total - 28 - 3, 'x')};
-            // The option unset and the option empty read the same (GetArg gives the empty string for both), which is how
-            // the check tells a default path from a chosen one; the empty one is set here explicitly.
-            if (explicit_empty) args.ForceSetArg("-quantumkeybackupdir", "");
-            BOOST_REQUIRE(args.GetArg("-quantumkeybackupdir", "x").empty());
-            BOOST_REQUIRE_EQUAL(DirectoryUnits(""), total);
-            const QuantumKeyBackupPathCheck check = CheckQuantumKeyBackupWalletPath("");
-            BOOST_CHECK_MESSAGE(!check.error, (explicit_empty ? "empty: " : "unset: ") << total << ": " << (check.error ? *check.error : ""));
-            BOOST_CHECK_EQUAL(check.warning.has_value(), total > 150);
-            if (check.warning) {
-                BOOST_CHECK_MESSAGE(check.warning->find("The wallet loads") != std::string::npos &&
-                                    check.warning->find("-quantumkeybackupdir") != std::string::npos, *check.warning);
-            }
-            BOOST_CHECK(!QuantumKeyBackupWalletPathRejection(""));
-            // the automatic backup itself is refused at runtime, before the file system is touched
-            if (total > 150) {
-                ScopedCommitRecorder recorder;
-                std::string error;
-                const fs::path directory = QuantumKeyBackupDirectory("");
-                BOOST_CHECK(!EnsureQuantumKeyBackupDirectory(directory, error));
-                BOOST_CHECK_MESSAGE(error.find("the path is too long") != std::string::npos &&
-                                    error.find("-quantumkeybackupdir") != std::string::npos, error);
-                BOOST_CHECK(recorder.committed.empty());
-            }
+    // D:\<n characters>/quantum-key-backups/default is 150 or 151 units. The option is set to the empty string here, so the
+    // test does not depend on what an earlier test left behind; the production check reads it with an empty fallback, so
+    // an option that was never set gives the same answer.
+    args.ForceSetArg("-quantumkeybackupdir", "");
+    BOOST_REQUIRE(args.GetArg("-quantumkeybackupdir", "x").empty());
+    for (const size_t total : {size_t{150}, size_t{151}}) {
+        const ScopedBackupDataDirectory datadir{R"(D:\)" + std::string(total - 28 - 3, 'x')};
+        BOOST_REQUIRE_EQUAL(DirectoryUnits(""), total);
+        const QuantumKeyBackupPathCheck check = CheckQuantumKeyBackupWalletPath("");
+        BOOST_CHECK_MESSAGE(!check.error, total << ": " << (check.error ? *check.error : ""));
+        BOOST_CHECK_EQUAL(check.warning.has_value(), total > 150);
+        if (check.warning) {
+            BOOST_CHECK_MESSAGE(check.warning->find("The wallet loads") != std::string::npos &&
+                                check.warning->find("-quantumkeybackupdir") != std::string::npos, *check.warning);
+        }
+        BOOST_CHECK(!QuantumKeyBackupWalletPathRejection(""));
+        // the automatic backup itself is refused at runtime, before the file system is touched
+        if (total > 150) {
+            ScopedCommitRecorder recorder;
+            std::string error;
+            const fs::path directory = QuantumKeyBackupDirectory("");
+            BOOST_CHECK(!EnsureQuantumKeyBackupDirectory(directory, error));
+            BOOST_CHECK_MESSAGE(error.find("the path is too long") != std::string::npos &&
+                                error.find("-quantumkeybackupdir") != std::string::npos, error);
+            BOOST_CHECK(recorder.committed.empty());
         }
     }
     // the same length chosen with the option is a refusal
@@ -852,39 +851,46 @@ BOOST_AUTO_TEST_CASE(an_overlong_default_backup_path_warns_and_an_overlong_chose
     args.ForceSetArg("-quantumkeybackupdir", "");
 }
 
-// A migration publishes the wallet, <name>_watchonly and <name>_solvables. Every one of those names is checked before it
-// converts anything.
-BOOST_AUTO_TEST_CASE(a_migration_is_checked_for_every_name_it_would_publish)
+// A migration publishes the wallet, and <name>_watchonly and <name>_solvables only when it needs them. Exactly the names of
+// its plan are checked.
+BOOST_AUTO_TEST_CASE(a_migration_is_checked_for_exactly_the_names_it_publishes)
 {
     ArgsManager& args = *Assert(m_node.args);
     const ScopedWindowsPathRules windows{true};
     const ScopedBackupDataDirectory datadir{"/d"};
-    BOOST_CHECK((QuantumKeyBackupMigrationNames("w") == std::vector<std::string>{"w", "w_watchonly", "w_solvables"}));
-    BOOST_CHECK((QuantumKeyBackupMigrationNames("") == std::vector<std::string>{"", "default_wallet_watchonly", "default_wallet_solvables"}));
+    BOOST_CHECK((QuantumKeyBackupMigrationNames("w", false, false) == std::vector<std::string>{"w"}));
+    BOOST_CHECK((QuantumKeyBackupMigrationNames("w", true, false) == std::vector<std::string>{"w", "w_watchonly"}));
+    BOOST_CHECK((QuantumKeyBackupMigrationNames("w", false, true) == std::vector<std::string>{"w", "w_solvables"}));
+    BOOST_CHECK((QuantumKeyBackupMigrationNames("", true, true) == std::vector<std::string>{"", "default_wallet_watchonly", "default_wallet_solvables"}));
     const size_t fixed_units = 2 + 1 + 1;
     const size_t original = QuantumKeyBackupWalletComponent("w").size();
     const size_t auxiliary = QuantumKeyBackupWalletComponent("w_watchonly").size();
     BOOST_REQUIRE(auxiliary > original);
+    // the original name fits exactly (150) and both auxiliary names (162) do not: a migration that needs neither is accepted
+    args.ForceSetArg("-quantumkeybackupdir", std::string(150 - fixed_units - original, 'r'));
+    BOOST_REQUIRE_EQUAL(DirectoryUnits("w"), size_t{150});
+    QuantumKeyBackupPathCheck check = CheckQuantumKeyBackupMigrationPaths("w", false, false);
+    BOOST_CHECK(!check.error && !check.warning);
+    // and refused, naming the auxiliary wallet, as soon as the plan needs one of them
+    for (const auto& [watchonly, solvables, named] : {std::tuple{true, false, "w_watchonly"}, std::tuple{false, true, "w_solvables"},
+                                                      std::tuple{true, true, "w_watchonly"}}) {
+        check = CheckQuantumKeyBackupMigrationPaths("w", watchonly, solvables);
+        BOOST_REQUIRE_MESSAGE(check.error, named);
+        BOOST_CHECK_MESSAGE(check.error->find(std::string{"wallet \""} + named + "\"") != std::string::npos, *check.error);
+    }
     // the original name is too long: refused, naming it
     args.ForceSetArg("-quantumkeybackupdir", std::string(151 - fixed_units - original, 'r'));
-    QuantumKeyBackupPathCheck check = CheckQuantumKeyBackupMigrationPaths("w");
+    check = CheckQuantumKeyBackupMigrationPaths("w", false, false);
     BOOST_REQUIRE(check.error);
     BOOST_CHECK_MESSAGE(check.error->find("wallet \"w\"") != std::string::npos, *check.error);
-    // only an auxiliary name is too long: the original fits and the migration is still refused
-    args.ForceSetArg("-quantumkeybackupdir", std::string(151 - fixed_units - auxiliary, 'r'));
-    BOOST_REQUIRE_EQUAL(DirectoryUnits("w"), 151 - (auxiliary - original));
-    BOOST_CHECK(!QuantumKeyBackupWalletPathRejection("w"));
-    check = CheckQuantumKeyBackupMigrationPaths("w");
-    BOOST_REQUIRE(check.error);
-    BOOST_CHECK_MESSAGE(check.error->find("wallet \"w_watchonly\"") != std::string::npos, *check.error);
-    // a configured path that fits for every name
+    // a configured path that fits for every name of the plan
     args.ForceSetArg("-quantumkeybackupdir", std::string(150 - fixed_units - auxiliary, 'r'));
-    check = CheckQuantumKeyBackupMigrationPaths("w");
+    check = CheckQuantumKeyBackupMigrationPaths("w", true, true);
     BOOST_CHECK(!check.error && !check.warning);
     // a default path that is too long only warns, and never refuses the migration
     args.ForceSetArg("-quantumkeybackupdir", "");
     SetQuantumKeyBackupDataDirectoryForTest(fs::PathFromString("/" + std::string(140, 'x')));
-    check = CheckQuantumKeyBackupMigrationPaths("w");
+    check = CheckQuantumKeyBackupMigrationPaths("w", true, true);
     BOOST_CHECK(!check.error);
     BOOST_CHECK(check.warning);
 }

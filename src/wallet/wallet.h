@@ -3482,6 +3482,9 @@ struct MigrationResult {
     std::shared_ptr<CWallet> watchonly_wallet;
     std::shared_ptr<CWallet> solvables_wallet;
     fs::path backup_path;
+    //! Warnings for the caller to show: the quantum key backup directory of a published wallet is a default path that is
+    //! too long for backups on Windows (the migration itself is not affected).
+    std::vector<bilingual_str> warnings;
 };
 
 //! Do all steps to migrate a legacy wallet to a descriptor wallet

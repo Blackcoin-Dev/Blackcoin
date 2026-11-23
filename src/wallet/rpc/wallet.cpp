@@ -843,6 +843,10 @@ static RPCHelpMan migratewallet()
                 {RPCResult::Type::STR, "watchonly_name", /*optional=*/true, "The name of the migrated wallet containing the watchonly scripts"},
                 {RPCResult::Type::STR, "solvables_name", /*optional=*/true, "The name of the migrated wallet containing solvable but not watched scripts"},
                 {RPCResult::Type::STR, "backup_path", "The location of the backup of the original wallet"},
+                {RPCResult::Type::ARR, "warnings", /*optional=*/true, "Warnings about the migration, for example that the default quantum key backup directory of a migrated wallet is too long for automatic backups on Windows (the wallets are migrated and usable)",
+                    {
+                        {RPCResult::Type::STR, "", "A warning"},
+                    }},
             }
         },
         RPCExamples{
@@ -884,6 +888,11 @@ static RPCHelpMan migratewallet()
                 r.pushKV("solvables_name", res->solvables_wallet->GetName());
             }
             r.pushKV("backup_path", res->backup_path.u8string());
+            if (!res->warnings.empty()) {
+                UniValue warnings{UniValue::VARR};
+                for (const bilingual_str& warning : res->warnings) warnings.push_back(warning.original);
+                r.pushKV("warnings", std::move(warnings));
+            }
 
             return r;
         },

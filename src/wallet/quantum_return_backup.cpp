@@ -474,19 +474,22 @@ std::optional<std::string> QuantumKeyBackupWalletPathRejection(const std::string
     return CheckQuantumKeyBackupWalletPath(wallet_name).error;
 }
 
-std::vector<std::string> QuantumKeyBackupMigrationNames(const std::string& wallet_name)
+std::vector<std::string> QuantumKeyBackupMigrationNames(const std::string& wallet_name, bool watchonly_wallet, bool solvables_wallet)
 {
     const std::string prefix = wallet_name.empty() ? "default_wallet" : wallet_name;
-    return {wallet_name, prefix + "_watchonly", prefix + "_solvables"};
+    std::vector<std::string> names{wallet_name};
+    if (watchonly_wallet) names.push_back(prefix + "_watchonly");
+    if (solvables_wallet) names.push_back(prefix + "_solvables");
+    return names;
 }
 
-QuantumKeyBackupPathCheck CheckQuantumKeyBackupMigrationPaths(const std::string& wallet_name)
+QuantumKeyBackupPathCheck CheckQuantumKeyBackupMigrationPaths(const std::string& wallet_name, bool watchonly_wallet, bool solvables_wallet)
 {
     QuantumKeyBackupPathCheck result;
-    for (const std::string& name : QuantumKeyBackupMigrationNames(wallet_name)) {
+    for (const std::string& name : QuantumKeyBackupMigrationNames(wallet_name, watchonly_wallet, solvables_wallet)) {
         const QuantumKeyBackupPathCheck one = CheckQuantumKeyBackupWalletPath(name);
         if (one.error) {
-            result.error = strprintf("the migration would publish the wallet \"%s\", whose %s", name, *one.error);
+            result.error = strprintf("the migration publishes the wallet \"%s\", whose %s", name, *one.error);
             return result;
         }
         if (one.warning && !result.warning) result.warning = one.warning;

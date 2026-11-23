@@ -36,7 +36,7 @@ class PendingReturnKeyDestinationsTest(TransitionTFinalTestBase, BitcoinTestFram
         backups = os.path.join(node.chain_path, "qkbackups")
         os.makedirs(backups, mode=0o700, exist_ok=True)
 
-        node.createwallet("pd", load_on_startup=True)
+        node.createwallet("pd", load_on_startup=True, descriptors=self.options.descriptors)
         wallet = node.get_wallet_rpc("pd")
         wallet.staking(False)
         for _ in range(3):

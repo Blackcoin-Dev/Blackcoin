@@ -20,11 +20,14 @@ from test_framework.util import (
     get_rpc_proxy,
 )
 from transition_t_final_util import (
+    COMMIT_PAUSE_MAX_MS,
     F,
     G,
     LIFECYCLE_ARGS,
     MATURITY,
     TransitionTFinalTestBase,
+    commit_pause,
+    scaled_wait,
 )
 
 BEFORE_GUARD = F - MATURITY - 2  # 80
@@ -35,15 +38,22 @@ class FinalStakeReserveWithdrawalTest(TransitionTFinalTestBase, BitcoinTestFrame
     def set_test_params(self):
         self.num_nodes = 1
         self.setup_clean_chain = True
-        self.extra_args = [LIFECYCLE_ARGS + ["-donatetodevfund=0", f"-qqstaketierheight={G + 1}", "-finalstakereservecommitdelaymillis=2000"]]
+        # The pause scales with the timeout factor up to the node's own cap (see commit_pause).
+        self.commit_delay_ms, self.delay_capped = commit_pause(self.options.timeout_factor)
+        self.extra_args = [LIFECYCLE_ARGS + ["-donatetodevfund=0", f"-qqstaketierheight={G + 1}",
+                                             f"-finalstakereservecommitdelaymillis={self.commit_delay_ms}"]]
 
     def run_test(self):
         node = self.nodes[0]
+        if self.delay_capped:
+            self.log.warning("The commit pause is capped at %d ms by the node; the timeout factor %s is not fully applied to it",
+                             COMMIT_PAUSE_MAX_MS, self.options.timeout_factor)
+        self.log.info("Commit pause: %d ms (timeout factor %s)", self.commit_delay_ms, self.options.timeout_factor)
         default = node.get_wallet_rpc(self.default_wallet_name)
         default.staking(False)
         self.set_initial_mt()
         pow_addr = default.getnewaddress("", "legacy")
-        node.createwallet("wb")
+        node.createwallet("wb", descriptors=self.options.descriptors)
         wallet = node.get_wallet_rpc("wb")
         wallet.staking(False)
 
@@ -69,18 +79,22 @@ class FinalStakeReserveWithdrawalTest(TransitionTFinalTestBase, BitcoinTestFrame
         outcome = {}
 
         def run():
-            rpc = get_rpc_proxy(url, 91, timeout=300 * int(self.options.timeout_factor), coveragedir=node.coverage_dir)
+            rpc = get_rpc_proxy(url, 91, timeout=scaled_wait(300, self.options.timeout_factor), coveragedir=node.coverage_dir)
             try:
                 outcome["value"] = rpc.withdrawquantumstakeaddress(big_address, outpoint, {"allow_new_quantum_key": True})
             except Exception as e:  # noqa: BLE001
                 outcome["error"] = str(e)
 
         thread = Thread(target=run, name="withdrawal-in-flight", daemon=True)
-        with node.wait_for_debug_log([b"Wallet commit test pause reached"], timeout=30):
-            thread.start()
+        try:
+            with node.wait_for_debug_log([b"Wallet commit test pause reached"], timeout=30):  # the node scales it itself
+                thread.start()
+        except AssertionError:
+            thread.join(timeout=scaled_wait(5, self.options.timeout_factor))
+            raise AssertionError("the withdrawal never paused: %s" % outcome)
         self.pow_blocks(node, 2, pow_addr)
         assert_equal(node.getblockcount(), BEFORE_GUARD + 2)
-        thread.join(timeout=60 * self.options.timeout_factor)
+        thread.join(timeout=scaled_wait(60, self.options.timeout_factor))
         assert not thread.is_alive(), "the withdrawal did not finish"
         assert "error" not in outcome, outcome
         result = outcome["value"]

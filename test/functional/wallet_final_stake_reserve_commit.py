@@ -17,7 +17,6 @@ before:
 The chain is taken back to height 80 between the cases (invalidateblock), so each starts the same way.
 """
 from decimal import Decimal
-from math import ceil
 from threading import Thread
 from urllib.parse import quote
 
@@ -29,19 +28,18 @@ from test_framework.util import (
 from transition_t_final_util import (
     F,
     G,
+    COMMIT_PAUSE_MAX_MS,
     LIFECYCLE_ARGS,
     MATURITY,
     TransitionTFinalTestBase,
+    commit_pause,
+    scaled_wait,
     single_output_reserve_bit,
 )
 
 BEFORE_GUARD = F - MATURITY - 2  # 80: the candidate 81 is outside the guard
 K_OUTPUTS = 2
-K_CANDIDATES = 12
 REFUSED = "held back as the final stake reserve"
-# The pause the node takes at the start of a commit is clamped to 10000 ms by the node.
-MAX_COMMIT_DELAY_MS = 10000
-BASE_COMMIT_DELAY_MS = 2000
 
 
 class FinalStakeReserveCommitTest(TransitionTFinalTestBase, BitcoinTestFramework):
@@ -50,9 +48,7 @@ class FinalStakeReserveCommitTest(TransitionTFinalTestBase, BitcoinTestFramework
         self.setup_clean_chain = True
         # A slow machine (a larger timeout factor) needs a longer pause for the chain to move while the commit waits, up
         # to the node's own cap of 10000 ms.
-        wanted = ceil(BASE_COMMIT_DELAY_MS * self.options.timeout_factor)
-        self.commit_delay_ms = min(MAX_COMMIT_DELAY_MS, max(BASE_COMMIT_DELAY_MS, wanted))
-        self.delay_capped = wanted > MAX_COMMIT_DELAY_MS
+        self.commit_delay_ms, self.delay_capped = commit_pause(self.options.timeout_factor)
         self.extra_args = [LIFECYCLE_ARGS + [f"-finalstakereservecommitdelaymillis={self.commit_delay_ms}"]]
 
     def skip_test_if_missing_module(self):
@@ -63,50 +59,39 @@ class FinalStakeReserveCommitTest(TransitionTFinalTestBase, BitcoinTestFramework
 
     def scaled(self, seconds):
         """A wait budget in seconds, scaled by the timeout factor where the framework does not do it itself."""
-        return ceil(seconds * self.options.timeout_factor)
+        return scaled_wait(seconds, self.options.timeout_factor)
 
     def run_test(self):
         node = self.nodes[0]
         if self.delay_capped:
             self.log.warning("The commit pause is capped at %d ms by the node; the timeout factor %s is not fully applied to it",
-                             MAX_COMMIT_DELAY_MS, self.options.timeout_factor)
+                             COMMIT_PAUSE_MAX_MS, self.options.timeout_factor)
         self.log.info("Commit pause: %d ms (timeout factor %s)", self.commit_delay_ms, self.options.timeout_factor)
         default = node.get_wallet_rpc(self.default_wallet_name)
         default.staking(False)
         self.set_initial_mt()
         pow_addr = default.getnewaddress("", "legacy")
 
-        self.log.info("Candidate wallets with two quantum outputs each, migrated from their own coinbases")
+        self.log.info("A wallet with two quantum outputs: the larger, which is the reserve, is constructed to be held")
         # A user lock takes an output out of the count, so in the case with lock_unspents below the reserved output is
-        # alone, and a lone output is held back only when the singleton rule says so: the test keeps a candidate whose
-        # reserved output the rule holds.
-        names = [f"wc{i}" for i in range(K_CANDIDATES)]
-        wallets = []
-        for name in names:
-            node.createwallet(name)
-            wallets.append(node.get_wallet_rpc(name))
-            wallets[-1].staking(False)
-        for _ in range(K_OUTPUTS):
-            for candidate in wallets:
-                self.generatetoaddress(node, 1, candidate.getnewaddress("", "legacy"), sync_fun=self.no_op)
-                self.bump()
+        # alone, and a lone output is held back only when the singleton rule says so: the larger source (the reserve) is
+        # funded by a transaction whose nonce is ground until its outpoint is held.
+        wallet_name = "wc"
+        node.createwallet(wallet_name, descriptors=self.options.descriptors)
+        wallet = node.get_wallet_rpc(wallet_name)
+        wallet.staking(False)
         self.pow_blocks(node, G - node.getblockcount(), pow_addr)
-        for candidate in wallets:
-            for _ in range(K_OUTPUTS):
-                candidate.migratetoquantum({"existing_address": candidate.getnewquantumaddress()["address"], "max_inputs": 1})
-            self.pow_blocks(node, 1, pow_addr)
+        sources = self.funding_inputs(default, minimum=Decimal(10000))
+        assert len(sources) >= K_OUTPUTS
+        self.fund_quantum_output(node, default, sources[0], wallet.getnewquantumaddress()["address"], Decimal(6000), held=True)
+        self.fund_quantum_output(node, default, sources[1], wallet.getnewquantumaddress()["address"], Decimal(3000))
+        self.pow_blocks(node, 1, pow_addr)
         self.pow_blocks(node, BEFORE_GUARD - node.getblockcount(), pow_addr)
         assert_equal(node.getblockcount(), BEFORE_GUARD)
         self.sync_mt_tip()
-        chosen = None
-        for name, candidate in zip(names, wallets):
-            planned = candidate.getquantumstakereadiness()["final_stake_reserve"]
-            assert_equal(planned["n"], K_OUTPUTS)
-            if single_output_reserve_bit(*self.key(planned["reserved_outpoints"][0])):
-                chosen = (name, candidate)
-                break
-        assert chosen is not None, "none of the %d candidates has a reserved output the singleton rule holds" % K_CANDIDATES
-        wallet_name, wallet = chosen
+        planned = wallet.getquantumstakereadiness()["final_stake_reserve"]
+        assert_equal(planned["n"], K_OUTPUTS)
+        assert single_output_reserve_bit(*self.key(planned["reserved_outpoints"][0])), "the larger source is not the held one"
         self.log.info("Using %s", wallet_name)
 
         info = wallet.getquantumstakereadiness()["final_stake_reserve"]

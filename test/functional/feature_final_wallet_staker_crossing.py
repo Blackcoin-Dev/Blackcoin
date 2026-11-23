@@ -28,6 +28,8 @@ Two populations (the same checks):
    from a fresh released output, because the return of an output staked at h is not mature before h + maturity, and
    held outputs have to be there at F. No proof of work follows the setup, and no wallet holds a legacy coin.
 """
+from decimal import Decimal
+
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import assert_equal
 from transition_t_final_util import (
@@ -49,8 +51,9 @@ WALLET = "producer"
 # The singleton population: wallets per node, and what the fixture must hold. Every candidate block before F (the heights
 # SETUP_END + 1 .. M, one per height) needs its own released output, and each side of the split needs a held one at F.
 SINGLETON_WALLETS_PER_NODE = 13
+RELEASED_PER_NODE = 7
+HELD_PER_NODE = 6
 PRE_F_BLOCKS = M - SETUP_END  # 11
-MIN_RELEASED = PRE_F_BLOCKS + 2
 MIN_HELD_PER_SIDE = 2
 
 
@@ -159,7 +162,7 @@ class FinalWalletStakerCrossingTest(TransitionTFinalTestBase, BitcoinTestFramewo
                       PRODUCERS, OUTPUTS_PER_PRODUCER)
         self.producers = [(i, WALLET) for i in range(PRODUCERS)]
         for producer in self.producers:
-            self.nodes[producer[0]].createwallet(WALLET)
+            self.nodes[producer[0]].createwallet(WALLET, descriptors=self.options.descriptors)
             self.wallet_of(producer).staking(False)
         for _ in range(OUTPUTS_PER_PRODUCER):
             for producer in self.producers:
@@ -184,44 +187,36 @@ class FinalWalletStakerCrossingTest(TransitionTFinalTestBase, BitcoinTestFramewo
 
     def build_singleton_producers(self, pow_addr, pow_addr_of):
         count = PRODUCERS * SINGLETON_WALLETS_PER_NODE
-        self.log.info("Setup (proof of work is allowed here): %d wallets with one migrated quantum output each", count)
+        self.log.info("Setup (proof of work is allowed here): %d wallets with one funded quantum output each, %d released and %d held on every node",
+                      count, RELEASED_PER_NODE, HELD_PER_NODE)
         self.producers = [(n, f"s{n}_{j}") for j in range(SINGLETON_WALLETS_PER_NODE) for n in range(PRODUCERS)]
+        # Wallet j of every node is released for j < RELEASED_PER_NODE and held otherwise: the fixture is constructed,
+        # not drawn (see fund_quantum_output), so every node has seven released and six held outputs.
+        self.held = {p: int(p[1].rsplit("_", 1)[1]) >= RELEASED_PER_NODE for p in self.producers}
         for producer in self.producers:
-            self.nodes[producer[0]].createwallet(producer[1])
+            self.nodes[producer[0]].createwallet(producer[1], descriptors=self.options.descriptors)
             self.wallet_of(producer).staking(False)
-        for producer in self.producers:  # one legacy coinbase for each wallet, all before the Gold Rush ends
-            self.generatetoaddress(self.nodes[0], 1, self.wallet_of(producer).getnewaddress("", "legacy"), sync_fun=self.sync_blocks)
-            self.bump()
-        self.pow_blocks(self.nodes[0], G - self.nodes[0].getblockcount(), pow_addr)
-        self.sync_blocks()
-        # Each node's wallets migrate their one coin each (the transactions wait in the mempool), and the node mines the
-        # block that holds them.
+        # All setup blocks are made by node 0 (the other nodes' own wallets hold nothing of proof of work).
+        self.pow_blocks(self.nodes[0], G + 3 - self.nodes[0].getblockcount(), pow_addr, sync=True)
+        default = self.nodes[0].get_wallet_rpc(self.default_wallet_name)
+        sources = self.funding_inputs(default, minimum=Decimal(10000))
+        assert len(sources) >= count, "%d mature coins to fund %d wallets from" % (len(sources), count)
         self.initial = {}
-        for node_index in range(PRODUCERS):
-            for producer in [p for p in self.producers if p[0] == node_index]:
-                wallet = self.wallet_of(producer)
-                address = wallet.getnewquantumaddress()["address"]
-                wallet.migratetoquantum({"existing_address": address, "max_inputs": 1})
-                outputs = [u for u in wallet.listunspent(0, 9999999, [address]) if u["amount"] > 0]
-                assert_equal(len(outputs), 1)
-                self.initial[producer] = key(outputs[0])
-            self.generatetoaddress(self.nodes[node_index], 1, pow_addr_of[node_index], sync_fun=self.sync_blocks)
-            self.bump()
-        self.pow_blocks(self.nodes[0], SETUP_END - self.nodes[0].getblockcount(), pow_addr)
-        self.sync_blocks()
+        for producer in self.producers:
+            address = self.wallet_of(producer).getnewquantumaddress()["address"]
+            self.initial[producer] = key(self.fund_quantum_output(
+                self.nodes[0], default, sources.pop(0), address, Decimal(1000), held=self.held[producer]))
+        self.pow_blocks(self.nodes[0], 1, pow_addr, sync=True)
+        self.pow_blocks(self.nodes[0], SETUP_END - self.nodes[0].getblockcount(), pow_addr, sync=True)
         assert_equal(self.nodes[0].getblockcount(), SETUP_END)
 
-        # The fixture's parity and maturity counts, asserted: the rule is by outpoint, so the split is random, and an
-        # accidental shortage must be a failure here, not a timeout later.
-        self.held = {p: single_output_reserve_bit(*self.initial[p]) for p in self.producers}
-        released = [p for p in self.producers if not self.held[p]]
-        held = [p for p in self.producers if self.held[p]]
-        self.log.info("Singleton population: %d released, %d held", len(released), len(held))
-        assert len(released) >= MIN_RELEASED, "%d released outputs, %d are needed for the %d blocks before F" % (len(released), MIN_RELEASED, PRE_F_BLOCKS)
-        for side in ([0, 1], [2, 3]):
-            side_held = [p for p in held if p[0] in side]
-            assert len(side_held) >= MIN_HELD_PER_SIDE, "only %d held outputs on the nodes %s" % (len(side_held), side)
+        # The fixture's counts, asserted on the actual outpoints: parity, maturity, one output per wallet, no legacy coin.
+        for node_index in range(PRODUCERS):
+            on_node = [p for p in self.producers if p[0] == node_index]
+            assert_equal(len([p for p in on_node if not single_output_reserve_bit(*self.initial[p])]), RELEASED_PER_NODE)
+            assert_equal(len([p for p in on_node if single_output_reserve_bit(*self.initial[p])]), HELD_PER_NODE)
         for producer in self.producers:
+            assert_equal(single_output_reserve_bit(*self.initial[producer]), self.held[producer])
             wallet = self.wallet_of(producer)
             outputs = [u for u in wallet.listunspent(1, 9999999) if u["amount"] > 0]
             assert_equal(len(outputs), 1)  # the wallet's one output, and nothing else: no legacy coin to stake
@@ -231,7 +226,7 @@ class FinalWalletStakerCrossingTest(TransitionTFinalTestBase, BitcoinTestFramewo
             assert_equal(info["n"], 1)
             assert_equal(info["single_output_rule"], "held" if self.held[producer] else "released")
             assert_equal(info["target"], 1 if self.held[producer] else 0)
-        # Every node's own default wallet holds only proof-of-work coinbases and does not stake.
+        # Every node's own default wallet holds only proof-of-work coinbases and change, and does not stake.
         for node in self.nodes:
             assert_equal(node.get_wallet_rpc(self.default_wallet_name).getstakinginfo()["staking"], False)
 
@@ -260,8 +255,12 @@ class FinalWalletStakerCrossingTest(TransitionTFinalTestBase, BitcoinTestFramewo
                     info, reserved = self.reserve_keys(producer)
                     assert_equal(info["active"], True)
                     assert_equal(info["final_height"], F)
-                    assert_equal(len(reserved), info["target"] - info["shortfall"])
-                    if not singleton:
+                    if singleton:
+                        # A wallet that staked earlier has outputs that are not all mature at F: a shortage is accounted.
+                        assert_equal(len(reserved), info["target"] - info["shortfall"])
+                    else:
+                        assert_equal(info["shortfall"], 0)
+                        assert_equal(len(reserved), info["target"])
                         assert info["target"] >= 1
             if height == M and singleton:
                 # What the wallets hold back at the last Migration block is what may make F.

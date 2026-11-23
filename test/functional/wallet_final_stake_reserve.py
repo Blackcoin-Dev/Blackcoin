@@ -46,7 +46,8 @@ from transition_t_final_util import (
 GUARD_START = F - MATURITY  # 82, the first candidate height with the reserve on
 K_MAIN = 6
 K_SINGLE = 1
-K_CANDIDATES = 20  # singleton candidates: three released and two held ones are needed, and the parity is by outpoint
+K_HELD = 2
+K_RELEASED = 3
 K_LOCKED = 4
 K_SPEND = 2
 K_NEGATIVE = 6
@@ -79,7 +80,7 @@ class FinalStakeReserveTest(TransitionTFinalTestBase, BitcoinTestFramework):
     def build_wallet(self, node, pow_addr, name, count):
         """A wallet with `count` quantum outputs, each migrated from its own legacy coinbase (a quantum coinbase has no
         lineage and is not stakable). Returns (wallet, [quantum addresses])."""
-        node.createwallet(name)
+        node.createwallet(name, descriptors=self.options.descriptors)
         wallet = node.get_wallet_rpc(name)
         wallet.staking(False)
         for _ in range(count):
@@ -155,19 +156,39 @@ class FinalStakeReserveTest(TransitionTFinalTestBase, BitcoinTestFramework):
         quantum_miner0 = default0.getnewquantumaddress()["address"]
         quantum_miner1 = default1.getnewquantumaddress()["address"]
 
-        self.log.info("Node 0: wallets with %d, %d and %d quantum outputs, and %d candidates for one output each", K_MAIN, K_LOCKED, K_SPEND, K_CANDIDATES)
+        self.log.info("Node 0: wallets with %d and %d migrated quantum outputs; a wallet with two funded outputs; %d held and %d released singleton wallets", K_MAIN, K_LOCKED, K_HELD, K_RELEASED)
         wq = self.build_wallet(n0, pow0, "wq", K_MAIN)
         wl = self.build_wallet(n0, pow0, "wl", K_LOCKED)
-        ws = self.build_wallet(n0, pow0, "ws", K_SPEND)
-        candidate_names = [f"c{i}" for i in range(K_CANDIDATES)]
-        candidates = [self.build_wallet(n0, pow0, name, K_SINGLE) for name in candidate_names]
         self.pow_blocks(n0, G - n0.getblockcount(), pow0)
-        # The singleton candidates are migrated first: a released one stakes at F - maturity and needs its output to be
-        # mature by then.
-        singles = self.choose_singletons(n0, pow0, candidates, candidate_names)
+        # Funded outputs are made by transactions built here, one coin each, so that the parity of every outpoint the
+        # singleton rule looks at is the wanted one (see fund_quantum_output). They are confirmed at once: a released
+        # singleton stakes at F - maturity and needs its output to be mature by then.
+        wants = [("s_held0", True), ("s_held1", True), ("s_rel0", False), ("s_rel1", False), ("s_rel2", False)]
+        sources = self.funding_inputs(default0, minimum=Decimal(10000))
+        assert len(sources) >= len(wants) + K_SPEND, "%d mature coins to fund from" % len(sources)
+        singles = {"held": [], "released": []}
+        for name, held in wants:
+            n0.createwallet(name, descriptors=self.options.descriptors)
+            wallet = n0.get_wallet_rpc(name)
+            wallet.staking(False)
+            address = wallet.getnewquantumaddress()["address"]
+            outpoint = self.fund_quantum_output(n0, default0, sources.pop(0), address, Decimal(3000), held=held)
+            singles["held" if held else "released"].append({"name": name, "wallet": wallet, "address": address, "outpoint": outpoint})
+        # The two-output wallet of the spending case: its larger output is the reserve and is constructed to be held, so
+        # that it is a held singleton once the other one is spent.
+        n0.createwallet("ws", descriptors=self.options.descriptors)
+        ws = n0.get_wallet_rpc("ws")
+        ws.staking(False)
+        q_spend = [ws.getnewquantumaddress()["address"] for _ in range(K_SPEND)]
+        self.fund_quantum_output(n0, default0, sources.pop(0), q_spend[0], Decimal(6000), held=True)
+        self.fund_quantum_output(n0, default0, sources.pop(0), q_spend[1], Decimal(3000))
+        self.pow_blocks(n0, 1, pow0)
+        for single in singles["held"]:
+            self.check_singleton(single, held=True)
+        for single in singles["released"]:
+            self.check_singleton(single, held=False)
         q_main = self.migrate_all(n0, pow0, wq, K_MAIN)
         q_locked = self.migrate_all(n0, pow0, wl, K_LOCKED)
-        q_spend = self.migrate_all(n0, pow0, ws, K_SPEND)
 
         self.log.info("Node 1 (-finalstakereserve=0): one wallet with %d quantum outputs", K_NEGATIVE)
         wn = self.build_wallet(n1, pow1, "wn", K_NEGATIVE)
@@ -192,23 +213,19 @@ class FinalStakeReserveTest(TransitionTFinalTestBase, BitcoinTestFramework):
         main = self.test_main_window(n0, wq, q_main, singles, pow0)
         self.test_final_block_and_reorgs(n0, quantum_miner0, main)
 
-    def choose_singletons(self, node, pow_addr, wallets, names):
-        """Migrate the one coin of each candidate wallet, and keep two wallets whose output the singleton rule holds back
-        and three whose output it releases. The rule is by outpoint, so the parity is computed here and checked
-        against what the node reports."""
-        found = self.migrate_singleton_candidates(node, pow_addr, wallets)
-        held, released = [], []
-        for name, (wallet, address, outpoint) in zip(names, found):
-            is_held = single_output_reserve_bit(outpoint["txid"], outpoint["vout"])
-            single = {"name": name, "wallet": wallet, "address": address, "outpoint": outpoint}
-            (held if is_held else released).append(single)
-            info = self.reserve(wallet)
-            assert_equal(info["n"], 1)
-            assert_equal(info["single_output_rule"], "held" if is_held else "released")
-            assert_equal(info["target"], 1 if is_held else 0)
-        self.log.info("Singleton candidates: %d held, %d released", len(held), len(released))
-        assert len(held) >= 2 and len(released) >= 3, "the candidates have too few outputs of one parity: %d held, %d released" % (len(held), len(released))
-        return {"held": held[:2], "released": released[:3]}
+    def check_singleton(self, single, held):
+        """The fixture's actual outpoint has the constructed parity: the node's own report agrees with the Python rule, and
+        the wallet holds that one output, mature."""
+        wallet, outpoint = single["wallet"], single["outpoint"]
+        is_held = single_output_reserve_bit(outpoint["txid"], outpoint["vout"])
+        assert_equal(is_held, held)
+        outputs = self.quantum_outputs(wallet, [single["address"]])
+        assert_equal([key(o) for o in outputs], [key(outpoint)])
+        assert outputs[0]["confirmations"] >= 1
+        info = self.reserve(wallet)
+        assert_equal(info["n"], 1)
+        assert_equal(info["single_output_rule"], "held" if is_held else "released")
+        assert_equal(info["target"], 1 if is_held else 0)
 
     def test_released_singletons(self, node, first, second):
         """A released singleton stakes like any unreserved output: at F - maturity its return is mature at F and joins N,
@@ -256,11 +273,13 @@ class FinalStakeReserveTest(TransitionTFinalTestBase, BitcoinTestFramework):
         destination = wallet.getnewquantumaddress()["address"]
         assert_raises_rpc_error(-6, "Insufficient funds", wallet.sendtoaddress, destination, value / 2)
         assert_raises_rpc_error(None, None, wallet.sendall, recipients=[destination], options={"add_to_wallet": False})
+        before = self.reserve(wallet)
         explicit = wallet.send(outputs=[{destination: value / 2}],
                                options={"inputs": [outpoint], "add_inputs": False, "change_address": destination})
         assert explicit["complete"]
+        after = self.reserve(wallet)
+        self.assert_reserve_report(explicit["final_stake_reserve_spent"], key(outpoint), before, after)
         report = explicit["final_stake_reserve_spent"]
-        assert_equal([(o["txid"], o["vout"]) for o in report["outpoints"]], [key(outpoint)])
         assert_equal((report["reserved_before"], report["reserved_after"], report["eligible_before"], report["eligible_after"]), (1, 0, 1, 0))
         assert_equal(self.reserve(wallet)["n"], 0)
 
@@ -348,6 +367,20 @@ class FinalStakeReserveTest(TransitionTFinalTestBase, BitcoinTestFramework):
         wallet.lockunspent(True, [locked])
         assert_equal(self.reserve(wallet)["n"], K_LOCKED)
 
+    def assert_reserve_report(self, report, spent_key, before, after):
+        """What a deliberate spend of the reserve reports, against the readiness before and after it."""
+        assert_equal([(o["txid"], o["vout"]) for o in report["outpoints"]], [spent_key])
+        assert_equal(report["outpoints"][0]["effective_value"], report["effective_value"])
+        assert report["effective_value"] > 0
+        assert_equal(report["reserved_before"], before["reserved_count"])
+        assert_equal(report["reserved_after"], after["reserved_count"])
+        assert_equal(report["eligible_before"], before["eligible_count"])
+        assert_equal(report["eligible_after"], after["eligible_count"])
+        assert_equal(report["eligible_weight_before"], before["eligible_weight"])
+        assert_equal(report["eligible_weight_after"], after["eligible_weight"])
+        assert report["eligible_after"] < report["eligible_before"]
+        assert report["eligible_weight_after"] < report["eligible_weight_before"]
+
     def test_spending(self, node, wallet, addresses):
         self.log.info("Automatic coin selection skips the reserve; explicit coin control may spend it")
         outputs = {key(o): o for o in self.quantum_outputs(wallet, addresses)}
@@ -393,28 +426,13 @@ class FinalStakeReserveTest(TransitionTFinalTestBase, BitcoinTestFramework):
         spent = {(i["txid"], i["vout"]) for i in node.decoderawtransaction(wallet.gettransaction(explicit["txid"])["hex"])["vin"]}
         assert_equal(spent, {reserved_key})
         after = self.reserve(wallet)
-        # With the other output spent, this one is the wallet's only source: the singleton rule says whether it is still
-        # in the reserve, so whether this spend takes from the reserve depends on its outpoint (the held case is also
-        # tested with a wallet of its own, test_held_singleton_spending).
+        # With the other output spent, this one is the wallet's only source: the fixture constructed its outpoint as held, so
+        # it is still the reserve and the spend takes from it.
         assert_equal(before_explicit["n"], 1)
-        still_reserved = single_output_reserve_bit(*reserved_key)
-        assert_equal(before_explicit["single_output_rule"], "held" if still_reserved else "released")
-        assert_equal(before_explicit["reserved_count"], 1 if still_reserved else 0)
-        if still_reserved:
-            report = explicit["final_stake_reserve_spent"]
-            assert_equal([(o["txid"], o["vout"]) for o in report["outpoints"]], [reserved_key])
-            assert_equal(report["outpoints"][0]["effective_value"], report["effective_value"])
-            assert report["effective_value"] > 0
-            assert_equal(report["reserved_before"], before_explicit["reserved_count"])
-            assert_equal(report["reserved_after"], after["reserved_count"])
-            assert_equal(report["eligible_before"], before_explicit["eligible_count"])
-            assert_equal(report["eligible_after"], after["eligible_count"])
-            assert_equal(report["eligible_weight_before"], before_explicit["eligible_weight"])
-            assert_equal(report["eligible_weight_after"], after["eligible_weight"])
-            assert report["eligible_after"] < report["eligible_before"]
-            assert report["eligible_weight_after"] < report["eligible_weight_before"]
-        else:
-            assert "final_stake_reserve_spent" not in explicit  # a released output is spent like any other
+        assert single_output_reserve_bit(*reserved_key), "the fixture's reserved output is not held"
+        assert_equal(before_explicit["single_output_rule"], "held")
+        assert_equal(before_explicit["reserved_count"], 1)
+        self.assert_reserve_report(explicit["final_stake_reserve_spent"], reserved_key, before_explicit, after)
         # A payment that spends no reserved output reports nothing of the kind.
         assert "final_stake_reserve_spent" not in sent
         # Both outputs are now spent by unconfirmed transactions: nothing qualifying is left until they confirm.
@@ -529,7 +547,7 @@ class FinalStakeReserveTest(TransitionTFinalTestBase, BitcoinTestFramework):
         self.pow_blocks(node, M - node.getblockcount(), pow_addr)
         assert_equal(node.getblockcount(), M)
         return {"wallet": wallet, "single": single, "reserved": reserved_list, "stake_hashes": stake_hashes,
-                "base": base, "singleton_names": singleton_names, "singleton_before": singleton_before}
+                "base": base, "singleton_names": singleton_names, "released_name": singles["released"][2]["name"], "singleton_before": singleton_before}
 
     def test_final_block_and_reorgs(self, node, quantum_miner, main):
         # The node was restarted: the wallet handles of the restarted node.
@@ -590,6 +608,14 @@ class FinalStakeReserveTest(TransitionTFinalTestBase, BitcoinTestFramework):
             again = self.reserve(node.get_wallet_rpc(name))
             for field in ("single_output_rule", "n", "target", "reserved_count", "reserved_outpoints"):
                 assert_equal(again[field], main["singleton_before"][name][field])
+        # A released singleton is spent like any other output: explicit coin control reports nothing of the reserve.
+        released = node.get_wallet_rpc(main["released_name"])
+        released_out = [u for u in released.listunspent(1, 9999999) if u["amount"] > 0][0]
+        spend = released.send(outputs=[{released.getnewquantumaddress()["address"]: Decimal(released_out["amount"]) / 2}],
+                              options={"inputs": [{"txid": released_out["txid"], "vout": released_out["vout"]}], "add_inputs": False,
+                                       "change_address": released.getnewquantumaddress()["address"]})
+        assert spend["complete"]
+        assert "final_stake_reserve_spent" not in spend
         node.reconsiderblock(coinstake_last)
         assert_equal(node.getblockcount(), F + 1)
         node.syncwithvalidationinterfacequeue()

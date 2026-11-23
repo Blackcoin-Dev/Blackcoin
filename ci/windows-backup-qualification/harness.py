@@ -51,6 +51,13 @@ PASSPHRASE = "correct horse battery"
 WINDOWS_CRASH_EXIT = 7
 # The daemon's own startup failure (InitError returns false, bitcoind exits with EXIT_FAILURE).
 STARTUP_REFUSAL_EXIT = 1
+# The longest per-wallet backup directory, in UTF-16 code units (src/wallet/quantum_return_backup.h). Windows allows 259 for a
+# path; a backup in progress adds, below the directory: the staging folder (1 + 31 + 16 = 48), the verification folder inside it
+# (1 + 33 + 16 = 50) and the longest file a verification opens, the Berkeley DB log `database\log.0000000001` (1 + 23 = 24;
+# the SQLite journal `wallet.dat-journal` beside the copy is 19). 48 + 50 + 24 = 122 and 259 - 122 = 137.
+BACKUP_WORK_PATH_UNITS = (1 + len(".blackcoin-wallet-backup-stage-") + 16) + (1 + len(".blackcoin-quantum-backup-verify-") + 16) + (
+    1 + len("database\\log.0000000001"))
+MAX_BACKUP_DIRECTORY_UNITS = 259 - BACKUP_WORK_PATH_UNITS
 CRASH_POINTS = ("after_key_insertion", "after_backup_install", "before_activation", "after_activation")
 LOG_INTEREST = re.compile(r"quantum|backup|durab|flush|Unable to|not active|FlushFileBuffers", re.IGNORECASE)
 
@@ -63,7 +70,7 @@ LOG_INTEREST = re.compile(r"quantum|backup|durab|flush|Unable to|not active|Flus
 #                                             (a path that starts with two separators, refused before any file system call)
 #  - QuantumKeyBackupSpellingRejection:      "a path that is relative to a drive or to the root of a drive (such as D:dir or \dir) is not
 #                                             supported; ..." (also refused at startup with the option's name and value)
-#  - QuantumKeyBackupLengthRejection:         "the path is too long: it has <n> characters and at most 150 are allowed ..." (a wallet whose
+#  - QuantumKeyBackupLengthRejection:         "the path is too long: it has <n> characters and at most 137 are allowed ..." (a wallet whose
 #                                             backup directory is longer is refused when it is created or loaded)
 #  - QuantumBackupVolumeRejection, l.265-268: "... network share (file system X) ..." / "... file system fat32 ..."
 #  - CommitOfEntryIsInjectedToFail, l.363:    "cannot make the entry of the backup directory <path> durable"
@@ -1182,14 +1189,14 @@ def case_relative_path(env, rec):
 
 
 def case_long_path(env, rec):
-    """The resolved per-wallet backup directory is at most 150 UTF-16 characters: 150 and 149 work end to end (a backup in
-    progress needs 109 more characters below it, up to the 259 Windows allows) and restore on a node whose default path is
-    short; 151 and longer are refused when the wallet is created, when it is loaded at startup and by loadwallet, with the
+    """The resolved per-wallet backup directory is at most MAX_BACKUP_DIRECTORY_UNITS (137) UTF-16 characters: that and one less work end
+    to end (a backup in progress needs 122 more characters below it, up to the 259 Windows allows) and restore on a node whose default path is
+    short; one more and longer are refused when the wallet is created, when it is loaded at startup and by loadwallet, with the
     length message, and nothing is created. Each length has its own data directory, so a wallet made for one backup
     directory is never loaded under another. The backup directories are below <datadir>\\regtest, where the product's walk
     up ends, so no permission above the data directory is involved."""
     case_root = env.case_dir("long-path")
-    for length in (150, 149):
+    for length in (MAX_BACKUP_DIRECTORY_UNITS, MAX_BACKUP_DIRECTORY_UNITS - 1):
         wallet = "wlong%d" % length
         datadir = os.path.join(case_root, "data%d" % length)
         shutil.rmtree(datadir, ignore_errors=True)
@@ -1207,7 +1214,7 @@ def case_long_path(env, rec):
             "result": exercise_success(node, root, wallet, None, restore_node=restore_node)}
         node.stop()
         restore_node.stop()
-    for length in (151, 190):
+    for length in (MAX_BACKUP_DIRECTORY_UNITS + 1, MAX_BACKUP_DIRECTORY_UNITS + 40):
         wallet = "wlong%d" % length
         datadir = os.path.join(case_root, "data%d" % length)
         shutil.rmtree(datadir, ignore_errors=True)
@@ -1217,7 +1224,7 @@ def case_long_path(env, rec):
         message = expect_rpc_error(lambda: node.rpc().createwallet(wallet_name=wallet, load_on_startup=True))
         record_error(rec, "length %d: %s" % (length, message))
         found = LENGTH_RE.search(message)
-        check(found and int(found.group(1)) == length and int(found.group(2)) == 150,
+        check(found and int(found.group(1)) == length and int(found.group(2)) == MAX_BACKUP_DIRECTORY_UNITS,
               "length %d: the refusal does not give the length and the limit: %s" % (length, message))
         check(NOT_DENIED_RE.search(message), "length %d: the refusal is an access-denied error: %s" % (length, message))
         check(wallet not in [entry["name"] for entry in node.rpc().listwalletdir()["wallets"]],
@@ -1226,7 +1233,7 @@ def case_long_path(env, rec):
         rec["observed"]["refused_%d" % length] = message
         node.stop()
     # a wallet that already exists is refused too, when it is loaded at startup and by loadwallet
-    length = 151
+    length = MAX_BACKUP_DIRECTORY_UNITS + 1
     wallet = "wlongload"
     datadir = os.path.join(case_root, "data-load")
     shutil.rmtree(datadir, ignore_errors=True)
@@ -1238,7 +1245,7 @@ def case_long_path(env, rec):
     startup = env.node(datadir, label="load-startup")
     code, output = startup.refused_at_startup(["-quantumkeybackupdir=" + root])
     found = LENGTH_RE.search(output)
-    check(found and int(found.group(1)) == length and int(found.group(2)) == 150,
+    check(found and int(found.group(1)) == length and int(found.group(2)) == MAX_BACKUP_DIRECTORY_UNITS,
           "startup: the refusal does not give the length and the limit: %s" % output.strip()[-400:])
     check(not os.path.exists(root), "startup: the refused backup directory was created: %s" % root)
     rec["observed"]["startup_refusal"] = output.strip()[-400:]
@@ -1248,7 +1255,7 @@ def case_long_path(env, rec):
     loading = env.node(datadir, ["-quantumkeybackupdir=" + root], label="load-rpc").start()
     message = expect_rpc_error(lambda: loading.rpc().loadwallet(filename=wallet))
     found = LENGTH_RE.search(message)
-    check(found and int(found.group(1)) == length and int(found.group(2)) == 150,
+    check(found and int(found.group(1)) == length and int(found.group(2)) == MAX_BACKUP_DIRECTORY_UNITS,
           "loadwallet: the refusal does not give the length and the limit: %s" % message)
     check(wallet not in loading.rpc().listwallets(), "loadwallet: the refused wallet was loaded")
     check(not os.path.exists(root), "loadwallet: the refused backup directory was created: %s" % root)
@@ -1637,7 +1644,7 @@ CASES = [
      "succeeds and restores (the walk ends at the data directory by its identity)", case_datadir_case),
     ("relative-path", "drive-relative (D:dir) and root-relative (\\dir, /dir) backup directories are refused at startup with the relative-to-"
      "a-drive message and nothing is created; a full path is accepted", case_relative_path),
-    ("long-path", "a per-wallet backup directory of 150 and 149 characters works end to end, 151 and longer is refused when the wallet is "
+    ("long-path", "a per-wallet backup directory of 137 and 136 characters works end to end, 138 and longer is refused when the wallet is "
      "created with the length message and nothing is created", case_long_path),
     ("mapped-drive", "a mapped drive is refused as unsupported, with the same pending and recovery behaviour", case_mapped_drive),
     ("denied-ancestor", "a denied ancestor gives an ancestor-specific refusal; after the denial is removed and the node restarted the "
@@ -1762,19 +1769,19 @@ def selftest():
                 "is not supported; give the full path with its drive and a separator (such as D:\\dir), or a path relative to the "
                 "data directory")
     assert RELATIVE_PATH_RE.search(relative) and not NETWORK_PATH_RE.search(relative) and NOT_DENIED_RE.search(relative)
-    too_long = ("Wallet creation failed. the quantum key backup directory C:\\x\\n_w: the path is too long: it has 151 characters and at "
-                "most 150 are allowed, because each backup is staged and verified in folders inside it; use a shorter path")
+    too_long = ("Wallet creation failed. the quantum key backup directory C:\\x\\n_w: the path is too long: it has 138 characters and at "
+                "most 137 are allowed, because each backup is staged and verified in folders inside it; use a shorter path")
     found_length = LENGTH_RE.search(too_long)
-    assert found_length and found_length.group(1) == "151" and found_length.group(2) == "150"
+    assert found_length and found_length.group(1) == "138" and found_length.group(2) == "137"
     assert not LENGTH_RE.search("the path is too long: it has 150 characters and at most 160 are allowed") is None
     # the long-path cases build a per-wallet directory of exactly the length they name, for any base that leaves room
     for base in ("C:\\qual\\cases\\long-path\\backups", "D:\\b", "C:\\" + "x" * 60):
         for wallet in ("wlong150", "wlong149", "w"):
-            for length in (149, 150, 151, 190):
+            for length in (136, 137, 138, 190):
                 built = backup_root_for_length(base, wallet, length)
                 assert utf16_units(built + "\\" + component(wallet)) == length and built.startswith(base + "\\p")
     try:
-        backup_root_for_length("C:\\" + "x" * 140, "wlong150", 150)
+        backup_root_for_length("C:\\" + "x" * 140, "wlong137", 137)
         raise AssertionError("a base that leaves no room must be unresolved")
     except Unresolved:
         pass
@@ -1783,7 +1790,7 @@ def selftest():
     assert utf16_units("abc") == 3 and utf16_units("a\U0001F600") == 3 and utf16_units("\u00e9") == 1
     # a non-BMP character in the base counts two units, so the built directory is exactly the length asked for
     for base in ("C:\\qual\\\U0001F600\\backups", "C:\\qual\\caf\u00e9"):
-        for length in (149, 150, 151):
+        for length in (136, 137, 138):
             built = backup_root_for_length(base, "wlong150", length)
             assert utf16_units(built + "\\" + component("wlong150")) == length
     assert DURABLE_RE.search(unc) and NETWORK_PATH_RE.search(unc) and UNSUPPORTED_VOLUME_RE.search(unc)
@@ -2008,6 +2015,7 @@ def selftest():
             except CheckFailed as error:
                 assert "exit code 1" in str(error)
         # a Windows exception status is not 1
+        assert BACKUP_WORK_PATH_UNITS == 122 and MAX_BACKUP_DIRECTORY_UNITS == 137
         assert STARTUP_REFUSAL_EXIT == 1 and 0xC0000005 != STARTUP_REFUSAL_EXIT
         assert refused_node.stop(clean=False) is None
         assert clean_stop_problem(1, False) and clean_stop_problem(0, True)

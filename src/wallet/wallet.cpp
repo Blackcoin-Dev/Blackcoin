@@ -11962,16 +11962,24 @@ static std::string MigrationPrefixName(CWallet& wallet)
     return name.empty() ? "default_wallet" : name;
 }
 
-bool DoMigration(CWallet& wallet, WalletContext& context, bilingual_str& error, MigrationResult& res, std::optional<MigrationData>& planned) EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet)
+//! Tests only: ends a migration with an error at a named point inside DoMigration, to exercise its rollback.
+static std::function<bool(std::string_view)> g_migration_failpoint;
+void SetWalletMigrationFailpointForTest(std::function<bool(std::string_view)> failpoint)
+{
+    g_migration_failpoint = std::move(failpoint);
+}
+
+//! Carry out a migration whose descriptors (the plan) were produced, and whose auxiliary wallet names were checked against
+//! the quantum key backup directory policy, before anything was converted: the wallets created here are exactly the ones
+//! that were checked.
+bool DoMigration(CWallet& wallet, WalletContext& context, bilingual_str& error, MigrationResult& res, MigrationData& plan) EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet)
 {
     AssertLockHeld(wallet.cs_wallet);
-
-    // The descriptors of the legacy wallet were produced before anything was converted, and the wallets that publishes
-    // were checked against the quantum key backup directory policy from them: that same plan is what is carried out.
-    std::optional<MigrationData> data = std::move(planned);
-    planned.reset();
-    if (data == std::nullopt) data = wallet.GetDescriptorsForLegacy(error);
-    if (data == std::nullopt) return false;
+    if (g_migration_failpoint && g_migration_failpoint("before_auxiliary_wallets")) {
+        error = Untranslated("Injected wallet migration failure before the auxiliary wallets");
+        return false;
+    }
+    std::optional<MigrationData> data{std::move(plan)};
 
     // Create the watchonly and solvable wallets if necessary
     if (data->watch_descs.size() > 0 || data->solvable_descs.size() > 0) {
@@ -12081,6 +12089,10 @@ bool DoMigration(CWallet& wallet, WalletContext& context, bilingual_str& error, 
         }
     }
 
+    if (g_migration_failpoint && g_migration_failpoint("before_apply_migration_data")) {
+        error = Untranslated("Injected wallet migration failure before the descriptors are applied");
+        return false;
+    }
     // Add the descriptors to wallet, remove LegacyScriptPubKeyMan, and cleanup txs and address book data
     if (!wallet.ApplyMigrationData(*data, error)) {
         return false;
@@ -12101,13 +12113,11 @@ util::Result<MigrationResult> MigrateLegacyToDescriptor(const std::string& walle
     }
 
     // If the wallet is still loaded, unload it so that nothing else tries to use it while we're changing it
-    bool was_loaded{false};
     if (auto wallet = GetWallet(context, wallet_name)) {
         if (!RemoveWallet(context, wallet, /*load_on_start=*/std::nullopt, warnings)) {
             return util::Error{_("Unable to unload the wallet before migrating")};
         }
         UnloadWallet(std::move(wallet));
-        was_loaded = true;
     }
 
     // Load the wallet but only in the context of this function.
@@ -12133,53 +12143,6 @@ util::Result<MigrationResult> MigrateLegacyToDescriptor(const std::string& walle
         return util::Error{_("Error: This wallet is already a descriptor wallet")};
     }
 
-    // A refusal before anything was converted: the private copy is released, and a wallet that was loaded when the
-    // migration began is loaded again, so the caller finds it as it was.
-    const auto restore_unloaded_wallet = [&](const bilingual_str& refusal) {
-        local_wallet.reset();
-        if (!was_loaded) return util::Result<MigrationResult>{util::Error{refusal}};
-        DatabaseStatus reload_status;
-        bilingual_str reload_error;
-        std::vector<bilingual_str> reload_warnings;
-        DatabaseOptions reload_options;
-        reload_options.require_existing = true;
-        if (!LoadWallet(context, wallet_name, /*load_on_start=*/std::nullopt, reload_options, reload_status, reload_error,
-                        reload_warnings, /*check_backup_path=*/false)) {
-            return util::Result<MigrationResult>{util::Error{refusal + _("\nThe wallet could not be loaded again: ") + reload_error}};
-        }
-        return util::Result<MigrationResult>{util::Error{refusal}};
-    };
-
-    // The wallet's own name was checked against the configured quantum key backup directory before it was unloaded. The
-    // auxiliary wallets this migration publishes depend on its descriptors, which are produced now, before the safety
-    // copy is made or anything is converted, so that the wallets that are checked are the wallets that are created. A
-    // refusal here leaves the original database exactly as it was, and the wallet is loaded again as it was before.
-    std::optional<MigrationData> planned;
-    {
-        LOCK(local_wallet->cs_wallet);
-        if (local_wallet->IsLocked() && !local_wallet->Unlock(passphrase)) {
-            if (passphrase.find('\0') == std::string::npos) {
-                return util::Error{Untranslated("Error: Wallet decryption failed, the wallet passphrase was not provided or was incorrect.")};
-            } else {
-                return util::Error{Untranslated("Error: Wallet decryption failed, the wallet passphrase entered was incorrect. "
-                                                "The passphrase contains a null character (ie - a zero byte). "
-                                                "If this passphrase was set with a version of this software prior to 25.0, "
-                                                "please try again with only the characters up to — but not including — "
-                                                "the first null character.")};
-            }
-        }
-        planned = local_wallet->GetDescriptorsForLegacy(error);
-    }
-    if (planned) {
-        const QuantumKeyBackupPathCheck backup_paths = CheckQuantumKeyBackupMigrationPaths(
-            wallet_name, !planned->watch_descs.empty(), !planned->solvable_descs.empty());
-        if (backup_paths.error) {
-            const bilingual_str refusal = Untranslated(strprintf("Wallet migration refused before any change was made: %s", *backup_paths.error));
-            return restore_unloaded_wallet(refusal);
-        }
-        if (backup_paths.warning) res.warnings.push_back(Untranslated(*backup_paths.warning));
-    }
-
     // Make a backup of the DB in the wallet's directory with a unique filename
     // using the wallet name and current timestamp. The backup filename is based
     // on the name of the parent directory containing the wallet data in most
@@ -12203,11 +12166,42 @@ util::Result<MigrationResult> MigrateLegacyToDescriptor(const std::string& walle
     {
         LOCK(local_wallet->cs_wallet);
 
-        // First change to using SQLite
-        if (!local_wallet->MigrateToSQLite(error)) return util::Error{error};
+        // Unlock the wallet if needed
+        if (local_wallet->IsLocked() && !local_wallet->Unlock(passphrase)) {
+            if (passphrase.find('\0') == std::string::npos) {
+                return util::Error{Untranslated("Error: Wallet decryption failed, the wallet passphrase was not provided or was incorrect.")};
+            } else {
+                return util::Error{Untranslated("Error: Wallet decryption failed, the wallet passphrase entered was incorrect. "
+                                                "The passphrase contains a null character (ie - a zero byte). "
+                                                "If this passphrase was set with a version of this software prior to 25.0, "
+                                                "please try again with only the characters up to — but not including — "
+                                                "the first null character.")};
+            }
+        }
 
-        // Do the migration, and cleanup if it fails
-        success = DoMigration(*local_wallet, context, error, res, planned);
+        // The descriptors are produced now, after the safety copy and before anything is converted (producing them writes
+        // descriptor records into this wallet's database), so that the wallets this migration creates can be checked
+        // against the quantum key backup directory policy first: the wallet's own name was checked before it was
+        // unloaded, and the auxiliary wallets are the ones these descriptors need. A refusal, like any other failure,
+        // goes through the rollback below, which restores the wallet from the safety copy.
+        std::optional<MigrationData> plan = local_wallet->GetDescriptorsForLegacy(error);
+        if (plan) {
+            const QuantumKeyBackupPathCheck backup_paths = CheckQuantumKeyBackupMigrationPaths(
+                wallet_name, !plan->watch_descs.empty(), !plan->solvable_descs.empty());
+            if (backup_paths.error) {
+                error = Untranslated(strprintf("Wallet migration refused before any wallet was converted or created: %s", *backup_paths.error));
+                plan.reset();
+            } else if (backup_paths.warning) {
+                res.warnings.push_back(Untranslated(*backup_paths.warning));
+            }
+        }
+        if (plan) {
+            // First change to using SQLite
+            if (!local_wallet->MigrateToSQLite(error)) return util::Error{error};
+
+            // Do the migration, and cleanup if it fails
+            success = DoMigration(*local_wallet, context, error, res, *plan);
+        }
     }
 
     // In case of loading failure, we need to remember the wallet files we have created to remove.

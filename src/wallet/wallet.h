@@ -3487,6 +3487,10 @@ struct MigrationResult {
     std::vector<bilingual_str> warnings;
 };
 
+//! Tests only: end a wallet migration with an error at a named point inside it (before_auxiliary_wallets,
+//! before_apply_migration_data); an empty function removes the failpoint.
+void SetWalletMigrationFailpointForTest(std::function<bool(std::string_view)> failpoint);
+
 //! Do all steps to migrate a legacy wallet to a descriptor wallet
 [[nodiscard]] util::Result<MigrationResult> MigrateLegacyToDescriptor(const std::string& wallet_name, const SecureString& passphrase, WalletContext& context);
 } // namespace wallet

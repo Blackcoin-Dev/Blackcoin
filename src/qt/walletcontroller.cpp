@@ -569,6 +569,15 @@ void MigrateWalletActivity::migrate(WalletModel* wallet_model)
             m_wallet_model = m_wallet_controller->getOrCreateWallet(std::move(res->wallet));
         } else {
             m_error_message = util::ErrorString(res);
+            // The model was deleted before the migration began. When the migration was refused or rolled back, the wallet
+            // is loaded in Core again (still the same one if it was refused before anything was unloaded, or restored from
+            // the safety copy and loaded again after a rollback): show it as available.
+            for (std::unique_ptr<interfaces::Wallet>& wallet : node().walletLoader().getWallets()) {
+                if (wallet->getWalletName() == name) {
+                    m_wallet_model = m_wallet_controller->getOrCreateWallet(std::move(wallet));
+                    break;
+                }
+            }
         }
 
         QTimer::singleShot(0, this, &MigrateWalletActivity::finish);

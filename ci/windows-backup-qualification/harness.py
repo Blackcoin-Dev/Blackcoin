@@ -26,6 +26,7 @@ import socket
 import subprocess
 import sys
 import time
+import uuid
 import traceback
 import urllib.parse
 
@@ -56,12 +57,16 @@ LOG_INTEREST = re.compile(r"quantum|backup|durab|flush|Unable to|not active|Flus
 #  - FlushDirectoryWindows, l.121:            "it cannot be opened for writing: <Win32ErrorString>"  ("Access is denied. (5)")
 #  - FlushDirectoryWindows, l.102 and l.131:  "its volume cannot be identified: ..." or "... not on a local volume that
 #                                             has a volume GUID path (a network share, ...)"
+#  - BackupDirectorySpellingRejection:        "a network or device path is not supported; use a folder on a local NTFS volume"
+#                                             (a path that starts with two separators, refused before any file system call)
 #  - QuantumBackupVolumeRejection, l.265-268: "... network share (file system X) ..." / "... file system fat32 ..."
 #  - CommitOfEntryIsInjectedToFail, l.363:    "cannot make the entry of the backup directory <path> durable"
 DURABLE_RE = re.compile(r"cannot make the backup directory .* durable", re.IGNORECASE | re.DOTALL)
 DENIED_RE = re.compile(r"access is denied", re.IGNORECASE)
 UNSUPPORTED_VOLUME_RE = re.compile(
     r"network share|volume GUID path|volume cannot be identified|local NTFS volume", re.IGNORECASE)
+NETWORK_PATH_RE = re.compile(r"a network or device path is not supported", re.IGNORECASE)
+NOT_DENIED_RE = re.compile(r"\A(?!.*access is denied)", re.IGNORECASE | re.DOTALL)
 FAT32_RE = re.compile(r"file system fat32", re.IGNORECASE)
 ENTRY_FAIL_RE = re.compile(r"cannot make the entry of the backup directory .* durable", re.IGNORECASE | re.DOTALL)
 GENERATION_RE = re.compile(r"^quantum-wallet-[0-9]{8}T[0-9]{6}Z-h[0-9]{10}-[0-9a-f]{16}\.dat$")
@@ -949,7 +954,7 @@ def share_precondition(env, base):
     os.remove(probe)
 
 
-def unsupported_case(env, rec, case, backup_dir_arg, directory, wallet_name, label):
+def unsupported_case(env, rec, case, backup_dir_arg, directory, wallet_name, label, volume_check=None):
     datadir = os.path.join(env.case_dir(case), "data")
     shutil.rmtree(datadir, ignore_errors=True)
     os.makedirs(datadir)
@@ -962,14 +967,45 @@ def unsupported_case(env, rec, case, backup_dir_arg, directory, wallet_name, lab
     node = env.node(datadir, ["-quantumkeybackupdir=" + backup_dir_arg]).start()
     refused_and_recovered(
         env, rec, node, wallet_name, None,
-        [("name a missing durable commit", DURABLE_RE), ("say the volume is unsupported", UNSUPPORTED_VOLUME_RE)],
+        [("name a missing durable commit", DURABLE_RE),
+         volume_check or ("say the volume is unsupported", UNSUPPORTED_VOLUME_RE),
+         ("stay clear of an access-denied error", NOT_DENIED_RE)],
         before, os.path.join(directory, component(wallet_name)), datadir, label)
+    return node
 
 
 def case_unc_share(env, rec):
     require_infra(env, "share", "the SMB share")
     unc = env.layout["share_unc"]
-    unsupported_case(env, rec, "unc", unc + "\\backups", unc + "\\backups", "wunc", "unc")
+    network_path = ("say a network or device path is not supported", NETWORK_PATH_RE)
+    node = unsupported_case(env, rec, "unc", unc + "\\backups", unc + "\\backups", "wunc", "unc", network_path)
+    node.stop()
+    # A share folder that does not exist yet: the refusal comes before anything is created, at the share and at the
+    # local folder the value used to be mistaken for (the data directory's drive, then the host and share names).
+    unique = "absent-" + uuid.uuid4().hex
+    datadir = os.path.join(env.case_dir("unc-absent"), "data")
+    shutil.rmtree(datadir, ignore_errors=True)
+    os.makedirs(datadir)
+    drive = os.path.splitdrive(os.path.abspath(datadir))[0]
+    mistaken_host = drive + "\\" + unc.lstrip("\\").split("\\")[0]
+    watched = {
+        "share_folder": os.path.join(env.layout["share_dir"], unique),
+        "share_folder_by_unc": unc + "\\" + unique,
+        "mistaken_local_folder": drive + "\\" + unc.lstrip("\\") + "\\" + unique,
+    }
+    for name, path in watched.items():
+        check(not os.path.exists(path), "unc-absent: %s exists before the test: %s" % (name, path))
+    host_before = os.path.exists(mistaken_host)
+    node = env.node(datadir, ["-quantumkeybackupdir=" + unc + "\\" + unique]).start()
+    refused_and_recovered(
+        env, rec, node, "wuncabs", None,
+        [("name a missing durable commit", DURABLE_RE), network_path, ("stay clear of an access-denied error", NOT_DENIED_RE)],
+        None, None, datadir, "unc-absent")
+    for name, path in watched.items():
+        check(not os.path.exists(path), "unc-absent: the refused backup path created %s: %s" % (name, path))
+    check(os.path.exists(mistaken_host) == host_before,
+          "unc-absent: %s appeared on the data directory's drive" % mistaken_host)
+    rec["observed"]["unc_absent_watched"] = dict(watched, mistaken_host=mistaken_host, mistaken_host_existed=host_before)
 
 
 def case_mapped_drive(env, rec):
@@ -1464,10 +1500,14 @@ def selftest():
     # daemon error texts (copied from the source) against the patterns
     durable = "cannot make the backup directory C:\\ durable: it cannot be opened for writing: Access is denied. (5)"
     assert DURABLE_RE.search(durable) and DENIED_RE.search(durable)
-    unc = ("cannot make the backup directory \\\\localhost\\QBackup\\backups\\n_wunc durable: the directory is not on a local "
-           "volume that has a volume GUID path (a network share, or a path that cannot be tied to one local volume); "
-           "use a folder on a local NTFS volume")
-    assert DURABLE_RE.search(unc) and UNSUPPORTED_VOLUME_RE.search(unc) and not DENIED_RE.search(unc)
+    unc = ("cannot make the backup directory \\\\localhost\\QBackup\\backups\\n_wunc durable: a network or device path is "
+           "not supported; use a folder on a local NTFS volume")
+    assert DURABLE_RE.search(unc) and NETWORK_PATH_RE.search(unc) and UNSUPPORTED_VOLUME_RE.search(unc)
+    assert NOT_DENIED_RE.search(unc) and not DENIED_RE.search(unc)
+    mapped = ("cannot make the backup directory R:\\backups\\n_wmap durable: its volume cannot be identified: The system "
+              "cannot find the path specified.  (3)")
+    assert DURABLE_RE.search(mapped) and UNSUPPORTED_VOLUME_RE.search(mapped) and not NETWORK_PATH_RE.search(mapped)
+    assert not NOT_DENIED_RE.search(durable)
     fat = ("cannot make the backup directory V:\\qb durable: the backup directory is on a volume with file system fat32, where "
            "a flush does not prove that the directory entries are on disk; use a folder on a local NTFS volume")
     assert FAT32_RE.search(fat) and DURABLE_RE.search(fat)

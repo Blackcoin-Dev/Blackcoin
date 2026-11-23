@@ -932,6 +932,45 @@ BOOST_AUTO_TEST_CASE(address_book_deletion_is_atomic)
     BOOST_CHECK(!has_entry(reloaded));
 }
 
+// The address-book records are keyed by the encoded address. A Base58 address that begins with the letters
+// of the Bech32 prefix must come back under the same destination after a reload, and must be movable.
+BOOST_AUTO_TEST_CASE(address_book_entry_survives_reload_when_its_base58_address_starts_like_the_bech32_prefix)
+{
+    const auto destination_from = [](const std::string& hash_hex) {
+        const std::vector<unsigned char> bytes{ParseHex(hash_hex)};
+        BOOST_REQUIRE_EQUAL(bytes.size(), 20U);
+        uint160 hash;
+        std::copy(bytes.begin(), bytes.end(), hash.begin());
+        return CTxDestination{PKHash(hash)};
+    };
+    const auto label = [](const CWallet& wallet, const CTxDestination& dest) -> std::optional<std::string> {
+        LOCK(wallet.cs_wallet);
+        const CAddressBookData* entry = wallet.FindAddressBookEntry(dest, /*allow_change=*/true);
+        return entry && !entry->IsChange() ? std::optional<std::string>{entry->GetLabel()} : std::nullopt;
+    };
+    const CTxDestination old_destination{destination_from("ae130a2ec0c92a0ce0b6718c772f48cdaa718de1")};
+    const CTxDestination new_destination{destination_from("b2cd70568c71987841b938ed0e11d397738989b7")};
+    BOOST_CHECK_EQUAL(EncodeDestination(old_destination).substr(0, 3), "BLK");
+    BOOST_CHECK_EQUAL(EncodeDestination(new_destination).substr(0, 3), "BLk");
+
+    CWallet seed(/*chain=*/nullptr, "", CreateMockableWalletDatabase());
+    BOOST_REQUIRE_EQUAL(seed.LoadWallet(), DBErrors::LOAD_OK);
+    BOOST_REQUIRE(seed.SetAddressBook(old_destination, "kept", AddressPurpose::SEND));
+
+    CWallet reloaded(/*chain=*/nullptr, "", DuplicateMockDatabase(seed.GetDatabase()));
+    BOOST_REQUIRE_EQUAL(reloaded.LoadWallet(), DBErrors::LOAD_OK);
+    BOOST_REQUIRE(label(reloaded, old_destination));
+    BOOST_CHECK_EQUAL(*label(reloaded, old_destination), "kept");
+    BOOST_CHECK(!label(reloaded, CTxDestination{CNoDestination{}}));
+
+    BOOST_REQUIRE(reloaded.MoveAddressBook(old_destination, new_destination));
+    CWallet moved(/*chain=*/nullptr, "", DuplicateMockDatabase(reloaded.GetDatabase()));
+    BOOST_REQUIRE_EQUAL(moved.LoadWallet(), DBErrors::LOAD_OK);
+    BOOST_CHECK(!label(moved, old_destination));
+    BOOST_REQUIRE(label(moved, new_destination));
+    BOOST_CHECK_EQUAL(*label(moved, new_destination), "kept");
+}
+
 BOOST_AUTO_TEST_CASE(address_book_move_is_atomic)
 {
     CKey old_key;

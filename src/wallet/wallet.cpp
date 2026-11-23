@@ -14756,8 +14756,8 @@ QuantumAddressBindingResult CWallet::ResolveConfiguredQuantumAddress(
                 option, purpose));
             return QuantumAddressBindingResult::INVALID;
         }
-        // A key made for the quantum stake return address is not usable for anything until its first verified
-        // wallet backup succeeded.
+        // A key made for the quantum stake return address is not adopted as a configured destination until its first
+        // verified wallet backup succeeded. (It still signs for, and stakes, funds already on it.)
         if (IsQuantumStakeReturnPendingKey(candidate)) {
             error = Untranslated(strprintf(
                 "%s for %s is a new quantum key still waiting for its first verified wallet backup.",

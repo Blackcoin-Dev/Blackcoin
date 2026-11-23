@@ -17,6 +17,7 @@
 #include <util/fs.h>
 #include <util/message.h>
 #include <util/result.h>
+#include <util/translation.h>
 #include <util/ui_change_type.h>
 
 #include <chrono>
@@ -228,11 +229,11 @@ public:
         int& change_pos,
         CAmount& fee) = 0;
 
-    //! Commit transaction. Returns a warning to show the user (empty when there is none), e.g. that the
-    //! transaction spent outputs the final stake reserve holds back, or that it was stored but could not be relayed
-    //! yet. Throws WalletCommitRejected when the wallet refused it and kept nothing; any other exception (a storage
+    //! Commit transaction. Returns a warning to show the user (empty when there is none): that the transaction was
+    //! stored but could not be relayed yet, that it spent outputs the final stake reserve holds back, or both. The
+    //! text is translated (its `translated` member is what a user interface shows). Throws WalletCommitRejected when the wallet refused it and kept nothing; any other exception (a storage
     //! failure, for one) means the wallet state cannot be trusted and is not to be recovered from.
-    virtual std::string commitTransaction(CTransactionRef tx,
+    virtual bilingual_str commitTransaction(CTransactionRef tx,
         WalletValueMap value_map,
         WalletOrderForm order_form) = 0;
 
@@ -1265,7 +1266,7 @@ struct WalletQuantumOperatorBondTx
     std::string migration_address;
     CAmount migration_amount{0};
     CAmount migration_fee{0};
-    std::string warning;
+    bilingual_str warning; //! translated for a user interface; the RPC reports `original`
 };
 
 //! Result of a planned or executed Quantum Cold-Stake redelegation.

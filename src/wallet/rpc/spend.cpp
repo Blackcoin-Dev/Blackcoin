@@ -2211,6 +2211,9 @@ RPCHelpMan migratetoquantum()
                 if (!pwallet->GetQuantumKeyInfo(dest).has_value()) {
                     throw JSONRPCError(RPC_WALLET_ERROR, "existing_address is not wallet-backed (no ML-DSA private key in this wallet)");
                 }
+                if (WITH_LOCK(pwallet->cs_wallet, return pwallet->IsQuantumStakeReturnPendingKey(dest))) {
+                    throw JSONRPCError(RPC_WALLET_ERROR, "existing_address is the quantum stake return key, a new key still waiting for its first verified wallet backup; it cannot be selected as this migration or consolidation destination until that backup succeeds");
+                }
             } else {
                 auto op_dest = pwallet->GetNewQuantumDestination(label);
                 if (!op_dest) throw JSONRPCError(RPC_WALLET_ERROR, util::ErrorString(op_dest).original);
@@ -2502,6 +2505,9 @@ RPCHelpMan migrategoldrushrewards()
                 }
                 if (!pwallet->GetQuantumKeyInfo(dest).has_value()) {
                     throw JSONRPCError(RPC_WALLET_ERROR, "existing_address is not wallet-backed (no ML-DSA private key in this wallet)");
+                }
+                if (WITH_LOCK(pwallet->cs_wallet, return pwallet->IsQuantumStakeReturnPendingKey(dest))) {
+                    throw JSONRPCError(RPC_WALLET_ERROR, "existing_address is the quantum stake return key, a new key still waiting for its first verified wallet backup; it cannot be selected as this migration or consolidation destination until that backup succeeds");
                 }
             } else {
                 auto op_dest = pwallet->GetNewQuantumDestination(label);

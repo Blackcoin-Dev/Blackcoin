@@ -3582,6 +3582,9 @@ void StakingMiningPage::onWithdrawSelfStakeAddress()
             .arg(QString::fromStdString(result->address))
             .arg(formatBLK(result->fee));
     }
+    // The warnings of the withdrawal: the new key to back up and, when it took an output the final stake reserve holds
+    // back, what it consumed.
+    if (!result->warning.empty()) m_selfstake_last_action_status += QStringLiteral("\n") + QString::fromStdString(result->warning.translated);
     m_selfstake_status->setText(m_selfstake_last_action_status);
     m_force_full_refresh = true;
     updateStatus();
@@ -3728,6 +3731,7 @@ void StakingMiningPage::onWithdrawOperatorBond()
             .arg(QString::fromStdString(result->address))
             .arg(formatBLK(result->fee));
     }
+    if (!result->warning.empty()) m_operator_last_action_status += QStringLiteral("\n") + QString::fromStdString(result->warning.translated);
     m_operator_status->setText(m_operator_last_action_status);
     m_force_full_refresh = true;
     updateStatus();
@@ -3874,7 +3878,7 @@ void StakingMiningPage::onFundColdStakeAddress()
             .arg(QString::fromStdString(result->migration_address))
             .arg(QString::fromStdString(result->migration_txid))
             .arg(formatBLK(result->migration_fee))
-            .arg(QString::fromStdString(result->warning));
+            .arg(QString::fromStdString(result->warning.translated));
         QMessageBox::information(this, tr("Gold Rush rewards consolidated"), m_coldstake_last_action_status);
     } else {
         m_coldstake_last_action_status = tr("Cold-stake delegation funding broadcast: %1. Amount: %2. Fee: %3.")
@@ -3923,6 +3927,7 @@ void StakingMiningPage::onWithdrawColdStakeAddress()
         .arg(formatBLK(result->amount))
         .arg(QString::fromStdString(result->address))
         .arg(formatBLK(result->fee));
+    if (!result->warning.empty()) m_coldstake_last_action_status += QStringLiteral("\n") + QString::fromStdString(result->warning.translated);
     m_coldstake_status->setText(m_coldstake_last_action_status);
     m_force_full_refresh = true;
     updateStatus();

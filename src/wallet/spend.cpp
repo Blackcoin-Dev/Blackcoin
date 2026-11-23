@@ -2738,6 +2738,13 @@ static util::Result<CreatedTransactionResult> CreateTransactionInternal(
             }
             created_quantum_change = *destination;
             scriptChange = GetScriptForDestination(*destination);
+        } else {
+            // Positive change never goes to the quantum stake return key while it waits for its first verified backup;
+            // the key may still sign for, and stake, funds it already holds.
+            CTxDestination change_dest;
+            if (ExtractDestination(scriptChange, change_dest) && wallet.IsQuantumStakeReturnPendingKey(change_dest)) {
+                return util::Error{_("The change address is the quantum stake return key, a new key still waiting for its first verified wallet backup. Choose another change address or wait for that backup.")};
+            }
         }
         CTxOut newTxOut(change_amount, scriptChange);
         if (nChangePosInOut == -1) {

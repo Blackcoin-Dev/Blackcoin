@@ -28,9 +28,13 @@ from test_framework.util import (
 from transition_t_final_util import (
     F,
     G,
+    COMMIT_PAUSE_MAX_MS,
     LIFECYCLE_ARGS,
     MATURITY,
     TransitionTFinalTestBase,
+    commit_pause,
+    scaled_wait,
+    single_output_reserve_bit,
 )
 
 BEFORE_GUARD = F - MATURITY - 2  # 80: the candidate 81 is outside the guard
@@ -42,7 +46,10 @@ class FinalStakeReserveCommitTest(TransitionTFinalTestBase, BitcoinTestFramework
     def set_test_params(self):
         self.num_nodes = 1
         self.setup_clean_chain = True
-        self.extra_args = [LIFECYCLE_ARGS + ["-finalstakereservecommitdelaymillis=2000"]]
+        # A slow machine (a larger timeout factor) needs a longer pause for the chain to move while the commit waits, up
+        # to the node's own cap of 10000 ms.
+        self.commit_delay_ms, self.delay_capped = commit_pause(self.options.timeout_factor)
+        self.extra_args = [LIFECYCLE_ARGS + [f"-finalstakereservecommitdelaymillis={self.commit_delay_ms}"]]
 
     def skip_test_if_missing_module(self):
         self.skip_if_no_wallet()
@@ -50,28 +57,42 @@ class FinalStakeReserveCommitTest(TransitionTFinalTestBase, BitcoinTestFramework
     def key(self, outpoint):
         return (outpoint["txid"], outpoint["vout"])
 
+    def scaled(self, seconds):
+        """A wait budget in seconds, scaled by the timeout factor where the framework does not do it itself."""
+        return scaled_wait(seconds, self.options.timeout_factor)
+
     def run_test(self):
         node = self.nodes[0]
+        if self.delay_capped:
+            self.log.warning("The commit pause is capped at %d ms by the node; the timeout factor %s is not fully applied to it",
+                             COMMIT_PAUSE_MAX_MS, self.options.timeout_factor)
+        self.log.info("Commit pause: %d ms (timeout factor %s)", self.commit_delay_ms, self.options.timeout_factor)
         default = node.get_wallet_rpc(self.default_wallet_name)
         default.staking(False)
         self.set_initial_mt()
         pow_addr = default.getnewaddress("", "legacy")
 
-        self.log.info("A wallet with two quantum outputs, each migrated from its own coinbase")
-        node.createwallet("wc")
-        wallet = node.get_wallet_rpc("wc")
+        self.log.info("A wallet with two quantum outputs: the larger, which is the reserve, is constructed to be held")
+        # A user lock takes an output out of the count, so in the case with lock_unspents below the reserved output is
+        # alone, and a lone output is held back only when the singleton rule says so: the larger source (the reserve) is
+        # funded by a transaction whose nonce is ground until its outpoint is held.
+        wallet_name = "wc"
+        node.createwallet(wallet_name, descriptors=self.options.descriptors)
+        wallet = node.get_wallet_rpc(wallet_name)
         wallet.staking(False)
-        for _ in range(K_OUTPUTS):
-            self.generatetoaddress(node, 1, wallet.getnewaddress("", "legacy"), sync_fun=self.no_op)
-            self.bump()
         self.pow_blocks(node, G - node.getblockcount(), pow_addr)
-        for _ in range(K_OUTPUTS):
-            address = wallet.getnewquantumaddress()["address"]
-            wallet.migratetoquantum({"existing_address": address, "max_inputs": 1})
-            self.pow_blocks(node, 1, pow_addr)
+        sources = self.funding_inputs(default, minimum=Decimal(10000))
+        assert len(sources) >= K_OUTPUTS
+        self.fund_quantum_output(node, default, sources[0], wallet.getnewquantumaddress()["address"], Decimal(6000), held=True)
+        self.fund_quantum_output(node, default, sources[1], wallet.getnewquantumaddress()["address"], Decimal(3000))
+        self.pow_blocks(node, 1, pow_addr)
         self.pow_blocks(node, BEFORE_GUARD - node.getblockcount(), pow_addr)
         assert_equal(node.getblockcount(), BEFORE_GUARD)
         self.sync_mt_tip()
+        planned = wallet.getquantumstakereadiness()["final_stake_reserve"]
+        assert_equal(planned["n"], K_OUTPUTS)
+        assert single_output_reserve_bit(*self.key(planned["reserved_outpoints"][0])), "the larger source is not the held one"
+        self.log.info("Using %s", wallet_name)
 
         info = wallet.getquantumstakereadiness()["final_stake_reserve"]
         assert_equal(info["active"], False)
@@ -85,7 +106,7 @@ class FinalStakeReserveCommitTest(TransitionTFinalTestBase, BitcoinTestFramework
         self.total = sum(Decimal(str(u["amount"])) for u in outputs.values())
         self.base_hash = node.getbestblockhash()
         self.destination = wallet.getnewquantumaddress()["address"]
-        self.wallet_url = f"{node.url}/wallet/{quote('wc', safe='')}"
+        self.wallet_url = f"{node.url}/wallet/{quote(wallet_name, safe='')}"
 
         records = wallet.getwalletinfo()["txcount"]
 
@@ -172,7 +193,7 @@ class FinalStakeReserveCommitTest(TransitionTFinalTestBase, BitcoinTestFramework
         outcome = {}
 
         def run():
-            rpc = get_rpc_proxy(self.wallet_url, 91, timeout=300, coveragedir=node.coverage_dir)
+            rpc = get_rpc_proxy(self.wallet_url, 91, timeout=self.scaled(300), coveragedir=node.coverage_dir)
             try:
                 outcome["value"] = call(rpc)
             except Exception as e:  # noqa: BLE001
@@ -180,13 +201,13 @@ class FinalStakeReserveCommitTest(TransitionTFinalTestBase, BitcoinTestFramework
 
         thread = Thread(target=run, name="commit-in-flight", daemon=True)
         try:
-            with node.wait_for_debug_log([b"Wallet commit test pause reached"], timeout=30):
+            with node.wait_for_debug_log([b"Wallet commit test pause reached"], timeout=30):  # the node scales it itself
                 thread.start()
         except AssertionError:
-            thread.join(timeout=5)
+            thread.join(timeout=self.scaled(5))
             raise AssertionError("the commit never paused: %s" % outcome)
         during()
-        thread.join(timeout=60)
+        thread.join(timeout=self.scaled(60))
         assert not thread.is_alive(), "the commit did not finish"
         if result is not None and "value" in outcome:
             result["value"] = outcome["value"]

@@ -11,7 +11,6 @@ the reserve) and a small legacy coin for the fee. The withdrawal that names the 
 the guard. The named output is the caller's own choice and may be spent; the result says that it was reserved. The
 fee input the withdrawal picked itself would not have that right (the unit tests cover the refusal).
 """
-from decimal import Decimal
 from threading import Thread
 from urllib.parse import quote
 

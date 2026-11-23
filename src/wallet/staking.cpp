@@ -4253,7 +4253,13 @@ bool CreateCoinStake(CWallet& wallet, unsigned int nBits, int64_t nSearchInterva
                 {
                     std::vector<valtype> vSolutionsTmp;
                     CScript scriptPubKeyTmp = GetScriptForDestination(destination);
-                    Solver(scriptPubKeyTmp, vSolutionsTmp);
+                    // The block-signing key comes from the staking destination, which must be a key-hash script: a
+                    // label match alone does not make a saved address one.
+                    if (Solver(scriptPubKeyTmp, vSolutionsTmp) != TxoutType::PUBKEYHASH ||
+                        vSolutionsTmp.size() != 1 || vSolutionsTmp[0].size() != 20) {
+                        LogPrint(BCLog::COINSTAKE, "CreateCoinStake : the staking destination is not a key-hash address, so no minter key can be derived for output %s\n", pcoin.first->tx->vout[pcoin.second].ToString());
+                        break;
+                    }
                     std::unique_ptr<SigningProvider> provider = wallet.GetSolvingProvider(scriptPubKeyTmp);
                     if (!provider) {
                         LogPrint(BCLog::COINSTAKE, "CreateCoinStake : failed to get signing provider for output %s\n", pcoin.first->tx->vout[pcoin.second].ToString());

@@ -226,6 +226,7 @@ BASE_SCRIPTS = [
     'wallet_final_stake_reserve.py',
     'wallet_final_stake_reserve_commit.py',
     'wallet_final_stake_reserve_option.py',
+    'wallet_final_reorg_staker_destination.py',
     'feature_final_wallet_staker_crossing.py',
     'feature_final_wallet_staker_crossing.py --singleton-population',
     'wallet_claim_reserve_maturity.py',

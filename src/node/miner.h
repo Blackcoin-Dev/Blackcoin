@@ -270,6 +270,12 @@ void IncrementExtraNonce(CBlock* pblock, const CBlockIndex* pindexPrev, unsigned
 /** Check if staking is enabled */
 bool CanStake();
 
+/** Make sure `dest` holds the wallet's legacy key-hash staking destination (the address labelled "Staking Legacy Address",
+ *  created when none exists) whenever the next block is not Final, where no legacy kernel can stake and none is needed.
+ *  The phase is read from one snapshot of the tip under cs_main. Returns false with `error` set when the wallet cannot
+ *  provide one (for example, the keypool is empty). */
+bool EnsureLegacyStakingDestination(wallet::CWallet& wallet, CTxDestination& dest, bilingual_str& error);
+
 /** Mine proof-of-stake blocks */
 void StakeCoins(bool fStake, wallet::CWallet *pwallet, std::unique_ptr<std::vector<std::thread>>& threadStakeMinerGroup);
 #endif

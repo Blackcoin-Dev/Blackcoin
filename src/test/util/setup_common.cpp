@@ -101,7 +101,13 @@ std::ostream& operator<<(std::ostream& os, const uint256& num)
 }
 
 BasicTestingSetup::BasicTestingSetup(const ChainType chainType, const std::vector<const char*>& extra_args)
+#ifdef WIN32
+      // A short random component: the wallet backup tests build paths several folders deep under this root, and
+      // Windows refuses a path of 260 characters.
+    : m_path_root{fs::temp_directory_path() / "test_common_" PACKAGE_NAME / g_insecure_rand_ctx_temp_path.rand256().ToString().substr(0, 16)},
+#else
     : m_path_root{fs::temp_directory_path() / "test_common_" PACKAGE_NAME / g_insecure_rand_ctx_temp_path.rand256().ToString()},
+#endif
       m_args{}
 {
     m_node.args = &gArgs;

@@ -524,14 +524,17 @@ jobs:
                 done
               fi
               test -n "$wine_runner"
+              WINEDEBUG=-all "$wine_runner" cmd /c "if not exist C:\\t mkdir C:\\t"
               for suite in \
                 crypto_hardening_tests \
                 quantum_return_backup_tests \
                 staking_candidate_tests \
                 final_stake_reserve_tests \
                 wallet_tests; do
-                WINEDEBUG=-all "$wine_runner" "$test_binary" \
-                  --run_test="$suite" --log_level=test_suite
+                # A short temporary folder: the wallet backup suites build paths several
+                # folders deep under it, and Windows refuses a path of 260 characters.
+                WINEDEBUG=-all "$wine_runner" cmd /c \
+                  "set TMP=C:\\t&& set TEMP=C:\\t&& src\\test\\test_blackcoin.exe --run_test=$suite --log_level=test_suite"
               done
               ;;
           esac

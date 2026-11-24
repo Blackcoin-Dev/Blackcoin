@@ -22,6 +22,7 @@
 #include <wallet/claim_maintenance.h>
 #include <wallet/context.h>
 #include <wallet/display_balance.h>
+#include <wallet/quantum_return_backup.h>
 #include <wallet/spend.h>
 #ifdef USE_SQLITE
 #include <wallet/sqlite.h>
@@ -348,6 +349,14 @@ bool LoadWallets(WalletContext& context)
             std::unique_ptr<WalletDatabase> database = MakeWalletDatabase(name, options, status, error);
             if (!database && status == DatabaseStatus::FAILED_NOT_FOUND) {
                 continue;
+            }
+            {
+                const QuantumKeyBackupPathCheck backup_path = CheckQuantumKeyBackupWalletPath(name);
+                if (backup_path.error) {
+                    chain.initError(Untranslated(strprintf("Wallet %s cannot be loaded: %s", name, *backup_path.error)));
+                    return false;
+                }
+                if (backup_path.warning) chain.initWarning(Untranslated(*backup_path.warning));
             }
             chain.initMessage(_("Loading wallet…").translated);
             std::shared_ptr<CWallet> pwallet = database ? CWallet::Create(context, name, std::move(database), options.create_flags, error, warnings) : nullptr;

@@ -7,6 +7,13 @@
 Regtest lifecycle used by these tests (coinbase and coinstake maturity is 10):
     G = last Gold Rush block, M = last Migration block, F = M + 1 = first Final block.
 """
+import hashlib
+import struct
+from decimal import Decimal
+from math import ceil
+
+COMMIT_PAUSE_BASE_MS = 2000
+COMMIT_PAUSE_MAX_MS = 10000  # the node clamps the pause to this
 BLOCKS = 60
 G = 1 + BLOCKS
 M = G + 30
@@ -33,6 +40,15 @@ LIFECYCLE_ARGS = [
     f"-qqgoldrushendheight={G}",
     f"-qqmigrationendheight={M}",
 ]
+
+
+def single_output_reserve_bit(txid, vout):
+    """The final stake reserve's rule for a wallet with exactly one qualifying output: True when that output is held
+    back (reserved) for the first Final block, False when it is released. One SHA-256 over the ASCII tag, the 32
+    transaction hash bytes in serialization order (the displayed txid reversed) and the output index as four
+    little-endian bytes; held when the last digest byte is odd."""
+    digest = hashlib.sha256(b"BLK final stake reserve v1" + bytes.fromhex(txid)[::-1] + struct.pack("<I", vout)).digest()
+    return bool(digest[31] & 1)
 
 
 class TransitionTFinalTestBase:
@@ -132,3 +148,43 @@ class TransitionTFinalTestBase:
         assert block["tx"][1]["vin"][0]["txid"] == outpoint["txid"]
         assert block["tx"][1]["vin"][0]["vout"] == outpoint["vout"]
         return block_hash
+
+    def funding_inputs(self, wallet, minimum, confirmations=MATURITY + 1):
+        """Mature, spendable legacy coins of `wallet` of at least `minimum` (one funding transaction takes one)."""
+        inputs = [u for u in wallet.listunspent(confirmations, 9999999) if u["spendable"] and u["amount"] >= minimum]
+        inputs.sort(key=lambda u: (-u["confirmations"], u["txid"], u["vout"]))
+        return inputs
+
+    def fund_quantum_output(self, node, source_wallet, funding_input, address, amount, held=None, fee=Decimal("0.01")):
+        """Pay `amount` to the quantum `address` from one legacy coin of `source_wallet`, in a transaction built and signed
+        here, and broadcast it. The final stake reserve's singleton rule depends on the outpoint, so with `held` given
+        (True or False) a deterministic nonce, an eight-byte zero-value OP_RETURN payload, is counted up until the actual
+        signed transaction's txid gives that parity for the output, and only that candidate is broadcast. The chain does
+        not move during the search. Returns {"txid", "vout"}. The tip must be past the Gold Rush (a legacy coin may pay a
+        quantum output in Migration)."""
+        change = source_wallet.getnewaddress("", "legacy")
+        value = Decimal(str(funding_input["amount"]))
+        assert value > amount + fee, (value, amount)
+        for nonce in range(100000):
+            outputs = [{address: amount}, {change: value - amount - fee}, {"data": struct.pack("<Q", nonce).hex()}]
+            raw = node.createrawtransaction([{"txid": funding_input["txid"], "vout": funding_input["vout"]}], outputs)
+            signed = source_wallet.signrawtransactionwithwallet(raw)
+            assert signed["complete"], signed
+            decoded = node.decoderawtransaction(signed["hex"])
+            vout = next(o["n"] for o in decoded["vout"] if o["scriptPubKey"].get("address") == address)
+            if held is None or single_output_reserve_bit(decoded["txid"], vout) == held:
+                node.sendrawtransaction(signed["hex"], 0)
+                return {"txid": decoded["txid"], "vout": vout}
+        raise AssertionError("no nonce gives the wanted parity")
+
+
+def commit_pause(timeout_factor):
+    """The commit pause of the interleaving tests (-finalstakereservecommitdelaymillis) in milliseconds, scaled by the
+    timeout factor within the node's own cap of 10000, and whether the cap kept it from scaling fully."""
+    wanted = ceil(COMMIT_PAUSE_BASE_MS * timeout_factor)
+    return min(COMMIT_PAUSE_MAX_MS, max(COMMIT_PAUSE_BASE_MS, wanted)), wanted > COMMIT_PAUSE_MAX_MS
+
+
+def scaled_wait(seconds, timeout_factor):
+    """A wait budget in seconds scaled by the timeout factor (never truncated to zero)."""
+    return max(1, ceil(seconds * timeout_factor))

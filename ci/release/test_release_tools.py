@@ -35,6 +35,21 @@ def load_module(name):
     return module
 
 
+def reproducibility_report(package_label, channel, configured_version, artifacts):
+    """A report with a digest entry for every file already in the artifact directory."""
+    lines = [
+        f"package_label={package_label}",
+        f"prerelease_channel={channel}",
+        f"configured_version={configured_version}",
+        "target=linux-64-bit",
+    ]
+    for path in sorted(artifacts.iterdir()):
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        lines.append(f"{digest}  linux-64-bit/{path.name}")
+    lines.append(f"source_commit={SOURCE_SHA}")
+    return "\n".join(lines) + "\n"
+
+
 def load_mixed_version_module(name):
     spec = importlib.util.spec_from_file_location(
         name, MIXED_VERSION_TOOLS / f"{name}.py"
@@ -2988,10 +3003,7 @@ class ReleaseToolTests(unittest.TestCase):
                 SOURCE_SHA + "\n", encoding="utf-8"
             )
             (artifacts / f"{prefix}REPRODUCIBILITY.txt").write_text(
-                f"package_label={package_label}\n"
-                "prerelease_channel=alpha\n"
-                "configured_version=30.1.1rc1\n"
-                f"source_commit={SOURCE_SHA}\n",
+                reproducibility_report(package_label, "alpha", "30.1.1rc1", artifacts),
                 encoding="utf-8",
             )
             (artifacts / f"{prefix}UNSIGNED-CANARY.txt").write_text(
@@ -3085,10 +3097,7 @@ class ReleaseToolTests(unittest.TestCase):
                 SOURCE_SHA + "\n", encoding="utf-8"
             )
             (artifacts / f"{prefix}REPRODUCIBILITY.txt").write_text(
-                f"package_label={package_label}\n"
-                "prerelease_channel=beta\n"
-                "configured_version=30.1.1rc1\n"
-                f"source_commit={SOURCE_SHA}\n",
+                reproducibility_report(package_label, "beta", "30.1.1rc1", artifacts),
                 encoding="utf-8",
             )
             (artifacts / f"{prefix}UNSIGNED-CANARY.txt").write_text(
@@ -3125,6 +3134,133 @@ class ReleaseToolTests(unittest.TestCase):
             self.assertTrue(manifest["release"]["macos_adhoc_signed"])
             self.assertFalse(manifest["release"]["published"])
 
+    def _canary_fixture(self, artifacts, package_label="30.1.1-alpha1"):
+        prefix = f"Blackcoin-{package_label}-{SOURCE_SHA}-"
+        (artifacts / f"{prefix}Linux-x86_64.tar.gz").write_bytes(b"canary")
+        (artifacts / f"{prefix}Windows-x86_64.zip").write_bytes(b"windows")
+        (artifacts / f"{prefix}linux-64-bit-SOURCE_COMMIT.txt").write_text(
+            SOURCE_SHA + "\n", encoding="utf-8"
+        )
+        report = reproducibility_report(package_label, "alpha", "30.1.1rc1", artifacts)
+        (artifacts / f"{prefix}UNSIGNED-CANARY.txt").write_text(
+            "UNSIGNED CANARY ARTIFACTS - NOT A PRODUCTION RELEASE\n"
+            f"package_label={package_label}\n"
+            "prerelease_channel=alpha\n"
+            "configured_version=30.1.1rc1\n"
+            f"source_commit={SOURCE_SHA}\n"
+            "workflow_run_id=12345\n"
+            "signed=false\n"
+            "developer_id_signed=false\n"
+            "macos_adhoc_signed=false\n"
+            "notarized=false\npublished=false\n",
+            encoding="utf-8",
+        )
+        return prefix, report
+
+    def _generate_canary(self, generator, artifacts, prefix, report_text):
+        (artifacts / f"{prefix}REPRODUCIBILITY.txt").write_text(report_text, encoding="utf-8")
+        return generator.generate_manifest(
+            artifacts=artifacts,
+            package_label="30.1.1-alpha1",
+            source_version="30.1.1",
+            configured_version="30.1.1rc1",
+            source_sha=SOURCE_SHA,
+            release_candidate="1",
+            workflow_run_id="12345",
+            output=artifacts / f"{prefix}MANIFEST-UNSIGNED.json",
+        )
+
+    def test_canary_manifest_requires_a_valid_digest_for_every_artifact(self):
+        generator = load_module("generate_canary_manifest")
+        with tempfile.TemporaryDirectory() as temporary:
+            artifacts = Path(temporary)
+            prefix, report = self._canary_fixture(artifacts)
+            self._generate_canary(generator, artifacts, prefix, report)
+
+        lines = report.splitlines()
+        windows_entry = next(line for line in lines if line.endswith("Windows-x86_64.zip"))
+        bad_reports = {
+            "digest entry missing": [line for line in lines if line != windows_entry],
+            "appears under more than one target": lines[:-1] + [
+                "target=windows-64-bit",
+                windows_entry.replace("linux-64-bit/", "windows-64-bit/"),
+                lines[-1],
+            ],
+            "duplicate digest entry": lines[:-1] + [windows_entry, lines[-1]],
+            "malformed report line": lines[:-1] + [windows_entry.upper(), lines[-1]],
+            "does not match the file": [
+                ("0" * 64 + windows_entry[64:]) if line == windows_entry else line
+                for line in lines
+            ],
+            "no digest entry": [line for line in lines if "/" not in line]
+            [:4] + [lines[-1]],
+        }
+        for message, bad in bad_reports.items():
+            with self.subTest(message=message), tempfile.TemporaryDirectory() as temporary:
+                artifacts = Path(temporary)
+                prefix, _ = self._canary_fixture(artifacts)
+                with self.assertRaisesRegex(RuntimeError, message):
+                    self._generate_canary(
+                        generator, artifacts, prefix, "\n".join(bad) + "\n"
+                    )
+
+    def test_reproducibility_report_validator_checks_every_compared_artifact(self):
+        validator = load_module("validate_reproducibility_report")
+        package_label = "30.1.7-alpha1"
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            artifacts = root / "artifacts"
+            for target in ("linux-64-bit", "windows-64-bit"):
+                primary = artifacts / f"release-{package_label}-{target}-primary-{SOURCE_SHA}"
+                (primary / "sub").mkdir(parents=True)
+                (primary / f"{target}.tar.gz").write_bytes(target.encode())
+                (primary / "sub" / "nested.txt").write_bytes(b"nested " + target.encode())
+            expected = validator.collect_primaries(artifacts, package_label, SOURCE_SHA)
+            good = [
+                f"package_label={package_label}",
+                "prerelease_channel=alpha",
+                "configured_version=30.1.7rc1",
+            ]
+            for target, files in sorted(expected.items()):
+                good.append(f"target={target}")
+                good += [f"{digest}  {target}/{path}" for path, digest in sorted(files.items())]
+            good.append(f"source_commit={SOURCE_SHA}")
+
+            def run(lines):
+                report = root / "REPRODUCIBILITY.txt"
+                report.write_text("\n".join(lines) + "\n", encoding="utf-8")
+                return validator.validate(
+                    report, artifacts,
+                    package_label=package_label,
+                    prerelease_channel="alpha",
+                    configured_version="30.1.7rc1",
+                    source_sha=SOURCE_SHA,
+                )
+
+            self.assertEqual(run(good), 4)
+            nested = next(line for line in good if line.endswith("windows-64-bit/sub/nested.txt"))
+            cases = {
+                "digest entry missing": [line for line in good if line != nested],
+                "duplicate digest entry": good[:-1] + [nested, good[-1]],
+                "malformed report line": [
+                    line.replace("  ", " ") if line == nested else line for line in good
+                ],
+                "does not match the file": [
+                    ("f" * 64 + nested[64:]) if line == nested else line for line in good
+                ],
+                "not compared": good[:-1]
+                + [f"{'a' * 64}  windows-64-bit/extra.bin", good[-1]],
+                "unsafe artifact path": good[:-1]
+                + [f"{'a' * 64}  windows-64-bit/../x", good[-1]],
+                "no source_commit": good[:-1],
+                "targets differ": [line for line in good if "linux-64-bit" not in line],
+                "does not match the exact source": good[:-1] + ["source_commit=" + "1" * 40],
+            }
+            for message, lines in cases.items():
+                with self.subTest(message=message):
+                    with self.assertRaisesRegex(RuntimeError, message):
+                        run(lines)
+
     def test_unsigned_beta2_manifest_is_bound_to_rc2_and_exact_source(self):
         generator = load_module("generate_canary_manifest")
         package_label = "30.1.1-beta2"
@@ -3136,10 +3272,7 @@ class ReleaseToolTests(unittest.TestCase):
                 SOURCE_SHA + "\n", encoding="utf-8"
             )
             (artifacts / f"{prefix}REPRODUCIBILITY.txt").write_text(
-                f"package_label={package_label}\n"
-                "prerelease_channel=beta\n"
-                "configured_version=30.1.1rc2\n"
-                f"source_commit={SOURCE_SHA}\n",
+                reproducibility_report(package_label, "beta", "30.1.1rc2", artifacts),
                 encoding="utf-8",
             )
             (artifacts / f"{prefix}UNSIGNED-CANARY.txt").write_text(

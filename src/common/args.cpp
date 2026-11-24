@@ -97,6 +97,21 @@ KeyInfo InterpretKey(std::string key)
     return result;
 }
 
+/** The strict reading of a boolean option: 0, 1, true and false in any letter case, nothing else. */
+static std::optional<bool> ParseStrictBool(const std::string& text)
+{
+    const std::string lower = ToLower(text);
+    if (lower == "1" || lower == "true") return true;
+    if (lower == "0" || lower == "false") return false;
+    return std::nullopt;
+}
+
+static std::string StrictBoolError(const KeyInfo& key, const std::string& value)
+{
+    return strprintf("Invalid value '%s' for -%s%s: only 0, 1, true or false is accepted (or no value)",
+                     value, key.negated ? "no" : "", key.name);
+}
+
 /**
  * Interpret settings value based on registered flags.
  *
@@ -117,6 +132,17 @@ std::optional<common::SettingsValue> InterpretValue(const KeyInfo& key, const st
             error = strprintf("Negating of -%s is meaningless and therefore forbidden", key.name);
             return std::nullopt;
         }
+        if (flags & ArgsManager::STRICT_BOOL) {
+            // The value is parsed before the lenient reading below can discard its text. A negated key is stored as a
+            // boolean, which the settings system treats as the negation marker.
+            std::optional<bool> parsed{true};
+            if (value) parsed = ParseStrictBool(*value);
+            if (!parsed) {
+                error = StrictBoolError(key, *value);
+                return std::nullopt;
+            }
+            return common::SettingsValue{!*parsed};
+        }
         // Double negatives like -nofoo=0 are supported (but discouraged)
         if (value && !InterpretBool(*value)) {
             LogPrintf("Warning: parsed potentially confusing double-negative -%s=%s\n", key.name, *value);
@@ -127,6 +153,17 @@ std::optional<common::SettingsValue> InterpretValue(const KeyInfo& key, const st
     if (!value && (flags & ArgsManager::DISALLOW_ELISION)) {
         error = strprintf("Can not set -%s with no value. Please specify value with -%s=value.", key.name, key.name);
         return std::nullopt;
+    }
+    if (flags & ArgsManager::STRICT_BOOL) {
+        // A positive assignment stays a string, as every ordinary option does, so that the first assignment of a
+        // configuration file and the last one of the command line keep their precedence.
+        std::optional<bool> parsed{true};
+        if (value) parsed = ParseStrictBool(*value);
+        if (!parsed) {
+            error = StrictBoolError(key, *value);
+            return std::nullopt;
+        }
+        return common::SettingsValue{*parsed ? "1" : "0"};
     }
     return value ? *value : "";
 }
@@ -410,18 +447,41 @@ bool ArgsManager::ReadSettingsFile(std::vector<std::string>* errors)
     }
 
     LOCK(cs_args);
+    // Loading is transactional: the live map is cleared as before, the file is read and checked into a temporary map, and
+    // the map is installed only when the whole file is acceptable. A rejected file leaves no setting behind (as a malformed
+    // file does), so a caller that goes on after the error, and writes the settings back, writes none of it.
     m_settings.rw_settings.clear();
+    std::map<std::string, common::SettingsValue> loaded;
     std::vector<std::string> read_errors;
-    if (!common::ReadSettings(path, m_settings.rw_settings, read_errors)) {
+    if (!common::ReadSettings(path, loaded, read_errors)) {
         SaveErrors(read_errors, errors);
         return false;
     }
-    for (const auto& setting : m_settings.rw_settings) {
+    for (const auto& setting : loaded) {
         KeyInfo key = InterpretKey(setting.first); // Split setting key into section and argname
-        if (!GetArgFlags('-' + key.name)) {
+        const std::optional<unsigned int> flags = GetArgFlags('-' + key.name);
+        if (!flags) {
             LogPrintf("Ignoring unknown rw_settings value %s\n", setting.first);
+        } else if (*flags & STRICT_BOOL) {
+            // The settings file is read without InterpretValue: a strict option is checked here, before anything uses it.
+            const common::SettingsValue& value = setting.second;
+            if (key.negated) {
+                SaveErrors({strprintf("Invalid key '%s' in the settings file: use '%s' with the wanted value (a boolean, 0, 1, \"true\" or \"false\")",
+                                      setting.first, key.section.empty() ? key.name : key.section + "." + key.name)}, errors);
+                return false;
+            }
+            bool valid{false};
+            if (value.isBool()) valid = true;
+            else if (value.isNum()) valid = value.write() == "0" || value.write() == "1";
+            else if (value.isStr()) valid = ParseStrictBool(value.get_str()).has_value();
+            if (!valid) {
+                SaveErrors({strprintf("Invalid value %s for '%s' in the settings file: only a boolean, 0, 1, \"true\" or \"false\" is accepted",
+                                      value.write(), setting.first)}, errors);
+                return false;
+            }
         }
     }
+    m_settings.rw_settings = std::move(loaded);
     return true;
 }
 

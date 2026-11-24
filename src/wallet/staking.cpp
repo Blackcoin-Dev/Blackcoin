@@ -9,8 +9,11 @@
 #include <addresstype.h>
 #include <chain.h>
 #include <common/args.h>
+#include <common/settings.h>
 #include <consensus/demurrage.h>
+#include <crypto/common.h>
 #include <crypto/mldsa.h>
+#include <crypto/sha256.h>
 #include <key_io.h>
 #include <node/quantum_pool.h>
 #include <policy/policy.h>
@@ -30,10 +33,12 @@
 #include <txmempool.h>
 #include <util/check.h>
 #include <util/moneystr.h>
+#include <util/strencodings.h>
 #include <util/result.h>
 #include <util/time.h>
 #include <util/translation.h>
 #include <undo.h>
+#include <univalue.h>
 #include <validation.h>
 #include <wallet/walletdb.h>
 
@@ -2725,12 +2730,14 @@ bool BackupQuantumReturnKey(CWallet& wallet, std::string& error)
     AssertLockNotHeld(wallet.cs_wallet);
     const fs::path directory = QuantumKeyBackupDirectory(wallet.GetName());
     if (!EnsureQuantumKeyBackupDirectory(directory, error)) return false;
-    const QuantumKeyBackupKeySet keys = WITH_LOCK(wallet.cs_wallet, return wallet.GetQuantumKeyPrograms());
     const std::optional<int> height = wallet.HaveChain() ? wallet.chain().getHeight() : std::nullopt;
     const std::string file_name = QuantumKeyBackupFileName(GetTime(), height.value_or(0), NewQuantumKeyBackupSuffix());
     const uint64_t sequence = NextQuantumKeyBackupSequence(directory);
     bilingual_str backup_error;
-    if (!wallet.BackupWallet(fs::PathToString(directory / fs::PathFromString(file_name)), &backup_error, /*verify_quantum_keys=*/true)) {
+    // The manifest records what the verified file holds, as BackupWallet reports it from the snapshot the copy was
+    // made from: an inventory read before or after the call could differ from the file's.
+    QuantumKeyBackupKeySet keys;
+    if (!wallet.BackupWallet(fs::PathToString(directory / fs::PathFromString(file_name)), &backup_error, /*verify_quantum_keys=*/true, &keys)) {
         error = backup_error.original.empty() ? "the wallet backup failed" : backup_error.original;
         return false;
     }
@@ -2880,18 +2887,20 @@ QuantumStakeReturnPreparation PrepareQuantumStakeReturn(CWallet& wallet, Quantum
             prep.detail = "Gold Rush has not ended; the explicit command is available";
             return prep;
         }
-        if (!WITH_LOCK(wallet.cs_wallet, return WalletHoldsLegacyStakableCoin(wallet))) {
-            prep.detail = "this wallet holds no legacy coin the staker could stake";
-            return prep;
-        }
     }
     QuantumReturnChoice choice;
     {
         LOCK(wallet.cs_wallet);
+        // A ready return address ends the preparation before the wallet is scanned for legacy coins: the scan is
+        // needed only when an automatic preparation still has to decide whether to choose or create a key.
         const LegacyStakeQuantumReturn current = ResolveLegacyStakeQuantumReturn(wallet);
         if (current.available) {
             prep.address = current.address;
             prep.detail = "a quantum stake return address is already saved";
+            return prep;
+        }
+        if (trigger == QuantumStakeReturnTrigger::AUTOMATIC && !WalletHoldsLegacyStakableCoin(wallet)) {
+            prep.detail = "this wallet holds no legacy coin the staker could stake";
             return prep;
         }
         CTxDestination configured_dest;
@@ -3369,7 +3378,41 @@ void AvailableCoinsForStakingReference(const CWallet& wallet,
 int64_t FinalStakeReserveTarget(int64_t n)
 {
     if (n <= 0) return 0;
-    return std::min(MAX_FINAL_STAKE_RESERVE_OUTPUTS, (n + 1) / 2);
+    // n / 2 + n % 2 is ceil(n / 2) without the overflow of n + 1.
+    const int64_t half = n / 2;
+    if (half >= MAX_FINAL_STAKE_RESERVE_OUTPUTS) return MAX_FINAL_STAKE_RESERVE_OUTPUTS;
+    return std::min(MAX_FINAL_STAKE_RESERVE_OUTPUTS, half + n % 2);
+}
+
+bool FinalStakeReserveOptionEnabled()
+{
+    const common::SettingsValue value = gArgs.GetSetting("-finalstakereserve");
+    if (value.isNull()) return DEFAULT_FINAL_STAKE_RESERVE;
+    // The argument parser (ArgsManager::STRICT_BOOL) and the settings file check have already refused every value but
+    // a boolean (the negation marker), 0, 1, "0", "1", "true" and "false". Programmatic settings (ForceSetArg) may also
+    // be the empty string, a bare flag.
+    if (value.isBool()) return value.get_bool();
+    if (value.isNum()) return value.write() != "0";
+    if (value.isStr()) {
+        const std::string text = ToLower(value.get_str());
+        if (text.empty() || text == "1" || text == "true") return true;
+        if (text == "0" || text == "false") return false;
+    }
+    return DEFAULT_FINAL_STAKE_RESERVE;
+}
+
+bool SingleOutputReserveBit(const COutPoint& outpoint)
+{
+    static constexpr char TAG[] = "BLK final stake reserve v1";
+    unsigned char vout[4];
+    WriteLE32(vout, outpoint.n);
+    unsigned char digest[CSHA256::OUTPUT_SIZE];
+    CSHA256()
+        .Write(reinterpret_cast<const unsigned char*>(TAG), sizeof(TAG) - 1)
+        .Write(outpoint.hash.data(), 32)
+        .Write(vout, sizeof(vout))
+        .Finalize(digest);
+    return (digest[CSHA256::OUTPUT_SIZE - 1] & 1) != 0;
 }
 
 /** M and F for the reserve guard, or nullopt without a complete height schedule. */
@@ -3405,7 +3448,15 @@ FinalStakeReservePlan PlanFinalStakeReserve(std::vector<FinalStakeReserveSource>
 
     FinalStakeReservePlan plan;
     plan.n = static_cast<int64_t>(all.size());
-    plan.target = FinalStakeReserveTarget(plan.n);
+    if (plan.n == 1) {
+        // The only source decides by its own outpoint whether it is held, so that a wallet with a single output keeps
+        // it for the first Final block only when the outpoint says so.
+        plan.single_output = true;
+        plan.single_output_held = SingleOutputReserveBit(*all.begin());
+        plan.target = plan.single_output_held ? 1 : 0;
+    } else {
+        plan.target = FinalStakeReserveTarget(plan.n);
+    }
     const size_t take = static_cast<size_t>(std::min<int64_t>(plan.target, static_cast<int64_t>(unspent.size())));
     plan.reserved.assign(unspent.begin(), unspent.begin() + take);
     plan.shortfall = plan.target - static_cast<int64_t>(take);
@@ -3461,7 +3512,7 @@ FinalStakeReserve ComputeFinalStakeReserve(const CWallet& wallet, const std::set
     AssertLockHeld(::cs_main);
     AssertLockHeld(wallet.cs_wallet);
     FinalStakeReserve reserve;
-    reserve.enabled = gArgs.GetBoolArg("-finalstakereserve", DEFAULT_FINAL_STAKE_RESERVE);
+    reserve.enabled = FinalStakeReserveOptionEnabled();
     const Consensus::Params& consensus = Params().GetConsensus();
     const CBlockIndex* tip = wallet.chain().getTip();
     if (!tip) return reserve;
@@ -3524,6 +3575,8 @@ FinalStakeReserve ComputeFinalStakeReserve(const CWallet& wallet, const std::set
     FinalStakeReservePlan plan = PlanFinalStakeReserve(std::move(unspent), consumed);
     reserve.n = plan.n;
     reserve.target = plan.target;
+    reserve.single_output = plan.single_output;
+    reserve.single_output_held = plan.single_output_held;
     // Released at F: n, R and the eligibility are reported, nothing is held back and nothing is short.
     if (int64_t{reserve.candidate_height} >= reserve.final_height) return reserve;
     reserve.shortfall = plan.shortfall;
@@ -3539,7 +3592,7 @@ std::set<COutPoint> FinalStakeReserveEnforcedOutpoints(const CWallet& wallet, co
 {
     AssertLockHeld(::cs_main);
     AssertLockHeld(wallet.cs_wallet);
-    if (!gArgs.GetBoolArg("-finalstakereserve", DEFAULT_FINAL_STAKE_RESERVE)) return {};
+    if (!FinalStakeReserveOptionEnabled()) return {};
     const CBlockIndex* tip = wallet.chain().getTip();
     if (!tip || !IsFinalStakeReserveGuardActive(Params().GetConsensus(), tip->nHeight + 1)) return {};
     return ComputeFinalStakeReserve(wallet, ignore_lock_of).enforced;
@@ -3580,7 +3633,7 @@ FinalStakeReserveSpendReport MakeFinalStakeReserveSpendReport(const CWallet& wal
 bool FinalStakeReserveGuardActiveNow(const CWallet& wallet)
 {
     AssertLockHeld(::cs_main);
-    if (!wallet.HaveChain() || !gArgs.GetBoolArg("-finalstakereserve", DEFAULT_FINAL_STAKE_RESERVE)) return false;
+    if (!wallet.HaveChain() || !FinalStakeReserveOptionEnabled()) return false;
     const CBlockIndex* tip = wallet.chain().getTip();
     return tip && IsFinalStakeReserveGuardActive(Params().GetConsensus(), tip->nHeight + 1);
 }
@@ -3814,7 +3867,7 @@ static bool StakeSlotCacheIsCurrent(const CWallet& wallet, const StakeSlotCache&
            cache.wallet_locked == wallet.IsLocked() &&
            cache.staking_only == wallet.m_wallet_unlock_staking_only.load() &&
            cache.protected_rgb_seals == wallet.GetProtectedRGBSeals() &&
-           cache.final_reserve_enabled == gArgs.GetBoolArg("-finalstakereserve", DEFAULT_FINAL_STAKE_RESERVE) &&
+           cache.final_reserve_enabled == FinalStakeReserveOptionEnabled() &&
            std::chrono::steady_clock::now() - cache.built_at < STAKE_SLOT_CACHE_MAX_AGE;
 }
 
@@ -3829,7 +3882,7 @@ static std::shared_ptr<StakeSlotCache> BuildStakeSlotCache(const CWallet& wallet
     cache->wallet_locked = wallet.IsLocked();
     cache->staking_only = wallet.m_wallet_unlock_staking_only.load();
     cache->protected_rgb_seals = wallet.GetProtectedRGBSeals();
-    cache->final_reserve_enabled = gArgs.GetBoolArg("-finalstakereserve", DEFAULT_FINAL_STAKE_RESERVE);
+    cache->final_reserve_enabled = FinalStakeReserveOptionEnabled();
     cache->built_at = std::chrono::steady_clock::now();
     CAmount target{MAX_MONEY};
     SelectCoinsForStaking(wallet, target, cache->coins, cache->value_in);
@@ -4204,7 +4257,13 @@ bool CreateCoinStake(CWallet& wallet, unsigned int nBits, int64_t nSearchInterva
                 {
                     std::vector<valtype> vSolutionsTmp;
                     CScript scriptPubKeyTmp = GetScriptForDestination(destination);
-                    Solver(scriptPubKeyTmp, vSolutionsTmp);
+                    // The block-signing key comes from the staking destination, which must be a key-hash script: a
+                    // label match alone does not make a saved address one.
+                    if (Solver(scriptPubKeyTmp, vSolutionsTmp) != TxoutType::PUBKEYHASH ||
+                        vSolutionsTmp.size() != 1 || vSolutionsTmp[0].size() != 20) {
+                        LogPrint(BCLog::COINSTAKE, "CreateCoinStake : the staking destination is not a key-hash address, so no minter key can be derived for output %s\n", pcoin.first->tx->vout[pcoin.second].ToString());
+                        break;
+                    }
                     std::unique_ptr<SigningProvider> provider = wallet.GetSolvingProvider(scriptPubKeyTmp);
                     if (!provider) {
                         LogPrint(BCLog::COINSTAKE, "CreateCoinStake : failed to get signing provider for output %s\n", pcoin.first->tx->vout[pcoin.second].ToString());

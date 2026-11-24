@@ -573,7 +573,31 @@ std::optional<bilingual_str> QuantumMigrationSweepPhaseError(
     return std::nullopt;
 }
 
-util::Result<void> CommitWalletTransactionOrError(CWallet& wallet, const CTransactionRef& tx, mapValue_t map_value, const std::string& action)
+//! The user-facing note for a transaction that spent outputs the final stake reserve holds back; empty when it spent none.
+bilingual_str FinalStakeReserveSpendWarning(const FinalStakeReserveSpendReport& report)
+{
+    if (report.spent.empty()) return {};
+    return strprintf(_("This transaction spends %d output(s) worth %s that the final stake reserve holds back for the first Final block. "
+                       "The reserve went from %d to %d held-back outputs, and the outputs able to stake at the first Final block from %d to %d."),
+                     report.spent.size(), FormatMoney(report.spent_effective_value),
+                     report.reserved_before, report.reserved_after,
+                     report.eligible_before, report.eligible_after);
+}
+
+//! The user-facing note for a transaction the wallet stored but could not hand to the network yet.
+bilingual_str PersistedPendingWarning(const std::string& broadcast_error)
+{
+    if (broadcast_error.empty()) {
+        return _("The transaction was stored in the wallet but could not be broadcast yet. It is not confirmed, and it is not certain that it will be relayed or confirmed.");
+    }
+    return strprintf(_("The transaction was stored in the wallet but could not be broadcast yet (%s). It is not confirmed, and it is not certain that it will be relayed or confirmed."), broadcast_error);
+}
+
+//! `provenance` names the inputs the caller selected itself (the only ones that may spend the final stake reserve);
+//! `reserve_report`, when given, receives what a deliberate spend of the reserve took.
+util::Result<void> CommitWalletTransactionOrError(CWallet& wallet, const CTransactionRef& tx, mapValue_t map_value, const std::string& action,
+                                                  const CommitSpendProvenance* provenance = nullptr,
+                                                  FinalStakeReserveSpendReport* reserve_report = nullptr)
     LOCKS_EXCLUDED(wallet.cs_wallet)
 {
     // CommitTransaction takes cs_main and then cs_wallet itself, so the caller holds neither wallet lock.
@@ -581,7 +605,8 @@ util::Result<void> CommitWalletTransactionOrError(CWallet& wallet, const CTransa
     try {
         std::string broadcast_error;
         WalletCommitStatus status;
-        if (!wallet.CommitTransaction(tx, std::move(map_value), {}, &broadcast_error, &status)) {
+        if (!wallet.CommitTransaction(tx, std::move(map_value), {}, &broadcast_error, &status,
+                                      /*shadow_pow_authority=*/std::nullopt, provenance, reserve_report)) {
             const std::string reason = broadcast_error.empty() ? "transaction was not accepted into the mempool" : broadcast_error;
             if (status == WalletCommitStatus::PERSISTED_PENDING) return {};
             return util::Error{Untranslated(strprintf("Error: %s transaction could not be committed: %s", action, reason))};
@@ -1312,7 +1337,7 @@ util::Result<WalletQuantumOperatorBondTx> FundTieredStakeAddress(
     result.address = address;
     result.amount = amount;
     result.fee = fee;
-    result.warning = "A new non-HD ML-DSA quantum change key was created during transaction construction. Back up this wallet now; an older backup cannot recover it.";
+    result.warning = _("A new non-HD ML-DSA quantum change key was created during transaction construction. Back up this wallet now; an older backup cannot recover it.");
     return result;
 }
 
@@ -1465,7 +1490,12 @@ util::Result<WalletQuantumOperatorBondTx> WithdrawTieredStakeAddress(
 
     mapValue_t map_value;
     map_value["comment"] = std::move(comment);
-    if (auto committed = CommitWalletTransactionOrError(wallet, tx, std::move(map_value), "staking address withdrawal"); !committed) {
+    // Only the output the caller named may spend the final stake reserve; the fee inputs the withdrawal adds itself and
+    // the outputs it selects when none is named are the wallet's own choice and stay subject to it.
+    CommitSpendProvenance provenance;
+    if (selected_outpoint) provenance.explicit_inputs.insert(*selected_outpoint);
+    FinalStakeReserveSpendReport reserve_report;
+    if (auto committed = CommitWalletTransactionOrError(wallet, tx, std::move(map_value), "staking address withdrawal", &provenance, &reserve_report); !committed) {
         return util::Error{DurableQuantumKeyFailure(*created_key, "Staking address withdrawal", util::ErrorString(committed))};
     }
 
@@ -1478,8 +1508,11 @@ util::Result<WalletQuantumOperatorBondTx> WithdrawTieredStakeAddress(
     result.started_unbonding = started_unbonding;
     result.completed_withdrawal = completed_withdrawal;
     result.warning = started_unbonding
-        ? "A new non-HD ML-DSA quantum change key was created while starting unbonding. Back up this wallet now; an older backup cannot recover it."
-        : "A new non-HD ML-DSA quantum withdrawal key was created. Back up this wallet now; an older backup cannot recover it.";
+        ? _("A new non-HD ML-DSA quantum change key was created while starting unbonding. Back up this wallet now; an older backup cannot recover it.")
+        : _("A new non-HD ML-DSA quantum withdrawal key was created. Back up this wallet now; an older backup cannot recover it.");
+    if (const bilingual_str reserve_warning = FinalStakeReserveSpendWarning(reserve_report); !reserve_warning.empty()) {
+        result.warning += Untranslated(" ") + reserve_warning;
+    }
     return result;
 }
 
@@ -1585,7 +1618,7 @@ util::Result<WalletQuantumOperatorBondTx> FundColdStakeDelegationAddress(
     result.address = address;
     result.amount = amount;
     result.fee = fee;
-    result.warning = "A new non-HD ML-DSA quantum change key was created during delegation funding. Back up this wallet now; an older backup cannot recover it.";
+    result.warning = _("A new non-HD ML-DSA quantum change key was created during delegation funding. Back up this wallet now; an older backup cannot recover it.");
     return result;
 }
 
@@ -1715,7 +1748,11 @@ util::Result<WalletQuantumOperatorBondTx> WithdrawColdStakeDelegationAddress(
 
     mapValue_t map_value;
     map_value["comment"] = "Blackcoin quantum cold-stake delegation withdrawal";
-    if (auto committed = CommitWalletTransactionOrError(wallet, tx, std::move(map_value), "cold-stake delegation withdrawal"); !committed) {
+    // See WithdrawTieredStakeAddress: only the output the caller named is an explicit choice.
+    CommitSpendProvenance provenance;
+    if (selected_outpoint) provenance.explicit_inputs.insert(*selected_outpoint);
+    FinalStakeReserveSpendReport reserve_report;
+    if (auto committed = CommitWalletTransactionOrError(wallet, tx, std::move(map_value), "cold-stake delegation withdrawal", &provenance, &reserve_report); !committed) {
         return util::Error{DurableQuantumKeyFailure(*created_key, "Cold-stake delegation withdrawal", util::ErrorString(committed))};
     }
 
@@ -1728,8 +1765,11 @@ util::Result<WalletQuantumOperatorBondTx> WithdrawColdStakeDelegationAddress(
     result.started_unbonding = started_unbonding;
     result.completed_withdrawal = completed_withdrawal;
     result.warning = started_unbonding
-        ? "A new non-HD ML-DSA quantum change key was created while starting delegation unbonding. Back up this wallet now; an older backup cannot recover it."
-        : "A new non-HD ML-DSA quantum withdrawal key was created. Back up this wallet now; an older backup cannot recover it.";
+        ? _("A new non-HD ML-DSA quantum change key was created while starting delegation unbonding. Back up this wallet now; an older backup cannot recover it.")
+        : _("A new non-HD ML-DSA quantum withdrawal key was created. Back up this wallet now; an older backup cannot recover it.");
+    if (const bilingual_str reserve_warning = FinalStakeReserveSpendWarning(reserve_report); !reserve_warning.empty()) {
+        result.warning += Untranslated(" ") + reserve_warning;
+    }
     return result;
 }
 
@@ -2004,6 +2044,9 @@ util::Result<WalletQuantumActionTx> CreateQuantumMigrationSweep(
         LOCK(wallet.cs_wallet);
         if (!wallet.GetQuantumKeyInfo(destination).has_value()) {
             return util::Error{_("The destination is not wallet-backed (no ML-DSA private key in this wallet). No transaction was created.")};
+        }
+        if (wallet.IsQuantumStakeReturnPendingKey(destination)) {
+            return util::Error{_("The destination is the quantum stake return key, a new key still waiting for its first verified wallet backup. It cannot be selected as this migration or consolidation destination until that backup succeeds. No transaction was created.")};
         }
     }
     const CScript destination_script = GetScriptForDestination(destination);
@@ -2755,7 +2798,7 @@ public:
         }
         return txr.tx;
     }
-    std::string commitTransaction(CTransactionRef tx,
+    bilingual_str commitTransaction(CTransactionRef tx,
         WalletValueMap value_map,
         WalletOrderForm order_form) override
     {
@@ -2771,6 +2814,7 @@ public:
         std::string broadcast_error;
         WalletCommitStatus status;
         FinalStakeReserveSpendReport reserve_report;
+        bool stored_but_not_relayed{false};
         if (!m_wallet->CommitTransaction(tx, std::move(value_map), std::move(order_form), &broadcast_error, &status,
                                          /*shadow_pow_authority=*/std::nullopt, &provenance, &reserve_report)) {
             // Stored but not relayed yet: the wallet keeps it and sends it later. It is a success of the commit, and the
@@ -2784,14 +2828,21 @@ public:
                 if (left_nothing) throw interfaces::WalletCommitRejected(reason);
                 throw std::runtime_error(reason);
             }
+            stored_but_not_relayed = true;
         }
-        // A deliberate spend of the final stake reserve is reported to the user.
-        if (reserve_report.spent.empty()) return {};
-        return strprintf("This transaction spends %d output(s) worth %s that the final stake reserve holds back for the first Final block. "
-                         "The reserve went from %d to %d held-back outputs, and the outputs able to stake at the first Final block from %d to %d.",
-                         reserve_report.spent.size(), FormatMoney(reserve_report.spent_effective_value),
-                         reserve_report.reserved_before, reserve_report.reserved_after,
-                         reserve_report.eligible_before, reserve_report.eligible_after);
+        // The warnings the user is shown: that the transaction was stored but not relayed, and that it spent outputs
+        // the final stake reserve holds back. Both are told when both apply.
+        bilingual_str warning;
+        if (stored_but_not_relayed) warning = PersistedPendingWarning(broadcast_error);
+        if (const bilingual_str reserve_warning = FinalStakeReserveSpendWarning(reserve_report); !reserve_warning.original.empty()) {
+            if (!warning.original.empty()) {
+                warning.original += " ";
+                warning.translated += " ";
+            }
+            warning.original += reserve_warning.original;
+            warning.translated += reserve_warning.translated;
+        }
+        return warning;
     }
     bool transactionCanBeAbandoned(const uint256& txid) override { return m_wallet->TransactionCanBeAbandoned(txid); }
     bool abandonTransaction(const uint256& txid) override
@@ -4293,6 +4344,7 @@ public:
             .solvables_wallet_name = res->solvables_wallet ? std::make_optional(res->solvables_wallet->GetName()) : std::nullopt,
             .backup_path = res->backup_path,
         };
+        for (const bilingual_str& warning : res->warnings) out.warnings.push_back(warning.translated);
         return {std::move(out)}; // std::move to work around clang bug
     }
     std::string getWalletDir() override

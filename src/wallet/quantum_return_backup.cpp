@@ -60,6 +60,42 @@ bool IsLowerHex(std::string_view s)
 //! Test seam: replaces the commit of a directory (see SetQuantumKeyBackupDirectoryCommitForTest).
 std::function<bool(const fs::path&)> g_directory_commit_hook;
 
+//! Test seam: an unknown drive type counts as a fixed disk (see SetQuantumKeyBackupUnknownDriveIsFixedForTest).
+bool g_unknown_drive_is_fixed_for_test{false};
+
+//! Test seam: the Windows path rule on any platform (see SetQuantumKeyBackupWindowsPathRulesForTest).
+std::optional<bool> g_windows_path_rules_for_test;
+
+bool WindowsPathRulesApply()
+{
+    if (g_windows_path_rules_for_test) return *g_windows_path_rules_for_test;
+#ifdef WIN32
+    return true;
+#else
+    return false;
+#endif
+}
+
+//! Test seam: the data directory the backup directory is resolved against (see SetQuantumKeyBackupDataDirectoryForTest).
+std::optional<fs::path> g_data_directory_for_test;
+
+fs::path BackupDataDirectory()
+{
+    return g_data_directory_for_test ? *g_data_directory_for_test : gArgs.GetDataDirNet();
+}
+
+//! Test seam: the identity of a directory (see SetQuantumKeyBackupDirectoryIdentityForTest).
+std::function<std::optional<QuantumBackupDirectoryIdentity>(const fs::path&)> g_directory_identity_hook;
+
+/** Why a backup directory given by the caller is refused for its spelling alone, before the file system is touched:
+ *  on Windows, a path that starts with two separators, or one that is relative to a drive or to a drive's root. Never
+ *  applied to the volume GUID path Windows reports for an open handle, which is how a local volume is recognised. */
+std::optional<std::string> BackupDirectorySpellingRejection(const fs::path& directory)
+{
+    if (!WindowsPathRulesApply()) return std::nullopt;
+    return QuantumKeyBackupSpellingRejection(fs::PathToString(directory));
+}
+
 std::string DriveTypeName(unsigned drive_type)
 {
     switch (drive_type) {
@@ -78,20 +114,88 @@ std::string DriveTypeName(unsigned drive_type)
 #define VOLUME_NAME_GUID 0x1
 #endif
 
+/** An open Windows handle that is closed when it goes out of scope, so no exit from a function (a return or an
+ *  exception) leaves it open. Close() closes it at a chosen point and reports why that failed. */
+class ScopedWindowsHandle
+{
+public:
+    explicit ScopedWindowsHandle(HANDLE handle) : m_handle(handle) {}
+    ScopedWindowsHandle(const ScopedWindowsHandle&) = delete;
+    ScopedWindowsHandle& operator=(const ScopedWindowsHandle&) = delete;
+    ~ScopedWindowsHandle()
+    {
+        if (m_handle != INVALID_HANDLE_VALUE) ::CloseHandle(m_handle);
+    }
+    HANDLE get() const { return m_handle; }
+    bool valid() const { return m_handle != INVALID_HANDLE_VALUE; }
+    /** Close now. On failure error is the system error taken at the failed call. The handle is never closed twice. */
+    bool Close(DWORD& error)
+    {
+        if (m_handle == INVALID_HANDLE_VALUE) return true;
+        const HANDLE handle = m_handle;
+        m_handle = INVALID_HANDLE_VALUE;
+        if (::CloseHandle(handle)) return true;
+        error = ::GetLastError();
+        return false;
+    }
+
+private:
+    HANDLE m_handle;
+};
+
+/** The identity of the directory an open handle names. On failure error says why (the system error is taken at the
+ *  failed call). */
+bool DirectoryIdentityOfHandle(HANDLE handle, QuantumBackupDirectoryIdentity& identity, std::string& error)
+{
+    BY_HANDLE_FILE_INFORMATION information{};
+    if (!::GetFileInformationByHandle(handle, &information)) {
+        const DWORD information_error = ::GetLastError();
+        error = strprintf("its identity cannot be read: %s", Win32ErrorString(static_cast<int>(information_error)));
+        return false;
+    }
+    identity.volume_serial = information.dwVolumeSerialNumber;
+    identity.file_index_high = information.nFileIndexHigh;
+    identity.file_index_low = information.nFileIndexLow;
+    return true;
+}
+
+/** The identity of a directory, from a handle opened for its attributes only (no write access is needed to compare). */
+bool DirectoryIdentityWindows(const fs::path& directory, QuantumBackupDirectoryIdentity& identity, std::string& error)
+{
+    ScopedWindowsHandle handle{::CreateFileW(directory.c_str(), FILE_READ_ATTRIBUTES,
+                                             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                                             FILE_FLAG_BACKUP_SEMANTICS, nullptr)};
+    if (!handle.valid()) {
+        const DWORD open_error = ::GetLastError();
+        error = strprintf("it cannot be opened to read its identity: %s", Win32ErrorString(static_cast<int>(open_error)));
+        return false;
+    }
+    return DirectoryIdentityOfHandle(handle.get(), identity, error);
+}
+
 /** The final path of an open handle with the volume named by its GUID (`\\?\Volume{...}\dir\sub`), in a buffer sized to
- *  fit: the size the call asks for is asked for again until the answer fits, so a long path is never cut short. */
+ *  fit: the size the call asks for is asked for again until the answer fits, so a long path is never cut short. The
+ *  system error is taken at the failed call, before anything else can change it. */
 bool FinalPathByVolumeGuid(HANDLE handle, std::wstring& final_path, std::string& reason)
 {
     DWORD needed = ::GetFinalPathNameByHandleW(handle, nullptr, 0, VOLUME_NAME_GUID);
+    if (needed == 0) {
+        const DWORD size_error = ::GetLastError();
+        reason = strprintf("its volume cannot be identified: %s", Win32ErrorString(static_cast<int>(size_error)));
+        return false;
+    }
     for (int attempt = 0; attempt < 4; ++attempt) {
-        if (needed == 0) break;
         if (needed > 65536) {
             reason = "its path is too long to be tied to one volume";
             return false;
         }
         std::wstring buffer(needed, L'\0');
         const DWORD written = ::GetFinalPathNameByHandleW(handle, buffer.data(), static_cast<DWORD>(buffer.size()), VOLUME_NAME_GUID);
-        if (written == 0) break;
+        if (written == 0) {
+            const DWORD path_error = ::GetLastError();
+            reason = strprintf("its volume cannot be identified: %s", Win32ErrorString(static_cast<int>(path_error)));
+            return false;
+        }
         if (written < buffer.size()) { // success: the length without the terminating null
             buffer.resize(written);
             final_path = std::move(buffer);
@@ -99,7 +203,8 @@ bool FinalPathByVolumeGuid(HANDLE handle, std::wstring& final_path, std::string&
         }
         needed = written; // too small: the size it needs, with the terminating null
     }
-    reason = strprintf("its volume cannot be identified: %s", Win32ErrorString(static_cast<int>(::GetLastError())));
+    // Every answer was too small for the next: the path kept growing while it was read. There is no system error.
+    reason = "its volume cannot be identified: its path kept changing length while it was being read";
     return false;
 }
 
@@ -111,57 +216,106 @@ bool FinalPathByVolumeGuid(HANDLE handle, std::wstring& final_path, std::string&
  *  taken from the path that was asked for, which could name another volume by the time it is looked up.
  *  DirectoryCommit() in util/fs_helpers.cpp returns success without flushing on this platform and is left as it is
  *  for its other callers; the backup must not take that for a commit, so an error here is a failed commit, and a
- *  file system that cannot vouch for the flush is refused before it is trusted. `reason` says why it failed. */
-bool FlushDirectoryWindows(const fs::path& directory, std::string& reason)
+ *  file system that cannot vouch for the flush is refused before it is trusted. `reason` says why it failed; the
+ *  first failure is the reason, and a failure to close the handle is reported only when nothing failed before it.
+ *  After a successful flush the directory's identity is read from the same handle: `identity` holds it, or stays
+ *  empty with `identity_error` saying why it could not be read (which does not fail the commit). */
+bool FlushDirectoryWindows(const fs::path& directory, std::string& reason, std::optional<QuantumBackupDirectoryIdentity>& identity,
+                           std::string& identity_error)
 {
-    const HANDLE handle = ::CreateFileW(directory.wstring().c_str(), GENERIC_WRITE,
-                                        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
-                                        FILE_FLAG_BACKUP_SEMANTICS, nullptr);
-    if (handle == INVALID_HANDLE_VALUE) {
-        reason = strprintf("it cannot be opened for writing: %s", Win32ErrorString(static_cast<int>(::GetLastError())));
+    ScopedWindowsHandle handle{::CreateFileW(directory.c_str(), GENERIC_WRITE,
+                                             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                                             FILE_FLAG_BACKUP_SEMANTICS, nullptr)};
+    if (!handle.valid()) {
+        const DWORD open_error = ::GetLastError();
+        reason = strprintf("it cannot be opened for writing: %s", Win32ErrorString(static_cast<int>(open_error)));
         LogPrintf("Unable to open directory %s for durable commit: %s\n", fs::PathToString(directory), reason);
         return false;
     }
     bool committed = true;
     std::wstring final_path;
     wchar_t file_system[MAX_PATH + 1] = {};
-    if (!FinalPathByVolumeGuid(handle, final_path, reason)) {
+    if (!FinalPathByVolumeGuid(handle.get(), final_path, reason)) {
         committed = false;
     } else if (const std::optional<std::wstring> volume_root = QuantumBackupLocalVolumeRoot(final_path); !volume_root) {
         reason = "the directory is not on a local volume that has a volume GUID path (a network share, or a path that cannot be tied to one local volume); use a folder on a local NTFS volume";
         committed = false;
-    } else if (!::GetVolumeInformationByHandleW(handle, nullptr, 0, nullptr, nullptr, nullptr, file_system, MAX_PATH + 1)) {
-        reason = strprintf("its file system cannot be identified: %s", Win32ErrorString(static_cast<int>(::GetLastError())));
+    } else if (!::GetVolumeInformationByHandleW(handle.get(), nullptr, 0, nullptr, nullptr, nullptr, file_system, MAX_PATH + 1)) {
+        const DWORD volume_error = ::GetLastError();
+        reason = strprintf("its file system cannot be identified: %s", Win32ErrorString(static_cast<int>(volume_error)));
         committed = false;
     } else {
         std::string narrow_file_system;
         for (const wchar_t* c = file_system; *c != L'\0'; ++c) narrow_file_system.push_back(*c < 0x80 ? static_cast<char>(*c) : '?');
-        const unsigned drive_type = ::GetDriveTypeW(volume_root->c_str());
+        unsigned drive_type = ::GetDriveTypeW(volume_root->c_str());
+        // Tests under an emulator only: every other answer, the file system name included, is still the real one.
+        if (g_unknown_drive_is_fixed_for_test && drive_type == QUANTUM_BACKUP_DRIVE_UNKNOWN) drive_type = QUANTUM_BACKUP_DRIVE_FIXED;
         if (const std::optional<std::string> rejection = QuantumBackupVolumeRejection(narrow_file_system, drive_type)) {
             reason = *rejection;
             committed = false;
         }
     }
-    if (committed && !::FlushFileBuffers(handle)) {
-        reason = strprintf("flushing it failed: %s", Win32ErrorString(static_cast<int>(::GetLastError())));
+    if (committed && !::FlushFileBuffers(handle.get())) {
+        const DWORD flush_error = ::GetLastError();
+        reason = strprintf("flushing it failed: %s", Win32ErrorString(static_cast<int>(flush_error)));
         committed = false;
     }
+    if (committed) {
+        QuantumBackupDirectoryIdentity found;
+        if (DirectoryIdentityOfHandle(handle.get(), found, identity_error)) {
+            identity = found;
+        }
+    }
+    DWORD close_error{0};
+    if (!handle.Close(close_error)) {
+        if (committed) {
+            reason = strprintf("closing it failed: %s", Win32ErrorString(static_cast<int>(close_error)));
+            committed = false;
+            identity.reset();
+        } else {
+            LogPrintf("Closing directory %s also failed: %s\n", fs::PathToString(directory), Win32ErrorString(static_cast<int>(close_error)));
+        }
+    }
     if (!committed) LogPrintf("Unable to durably commit directory %s: %s\n", fs::PathToString(directory), reason);
-    if (!::CloseHandle(handle)) committed = false;
     return committed;
 }
 #endif
 
-/** Make the entries of one directory durable: what has been created in it and what has been renamed into it. */
-bool CommitDirectory(const fs::path& directory, std::string& reason)
+/** Make the entries of one directory durable: what has been created in it and what has been renamed into it. When
+ *  it succeeds, `identity` is the directory's identity if it could be read, taken from the handle that was validated
+ *  and flushed on Windows; otherwise it stays empty and `identity_error` may say why. */
+bool CommitDirectory(const fs::path& directory, std::string& reason, std::optional<QuantumBackupDirectoryIdentity>& identity,
+                     std::string& identity_error)
 {
-    if (g_directory_commit_hook) return g_directory_commit_hook(directory);
+    identity.reset();
+    identity_error.clear();
+    if (g_directory_commit_hook) {
+        if (!g_directory_commit_hook(directory)) return false;
+        if (g_directory_identity_hook) identity = g_directory_identity_hook(directory);
+        return true;
+    }
 #ifdef WIN32
-    return FlushDirectoryWindows(directory, reason);
+    if (!FlushDirectoryWindows(directory, reason, identity, identity_error)) return false;
+    if (g_directory_identity_hook) identity = g_directory_identity_hook(directory);
+    return true;
 #else
     (void)reason;
-    return DirectoryCommit(directory);
+    if (!DirectoryCommit(directory)) return false;
+    if (g_directory_identity_hook) identity = g_directory_identity_hook(directory);
+    return true;
 #endif
+}
+
+/** The identity of the data directory, as the walk compares it. */
+std::optional<QuantumBackupDirectoryIdentity> DataDirectoryIdentity(const fs::path& datadir, std::string& error)
+{
+    error.clear();
+    if (g_directory_identity_hook) return g_directory_identity_hook(datadir);
+#ifdef WIN32
+    QuantumBackupDirectoryIdentity identity;
+    if (DirectoryIdentityWindows(datadir, identity, error)) return identity;
+#endif
+    return std::nullopt;
 }
 
 /** On a test chain, -quantumreturnfailcommit=<name> makes the commit of the entry of the directory called <name> fail,
@@ -202,7 +356,9 @@ std::optional<QuantumKeyBackupGeneration> ReadManifest(const fs::path& directory
     if (!named || *named != file_name || !sequence || !count) return std::nullopt;
     const auto sequence_value = ToIntegral<uint64_t>(*sequence);
     const auto count_value = ToIntegral<uint64_t>(*count);
-    if (!sequence_value || !count_value || lines.size() != 4 + *count_value + 2) return std::nullopt;
+    // A generation made by this feature holds at least the key it protects: a manifest with no key is not evidence of
+    // an empty wallet file, so it is not a verified generation.
+    if (!sequence_value || !count_value || *count_value == 0 || lines.size() != 4 + *count_value + 2) return std::nullopt;
     if (lines[4 + *count_value] != "end" || !lines.back().empty()) return std::nullopt;
 
     QuantumKeyBackupGeneration generation;
@@ -243,15 +399,144 @@ std::string QuantumKeyBackupWalletComponent(const std::string& wallet_name)
     return out;
 }
 
+bool QuantumBackupPathHasWindowsDoubleSeparatorPrefix(std::string_view value)
+{
+    const auto separator = [](char c) { return c == '\\' || c == '/'; };
+    return value.size() >= 2 && separator(value[0]) && separator(value[1]);
+}
+
+bool QuantumBackupPathIsWindowsDriveOrRootRelative(std::string_view value)
+{
+    const auto separator = [](char c) { return c == '\\' || c == '/'; };
+    const auto letter = [](char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'); };
+    if (value.size() >= 2 && letter(value[0]) && value[1] == ':') {
+        return value.size() == 2 || !separator(value[2]);
+    }
+    return !value.empty() && separator(value[0]) && (value.size() == 1 || !separator(value[1]));
+}
+
+size_t QuantumBackupUtf16Length(std::string_view utf8)
+{
+    size_t units{0};
+    for (const char ch : utf8) {
+        const auto byte = static_cast<unsigned char>(ch);
+        if ((byte & 0xC0) == 0x80) continue; // a continuation byte belongs to the character already counted
+        units += byte >= 0xF0 ? 2 : 1;       // a four-byte character is a surrogate pair
+    }
+    return units;
+}
+
+std::optional<std::string> QuantumKeyBackupSpellingRejection(std::string_view configured)
+{
+    if (!WindowsPathRulesApply()) return std::nullopt;
+    if (QuantumBackupPathHasWindowsDoubleSeparatorPrefix(configured)) {
+        return "a network or device path is not supported; use a folder on a local NTFS volume";
+    }
+    if (QuantumBackupPathIsWindowsDriveOrRootRelative(configured)) {
+        return "a path that is relative to a drive or to the root of a drive (such as D:dir or \\dir) is not supported; "
+               "give the full path with its drive and a separator (such as D:\\dir), or a path relative to the data directory";
+    }
+    return std::nullopt;
+}
+
+std::optional<std::string> QuantumKeyBackupLengthRejection(const fs::path& wallet_directory)
+{
+    if (!WindowsPathRulesApply()) return std::nullopt;
+    const size_t units = QuantumBackupUtf16Length(fs::PathToString(wallet_directory));
+    if (units > QUANTUM_BACKUP_WINDOWS_MAX_DIRECTORY_UNITS) {
+        return strprintf("the path is too long: it has %d characters and at most %d are allowed, because each backup is staged "
+                         "and verified in folders inside it; use a shorter path (set -quantumkeybackupdir to a shorter folder "
+                         "on a local NTFS volume)",
+                         units, QUANTUM_BACKUP_WINDOWS_MAX_DIRECTORY_UNITS);
+    }
+    return std::nullopt;
+}
+
+QuantumKeyBackupPathCheck CheckQuantumKeyBackupWalletPath(const std::string& wallet_name)
+{
+    QuantumKeyBackupPathCheck check;
+    if (!WindowsPathRulesApply()) return check;
+    const std::string configured = gArgs.GetArg("-quantumkeybackupdir", "");
+    if (const auto rejection = QuantumKeyBackupSpellingRejection(configured)) {
+        check.error = strprintf("-quantumkeybackupdir: %s", *rejection);
+        return check;
+    }
+    const fs::path directory = QuantumKeyBackupDirectory(wallet_name);
+    if (const auto rejection = QuantumKeyBackupLengthRejection(directory)) {
+        if (!configured.empty()) {
+            check.error = strprintf("the quantum key backup directory %s: %s", fs::PathToString(directory), *rejection);
+        } else {
+            check.warning = strprintf("the default quantum key backup directory %s: %s. The wallet loads, but a backup of a new "
+                                      "quantum stake return key is refused, and the key stays pending, until the option is set",
+                                      fs::PathToString(directory), *rejection);
+        }
+    }
+    return check;
+}
+
+std::optional<std::string> QuantumKeyBackupWalletPathRejection(const std::string& wallet_name)
+{
+    return CheckQuantumKeyBackupWalletPath(wallet_name).error;
+}
+
+std::vector<std::string> QuantumKeyBackupMigrationNames(const std::string& wallet_name, bool watchonly_wallet, bool solvables_wallet)
+{
+    const std::string prefix = wallet_name.empty() ? "default_wallet" : wallet_name;
+    std::vector<std::string> names{wallet_name};
+    if (watchonly_wallet) names.push_back(prefix + "_watchonly");
+    if (solvables_wallet) names.push_back(prefix + "_solvables");
+    return names;
+}
+
+QuantumKeyBackupPathCheck CheckQuantumKeyBackupMigrationPaths(const std::string& wallet_name, bool watchonly_wallet, bool solvables_wallet)
+{
+    QuantumKeyBackupPathCheck result;
+    for (const std::string& name : QuantumKeyBackupMigrationNames(wallet_name, watchonly_wallet, solvables_wallet)) {
+        const QuantumKeyBackupPathCheck one = CheckQuantumKeyBackupWalletPath(name);
+        if (one.error) {
+            result.error = strprintf("the migration publishes the wallet \"%s\", whose %s", name, *one.error);
+            return result;
+        }
+        if (one.warning && !result.warning) result.warning = one.warning;
+    }
+    return result;
+}
+
+bool QuantumBackupWalkReachedDataDirectory(const std::optional<QuantumBackupDirectoryIdentity>& walked,
+                                           const std::optional<QuantumBackupDirectoryIdentity>& data_directory,
+                                           bool same_path)
+{
+    if (walked && data_directory) return *walked == *data_directory;
+    return same_path;
+}
+
+void SetQuantumKeyBackupDirectoryIdentityForTest(std::function<std::optional<QuantumBackupDirectoryIdentity>(const fs::path&)> hook)
+{
+    g_directory_identity_hook = std::move(hook);
+}
+
+void SetQuantumKeyBackupDataDirectoryForTest(std::optional<fs::path> data_directory)
+{
+    g_data_directory_for_test = std::move(data_directory);
+}
+
+void SetQuantumKeyBackupWindowsPathRulesForTest(std::optional<bool> rules)
+{
+    g_windows_path_rules_for_test = rules;
+}
+
 fs::path QuantumKeyBackupBaseDirectory()
 {
     const std::string configured = gArgs.GetArg("-quantumkeybackupdir", "");
     if (!configured.empty()) {
         fs::path path = fs::PathFromString(configured);
-        if (path.is_relative()) path = gArgs.GetDataDirNet() / path;
+        // A network or device path, and a path relative to a drive or to a drive's root, keep their spelling, so
+        // each is refused as what it is and never becomes a folder below the data directory.
+        if (QuantumKeyBackupSpellingRejection(configured)) return path;
+        if (path.is_relative()) path = BackupDataDirectory() / path;
         return path;
     }
-    return gArgs.GetDataDirNet() / "quantum-key-backups";
+    return BackupDataDirectory() / "quantum-key-backups";
 }
 
 fs::path QuantumKeyBackupDirectory(const std::string& wallet_name)
@@ -297,6 +582,11 @@ std::optional<std::wstring> QuantumBackupLocalVolumeRoot(std::wstring_view final
     return std::wstring{final_path.substr(0, ROOT_CHARS)};
 }
 
+void SetQuantumKeyBackupUnknownDriveIsFixedForTest(bool unknown_is_fixed)
+{
+    g_unknown_drive_is_fixed_for_test = unknown_is_fixed;
+}
+
 void SetQuantumKeyBackupDirectoryCommitForTest(std::function<bool(const fs::path&)> hook)
 {
     g_directory_commit_hook = std::move(hook);
@@ -304,6 +594,14 @@ void SetQuantumKeyBackupDirectoryCommitForTest(std::function<bool(const fs::path
 
 bool EnsureQuantumKeyBackupDirectory(const fs::path& directory, std::string& error)
 {
+    if (const std::optional<std::string> rejection = BackupDirectorySpellingRejection(directory)) {
+        error = strprintf("cannot make the backup directory %s durable: %s", fs::PathToString(directory), *rejection);
+        return false;
+    }
+    if (const std::optional<std::string> rejection = QuantumKeyBackupLengthRejection(directory)) {
+        error = strprintf("cannot make the backup directory %s durable: %s", fs::PathToString(directory), *rejection);
+        return false;
+    }
     try {
         // Create what is missing from the top down, each with mode 0700, so no part of the path is ever
         // readable by others, and tighten the wallet's own directory when it already exists and is wider.
@@ -349,16 +647,29 @@ bool EnsureQuantumKeyBackupDirectory(const fs::path& directory, std::string& err
         // the name of the directory below it durable. A directory made by an earlier attempt that was interrupted
         // between its creation and the commit of its parent's entry, or that could not be taken away again, is
         // found by this walk like any other: nothing here depends on what an earlier attempt managed to undo.
+        // The data directory is recognised by its identity when the file system gives one (its volume and file
+        // index, which a path spelled in another case or by a short name shares), and by its path otherwise.
         const fs::path datadir = gArgs.GetDataDirNet();
+        std::string datadir_identity_error;
+        const std::optional<QuantumBackupDirectoryIdentity> datadir_identity = DataDirectoryIdentity(datadir, datadir_identity_error);
         for (fs::path path = directory;; path = path.parent_path()) {
             std::string reason;
-            if (!CommitDirectory(path, reason)) {
+            std::optional<QuantumBackupDirectoryIdentity> identity;
+            std::string identity_error;
+            if (!CommitDirectory(path, reason, identity, identity_error)) {
                 error = strprintf("cannot make the backup directory %s durable", fs::PathToString(path));
                 if (!reason.empty()) error += ": " + reason;
                 return false;
             }
+            if (!identity && !identity_error.empty()) {
+                LogPrintf("Comparing the path of %s with the data directory because its identity cannot be read: %s\n",
+                          fs::PathToString(path), identity_error);
+            } else if (!datadir_identity && !datadir_identity_error.empty()) {
+                LogPrintf("Comparing the path of %s with the data directory because the data directory's identity cannot be read: %s\n",
+                          fs::PathToString(path), datadir_identity_error);
+            }
             const fs::path parent = path.parent_path();
-            if (path == datadir || parent.empty() || parent == path) break;
+            if (QuantumBackupWalkReachedDataDirectory(identity, datadir_identity, path == datadir) || parent.empty() || parent == path) break;
             // The entry of `path` is in `parent`, which the next round commits.
             if (CommitOfEntryIsInjectedToFail(path)) {
                 error = strprintf("cannot make the entry of the backup directory %s durable", fs::PathToString(path));
@@ -425,9 +736,13 @@ std::set<std::string> SelectQuantumKeyBackupsToPrune(const std::vector<QuantumKe
         const QuantumKeyBackupGeneration& generation = *verified[i];
         bool keep = i < keep_newest;
         if (!keep) {
-            // An older generation that is the only one holding a live key stays.
+            // An older generation stays when it holds a key this wallet does not know (a key another process
+            // sharing the directory made, or one since removed from the wallet), because this wallet cannot say
+            // whether another generation protects that key, and when it holds a key that no newer retained
+            // generation holds (so the sole protector of a key is never deleted). Only the retained generations
+            // newer than it count as covering.
             for (const auto& key : generation.keys) {
-                if (live_keys.count(key) && !covered.count(key)) {
+                if (!live_keys.count(key) || !covered.count(key)) {
                     keep = true;
                     break;
                 }
@@ -506,10 +821,17 @@ bool WriteQuantumKeyBackupManifest(const fs::path& directory, const std::string&
         fs::remove(temporary, ec);
         return false;
     }
-    if (!RenameOver(temporary, final_path) || !DirectoryCommit(directory)) {
+    // The system's reason for a failed rename is taken at the call, before the temporary file is removed.
+    std::string rename_error;
+    if (!RenameOver(temporary, final_path, &rename_error)) {
         error = strprintf("cannot install the backup manifest %s", fs::PathToString(final_path));
+        if (!rename_error.empty()) error += ": " + rename_error;
         std::error_code ec;
         fs::remove(temporary, ec);
+        return false;
+    }
+    if (!DirectoryCommit(directory)) {
+        error = strprintf("cannot make the installed backup manifest %s durable", fs::PathToString(final_path));
         return false;
     }
     return true;
@@ -517,6 +839,10 @@ bool WriteQuantumKeyBackupManifest(const fs::path& directory, const std::string&
 
 size_t PruneQuantumKeyBackups(const fs::path& directory, const QuantumKeyBackupKeySet& live_keys, size_t keep_newest)
 {
+    if (const std::optional<std::string> rejection = BackupDirectorySpellingRejection(directory)) {
+        LogPrintf("Not pruning the wallet backups in %s: %s\n", fs::PathToString(directory), *rejection);
+        return 0;
+    }
     const std::set<std::string> doomed = SelectQuantumKeyBackupsToPrune(ListQuantumKeyBackupGenerations(directory), live_keys, keep_newest);
     size_t removed{0};
     for (const std::string& name : doomed) {

@@ -561,7 +561,7 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
             "mining_gate_live_claims", "mining_gate_eligible_claims",
             "mining_gate_unresolved_components", "mining_gate_unsafe_claims",
             "raw_quarantined_claims", "blocking_quarantined_claims",
-            "indeterminate_quarantined_claims",
+            "indeterminate_quarantined_claims", "last_claim_timing",
         )
         sample = {key: info[key] for key in fields if key in info}
         duty = info.get("duty_cycle", {})
@@ -590,7 +590,7 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         submitted = {name: 0 for name in wallets}
         new_claims = {}
         started = time.monotonic()
-        deadline = started + timeout
+        deadline = started + timeout * self.options.timeout_factor
         first_samples, last_samples = {}, {}
         while time.monotonic() < deadline:
             for name, wallet in wallets.items():

@@ -9,10 +9,16 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <exception>
+#include <functional>
 #include <future>
 #include <iterator>
+#include <list>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <stdint.h>
@@ -60,6 +66,7 @@
 #ifdef USE_BDB
 #include <wallet/bdb.h>
 #endif
+#include <wallet/quantum_return_backup.h>
 #include <wallet/quantum_stake_ops.h>
 #include <wallet/receive.h>
 #include <wallet/rpc/util.h>
@@ -9189,6 +9196,728 @@ BOOST_AUTO_TEST_CASE(QuantumWalletBackupDestinationWorkRunsWithoutTheWalletLock)
             const auto infos = wallet->ListQuantumKeyInfos();
             BOOST_REQUIRE_EQUAL(infos.size(), 3U);
             BOOST_CHECK(std::all_of(infos.begin(), infos.end(), [](const QuantumKeyInfo& info) { return info.backup_verified; }));
+        }
+    }
+}
+
+namespace {
+/** Lets a test hold one backup of a wallet at a named failpoint while others run, without sleeps: the callback is
+ *  installed once, before any thread starts, and decides by the thread's own flag whether to pause. */
+struct BackupGate
+{
+    std::mutex mutex;
+    std::condition_variable condition;
+    std::string pause_point;     // the failpoint at which the paused thread waits
+    std::string observe_point;   // a failpoint the observed thread only reports
+    bool paused{false};
+    bool released{false};
+    bool observed{false};
+
+    template <typename Predicate>
+    bool WaitFor(Predicate predicate)
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        return condition.wait_for(lock, std::chrono::seconds{120}, predicate);
+    }
+    void Release()
+    {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            released = true;
+        }
+        condition.notify_all();
+    }
+};
+thread_local bool t_backup_is_paused_thread{false};
+thread_local bool t_backup_is_observed_thread{false};
+
+/** Removes the failpoint callback of a wallet when it goes out of scope (after the threads that use it are joined). */
+class ScopedBackupFailpoint
+{
+public:
+    ScopedBackupFailpoint(CWallet& wallet, std::function<bool(std::string_view)> callback) : m_wallet(wallet)
+    {
+        m_wallet.m_quantum_backup_failpoint = std::move(callback);
+    }
+    ~ScopedBackupFailpoint() { m_wallet.m_quantum_backup_failpoint = {}; }
+
+private:
+    CWallet& m_wallet;
+};
+
+/** The threads a test starts. Going out of scope, for any reason (a failed fatal assertion included), releases the gate and
+ *  joins every thread that was started, so a joinable thread is never destroyed; an exception a thread ended with is kept
+ *  and rethrown by Rethrow() on the test thread. */
+class BackupThreads
+{
+public:
+    explicit BackupThreads(BackupGate& gate) : m_gate(gate) {}
+    BackupThreads(const BackupThreads&) = delete;
+    BackupThreads& operator=(const BackupThreads&) = delete;
+    ~BackupThreads()
+    {
+        m_gate.Release();
+        for (std::thread& thread : m_threads) {
+            if (thread.joinable()) thread.join();
+        }
+    }
+    template <typename Function>
+    void Start(Function function)
+    {
+        m_errors.emplace_back();
+        std::exception_ptr& slot = m_errors.back();
+        m_threads.emplace_back([&slot, function] {
+            try {
+                function();
+            } catch (...) {
+                slot = std::current_exception();
+            }
+        });
+    }
+    void JoinAll()
+    {
+        for (std::thread& thread : m_threads) {
+            if (thread.joinable()) thread.join();
+        }
+    }
+    void Rethrow()
+    {
+        for (const std::exception_ptr& error : m_errors) {
+            if (error) std::rethrow_exception(error);
+        }
+    }
+
+private:
+    BackupGate& m_gate;
+    std::list<std::exception_ptr> m_errors; // stable addresses
+    std::vector<std::thread> m_threads;
+};
+} // namespace
+
+// Two backups of one wallet install into the same file. The first one's copy was made from an older inventory: after a
+// second backup (made later, from a larger inventory) has installed its file, the first must not replace it, whether its
+// own inventory was empty, whether it verified its keys or not.
+BOOST_AUTO_TEST_CASE(QuantumWalletBackupPromotionNeverReplacesALaterBackupOfALargerInventory)
+{
+    struct Scenario {
+        const char* name;
+        bool first_has_key;
+        bool first_verifies;
+    };
+    for (DatabaseFormat format : DATABASE_FORMATS) {
+        for (const Scenario& scenario : {Scenario{"verified", true, true}, Scenario{"unverified", true, false},
+                                         Scenario{"empty", false, true}, Scenario{"empty-unverified", false, false}}) {
+            const std::string name{strprintf("quantum-backup-promotion-later-%s-%i", scenario.name, format)};
+            const fs::path backup_dir = m_path_root / fs::PathFromString(name + "-dest");
+            BOOST_REQUIRE(fs::create_directory(backup_dir));
+            auto wallet{TestLoadQuantumWallet(name, format)};
+            const std::string wallet_filename = fs::PathToString(fs::PathFromString(wallet->GetDatabase().Filename()).filename());
+            const fs::path backup_path = backup_dir / fs::PathFromString(wallet_filename);
+            std::optional<CTxDestination> k1;
+            if (scenario.first_has_key) {
+                auto made = wallet->GetNewQuantumDestination("promotion-k1");
+                BOOST_REQUIRE(made);
+                k1 = *made;
+            }
+
+            // Everything a worker thread refers to is declared before the guard that joins the workers, so none of it is
+            // destroyed while a worker can still write to it. The order here is the order of construction; they are undone
+            // in reverse: threads joined, callback removed, gate gone, results gone.
+            bool first_ok{true};
+            bilingual_str first_error;
+            BackupGate gate;
+            gate.pause_point = "before_promotion_mutex";
+            ScopedBackupFailpoint failpoint{*wallet, [&gate](std::string_view point) {
+                if (t_backup_is_paused_thread && point == gate.pause_point) {
+                    std::unique_lock<std::mutex> lock(gate.mutex);
+                    gate.paused = true;
+                    gate.condition.notify_all();
+                    gate.condition.wait(lock, [&] { return gate.released; });
+                }
+                return false;
+            }};
+            BackupThreads threads{gate};
+
+            // A makes its copy from the inventory it sees now and stops just before the promotion mutex.
+            threads.Start([&] {
+                t_backup_is_paused_thread = true;
+                first_ok = wallet->BackupWallet(fs::PathToString(backup_dir), &first_error, scenario.first_verifies);
+            });
+            const bool reached = gate.WaitFor([&] { return gate.paused; });
+            std::optional<CTxDestination> k2;
+            bool second_ok{false};
+            bilingual_str second_error;
+            std::string second_file;
+            if (reached) {
+                // B: K2 is made, and a complete verified backup of the larger inventory is installed.
+                auto made = wallet->GetNewQuantumDestination("promotion-k2");
+                if (made) k2 = *made;
+                second_ok = k2.has_value() && wallet->BackupWallet(fs::PathToString(backup_dir), &second_error);
+                if (second_ok) second_file = ReadBinaryFile(backup_path).second;
+            }
+            // A resumes: it must fail on the inventory and leave B's file as it is.
+            gate.Release();
+            threads.JoinAll();
+            threads.Rethrow();
+            BOOST_REQUIRE_MESSAGE(reached, "the first backup did not reach the promotion mutex");
+            BOOST_REQUIRE(k2.has_value());
+            BOOST_REQUIRE_MESSAGE(second_ok, second_error.original);
+            BOOST_CHECK(!first_ok);
+            BOOST_CHECK_MESSAGE(first_error.original.find("inventory changed while finalizing") != std::string::npos, first_error.original);
+            const auto [after_ok, after_file] = ReadBinaryFile(backup_path);
+            BOOST_REQUIRE(after_ok);
+            BOOST_CHECK_EQUAL_COLLECTIONS(second_file.begin(), second_file.end(), after_file.begin(), after_file.end());
+
+            // B's installed backup holds K2 and can sign for it, and K2's marker in the source wallet is still true.
+            {
+                auto restored{TestLoadQuantumWalletBackup(backup_path)};
+                LOCK(restored->cs_wallet);
+                const auto info = restored->GetQuantumKeyInfo(*k2);
+                BOOST_REQUIRE(info.has_value());
+                BOOST_CHECK(info->backup_verified);
+                CheckQuantumKeyChallenge(*restored, *k2);
+            }
+            {
+                LOCK(wallet->cs_wallet);
+                const auto info = wallet->GetQuantumKeyInfo(*k2);
+                BOOST_REQUIRE(info.has_value());
+                BOOST_CHECK(info->backup_verified);
+                if (k1) {
+                    const auto first_info = wallet->GetQuantumKeyInfo(*k1);
+                    BOOST_REQUIRE(first_info.has_value());
+                    BOOST_CHECK(first_info->backup_verified);
+                }
+            }
+            // no staging folder is left behind
+            for (const auto& entry : fs::directory_iterator(backup_dir)) {
+                BOOST_CHECK_MESSAGE(entry.path().filename() == fs::PathFromString(wallet_filename), fs::PathToString(entry.path()));
+            }
+        }
+    }
+}
+
+// The other order: the first backup owns the promotion mutex when the wallet gains a key, and the second waits for the
+// mutex. The first fails its final check of the inventory; the second, made from the larger inventory, then succeeds.
+BOOST_AUTO_TEST_CASE(QuantumWalletBackupPromotionWaitsForTheBackupThatOwnsTheMutex)
+{
+    for (DatabaseFormat format : DATABASE_FORMATS) {
+        const std::string name{strprintf("quantum-backup-promotion-owner-%i", format)};
+        const fs::path backup_dir = m_path_root / fs::PathFromString(name + "-dest");
+        BOOST_REQUIRE(fs::create_directory(backup_dir));
+        auto wallet{TestLoadQuantumWallet(name, format)};
+        const std::string wallet_filename = fs::PathToString(fs::PathFromString(wallet->GetDatabase().Filename()).filename());
+        const fs::path backup_path = backup_dir / fs::PathFromString(wallet_filename);
+        auto k1 = wallet->GetNewQuantumDestination("owner-k1");
+        BOOST_REQUIRE(k1);
+
+        // what the workers write to is declared before the guard that joins them (see the first test)
+        bool first_ok{true};
+        bilingual_str first_error;
+        bool second_ok{false};
+        bilingual_str second_error;
+        BackupGate gate;
+        gate.pause_point = "before_final_identity_revalidation"; // inside the promotion mutex
+        gate.observe_point = "before_promotion_mutex";
+        ScopedBackupFailpoint failpoint{*wallet, [&gate](std::string_view point) {
+            if (t_backup_is_paused_thread && point == gate.pause_point) {
+                std::unique_lock<std::mutex> lock(gate.mutex);
+                gate.paused = true;
+                gate.condition.notify_all();
+                gate.condition.wait(lock, [&] { return gate.released; });
+            }
+            if (t_backup_is_observed_thread && point == gate.observe_point) {
+                {
+                    std::lock_guard<std::mutex> lock(gate.mutex);
+                    gate.observed = true;
+                }
+                gate.condition.notify_all();
+            }
+            return false;
+        }};
+        BackupThreads threads{gate};
+
+        threads.Start([&] {
+            t_backup_is_paused_thread = true;
+            first_ok = wallet->BackupWallet(fs::PathToString(backup_dir), &first_error);
+        });
+        const bool first_inside = gate.WaitFor([&] { return gate.paused; });
+        std::optional<CTxDestination> k2;
+        bool mutex_is_taken{false};
+        bool nothing_installed{false};
+        bool second_reached{false};
+        if (first_inside) {
+            // A is inside the promotion: the mutex is taken, so another thread cannot take it
+            {
+                TRY_LOCK(wallet->m_backup_promotion_mutex, promotion_lock);
+                mutex_is_taken = !promotion_lock;
+            }
+            // the wallet gains K2 while A owns the mutex, then B starts: its copy is of both keys
+            auto made = wallet->GetNewQuantumDestination("owner-k2");
+            if (made) k2 = *made;
+            threads.Start([&] {
+                t_backup_is_observed_thread = true;
+                second_ok = wallet->BackupWallet(fs::PathToString(backup_dir), &second_error);
+            });
+            second_reached = gate.WaitFor([&] { return gate.observed; });
+            // B has made its copy and is at, or waiting for, the mutex that A owns: nothing is installed yet, and the
+            // mutex is still taken
+            nothing_installed = !fs::exists(backup_path);
+            {
+                TRY_LOCK(wallet->m_backup_promotion_mutex, promotion_lock);
+                mutex_is_taken = mutex_is_taken && !promotion_lock;
+            }
+        }
+        gate.Release();
+        threads.JoinAll();
+        threads.Rethrow();
+        BOOST_REQUIRE_MESSAGE(first_inside, "the first backup did not own the promotion mutex");
+        BOOST_REQUIRE(k2.has_value());
+        BOOST_REQUIRE_MESSAGE(second_reached, "the second backup did not reach the promotion mutex");
+        BOOST_CHECK_MESSAGE(mutex_is_taken, "the promotion mutex was free while a backup was inside its promotion");
+        BOOST_CHECK(nothing_installed);
+
+        BOOST_CHECK(!first_ok);
+        BOOST_CHECK_MESSAGE(first_error.original.find("inventory changed while finalizing") != std::string::npos, first_error.original);
+        BOOST_CHECK_MESSAGE(second_ok, second_error.original);
+        auto restored = TestLoadQuantumWalletBackup(backup_path);
+        {
+            LOCK(restored->cs_wallet);
+            for (const CTxDestination& key : {*k1, *k2}) {
+                const auto info = restored->GetQuantumKeyInfo(key);
+                BOOST_REQUIRE(info.has_value());
+                BOOST_CHECK(info->backup_verified);
+                CheckQuantumKeyChallenge(*restored, key);
+            }
+        }
+        {
+            LOCK(wallet->cs_wallet);
+            const auto infos = wallet->ListQuantumKeyInfos();
+            BOOST_REQUIRE_EQUAL(infos.size(), 2U);
+            BOOST_CHECK(std::all_of(infos.begin(), infos.end(), [](const QuantumKeyInfo& info) { return info.backup_verified; }));
+        }
+    }
+}
+
+#ifdef USE_BDB
+namespace {
+//! Every record of a wallet database, read through a raw cursor: serialized key to serialized value, both in hex.
+std::map<std::string, std::string> DumpWalletRecords(WalletDatabase& database)
+{
+    std::map<std::string, std::string> records;
+    std::unique_ptr<DatabaseBatch> batch = database.MakeBatch();
+    std::unique_ptr<DatabaseCursor> cursor = batch->GetNewCursor();
+    BOOST_REQUIRE(cursor);
+    for (;;) {
+        DataStream key, value;
+        const DatabaseCursor::Status status = cursor->Next(key, value);
+        if (status == DatabaseCursor::Status::DONE) break;
+        BOOST_REQUIRE(status == DatabaseCursor::Status::MORE);
+        records.emplace(HexStr(key), HexStr(value));
+    }
+    return records;
+}
+
+//! How many of those records are descriptor records (descriptors, their keys and encrypted keys, caches excluded by type).
+size_t CountDescriptorRecords(const std::map<std::string, std::string>& records)
+{
+    size_t count{0};
+    for (const auto& entry : records) {
+        const std::vector<unsigned char> bytes = ParseHex(entry.first);
+        DataStream stream{bytes};
+        std::string type;
+        stream >> type;
+        if (type == DBKeys::WALLETDESCRIPTOR || type == DBKeys::WALLETDESCRIPTORKEY || type == DBKeys::WALLETDESCRIPTORCKEY ||
+            type == "walletdescriptorcache" || type == "walletdescriptorlhcache") {
+            ++count;
+        }
+    }
+    return count;
+}
+} // namespace
+
+// Migration under the Windows backup-path policy (the rules are applied through the test seam, with a short data directory
+// so that exact lengths can be built), on real BDB legacy wallets, unencrypted and encrypted. The wallet's own name is
+// checked before it is unloaded. The migration then runs as it always did: private load, safety copy, unlock, conversion to
+// SQLite, descriptors, and only then, with the descriptors known, the auxiliary wallets they need are checked before any of
+// them is created. A refusal there, like a failure inside DoMigration or while the migrated wallets are reloaded, is rolled back from the safety copy: the wallet is restored and loaded
+// again (whether or not it was loaded before), and the records the descriptors wrote are gone.
+BOOST_AUTO_TEST_CASE(MigrationHonoursTheQuantumBackupPathPolicyForExactlyTheWalletsItPublishes)
+{
+    struct PolicyGuard {
+        explicit PolicyGuard(ArgsManager& a) : args(a)
+        {
+            SetQuantumKeyBackupWindowsPathRulesForTest(true);
+            SetQuantumKeyBackupDataDirectoryForTest(fs::PathFromString("/d"));
+        }
+        ~PolicyGuard()
+        {
+            SetQuantumKeyBackupWindowsPathRulesForTest(std::nullopt);
+            SetQuantumKeyBackupDataDirectoryForTest(std::nullopt);
+            SetWalletMigrationFailpointForTest({});
+            args.ForceSetArg("-quantumkeybackupdir", "");
+        }
+        ArgsManager& args;
+    } policy{gArgs};
+    WalletContext context;
+    context.args = &m_args;
+    context.chain = m_node.chain.get();
+    // every wallet this test leaves loaded is unloaded before the node it was loaded from is torn down
+    struct UnloadAll {
+        WalletContext& context;
+        ~UnloadAll()
+        {
+            for (std::shared_ptr<CWallet>& wallet : GetWallets(context)) {
+                RemoveWallet(context, wallet, /*load_on_start=*/std::nullopt);
+                TestUnloadWallet(std::move(wallet));
+            }
+        }
+    } unload_all{context};
+
+    const std::string passphrase_text{"correct horse"};
+    const auto make_legacy = [&](const std::string& name, bool watch_only, bool encrypted, bool old_key_metadata = false) {
+        DatabaseOptions options;
+        options.require_format = DatabaseFormat::BERKELEY;
+        options.require_create = true;
+        DatabaseStatus status;
+        bilingual_str error;
+        std::vector<bilingual_str> warnings;
+        auto database = MakeWalletDatabase(name, options, status, error);
+        BOOST_REQUIRE_MESSAGE(database, error.original);
+        auto wallet = CWallet::Create(context, name, std::move(database), /*wallet_creation_flags=*/0, error, warnings);
+        BOOST_REQUIRE_MESSAGE(wallet, error.original);
+        BOOST_REQUIRE(WITH_LOCK(wallet->cs_wallet, return wallet->GetLegacyScriptPubKeyMan() != nullptr));
+        if (watch_only) {
+            CKey key;
+            key.MakeNewKey(true);
+            LOCK(wallet->cs_wallet);
+            BOOST_REQUIRE(wallet->ImportScriptPubKeys("watched", {GetScriptForDestination(PKHash(key.GetPubKey()))}, /*have_solving_data=*/false, /*apply_label=*/false, /*timestamp=*/1));
+        }
+        if (encrypted) BOOST_REQUIRE(wallet->EncryptWallet(SecureString{passphrase_text}));
+        // a flag-only fixture: the key-origin flag is cleared on disk (the wallet is not one whose key metadata awaits an upgrade)
+        if (old_key_metadata) wallet->UnsetWalletFlag(WALLET_FLAG_KEY_ORIGIN_METADATA);
+        BOOST_REQUIRE(AddWallet(context, wallet));
+    };
+    // an option that makes the wallet's own directory exactly `units` long (the data directory is /d)
+    const auto set_option_for = [&](const std::string& name, size_t units) {
+        const size_t component = QuantumKeyBackupWalletComponent(name).size();
+        BOOST_REQUIRE(units > 4 + component);
+        gArgs.ForceSetArg("-quantumkeybackupdir", std::string(units - 4 - component, 'r'));
+        BOOST_REQUIRE_EQUAL(QuantumBackupUtf16Length(fs::PathToString(QuantumKeyBackupDirectory(name))), units);
+    };
+    const auto no_auxiliary_wallet_exists = [&](const std::string& name) {
+        BOOST_CHECK(!fs::exists(GetWalletDir() / fs::PathFromString(name + "_watchonly")));
+        BOOST_CHECK(!fs::exists(GetWalletDir() / fs::PathFromString(name + "_solvables")));
+    };
+    const auto safety_copies = [&](const std::string& name) {
+        size_t count{0};
+        for (const auto& entry : fs::directory_iterator(GetWalletDir())) {
+            const std::string file = fs::PathToString(entry.path().filename());
+            if (file.find(".legacy.bak") != std::string::npos && file.rfind(name + "_", 0) == 0) ++count;
+        }
+        return count;
+    };
+    // the wallet is loaded, legacy, in its BDB file, with no descriptor record
+    const auto require_original_available = [&](const std::string& name, bool encrypted, size_t keypool) {
+        const auto wallet = GetWallet(context, name);
+        BOOST_REQUIRE_MESSAGE(wallet != nullptr, name << " is not loaded");
+        BOOST_CHECK_EQUAL(wallet->GetDatabase().Format(), "bdb");
+        BOOST_CHECK(WITH_LOCK(wallet->cs_wallet, return wallet->GetLegacyScriptPubKeyMan() != nullptr));
+        BOOST_CHECK(!wallet->IsWalletFlagSet(WALLET_FLAG_DESCRIPTORS));
+        BOOST_CHECK_EQUAL(wallet->IsCrypted(), encrypted);
+        BOOST_CHECK_EQUAL(WITH_LOCK(wallet->cs_wallet, return wallet->GetKeyPoolSize()), keypool);
+        BOOST_CHECK_EQUAL(CountDescriptorRecords(DumpWalletRecords(wallet->GetDatabase())), size_t{0});
+    };
+
+    for (const bool encrypted : {false, true}) {
+        const std::string tag = encrypted ? "e" : "p";
+        const SecureString passphrase{std::string_view{encrypted ? passphrase_text : std::string{}}};
+        BOOST_TEST_MESSAGE("encrypted: " << encrypted);
+
+        // (a) The wallet's own name is too long: refused before the wallet is unloaded, with no database access. The same
+        // instance is still loaded and its records are exactly what they were.
+        {
+            const std::string name = "mga-" + tag;
+            make_legacy(name, /*watch_only=*/false, encrypted);
+            set_option_for(name, QUANTUM_BACKUP_WINDOWS_MAX_DIRECTORY_UNITS + 1);
+            auto before = GetWallet(context, name);
+            BOOST_REQUIRE(before != nullptr);
+            const auto records_before = DumpWalletRecords(before->GetDatabase());
+            const CWallet* instance = before.get();
+            before.reset(); // the migration waits for the last reference to a loaded wallet
+            auto result = MigrateLegacyToDescriptor(name, passphrase, context);
+            BOOST_REQUIRE(!result);
+            BOOST_CHECK_MESSAGE(util::ErrorString(result).original.find("refused before any change was made") != std::string::npos, util::ErrorString(result).original);
+            const auto after = GetWallet(context, name);
+            BOOST_REQUIRE(after != nullptr);
+            BOOST_CHECK(after.get() == instance);
+            BOOST_CHECK(DumpWalletRecords(after->GetDatabase()) == records_before);
+            BOOST_CHECK_EQUAL(safety_copies(name), size_t{0});
+            no_auxiliary_wallet_exists(name);
+        }
+
+        // (b) The wallet's name fits and it needs a watch-only wallet whose name does not: no auxiliary wallet is created, the
+        // wallet is restored from the safety copy and loaded again with no descriptor record, and after the path is
+        // shortened the same wallet migrates.
+        // The second round clears the key-origin flag of an encrypted wallet first, so the flag the unlock sets is absent on
+        // disk before the migration. This tests that the flag is restored with the rest of the wallet; it is a flag-only
+        // fixture, not a wallet whose key metadata awaits an upgrade (no such fixture is built).
+        for (const bool old_key_metadata : {false, true}) {
+            if (old_key_metadata && !encrypted) continue;
+            const std::string name = std::string{"mgb-"} + tag + (old_key_metadata ? "-old" : "");
+            make_legacy(name, /*watch_only=*/true, encrypted, old_key_metadata);
+            set_option_for(name, QUANTUM_BACKUP_WINDOWS_MAX_DIRECTORY_UNITS);
+            BOOST_REQUIRE_EQUAL(QuantumBackupUtf16Length(fs::PathToString(QuantumKeyBackupDirectory(name + "_watchonly"))), QUANTUM_BACKUP_WINDOWS_MAX_DIRECTORY_UNITS + QuantumKeyBackupWalletComponent(name + "_watchonly").size() - QuantumKeyBackupWalletComponent(name).size());
+            size_t keypool{0};
+            bool flag_before{false}; // an encrypted wallet that has not had its key metadata upgraded is upgraded when it is unlocked
+            {
+                const auto wallet = GetWallet(context, name);
+                BOOST_REQUIRE(wallet != nullptr);
+                keypool = WITH_LOCK(wallet->cs_wallet, return wallet->GetKeyPoolSize());
+                flag_before = wallet->IsWalletFlagSet(WALLET_FLAG_KEY_ORIGIN_METADATA);
+            }
+            auto result = MigrateLegacyToDescriptor(name, passphrase, context);
+            BOOST_REQUIRE(!result);
+            const std::string message = util::ErrorString(result).original;
+            BOOST_CHECK_MESSAGE(message.find("refused before any auxiliary wallet was created") != std::string::npos &&
+                                message.find("\"" + name + "_watchonly\"") != std::string::npos, message);
+            require_original_available(name, encrypted, keypool);
+            // what the unlock wrote to the wallet was undone with everything else
+            // (loading an unencrypted wallet upgrades its key metadata by itself, so only the encrypted wallet, which is
+            // upgraded when the migration unlocks it, shows that the write was undone)
+            if (encrypted) BOOST_CHECK_MESSAGE(GetWallet(context, name)->IsWalletFlagSet(WALLET_FLAG_KEY_ORIGIN_METADATA) == flag_before, name << ": flag before " << flag_before);
+            no_auxiliary_wallet_exists(name);
+            BOOST_CHECK_EQUAL(safety_copies(name), size_t{1}); // the safety copy is kept
+            // retry with a path that fits every wallet that is published
+            set_option_for(name, QUANTUM_BACKUP_WINDOWS_MAX_DIRECTORY_UNITS - (QuantumKeyBackupWalletComponent(name + "_watchonly").size() - QuantumKeyBackupWalletComponent(name).size()));
+            result = MigrateLegacyToDescriptor(name, passphrase, context);
+            BOOST_REQUIRE_MESSAGE(result, util::ErrorString(result).original);
+            BOOST_CHECK(result->wallet->IsWalletFlagSet(WALLET_FLAG_DESCRIPTORS));
+            BOOST_CHECK(result->watchonly_wallet);
+            BOOST_CHECK(result->warnings.empty());
+        }
+
+        // (c) A failure inside the migration, after the auxiliary wallet was created: the rollback removes it and restores the
+        // wallet from the safety copy; with the failure removed the same wallet migrates.
+        {
+            const std::string name = "mgc-" + tag;
+            make_legacy(name, /*watch_only=*/true, encrypted);
+            gArgs.ForceSetArg("-quantumkeybackupdir", "");
+            SetQuantumKeyBackupDataDirectoryForTest(fs::PathFromString("/d"));
+            size_t keypool{0};
+            {
+                const std::shared_ptr<CWallet> loaded = GetWallet(context, name);
+                keypool = WITH_LOCK(loaded->cs_wallet, return loaded->GetKeyPoolSize());
+            }
+            SetWalletMigrationFailpointForTest([](std::string_view point) { return point == "before_apply_migration_data"; });
+            auto result = MigrateLegacyToDescriptor(name, passphrase, context);
+            SetWalletMigrationFailpointForTest({});
+            BOOST_REQUIRE(!result);
+            BOOST_CHECK_MESSAGE(util::ErrorString(result).original.find("Injected wallet migration failure") != std::string::npos, util::ErrorString(result).original);
+            require_original_available(name, encrypted, keypool);
+            no_auxiliary_wallet_exists(name);
+            result = MigrateLegacyToDescriptor(name, passphrase, context);
+            BOOST_REQUIRE_MESSAGE(result, util::ErrorString(result).original);
+            BOOST_CHECK(result->watchonly_wallet);
+            BOOST_CHECK(result->wallet->IsWalletFlagSet(WALLET_FLAG_DESCRIPTORS));
+        }
+
+        // (d) The wallet's name fits and no auxiliary wallet is needed: the auxiliary names would be too long, and the
+        // migration succeeds without a warning.
+        {
+            const std::string name = "mgd-" + tag;
+            make_legacy(name, /*watch_only=*/false, encrypted);
+            set_option_for(name, QUANTUM_BACKUP_WINDOWS_MAX_DIRECTORY_UNITS);
+            auto result = MigrateLegacyToDescriptor(name, passphrase, context);
+            BOOST_REQUIRE_MESSAGE(result, util::ErrorString(result).original);
+            BOOST_CHECK(result->wallet);
+            BOOST_CHECK(!result->watchonly_wallet);
+            BOOST_CHECK(!result->solvables_wallet);
+            BOOST_CHECK(result->warnings.empty());
+            BOOST_CHECK(result->wallet->IsWalletFlagSet(WALLET_FLAG_DESCRIPTORS));
+            BOOST_CHECK_EQUAL(result->wallet->GetDatabase().Format(), "sqlite");
+        }
+
+        // (e) A default backup path that is too long never refuses a migration: the warning reaches the caller.
+        {
+            const std::string name = "mge-" + tag;
+            make_legacy(name, /*watch_only=*/true, encrypted);
+            gArgs.ForceSetArg("-quantumkeybackupdir", "");
+            SetQuantumKeyBackupDataDirectoryForTest(fs::PathFromString(R"(D:\)" + std::string(130, 'x')));
+            BOOST_REQUIRE_GT(QuantumBackupUtf16Length(fs::PathToString(QuantumKeyBackupDirectory(name))), QUANTUM_BACKUP_WINDOWS_MAX_DIRECTORY_UNITS);
+            auto result = MigrateLegacyToDescriptor(name, passphrase, context);
+            BOOST_REQUIRE_MESSAGE(result, util::ErrorString(result).original);
+            BOOST_CHECK(result->watchonly_wallet);
+            BOOST_REQUIRE_EQUAL(result->warnings.size(), size_t{1});
+            BOOST_CHECK_MESSAGE(result->warnings[0].original.find("default quantum key backup directory") != std::string::npos &&
+                                result->warnings[0].original.find("-quantumkeybackupdir") != std::string::npos, result->warnings[0].original);
+            SetQuantumKeyBackupDataDirectoryForTest(fs::PathFromString("/d"));
+        }
+    }
+
+    // (g) The conversion to SQLite fails: no descriptor record has been written (the conversion comes first), so the wallet has as
+    // many records as before and none of them is a descriptor record (counts, not byte equality), and the wallet, unloaded for the migration as it always was, migrates when the
+    // failure is gone.
+    for (const bool encrypted : {false, true}) {
+        const std::string name = std::string{"mgg-"} + (encrypted ? "e" : "p");
+        const SecureString passphrase{std::string_view{encrypted ? passphrase_text : std::string{}}};
+        make_legacy(name, /*watch_only=*/true, encrypted);
+        gArgs.ForceSetArg("-quantumkeybackupdir", "");
+        std::map<std::string, std::string> records_before;
+        {
+            const auto wallet = GetWallet(context, name);
+            BOOST_REQUIRE(wallet != nullptr);
+            records_before = DumpWalletRecords(wallet->GetDatabase());
+        }
+        SetWalletMigrationFailpointForTest([](std::string_view point) { return point == "fail_sqlite_conversion"; });
+        auto result = MigrateLegacyToDescriptor(name, passphrase, context);
+        SetWalletMigrationFailpointForTest({});
+        BOOST_REQUIRE(!result);
+        BOOST_CHECK_MESSAGE(util::ErrorString(result).original.find("Injected wallet migration failure in the conversion") != std::string::npos, util::ErrorString(result).original);
+        BOOST_CHECK(GetWallet(context, name) == nullptr);
+        DatabaseOptions options;
+        options.require_existing = true;
+        DatabaseStatus status;
+        bilingual_str error;
+        {
+            auto database = MakeWalletDatabase(name, options, status, error);
+            BOOST_REQUIRE_MESSAGE(database, error.original);
+            const auto records_after = DumpWalletRecords(*database);
+            BOOST_CHECK_EQUAL(CountDescriptorRecords(records_after), size_t{0});
+            BOOST_CHECK_EQUAL(records_after.size(), records_before.size());
+        }
+        result = MigrateLegacyToDescriptor(name, passphrase, context);
+        BOOST_REQUIRE_MESSAGE(result, util::ErrorString(result).original);
+        BOOST_CHECK(result->watchonly_wallet);
+    }
+
+    // (f) A wrong passphrase for an encrypted legacy wallet leaves its database as it was (the wallet stays unloaded, as it
+    // always did, and no migration wrote anything).
+    {
+        const std::string name = "mgf";
+        make_legacy(name, /*watch_only=*/false, /*encrypted=*/true);
+        gArgs.ForceSetArg("-quantumkeybackupdir", "");
+        std::map<std::string, std::string> records_before;
+        {
+            const auto wallet = GetWallet(context, name);
+            BOOST_REQUIRE(wallet != nullptr);
+            records_before = DumpWalletRecords(wallet->GetDatabase());
+        }
+        auto result = MigrateLegacyToDescriptor(name, SecureString{"not the passphrase"}, context);
+        BOOST_REQUIRE(!result);
+        BOOST_CHECK_MESSAGE(util::ErrorString(result).original.find("passphrase was not provided or was incorrect") != std::string::npos, util::ErrorString(result).original);
+        BOOST_CHECK(GetWallet(context, name) == nullptr);
+        DatabaseOptions options;
+        options.require_existing = true;
+        DatabaseStatus status;
+        bilingual_str error;
+        auto database = MakeWalletDatabase(name, options, status, error);
+        BOOST_REQUIRE_MESSAGE(database, error.original);
+        const auto records_after = DumpWalletRecords(*database);
+        BOOST_CHECK_EQUAL(CountDescriptorRecords(records_after), size_t{0});
+        BOOST_CHECK(records_after == records_before);
+    }
+}
+#endif
+
+// The coordinator of these tests can fail while a backup thread is paused (a fatal assertion is an exception). The guard
+// releases the paused thread and joins it before anything the thread refers to is destroyed, and the exception goes on.
+BOOST_AUTO_TEST_CASE(QuantumWalletBackupTestThreadsAreJoinedWhenTheCoordinatorThrows)
+{
+    const DatabaseFormat format = DATABASE_FORMATS[0];
+    const std::string name{strprintf("quantum-backup-promotion-throw-%i", format)};
+    const fs::path backup_dir = m_path_root / fs::PathFromString(name + "-dest");
+    BOOST_REQUIRE(fs::create_directory(backup_dir));
+    auto wallet{TestLoadQuantumWallet(name, format)};
+    BOOST_REQUIRE(wallet->GetNewQuantumDestination("throw-k1"));
+    bool worker_ok{false};
+    bilingual_str worker_error;
+    bool reached{false};
+    bool coordinator_exception_seen{false};
+    try {
+        BackupGate gate;
+        gate.pause_point = "before_promotion_mutex";
+        ScopedBackupFailpoint failpoint{*wallet, [&gate](std::string_view point) {
+            if (t_backup_is_paused_thread && point == gate.pause_point) {
+                std::unique_lock<std::mutex> lock(gate.mutex);
+                gate.paused = true;
+                gate.condition.notify_all();
+                gate.condition.wait(lock, [&] { return gate.released; });
+            }
+            return false;
+        }};
+        BackupThreads threads{gate};
+        threads.Start([&] {
+            t_backup_is_paused_thread = true;
+            worker_ok = wallet->BackupWallet(fs::PathToString(backup_dir), &worker_error);
+        });
+        reached = gate.WaitFor([&] { return gate.paused; });
+        throw std::runtime_error("injected coordinator failure while the backup is paused");
+    } catch (const std::runtime_error&) {
+        coordinator_exception_seen = true;
+    }
+    // the guard ran: the worker was released and joined before its results and the gate were destroyed, so it finished
+    BOOST_CHECK(coordinator_exception_seen);
+    BOOST_CHECK(reached);
+    BOOST_CHECK_MESSAGE(worker_ok, worker_error.original);
+    BOOST_CHECK(!wallet->m_quantum_backup_failpoint);
+}
+
+// A copy that was not verified key by key (an empty inventory, or verify_quantum_keys=false) is checked again after it is
+// installed as well: a key made, or the wallet encrypted, while the file was being installed is reported as a failure. The
+// complete file that was installed stays, and no marker is written for a key the copy does not hold.
+BOOST_AUTO_TEST_CASE(QuantumWalletUnverifiedBackupReportsAChangeDuringInstallation)
+{
+    struct Scenario {
+        const char* name;
+        bool has_key;
+        bool verifies;
+        bool encrypts;
+    };
+    for (DatabaseFormat format : DATABASE_FORMATS) {
+        for (const Scenario& scenario : {Scenario{"empty-key", false, true, false}, Scenario{"empty-encrypt", false, true, true},
+                                         Scenario{"unverified-key", true, false, false}, Scenario{"unverified-encrypt", true, false, true}}) {
+            const std::string name{strprintf("quantum-backup-unverified-late-%s-%i", scenario.name, format)};
+            const fs::path backup_dir = m_path_root / fs::PathFromString(name + "-dest");
+            BOOST_REQUIRE(fs::create_directory(backup_dir));
+            auto wallet{TestLoadQuantumWallet(name, format)};
+            const std::string wallet_filename = fs::PathToString(fs::PathFromString(wallet->GetDatabase().Filename()).filename());
+            const fs::path backup_path = backup_dir / fs::PathFromString(wallet_filename);
+            std::optional<CTxDestination> first;
+            if (scenario.has_key) {
+                auto made = wallet->GetNewQuantumDestination("late-first");
+                BOOST_REQUIRE(made);
+                first = *made;
+            }
+            std::optional<CTxDestination> late;
+            bool encrypted_now{false};
+            ScopedBackupFailpoint failpoint{*wallet, [&](std::string_view point) {
+                if (point == "before_installed_identity_revalidation" && !late && !encrypted_now) {
+                    if (scenario.encrypts) {
+                        encrypted_now = wallet->EncryptWallet("pass");
+                    } else if (auto made = wallet->GetNewQuantumDestination("late-second")) {
+                        late = *made;
+                    }
+                }
+                return false;
+            }};
+            bilingual_str error;
+            const bool ok = wallet->BackupWallet(fs::PathToString(backup_dir), &error, scenario.verifies);
+            BOOST_CHECK(!ok);
+            BOOST_CHECK_MESSAGE(error.original.find("inventory changed while finalizing") != std::string::npos, error.original);
+            BOOST_CHECK(scenario.encrypts ? encrypted_now : late.has_value());
+            // the complete file that was installed stays
+            BOOST_CHECK(fs::is_regular_file(backup_path));
+            LOCK(wallet->cs_wallet);
+            if (late) {
+                const auto info = wallet->GetQuantumKeyInfo(*late);
+                BOOST_REQUIRE(info.has_value());
+                BOOST_CHECK(!info->backup_verified);
+            }
+            if (first) {
+                const auto info = wallet->GetQuantumKeyInfo(*first);
+                BOOST_REQUIRE(info.has_value());
+                BOOST_CHECK(!info->backup_verified);
+            }
         }
     }
 }

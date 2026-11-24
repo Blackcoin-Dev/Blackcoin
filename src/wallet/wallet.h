@@ -600,9 +600,9 @@ bool RemoveWallet(WalletContext& context, const std::shared_ptr<CWallet>& wallet
 std::vector<std::shared_ptr<CWallet>> GetWallets(WalletContext& context);
 std::shared_ptr<CWallet> GetDefaultWallet(WalletContext& context, size_t& count);
 std::shared_ptr<CWallet> GetWallet(WalletContext& context, const std::string& name);
-std::shared_ptr<CWallet> LoadWallet(WalletContext& context, const std::string& name, std::optional<bool> load_on_start, const DatabaseOptions& options, DatabaseStatus& status, bilingual_str& error, std::vector<bilingual_str>& warnings);
+std::shared_ptr<CWallet> LoadWallet(WalletContext& context, const std::string& name, std::optional<bool> load_on_start, const DatabaseOptions& options, DatabaseStatus& status, bilingual_str& error, std::vector<bilingual_str>& warnings, bool check_backup_path = true);
 std::shared_ptr<CWallet> CreateWallet(WalletContext& context, const std::string& name, std::optional<bool> load_on_start, DatabaseOptions& options, DatabaseStatus& status, bilingual_str& error, std::vector<bilingual_str>& warnings);
-std::shared_ptr<CWallet> RestoreWallet(WalletContext& context, const fs::path& backup_file, const std::string& wallet_name, std::optional<bool> load_on_start, DatabaseStatus& status, bilingual_str& error, std::vector<bilingual_str>& warnings);
+std::shared_ptr<CWallet> RestoreWallet(WalletContext& context, const fs::path& backup_file, const std::string& wallet_name, std::optional<bool> load_on_start, DatabaseStatus& status, bilingual_str& error, std::vector<bilingual_str>& warnings, bool check_backup_path = true);
 std::unique_ptr<interfaces::Handler> HandleLoadWallet(WalletContext& context, LoadWalletFn load_wallet);
 void NotifyWalletLoaded(WalletContext& context, const std::shared_ptr<CWallet>& wallet);
 std::unique_ptr<WalletDatabase> MakeWalletDatabase(const std::string& name, const DatabaseOptions& options, DatabaseStatus& status, bilingual_str& error);
@@ -2840,8 +2840,22 @@ public:
      * Internal pre-migration safety copies may opt out because they preserve
      * the exact source database and are not represented to the user as a
      * verified current-generation quantum-key backup.
+     *
+     * Every installation of a backup file takes m_backup_promotion_mutex and, under it, checks that the wallet's
+     * encryption state and quantum key inventory are still those the copy was made from (whatever
+     * verify_quantum_keys says, and for an empty inventory too), so a copy of an older inventory never replaces
+     * the file a later, complete backup installed. On a successful verified backup, verified_inventory (when given) is
+     * the witness program of every quantum key the installed file holds, from the same snapshot the copy was made from. The lock order is that mutex, then cs_wallet: the caller must
+     * not hold cs_wallet.
      */
-    bool BackupWallet(const std::string& strDest, bilingual_str* error = nullptr, bool verify_quantum_keys = true);
+    bool BackupWallet(const std::string& strDest, bilingual_str* error = nullptr, bool verify_quantum_keys = true,
+                      std::set<std::vector<unsigned char>>* verified_inventory = nullptr)
+        EXCLUSIVE_LOCKS_REQUIRED(!cs_wallet);
+
+    //! Serializes the installation of a wallet backup file by this wallet (the snapshot check, the rename, the
+    //! directory commits, the check of the installed file and the publication of the source markers). Taken
+    //! before cs_wallet, which is held only for short checks inside it and never across file system work.
+    Mutex m_backup_promotion_mutex;
 
     /** In-process fault injection for wallet backup tests. Never persisted or exposed through RPC. */
     std::function<bool(std::string_view)> m_quantum_backup_failpoint;
@@ -3468,7 +3482,14 @@ struct MigrationResult {
     std::shared_ptr<CWallet> watchonly_wallet;
     std::shared_ptr<CWallet> solvables_wallet;
     fs::path backup_path;
+    //! Warnings for the caller to show: the quantum key backup directory of a published wallet is a default path that is
+    //! too long for backups on Windows (the migration itself is not affected).
+    std::vector<bilingual_str> warnings;
 };
+
+//! Tests only: end a wallet migration with an error at a named point inside it (before_auxiliary_wallets,
+//! before_apply_migration_data); an empty function removes the failpoint.
+void SetWalletMigrationFailpointForTest(std::function<bool(std::string_view)> failpoint);
 
 //! Do all steps to migrate a legacy wallet to a descriptor wallet
 [[nodiscard]] util::Result<MigrationResult> MigrateLegacyToDescriptor(const std::string& wallet_name, const SecureString& passphrase, WalletContext& context);

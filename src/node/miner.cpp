@@ -1128,6 +1128,42 @@ static void PublishStakingStateAtCurrentTip(
         state, tip_hash, tip_height, worker_running, std::move(reason));
 }
 
+bool EnsureLegacyStakingDestination(CWallet& wallet, CTxDestination& dest, bilingual_str& error)
+{
+    int64_t tip_mtp{0};
+    int tip_height{-1};
+    {
+        // The phase is read from the tip as one snapshot under cs_main.
+        LOCK(cs_main);
+        const CBlockIndex* tip = wallet.chain().getTip();
+        if (tip) {
+            tip_mtp = tip->GetMedianTimePast();
+            tip_height = tip->nHeight;
+        }
+    }
+    // After Final no legacy kernel can stake, so no legacy destination is needed. Without a tip the phase is unknown
+    // and startup keeps its earlier behavior of making the destination.
+    if (tip_height >= 0 && Params().GetConsensus().IsQuantumFinalLockout(tip_mtp, tip_height + 1)) return true;
+    if (IsValidDestination(dest)) return true;
+    const std::string label = "Staking Legacy Address";
+    {
+        LOCK(wallet.cs_wallet);
+        wallet.ForEachAddrBookEntry([&](const CTxDestination& entry_dest, const std::string& entry_label, bool is_change, const std::optional<wallet::AddressPurpose>&) {
+            if (is_change) return;
+            if (entry_label == label) dest = entry_dest;
+        });
+    }
+    if (std::get_if<CNoDestination>(&dest)) {
+        auto op_dest = wallet.GetNewDestination(OutputType::LEGACY, label);
+        if (!op_dest) {
+            error = Untranslated("Error: Keypool ran out, please call keypoolrefill first.");
+            return false;
+        }
+        dest = *op_dest;
+    }
+    return true;
+}
+
 void PoSMiner(CWallet *pwallet)
 {
     pwallet->WalletLogPrintf("PoSMiner started for proof-of-stake\n");
@@ -1148,25 +1184,11 @@ void PoSMiner(CWallet *pwallet)
     const unsigned int pos_timio = static_cast<unsigned int>(
         std::max<int64_t>(1, gArgs.GetIntArg("-staketimio", DEFAULT_STAKETIMIO)));
     {
-        CBlockIndex* tip = pwallet->chain().getTip();
-        const bool final_quantum_lockout = tip && Params().GetConsensus().IsQuantumFinalLockout(tip->GetMedianTimePast(), tip->nHeight + 1);
-        if (!final_quantum_lockout) {
-            const std::string label = "Staking Legacy Address";
-            {
-                LOCK(pwallet->cs_wallet);
-                pwallet->ForEachAddrBookEntry([&](const CTxDestination& _dest, const std::string& _label, bool _is_change, const std::optional<wallet::AddressPurpose>& _purpose) {
-                    if (_is_change) return;
-                    if (_label == label)
-                        dest = _dest;
-                });
-            }
-
-            if (std::get_if<CNoDestination>(&dest)) {
-                auto op_dest = pwallet->GetNewDestination(OutputType::LEGACY, label);
-                if (!op_dest)
-                    throw std::runtime_error("Error: Keypool ran out, please call keypoolrefill first.");
-                dest = *op_dest;
-            }
+        // The destination of the legacy block-signing key. Made here at startup when the next block is not Final; a worker
+        // started at or after Final has none yet, and the loop below makes it if the chain returns to Migration.
+        bilingual_str destination_error;
+        if (!EnsureLegacyStakingDestination(*pwallet, dest, destination_error)) {
+            throw std::runtime_error(destination_error.original);
         }
 
         pwallet->WalletLogPrintf("Set proof-of-stake timeout: %ums; %u live wallet outputs indexed for staking (%u with a stakable script scanned per slot)\n",
@@ -1217,6 +1239,23 @@ void PoSMiner(CWallet *pwallet)
                 pwallet->WalletLogPrintf("Staker thread sleeps while sync at %f\n", GuessVerificationProgress(Params().TxData(), pwallet->chain().getTip()));
                 if (!SleepStaker(pwallet, 10000))
                     return;
+            }
+
+            {
+                // After a reorganisation back to Migration the worker may hold no legacy destination (it was started
+                // at Final). Make it here, after the waits and before the block is assembled; a failure takes the
+                // worker's ordinary retry path.
+                bilingual_str destination_error;
+                if (!EnsureLegacyStakingDestination(*pwallet, dest, destination_error)) {
+                    pwallet->WalletLogPrintf("PoSMiner: %s\n", destination_error.original);
+                    PublishStakingStateAtCurrentTip(
+                        pwallet, wallet::StakingTelemetryState::FAULT,
+                        strprintf("staking destination error: %s", destination_error.original));
+                    assembly_failures = std::min(assembly_failures + 1, 6U);
+                    const uint64_t backoff_ms = std::min<uint64_t>(250ULL << (assembly_failures - 1), 5000ULL);
+                    if (!SleepStaker(pwallet, backoff_ms)) return;
+                    continue;
+                }
             }
 
             wallet::MaybeAutoDemurrageAttest(*pwallet);

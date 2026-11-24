@@ -17,6 +17,7 @@
 #include <util/check.h>
 #include <util/fs_helpers.h>
 #include <util/strencodings.h>
+#include <util/syserror.h>
 #include <util/translation.h>
 
 #include <stdint.h>
@@ -26,6 +27,10 @@
 
 // Windows may not define S_IRUSR or S_IWUSR. We define both
 // here, with the same values as glibc (see stat.h).
+#ifdef WIN32
+#include <windows.h>
+#endif
+
 #ifdef WIN32
 #ifndef S_IRUSR
 #define S_IRUSR             0400
@@ -687,7 +692,18 @@ bool BerkeleyDatabase::Backup(const std::string& strDest) const
                         return false;
                     }
 
+#ifdef WIN32
+                    // The standard library the Windows build uses (libstdc++ of GCC 10) refuses to copy over an
+                    // existing file on the same volume: it compares the two files by an inode number that is always
+                    // zero on Windows and takes them for one file. The verified backup rewrites its staged copy, so
+                    // the system call is used here; it replaces an existing destination.
+                    if (!::CopyFileW(pathSrc.c_str(), pathDest.c_str(), /*bFailIfExists=*/FALSE)) {
+                        LogPrintf("error copying %s to %s - %s\n", strFile, fs::PathToString(pathDest), Win32ErrorString(static_cast<int>(::GetLastError())));
+                        return false;
+                    }
+#else
                     fs::copy_file(pathSrc, pathDest, fs::copy_options::overwrite_existing);
+#endif
                     LogPrintf("copied %s to %s\n", strFile, fs::PathToString(pathDest));
                     return true;
                 } catch (const fs::filesystem_error& e) {

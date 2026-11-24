@@ -17,6 +17,9 @@
 #include <util/strencodings.h>
 
 #include <array>
+#include <fstream>
+#include <iterator>
+#include <memory>
 #include <optional>
 #include <cstdint>
 #include <cstring>
@@ -1064,6 +1067,67 @@ BOOST_AUTO_TEST_CASE(util_ReadWriteSettings)
         args2.WriteSettingsFile();
         fs::remove(args1.GetDataDirBase() / "settings.json");
     }
+}
+
+// Loading the settings file is transactional: a file rejected for a strict option leaves nothing of it in the live map,
+// so the Reset choice of the Qt error dialog (go on and write the settings back) writes valid, empty settings and the
+// next read succeeds, and Abort (nothing is written) leaves the file as it was.
+BOOST_AUTO_TEST_CASE(util_RejectedSettingsFileLeavesNothingLoaded)
+{
+    const auto make_args = [&] {
+        auto args = std::make_unique<TestArgsManager>();
+        args->ForceSetArg("-datadir", fs::PathToString(m_path_root));
+        args->SetupArgs({{"-strict", ArgsManager::ALLOW_ANY | ArgsManager::STRICT_BOOL}});
+        return args;
+    };
+    const fs::path settings_file = m_path_root / "settings.json";
+    const auto write_file = [&](const std::string& text) {
+        std::ofstream out{settings_file};
+        out << text;
+    };
+    const auto read_file = [&] {
+        std::ifstream in{settings_file};
+        return std::string{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+    };
+    const auto loaded_count = [](TestArgsManager& args) {
+        size_t count{0};
+        args.LockSettings([&](common::Settings& settings) { count = settings.rw_settings.size(); });
+        return count;
+    };
+    const std::vector<std::string> rejected{
+        R"({"wallet": ["example"], "listen": false, "strict": []})",
+        R"({"wallet": ["example"], "strict": "maybe"})",
+        R"({"wallet": ["example"], "strict": ""})",
+        R"({"wallet": ["example"], "strict": 2})",
+        R"({"wallet": ["example"], "strict": null})",
+        R"({"wallet": ["example"], "nostrict": true})",
+    };
+    for (const std::string& text : rejected) {
+        write_file(text);
+        auto args = make_args();
+        // A previous good load must not survive a rejected one either.
+        args->LockSettings([&](common::Settings& settings) { settings.rw_settings["stale"] = 1; });
+        std::vector<std::string> errors;
+        BOOST_CHECK_MESSAGE(!args->ReadSettingsFile(&errors), text);
+        BOOST_CHECK(!errors.empty());
+        BOOST_CHECK_EQUAL(loaded_count(*args), 0U); // nothing of the rejected file, nor of the stale map
+        // Abort: nothing is written, the file stays as it was.
+        BOOST_CHECK_EQUAL(read_file(), text);
+        // Reset: the caller goes on and writes the settings back.
+        BOOST_CHECK(args->WriteSettingsFile(&errors));
+        BOOST_CHECK_MESSAGE(read_file().find("strict") == std::string::npos && read_file().find("example") == std::string::npos, read_file());
+        auto next = make_args();
+        std::vector<std::string> next_errors;
+        BOOST_CHECK_MESSAGE(next->ReadSettingsFile(&next_errors), text);
+        BOOST_CHECK(next_errors.empty());
+        BOOST_CHECK(next->GetSetting("strict").isNull());
+    }
+    // An acceptable file is loaded whole, unrelated keys included.
+    write_file(R"({"wallet": ["example"], "strict": 0, "x": []})");
+    auto args = make_args();
+    BOOST_CHECK(args->ReadSettingsFile());
+    BOOST_CHECK_EQUAL(loaded_count(*args), 3U);
+    fs::remove(settings_file);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

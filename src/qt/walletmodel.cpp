@@ -1709,10 +1709,11 @@ void WalletModel::sendCoins(WalletModelTransaction& transaction)
         }
 
         auto& newTx = transaction.getWtx();
-        const std::string commit_warning = wallet().commitTransaction(newTx, /*value_map=*/{}, std::move(vOrderForm));
+        const bilingual_str commit_warning = wallet().commitTransaction(newTx, /*value_map=*/{}, std::move(vOrderForm));
         if (!commit_warning.empty()) {
-            // e.g. the transaction spent outputs the final stake reserve holds back: it is done, the user is told.
-            Q_EMIT message(tr("Send Coins"), QString::fromStdString(commit_warning), CClientUIInterface::MSG_WARNING);
+            // e.g. the transaction was stored but not relayed yet, or it spent outputs the final stake reserve holds
+            // back: it is done, the user is told (in the translated text).
+            Q_EMIT message(tr("Send Coins"), QString::fromStdString(commit_warning.translated), CClientUIInterface::MSG_WARNING);
         }
 
         DataStream ssTx;

@@ -539,6 +539,15 @@ jobs:
                   "set TMP=C:\\t&& set TEMP=C:\\t&& src\\test\\test_blackcoin.exe --run_test=$suite --log_level=test_suite" ||
                   failed_suites+=("$suite")
               done
+              # A failed suite runs once more with the node log on the console, cut down to the
+              # lines that say why a backup or a file operation failed.
+              for suite in "${failed_suites[@]}"; do
+                echo "::group::node log lines for $suite"
+                WINEDEBUG=-all "$wine_runner" cmd /c \
+                  "set TMP=C:\\t&& set TEMP=C:\\t&& src\\test\\test_blackcoin.exe --run_test=$suite --log_level=nothing -- -printtoconsole=1" 2>&1 |
+                  grep -iE 'error|unable|cannot|failed|refus' | tail -n 400 || true
+                echo "::endgroup::"
+              done
               if (( ${#failed_suites[@]} )); then
                 echo "Failed suites under Wine: ${failed_suites[*]}" >&2
                 exit 1

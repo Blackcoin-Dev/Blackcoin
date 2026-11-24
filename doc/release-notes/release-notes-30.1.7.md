@@ -282,8 +282,34 @@ address were never affected. Transaction and block validation rules are unchange
   junctions or other reparse points while backup preparation is running. The fixed-drive check
   does not prove that a device cannot be disconnected. Volume validation is not bound to every
   later path-based operation. These are limits of this release, not qualified storage
-  configurations. This Windows code was written without a
-  Windows build or test machine and has not been run.
+  configurations.
+
+  **Windows backup qualification.** Sixteen native regtest backup qualification cases passed against
+  the primary Windows artifact built from candidate commit
+  `9650d9d1acfbd3ca8ea7f5c38946895e0d4ff0b2`, on a Windows Server runner with the daemon running as
+  a separate standard user and with plain and encrypted descriptor wallets. Successful cases used
+  the default profile location on local NTFS, an NTFS virtual disk mounted inside the data
+  directory, a junction to another NTFS volume, a SUBST drive, a data directory spelled in a
+  different letter case, and per-wallet backup directory paths measuring 136 and 137 UTF-16 code
+  units, including the wallet component. Backups were restored and the quantum keys checked,
+  including in a fresh data directory. The cases confirmed refusal of UNC shares, a mapped network
+  drive, FAT32, drive-relative and root-relative paths, per-wallet backup directory paths measuring
+  138 and 177 UTF-16 code units, a denied ancestor, and an outside path whose ancestors reach an
+  unwritable `C:\`. The mapped-drive case failed volume identification and reported that error
+  rather than an explicit network-drive rejection. A refusal left the new key pending and the
+  existing return address in use, and recovery reused the same key. The cases also covered pruning
+  to the newest three generations, an injected commit failure and four process-crash points. A probe
+  built from the same source exercised directory flushing and injected flush failures. The Windows
+  unit suites for this code run under Wine in the build, not on Windows.
+
+  Native Windows qualification covered descriptor wallets only; the legacy BDB backup-copy path was
+  exercised under Wine. This qualification did not exercise Windows desktop editions, ReFS, exFAT,
+  physical removable media, BitLocker, cloud placeholders, Controlled Folder Access, antivirus
+  sharing conflicts or concurrent reparse-point changes. It did not test spending with a restored
+  key, funded staking at the migration boundaries, power loss or storage cache loss. These native
+  results apply directly to the tested artifact; a documentation-only successor may reference them
+  with the tested commit identified, but a different executable build has not itself undergone this
+  native run.
 - **A better order for choosing the return address.** With no address saved, the wallet takes, in
   this order: the one `-qqpospayoutaddress`, the wallet's recorded Gold Rush claim payout key (the
   key the claim miner is bound to, the configured `-qqpowpayoutaddress`, or the key its confirmed

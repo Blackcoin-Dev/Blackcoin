@@ -1,8 +1,6 @@
-# Blackcoin Core 30.1.7rc1 (DEVELOPMENT, unreleased candidate)
+# Blackcoin Core 30.1.7
 
-RELEASE_NOTES_NOT_FINAL
-
-Blackcoin Core 30.1.7rc1 follows 30.1.6. It is an efficiency and cleanup release on
+Blackcoin Core 30.1.7 follows 30.1.6. It is an efficiency and cleanup release on
 the wallet and node side, with clearer behaviour around the migration to quantum
 outputs, the Final phase and the end of Gold Rush.
 
@@ -11,8 +9,7 @@ file format are unchanged. None of the changes below alters which blocks or
 transactions are valid. A wallet file written by 30.1.7 opens in 30.1.6, the release
 this one was tested against. Older releases were not tested.
 
-This candidate has `CLIENT_VERSION_IS_RELEASE=false`.
-Release qualification is pending.
+The final source is RC0 with `CLIENT_VERSION_IS_RELEASE=true`.
 
 ## Wallet load and cleanup
 
@@ -546,10 +543,28 @@ operator can see before the last Gold Rush block (height 6,192,999), in plain la
   (`-staking=0` does not stop it; `-disablewallet` does).
 - Check the boolean value of `-finalstakereserve` and the directory supplied to
   `-quantumkeybackupdir`, and set an unlock timeout that covers the whole observation window.
-- On one canary node, confirm the exact candidate artifact, that the node is synchronised, that
+- On one canary node, confirm the exact artifact, that the node is synchronised, that
   `getstakinginfo` reports a searching worker, and that a stake it finds is accepted (check the
   block, not only the log line). A canary run before a boundary height says nothing about the
   later transition.
+
+## Pre-release operation
+
+The candidate binary, built from commit d3fb3d1, ran on a private fleet of 32
+mainnet nodes for about three days and about 3,400 blocks. It had no crash, no
+unplanned restart attributable to the software, and no wallet or database
+error. The nodes staked and won blocks normally.
+
+A wallet backup made after the upgrade was restored offline under 30.1.7,
+opened under 30.1.6, and opened again under 30.1.7 with the return binding
+intact. The restore used an empty chain with the wallet locked.
+
+The quantum stake return path has not been exercised on mainnet; its validation
+rests on regtest and CI evidence.
+
+The final source differs from the operated candidate by this
+release-finalization commit, which changes version identity, documentation and
+tests.
 
 ## Known limitations
 
@@ -651,8 +666,8 @@ operator can see before the last Gold Rush block (height 6,192,999), in plain la
 
 ## Version identity
 
-The source is configured as `30.1.7rc1`: major 30, minor 1, build 7, revision 0, RC1. The
-numeric `CLIENT_VERSION` is
+The source is configured as `30.1.7`: major 30, minor 1, build 7, revision 0, RC0, with
+`CLIENT_VERSION_IS_RELEASE=true`. The numeric `CLIENT_VERSION` is
 `300107`. macOS uses short version `30.1.7` and bundle version `30.1.700`, and
 `BlackcoinFullVersion` is `30.1.7`. The steps to a signed release are in the
 [release process](../release-process.md).

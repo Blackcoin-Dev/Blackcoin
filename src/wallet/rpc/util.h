@@ -65,6 +65,13 @@ void PushParentDescriptors(const CWallet& wallet, const CScript& script_pubkey, 
 void HandleWalletError(const std::shared_ptr<CWallet> wallet, DatabaseStatus& status, bilingual_str& error);
 int64_t ParseISO8601DateTime(const std::string& str);
 void AppendLastProcessedBlock(UniValue& entry, const CWallet& wallet) EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet);
+//! The funds a closed Gold Rush claim keeps reserved, what holds them and the
+//! command that releases them.
+UniValue ClosedClaimReservationToJSON(const ShadowPowClosedClaimReservation& reservation);
+std::vector<RPCResult> ClosedClaimReservationResults();
+//! Adds "closed_claim_reserved" only while an amount is held, so wallets that
+//! never had a claim see no change in these results.
+void AppendClosedClaimReservation(UniValue& entry, const CWallet& wallet) EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet);
 //! Whether a balance RPC waits for an exact balance: the caller's `exact`
 //! argument, or -walletrpcexactbalance when it is not given.
 bool WantExactBalance(const UniValue& param);

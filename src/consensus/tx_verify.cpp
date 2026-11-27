@@ -231,7 +231,7 @@ bool CheckTxInputsImpl(const CTransaction& tx, TxValidationState& state,
             latest_attestation ? std::optional<int>{latest_attestation->height} : std::nullopt,
             latest_attestation ? std::optional<int>{static_cast<int>(latest_attestation->coverage_start_height)} : std::nullopt);
         if (demurrage.locked) {
-            return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-txns-spends-locked-coin");
+            return state.Invalid(TxValidationResult::TX_CONSENSUS, Consensus::REJECT_TX_SPENDS_LOCKED_COIN);
         }
         nValueIn += demurrage.effective_value;
         if (!MoneyRange(demurrage.effective_value) || !MoneyRange(nValueIn)) {
@@ -243,7 +243,7 @@ bool CheckTxInputsImpl(const CTransaction& tx, TxValidationState& state,
     {
         const CAmount value_out = tx.GetValueOut();
         if (nValueIn < value_out) {
-            return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-txns-in-belowout",
+            return state.Invalid(TxValidationResult::TX_CONSENSUS, Consensus::REJECT_TX_IN_BELOW_OUT,
                 strprintf("value in (%s) < value out (%s)", FormatMoney(nValueIn), FormatMoney(value_out)));
         }
 
@@ -255,7 +255,7 @@ bool CheckTxInputsImpl(const CTransaction& tx, TxValidationState& state,
 
         // Blackcoin: Minimum fee check
         if (::Params().GetConsensus().IsProtocolV3_1(nTimeTx) && txfee_aux < GetMinFee(tx, nTimeTx))
-            return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-txns-fee-not-enough");
+            return state.Invalid(TxValidationResult::TX_CONSENSUS, Consensus::REJECT_TX_FEE_NOT_ENOUGH);
 
         txfee = txfee_aux; 
     }

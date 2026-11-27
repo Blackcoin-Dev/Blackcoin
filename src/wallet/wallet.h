@@ -169,6 +169,19 @@ enum class WalletCommitStatus {
     REJECTED_ABANDONED,
 };
 
+struct FinalStakeReserveSpendReport;
+
+/** How the inputs of a transaction came to be chosen, carried with the operation from construction to commitment. */
+struct CommitSpendProvenance
+{
+    //! Outputs the user selected with coin control: the only inputs allowed to spend the final stake reserve.
+    std::set<COutPoint> explicit_inputs;
+    //! Coin locks THIS operation put on its inputs (lock_unspents); a lock that was there before is not listed. They
+    //! do not take an input out of the reserve when it is derived at the commit, and they are released when the commit
+    //! is refused because of the reserve.
+    std::set<COutPoint> operation_locks;
+};
+
 /** Optional exact precondition checked while the wallet transaction is
  * reserved for broadcast. The successful check is the recovery relay's
  * linearization point: later wallet changes do not retroactively revoke bytes
@@ -587,9 +600,9 @@ bool RemoveWallet(WalletContext& context, const std::shared_ptr<CWallet>& wallet
 std::vector<std::shared_ptr<CWallet>> GetWallets(WalletContext& context);
 std::shared_ptr<CWallet> GetDefaultWallet(WalletContext& context, size_t& count);
 std::shared_ptr<CWallet> GetWallet(WalletContext& context, const std::string& name);
-std::shared_ptr<CWallet> LoadWallet(WalletContext& context, const std::string& name, std::optional<bool> load_on_start, const DatabaseOptions& options, DatabaseStatus& status, bilingual_str& error, std::vector<bilingual_str>& warnings);
+std::shared_ptr<CWallet> LoadWallet(WalletContext& context, const std::string& name, std::optional<bool> load_on_start, const DatabaseOptions& options, DatabaseStatus& status, bilingual_str& error, std::vector<bilingual_str>& warnings, bool check_backup_path = true);
 std::shared_ptr<CWallet> CreateWallet(WalletContext& context, const std::string& name, std::optional<bool> load_on_start, DatabaseOptions& options, DatabaseStatus& status, bilingual_str& error, std::vector<bilingual_str>& warnings);
-std::shared_ptr<CWallet> RestoreWallet(WalletContext& context, const fs::path& backup_file, const std::string& wallet_name, std::optional<bool> load_on_start, DatabaseStatus& status, bilingual_str& error, std::vector<bilingual_str>& warnings);
+std::shared_ptr<CWallet> RestoreWallet(WalletContext& context, const fs::path& backup_file, const std::string& wallet_name, std::optional<bool> load_on_start, DatabaseStatus& status, bilingual_str& error, std::vector<bilingual_str>& warnings, bool check_backup_path = true);
 std::unique_ptr<interfaces::Handler> HandleLoadWallet(WalletContext& context, LoadWalletFn load_wallet);
 void NotifyWalletLoaded(WalletContext& context, const std::shared_ptr<CWallet>& wallet);
 std::unique_ptr<WalletDatabase> MakeWalletDatabase(const std::string& name, const DatabaseOptions& options, DatabaseStatus& status, bilingual_str& error);
@@ -632,6 +645,9 @@ static const CAmount DEFAULT_MIN_STAKING_AMOUNT = 0.1 * COIN;
 static const CAmount DEFAULT_RESERVE_BALANCE = 0;
 //! Optional wallet automation is opt-in. Consensus lifecycle and demurrage
 //! rules are independent and remain mandatory at their configured heights.
+//! The error of a commit refused because an input the wallet chose itself is in the final stake reserve.
+static constexpr const char* FINAL_STAKE_RESERVE_COMMIT_ERROR{
+    "the transaction would spend outputs held back as the final stake reserve (they changed after it was built); build it again, or select those outputs explicitly"};
 static constexpr bool DEFAULT_AUTOSTART_STAKING{false};
 static constexpr bool DEFAULT_AUTO_SHADOW_SIGNAL{false};
 static constexpr bool DEFAULT_AUTO_DEMURRAGE_ATTEST{false};
@@ -834,6 +850,24 @@ struct QuantumColdStakeDelegationRecord
     SERIALIZE_METHODS(QuantumColdStakeDelegationRecord, obj)
     {
         READWRITE(obj.staker_pubkey_hash, obj.owner_pubkey_hash, obj.creation_time);
+    }
+};
+
+/** A quantum key made for the legacy-stake return address whose backup has not succeeded yet (wallet record
+ *  "quantumreturnpending", skipped by older versions). It is written in the same database transaction as the
+ *  key, names the key, says what consent created it, and exists until the destination is activated. */
+struct QuantumStakeReturnPendingRecord
+{
+    uint32_t version{1};
+    std::vector<unsigned char> witness_program;
+    //! Which consent made the key: "explicit" (setquantumstakereturn with allow_new_quantum_key) or "automatic"
+    //! (-qqallowautokeycreation).
+    std::string consent;
+    int64_t creation_time{0};
+
+    SERIALIZE_METHODS(QuantumStakeReturnPendingRecord, obj)
+    {
+        READWRITE(obj.version, obj.witness_program, obj.consent, obj.creation_time);
     }
 };
 
@@ -1153,6 +1187,10 @@ private:
     /** Every observable live-index membership change advances this value.
      * Warm scans carry it through the exact one-coin reservation boundary. */
     uint64_t m_live_unspent_stake_generation GUARDED_BY(cs_wallet){1};
+    //! True while the database load adds transactions: the live-unspent
+    //! indexes are not maintained per transaction then, because LoadWallet
+    //! rebuilds them from the finished wallet (RecomputeLiveUnspentStakeOutpoints).
+    bool m_defer_live_unspent_index GUARDED_BY(cs_wallet){false};
     bool IsSpentForStakeIndex(const COutPoint& outpoint) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     void RefreshLiveUnspentStakeOutpoint(const COutPoint& outpoint) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     /** Restriction-only repair for an exact chain/wallet mismatch discovered
@@ -1381,7 +1419,9 @@ private:
     bool WriteAddressBookWithDB(WalletBatch& batch, const CTxDestination& address, const std::string& name, const std::optional<AddressPurpose>& purpose) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     bool SetAddressBookLocked(const CTxDestination& address, const std::string& name, const std::optional<AddressPurpose>& purpose, AddressBookNotification& notification) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
 
-    util::Result<CTxDestination> AddQuantumKeyInternal(const std::vector<unsigned char>& public_key, const CKeyingMaterial& private_key, const std::string& label, int64_t creation_time, bool record_as_receive, const std::optional<CTxDestination>& receive_destination);
+    //! stake_return_consent, when not null, also writes the pending-return record for the new key in the same
+    //! database transaction and publishes it with the key (see QuantumStakeReturnPendingRecord).
+    util::Result<CTxDestination> AddQuantumKeyInternal(const std::vector<unsigned char>& public_key, const CKeyingMaterial& private_key, const std::string& label, int64_t creation_time, bool record_as_receive, const std::optional<CTxDestination>& receive_destination, const std::string* stake_return_consent = nullptr);
 
     //! Unsets a wallet flag and saves it to disk
     void UnsetWalletFlagWithDB(WalletBatch& batch, uint64_t flag);
@@ -2140,9 +2180,25 @@ public:
      * @param[in] mapValue key-values to be set on the transaction.
      * @param[in] orderForm BIP 70 / BIP 21 order form details to be set on the transaction.
      */
+    /** Commit a transaction the wallet created.
+     *
+     *  Entry contract: the caller holds no wallet lock (cs_wallet) of this wallet. The function takes cs_main and then
+     *  cs_wallet itself, in that order, and keeps both from the decision whether the final stake reserve guard is on
+     *  to the end of the wallet record's publication (it is not safe to hold cs_wallet without cs_main on entry, since
+     *  cs_main would then be taken after it). A caller that holds cs_main may keep it. Enforced by AssertLockNotHeld
+     *  (lock-order builds) and by LOCKS_EXCLUDED (thread-safety analysis).
+     *
+     *  While the guard is on, the reserve is derived again under those two locks and a transaction with an input
+     *  in it is refused (nothing is stored, FINAL_STAKE_RESERVE_COMMIT_ERROR is the error). An input counts as one the
+     *  wallet chose itself unless the provenance lists it as explicit (selected by the user with coin control).
+     *  When the commit is refused for the reserve, the coin locks the provenance lists as this operation's own are
+     *  released inside the same critical section. When an explicit input spends reserved outputs and reserve_report is
+     *  given, it receives the outputs consumed and the reserve before and after, derived inside the critical section. */
     bool CommitTransaction(CTransactionRef tx, mapValue_t mapValue, std::vector<std::pair<std::string, std::string>> orderForm,
                            std::string* broadcast_error = nullptr, WalletCommitStatus* commit_status = nullptr,
-                           std::optional<ShadowPowClaimCommitAuthority> shadow_pow_authority = std::nullopt);
+                           std::optional<ShadowPowClaimCommitAuthority> shadow_pow_authority = std::nullopt,
+                           const CommitSpendProvenance* provenance = nullptr,
+                           FinalStakeReserveSpendReport* reserve_report = nullptr) LOCKS_EXCLUDED(cs_wallet);
     bool CommitRGBTransaction(CTransactionRef tx, mapValue_t mapValue, std::vector<std::pair<std::string, std::string>> orderForm, const RGBTxCommitData& rgb_data, std::string& error);
 
     /** Pass this transaction to node for mempool insertion and relay to peers if flag set to true */
@@ -2217,9 +2273,19 @@ public:
     mutable Mutex m_staking_telemetry_mutex;
     StakingTelemetrySnapshot m_staking_telemetry
         GUARDED_BY(m_staking_telemetry_mutex);
+    // The automatic scans skip only a tip they already scanned: the height
+    // alone cannot tell two competing blocks at one height apart, so each
+    // watermark pairs it with the tip hash. A null hash means "scan again".
     int m_demurrage_last_auto_attest_scan_height GUARDED_BY(cs_wallet){-1};
+    uint256 m_demurrage_last_auto_attest_scan_tip GUARDED_BY(cs_wallet);
+    // Rescans of a tip that is not newer than the last one scanned (a
+    // reorganisation) are rate limited; see DecideAutoScan.
+    std::chrono::steady_clock::time_point m_demurrage_last_reorg_scan GUARDED_BY(cs_wallet){};
+    std::chrono::steady_clock::time_point m_shadow_signal_last_reorg_scan GUARDED_BY(cs_wallet){};
+    std::chrono::steady_clock::time_point m_redelegation_last_reorg_scan GUARDED_BY(cs_wallet){};
     std::map<uint256, int> m_demurrage_last_auto_attest_attempt_height GUARDED_BY(cs_wallet);
     int m_shadow_signal_last_auto_scan_height GUARDED_BY(cs_wallet){-1};
+    uint256 m_shadow_signal_last_auto_scan_tip GUARDED_BY(cs_wallet);
     // The staking thread and the periodic wallet scheduler can both request an
     // automatic QQSIGNAL. Keep construction single-flight per wallet and use a
     // non-blocking retry deadline so transient validation/signing failures do
@@ -2230,11 +2296,27 @@ public:
     // Resume automatic QQSIGNAL fee-input discovery after the last bounded
     // wallet-history slice instead of rescanning mapWallet from the beginning.
     COutPoint m_shadow_signal_coin_scan_cursor GUARDED_BY(cs_wallet);
-    // GetStakeWeight is an O(wallet history) calculation. The staking worker
-    // publishes its most recent complete result for non-blocking RPC/GUI reads.
+    // The staking worker publishes its most recent complete stake weight for
+    // non-blocking RPC/GUI reads.
     mutable std::atomic<uint64_t> m_cached_stake_weight{0};
     mutable std::atomic<int> m_cached_stake_weight_height{-1};
     int m_redelegation_last_auto_scan_height GUARDED_BY(cs_wallet){-1};
+    uint256 m_redelegation_last_auto_scan_tip GUARDED_BY(cs_wallet);
+    //! Quantum address that receives the principal and reward of a legacy stake made in the last
+    //! blocks of Migration (record "quantumstakereturn", skipped by older versions); empty when unset.
+    std::string m_quantum_stake_return GUARDED_BY(cs_wallet);
+    //! The key made for the return address that is not yet in a verified backup, while it is not the active
+    //! destination (record "quantumreturnpending"). Set with the key, cleared with the activation.
+    std::optional<QuantumStakeReturnPendingRecord> m_quantum_return_pending GUARDED_BY(cs_wallet);
+    //! The last backup error of that pending key, for status output. Not persisted.
+    std::string m_quantum_return_pending_error GUARDED_BY(cs_wallet);
+    //! Serializes every preparation of the return destination of this wallet (choice, creation, backup and
+    //! activation), so concurrent callers produce one key. Taken before cs_wallet and never with cs_main held.
+    Mutex m_quantum_return_prepare_mutex;
+    //! The wallet's own (automatic) retry of a failed backup waits until this steady-clock time, so a backup
+    //! that keeps failing is not attempted on every pass of the maintenance and staking threads. Explicit calls
+    //! ignore it. Not persisted.
+    SteadyClock::time_point m_quantum_return_retry_at GUARDED_BY(m_quantum_return_prepare_mutex){};
     std::map<std::vector<unsigned char>, int> m_redelegation_last_auto_attempt_height GUARDED_BY(cs_wallet);
     std::map<std::vector<unsigned char>, int> m_redelegation_last_auto_success_height GUARDED_BY(cs_wallet);
     std::map<std::vector<unsigned char>, int> m_redelegation_last_win_height GUARDED_BY(cs_wallet);
@@ -2253,6 +2335,26 @@ public:
     std::atomic<double> m_pow_hashrate{0.0};   // aggregate Argon2id tries/s reported by the solver
     std::atomic<int64_t> m_pow_claims_submitted{0};
     std::atomic<bool> m_stop_pow_mining_thread{false};
+    // Gold Rush end handling: the last tip the wallet saw on each side of the
+    // end of the reward window (to queue one recovery pass at the transition),
+    // and the miner settings to restore if a reorganisation returns the chain
+    // below the end after the miner was stopped for it.
+    std::atomic<bool> m_gold_rush_end_observed{false};
+    std::atomic<bool> m_pow_resume_below_end{false};
+    // Counts explicit miner-control requests. It is written only under
+    // m_pow_recovery_authority_mutex. An automatic restart records it before
+    // deciding and is honoured only if it is unchanged when checked again
+    // under that mutex, so an explicit request that completes in between wins.
+    std::atomic<uint64_t> m_pow_explicit_generation{0};
+    // Automatic restarts refused because an explicit request superseded them.
+    std::atomic<uint64_t> m_pow_auto_restart_refusals{0};
+    // Test-only: called at the named point of the automatic end-stop or
+    // restart (and, as "before_end_stop_join", between setting the stop flag
+    // and joining the workers in StopPowMiningLocked) so a test can interleave
+    // an explicit request deterministically. Unset, it does nothing.
+    std::function<void(const char* stage)> m_pow_reconcile_test_hook;
+    std::atomic<int> m_pow_resume_threads{1};
+    std::atomic<int> m_pow_resume_cpu_percent{1};
     std::atomic<uint64_t> m_pow_next_nonce{0};
     std::atomic<uint64_t> m_pow_total_tries{0};
     std::atomic<int64_t> m_pow_hashrate_start_ms{0};
@@ -2321,8 +2423,6 @@ public:
     uint256 m_pow_gate_ready_tip GUARDED_BY(m_pow_miner_mutex);
     std::chrono::steady_clock::time_point m_pow_gate_ready_at GUARDED_BY(m_pow_miner_mutex){};
     std::set<uint256> m_inflight_wallet_broadcasts GUARDED_BY(cs_wallet);
-
-    uint64_t GetStakeWeight() const EXCLUSIVE_LOCKS_REQUIRED(::cs_main, cs_wallet);
 
     /** Broad ordered staking prefilter. Caller must keep cs_wallet held while
      *  using the returned reference. */
@@ -2527,6 +2627,21 @@ public:
     util::Result<CTxDestination> GetNewDestination(const OutputType type, const std::string label, bool* reserved = nullptr);
     util::Result<CTxDestination> GetNewChangeDestination(const OutputType type);
     util::Result<CTxDestination> GetNewQuantumDestination(const std::string label);
+    /** A new quantum key for the legacy-stake return address with its pending-return record, both in one
+     *  database transaction. consent is "explicit" or "automatic". */
+    util::Result<CTxDestination> AddQuantumStakeReturnKey(const std::string& label, const std::string& consent);
+    /** The witness program of every quantum key the wallet holds. */
+    std::set<std::vector<unsigned char>> GetQuantumKeyPrograms() const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    /** Whether dest is the key made for the return address that is still waiting for its backup. */
+    bool IsQuantumStakeReturnPendingKey(const CTxDestination& dest) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    /** Load the pending-return record. Refused (false) when it names no key of this wallet. */
+    bool LoadQuantumStakeReturnPending(const QuantumStakeReturnPendingRecord& record) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    /** The quantum key the wallet records as its Gold Rush claim payout key, or an invalid destination:
+     *  the payout key bound for the claim miner (configured, restored or created), else the configured
+     *  -qqpowpayoutaddress, else the one key that confirmed synthetic Gold Rush payouts in this wallet were
+     *  paid to (the oldest if several). An address-book label alone never identifies it. Only an ordinary
+     *  direct quantum key with a durably stored key of this wallet qualifies. */
+    CTxDestination GetRecordedPowPayoutKey() const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     util::Result<CTxDestination> GetNewTieredQuantumDestination(const std::string label, uint16_t unbonding_blocks);
     util::Result<CTxDestination> GetNewQuantumChangeDestination();
     util::Result<CTxDestination> AddQuantumKey(const std::vector<unsigned char>& public_key, const CKeyingMaterial& private_key, const std::string& label, int64_t creation_time, bool record_as_receive = true);
@@ -2725,8 +2840,22 @@ public:
      * Internal pre-migration safety copies may opt out because they preserve
      * the exact source database and are not represented to the user as a
      * verified current-generation quantum-key backup.
+     *
+     * Every installation of a backup file takes m_backup_promotion_mutex and, under it, checks that the wallet's
+     * encryption state and quantum key inventory are still those the copy was made from (whatever
+     * verify_quantum_keys says, and for an empty inventory too), so a copy of an older inventory never replaces
+     * the file a later, complete backup installed. On a successful verified backup, verified_inventory (when given) is
+     * the witness program of every quantum key the installed file holds, from the same snapshot the copy was made from. The lock order is that mutex, then cs_wallet: the caller must
+     * not hold cs_wallet.
      */
-    bool BackupWallet(const std::string& strDest, bilingual_str* error = nullptr, bool verify_quantum_keys = true);
+    bool BackupWallet(const std::string& strDest, bilingual_str* error = nullptr, bool verify_quantum_keys = true,
+                      std::set<std::vector<unsigned char>>* verified_inventory = nullptr)
+        EXCLUSIVE_LOCKS_REQUIRED(!cs_wallet);
+
+    //! Serializes the installation of a wallet backup file by this wallet (the snapshot check, the rename, the
+    //! directory commits, the check of the installed file and the publication of the source markers). Taken
+    //! before cs_wallet, which is held only for short checks inside it and never across file system work.
+    Mutex m_backup_promotion_mutex;
 
     /** In-process fault injection for wallet backup tests. Never persisted or exposed through RPC. */
     std::function<bool(std::string_view)> m_quantum_backup_failpoint;
@@ -2934,8 +3063,19 @@ public:
     bool SetPowMining(bool enabled, int threads, int cpu_percent, bilingual_str& error,
                       bool* created_payout = nullptr, bool allow_new_payout_key = false,
                       bool wait_for_normal_unlock = false,
-                      const std::function<bool()>& cancelled = {});
+                      const std::function<bool()>& cancelled = {},
+                      const uint64_t* automatic_restart_consent = nullptr);
     void StopPowMining();
+    /** Stop the claim miner once the next block is past the Gold Rush reward
+     *  window, and restart it if a reorganisation returns below the end. Runs
+     *  on the claim maintenance thread, which may join the workers. */
+    void ReconcilePowMinerWithGoldRushWindow();
+    /** The decision part of the above for a given window state. */
+    void ReconcilePowMinerWithWindowState(bool closed, int tip_height);
+    /** Funds held by claims that the closed reward window left unconfirmable.
+     *  Empty before the window closes. */
+    ShadowPowClosedClaimReservation GetClosedClaimReservationLocked() const
+        EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     void StopPowMiningLocked()
         EXCLUSIVE_LOCKS_REQUIRED(m_pow_recovery_authority_mutex);
     bool IsPowMiningClosing() const;
@@ -3342,7 +3482,14 @@ struct MigrationResult {
     std::shared_ptr<CWallet> watchonly_wallet;
     std::shared_ptr<CWallet> solvables_wallet;
     fs::path backup_path;
+    //! Warnings for the caller to show: the quantum key backup directory of a published wallet is a default path that is
+    //! too long for backups on Windows (the migration itself is not affected).
+    std::vector<bilingual_str> warnings;
 };
+
+//! Tests only: end a wallet migration with an error at a named point inside it (before_auxiliary_wallets,
+//! before_apply_migration_data); an empty function removes the failpoint.
+void SetWalletMigrationFailpointForTest(std::function<bool(std::string_view)> failpoint);
 
 //! Do all steps to migrate a legacy wallet to a descriptor wallet
 [[nodiscard]] util::Result<MigrationResult> MigrateLegacyToDescriptor(const std::string& wallet_name, const SecureString& passphrase, WalletContext& context);

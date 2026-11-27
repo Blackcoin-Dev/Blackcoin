@@ -98,29 +98,29 @@ class GoldRushHeightScheduleMultiNodeTest(BitcoinTestFramework):
         self._set_mocktime(max(self.mock_time, (tip_time & ~0xF) + 16))
 
     # --- staking helpers --------------------------------------------------
-    def _staking_inputs(self, wallet):
+    def _staking_inputs(self, wallet, min_confirmations=COINBASE_MATURITY + 1):
         return [
             {"txid": utxo["txid"], "vout": utxo["vout"]}
             for utxo in wallet.listunspent(1, 9999999)
             if utxo.get("spendable", True)
-            and utxo.get("confirmations", 0) > COINBASE_MATURITY
+            and utxo.get("confirmations", 0) >= min_confirmations
         ]
 
-    def _find_next_kernel_time(self, wallet):
-        inputs = self._staking_inputs(wallet)
+    def _find_next_kernel_time(self, wallet, min_confirmations=COINBASE_MATURITY + 1, max_slots=2000):
+        inputs = self._staking_inputs(wallet, min_confirmations)
         assert inputs, "staker wallet must have mature staking inputs"
-        for _ in range(2000):
+        for _ in range(max_slots):
             self._bump_mocktime(16)
             kernel = wallet.checkkernel(inputs)
             if kernel["found"]:
                 return kernel["kernel"]["time"]
         raise AssertionError("timed out searching for a deterministic PoS kernel")
 
-    def _mine_pos_block(self, node, wallet, expect_txid=None):
+    def _mine_pos_block(self, node, wallet, expect_txid=None, min_confirmations=COINBASE_MATURITY + 1, max_slots=2000):
         last_error = None
         for _ in range(6):
             start_height = node.getblockcount()
-            kernel_time = self._find_next_kernel_time(wallet)
+            kernel_time = self._find_next_kernel_time(wallet, min_confirmations, max_slots)
             self._set_mocktime(kernel_time - 16)
             wallet.staking(True)
             try:
@@ -363,11 +363,66 @@ class GoldRushHeightScheduleMultiNodeTest(BitcoinTestFramework):
         self._assert_network_agrees()
 
         self.log.info("Crossing the migration end height %d into Final Lockout", MIGRATION_END_HEIGHT)
+        # In the last blocks of Migration a legacy stake is paid to one quantum
+        # output of the staking wallet, so the legacy staker keeps producing
+        # every block through the window (proof of work is not available on
+        # mainnet at these heights). staker_a has no quantum address yet: until
+        # one is set it does not stake legacy coins in the window.
+        info = staker_a.getstakinginfo()
+        window_start = info["legacy_staking_window_start_height"]
+        assert window_start < MIGRATION_END_HEIGHT
+        self._mine_pos_to_height(node, staker_a, window_start - 2)
+        info = staker_a.getstakinginfo()
+        assert_equal(info["legacy_staking_in_window"], False)
+        assert_equal(info["legacy_staking_stopped"], False)
+        self._mine_pos_block(node, staker_a)
+        # The next block is the first in the window and no return address is
+        # ready: the wallet refuses to stake its legacy coins and says so.
+        info = staker_a.getstakinginfo()
+        assert_equal(info["legacy_staking_in_window"], True)
+        assert_equal(info["legacy_stake_return_ready"], False)
+        assert_equal(info["legacy_staking_stopped"], True)
+        staker_a.setquantumstakereturn({"allow_new_quantum_key": True})
+        info = staker_a.getstakinginfo()
+        assert_equal(info["legacy_stake_return_ready"], True)
+        return_height = node.getblockcount() + 1  # the first block staked with the return address ready
+        return_script = node.validateaddress(info["legacy_stake_return_address"])["scriptPubKey"]
         self._mine_pos_to_height(node, staker_a, MIGRATION_END_HEIGHT - 1)
         self._assert_phase_everywhere("migration")
+        coinstake = node.getblock(node.getblockhash(window_start), 2)["tx"][1]
+        valued = [o for o in coinstake["vout"] if o["value"] > 0]
+        assert_equal(len(valued), 1)
+        assert_equal(valued[0]["scriptPubKey"]["type"], "witness_unknown")
+        # Every window block from the one after the address is ready through M itself (M is produced after the
+        # loop over the earlier ones and checked the same way): a legacy kernel is paid back in full (principal
+        # plus the scheduled reward plus the exact fees of the block's transactions) to ONE output, the return
+        # address; a quantum kernel keeps paying quantum outputs.
+        legacy_returns = [0]
+
+        def check_window_block(height):
+            block = node.getblock(node.getblockhash(height), 2)
+            if "proof-of-stake" not in block["flags"]:
+                return
+            coinstake = block["tx"][1]
+            prev = node.getrawtransaction(coinstake["vin"][0]["txid"], True)["vout"][coinstake["vin"][0]["vout"]]
+            valued = [o for o in coinstake["vout"] if o["value"] > 0]
+            assert all(o["scriptPubKey"]["type"] == "witness_unknown" for o in valued), (height, valued)
+            if prev["scriptPubKey"]["type"] != "witness_unknown":  # a legacy kernel
+                legacy_returns[0] += 1
+                assert_equal(len(valued), 1)
+                assert_equal(valued[0]["scriptPubKey"]["hex"], return_script)
+                fees = sum((tx["fee"] for tx in block["tx"][2:]), Decimal(0))  # the block's transactions after the coinstake
+                assert_equal(valued[0]["value"], prev["value"] + Decimal("1.5") + fees)
+                if len(block["tx"]) > 2:
+                    assert fees > 0, (height, fees)
+
+        for height in range(return_height, MIGRATION_END_HEIGHT):
+            check_window_block(height)
+        assert legacy_returns[0] > 0, "no legacy kernel was staked inside the window after the address was ready"
         self._mine_pos_block(node, staker_a)  # the final Migration block
         self._sync_started()
         assert_equal(node.getblockcount(), MIGRATION_END_HEIGHT)
+        check_window_block(MIGRATION_END_HEIGHT)  # the last Migration block itself
         self._assert_phase_everywhere("final_lockout")
         self.log.info("All 5 nodes flipped to Final Lockout at exactly boundary height %d", MIGRATION_END_HEIGHT)
 
@@ -382,6 +437,27 @@ class GoldRushHeightScheduleMultiNodeTest(BitcoinTestFramework):
             assert_equal((i, result["allowed"]), (i, False))
             assert_equal((i, result["reject-reason"]), (i, "legacy-spend-disabled"))
 
+        self._assert_network_agrees()
+
+        self.log.info("Block F, the first Final block, is produced by the wallet's own staker and accepted by every node")
+        # The kernels are the quantum payouts of the window, a few dozen blocks old: older than the consensus
+        # maturity (10 on this chain), younger than the helper's default.
+        # The report agrees with the staker: the two payouts old enough are stakeable at block F.
+        readiness = staker_a.getquantumstakereadiness()
+        assert_equal(readiness["next_height"], MIGRATION_END_HEIGHT + 1)
+        assert_equal(readiness["next_block"]["stakeable_outputs"] > 0, True)
+        # Their weight is a small fraction of the legacy coins' that staked every earlier block, so the search
+        # for a kernel slot is longer.
+        self._mine_pos_block(node, staker_a, min_confirmations=10, max_slots=200000)
+        self._sync_started()
+        assert_equal(node.getblockcount(), MIGRATION_END_HEIGHT + 1)
+        self._assert_phase_everywhere("final_lockout")
+        f_coinstake = node.getblock(node.getblockhash(MIGRATION_END_HEIGHT + 1), 2)["tx"][1]
+        f_prev = node.getrawtransaction(f_coinstake["vin"][0]["txid"], True)["vout"][f_coinstake["vin"][0]["vout"]]
+        assert_equal(f_prev["scriptPubKey"]["type"], "witness_unknown")  # a quantum kernel: Final rejects legacy ones
+        assert all(o["scriptPubKey"]["type"] == "witness_unknown" for o in f_coinstake["vout"] if o["value"] > 0)
+        for i in self.started:
+            assert_equal(self.nodes[i].getblockcount(), MIGRATION_END_HEIGHT + 1)
         self._assert_network_agrees()
         self.log.info("Height-scheduled lifecycle complete: 5 nodes in consensus end to end")
 

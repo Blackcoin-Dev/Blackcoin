@@ -538,6 +538,18 @@ int64_t DemurrageRemainingPpm(int inactive_blocks, const Params& params)
     return DEMURRAGE_PPM - ((t_ppm * t_ppm) / DEMURRAGE_PPM);
 }
 
+int DemurrageBlocksUntilFirstReduction(int inactive_blocks, const Params& params)
+{
+    const int64_t window = params.DemurrageDecayWindowBlocks();
+    if (window <= 0) return 0;
+    // The first elapsed count e with floor(e * PPM / window) >= 1000, which
+    // is the first at which t * t / PPM is at least one.
+    const int64_t first_elapsed = (window * 1000 + DEMURRAGE_PPM - 1) / DEMURRAGE_PPM;
+    const int64_t first_inactive = static_cast<int64_t>(params.DemurrageGraceBlocks()) + std::max<int64_t>(1, first_elapsed);
+    const int64_t remaining = first_inactive - std::max(0, inactive_blocks);
+    return remaining > 0 ? static_cast<int>(remaining) : 0;
+}
+
 CAmount DemurrageEffectiveValue(CAmount nominal_value, int64_t remaining_ppm)
 {
     if (nominal_value <= 0 || remaining_ppm <= 0) return 0;
@@ -851,6 +863,72 @@ static bool CheckDemurrageAttestationsImpl(const CTransaction& tx,
     attested_keys = std::move(next_keys);
     attestation_count += attestations.size();
     return true;
+}
+
+DemurrageAttestationPreflightResult PreflightDemurrageAttestations(const CTransaction& tx,
+                                                                   const CCoinsViewCache& view,
+                                                                   const Params& params,
+                                                                   int spend_height,
+                                                                   int64_t spend_time,
+                                                                   std::string& reject_reason)
+{
+    if (!params.IsDemurrageActive(spend_height, spend_time)) return DemurrageAttestationPreflightResult::PASS;
+    for (const DemurrageAttestation& attestation : ExtractDemurrageAttestations(tx)) {
+        if (attestation.height < 0) {
+            reject_reason = "bad-demurrage-attestation";
+            return DemurrageAttestationPreflightResult::INVALID;
+        }
+        if (std::any_of(tx.vin.begin(), tx.vin.end(), [&](const CTxIn& txin) {
+                return txin.prevout == attestation.target_outpoint;
+            })) {
+            reject_reason = "demurrage-attestation-target-conflict";
+            return DemurrageAttestationPreflightResult::INVALID;
+        }
+        Coin target_coin;
+        if (!view.GetCoin(attestation.target_outpoint, target_coin) || target_coin.IsSpent()) {
+            reject_reason = "bad-demurrage-attestation-target";
+            return DemurrageAttestationPreflightResult::INVALID;
+        }
+        const std::optional<uint256> controlling_key = DemurrageControllingKeyHashForScript(target_coin.out.scriptPubKey);
+        if (!controlling_key || *controlling_key != attestation.pubkey_hash) {
+            reject_reason = "bad-demurrage-attestation-target";
+            return DemurrageAttestationPreflightResult::INVALID;
+        }
+        DemurrageLatestRecord previous_record;
+        const LatestReadResult previous_read = ReadLatestRecord(view, attestation.pubkey_hash, previous_record);
+        if (previous_read == LatestReadResult::INVALID) return DemurrageAttestationPreflightResult::PASS;
+        const std::optional<DemurrageAttestationState> previous_state =
+            previous_read == LatestReadResult::VALID
+                ? std::optional<DemurrageAttestationState>{previous_record.state}
+                : std::nullopt;
+        if (previous_state.has_value() != attestation.previous_height.has_value() ||
+            (previous_state && (previous_state->height != *attestation.previous_height ||
+                                previous_state->time != attestation.previous_time ||
+                                previous_state->coverage_start_height != attestation.previous_coverage_start_height)) ||
+            ((previous_read == LatestReadResult::VALID) != attestation.previous_source.has_value()) ||
+            (previous_read == LatestReadResult::VALID &&
+             (previous_record.source_block_hash != attestation.previous_source->block_hash ||
+              previous_record.source_txid != attestation.previous_source->txid ||
+              previous_record.source_output_index != attestation.previous_source->output_index)) ||
+            (!previous_state && (attestation.previous_time != 0 ||
+                                 attestation.previous_coverage_start_height != 0))) {
+            reject_reason = "stale-demurrage-attestation-state";
+            return DemurrageAttestationPreflightResult::NON_PUNITIVE;
+        }
+        const DemurrageEvaluation target_evaluation = EvaluateDemurrage(
+            target_coin, params, spend_height, spend_time,
+            previous_state ? std::optional<int>{previous_state->height} : std::nullopt,
+            previous_state ? std::optional<int>{static_cast<int>(previous_state->coverage_start_height)} : std::nullopt);
+        if (target_evaluation.locked) {
+            reject_reason = "demurrage-attestation-target-locked";
+            return DemurrageAttestationPreflightResult::NON_PUNITIVE;
+        }
+        if (previous_state && spend_height - previous_state->height < params.DemurrageAutoAttestBlocks()) {
+            reject_reason = "demurrage-attestation-too-soon";
+            return DemurrageAttestationPreflightResult::NON_PUNITIVE;
+        }
+    }
+    return DemurrageAttestationPreflightResult::PASS;
 }
 
 DemurrageAttestationValidationResult CheckDemurrageAttestationsDetailed(
@@ -1315,6 +1393,17 @@ CAmount GetDemurrageAdjustedValueIn(const CTransaction& tx, const CCoinsViewCach
         n_result += eval.effective_value;
     }
     return n_result;
+}
+
+std::string DemurragePermanentExemption(const CScript& script_pub_key, const Params& params)
+{
+    // The same two tests, in the same order, as EvaluateDemurrage applies once demurrage is active.
+    if (IsDemurrageTreasuryExemptScript(script_pub_key, params)) return "treasury";
+    if (!IsQuantumMigrationScript(script_pub_key) && !IsQuantumColdStakeScript(script_pub_key) &&
+        !IsEUTXOScript(script_pub_key)) {
+        return "non_quantum";
+    }
+    return "";
 }
 
 DemurrageEvaluation EvaluateDemurrage(

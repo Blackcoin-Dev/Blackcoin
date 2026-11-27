@@ -1,4 +1,4 @@
-name: v30.1.6 signed maintenance release build
+name: v30.1.7 signed maintenance release build
 
 on:
   workflow_dispatch:
@@ -10,7 +10,7 @@ on:
       package_label:
         description: Explicit unpublished prerelease label (must match source RC)
         required: true
-        default: 30.1.6-beta1
+        default: 30.1.7-beta1
         type: string
       target:
         description: Build target to run (manual runs never publish)
@@ -27,13 +27,13 @@ on:
           - macos-arm-64-bit
   push:
     tags:
-      - 'v30.1.6'
+      - 'v30.1.7'
 
 permissions:
   contents: read
 
 concurrency:
-  group: v30.1.6-release-${{ github.ref }}
+  group: v30.1.7-release-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -85,8 +85,8 @@ jobs:
           if [[ "$REVISION" != "0" ]]; then
             BASE_VERSION="$BASE_VERSION.$REVISION"
           fi
-          test "$BASE_VERSION" = "30.1.6" || {
-            echo "::error::This workflow is locked to the v30.1.6 source line"
+          test "$BASE_VERSION" = "30.1.7" || {
+            echo "::error::This workflow is locked to the v30.1.7 source line"
             exit 1
           }
           [[ "$RC" =~ ^[0-9]+$ ]]
@@ -206,7 +206,7 @@ jobs:
               echo "::error::Release notes are still marked non-final"
               exit 1
             }
-            ! grep -Eiq 'unreleased[[:space:]]+candidate|30[.]1[.]6rc[0-9]+|CLIENT_VERSION_IS_RELEASE=false|release qualification is pending' "$NOTES" || {
+            ! grep -Eiq 'unreleased[[:space:]]+candidate|30[.]1[.]7rc[0-9]+|CLIENT_VERSION_IS_RELEASE=false|release qualification is pending' "$NOTES" || {
               echo "::error::Final release notes retain candidate or RC status"
               exit 1
             }
@@ -237,7 +237,7 @@ jobs:
       target_sha: ${{ needs.resolve-target.outputs.target_sha }}
       # Alpha artifacts wait for the core gate. A beta adds native-platform,
       # sanitizer, pinned-fuzz, and complete extended functional evidence.
-      # v30.1.6 changes runtime and wallet behavior, so every exact-SHA
+      # v30.1.7 changes runtime and wallet behavior, so every exact-SHA
       # production gate runs against this source. No inherited corrective
       # evidence or fast path is permitted.
       release_mode: ${{ needs.resolve-target.outputs.publish == 'true' || needs.resolve-target.outputs.prerelease_channel == 'beta' }}
@@ -524,8 +524,34 @@ jobs:
                 done
               fi
               test -n "$wine_runner"
-              WINEDEBUG=-all "$wine_runner" "$test_binary" \
-                --run_test=crypto_hardening_tests --log_level=test_suite
+              WINEDEBUG=-all "$wine_runner" cmd /c "if not exist C:\\t mkdir C:\\t"
+              # Every suite runs, so one run reports every failing suite; any failure fails the step.
+              failed_suites=()
+              for suite in \
+                crypto_hardening_tests \
+                quantum_return_backup_tests \
+                staking_candidate_tests \
+                final_stake_reserve_tests \
+                wallet_tests; do
+                # A short temporary folder: the wallet backup suites build paths several
+                # folders deep under it, and Windows refuses a path of 260 characters.
+                WINEDEBUG=-all "$wine_runner" cmd /c \
+                  "set TMP=C:\\t&& set TEMP=C:\\t&& src\\test\\test_blackcoin.exe --run_test=$suite --log_level=test_suite" ||
+                  failed_suites+=("$suite")
+              done
+              # A failed suite runs once more with the node log on the console, cut down to the
+              # lines that say why a backup or a file operation failed.
+              for suite in "${failed_suites[@]}"; do
+                echo "::group::node log lines for $suite"
+                WINEDEBUG=-all "$wine_runner" cmd /c \
+                  "set TMP=C:\\t&& set TEMP=C:\\t&& src\\test\\test_blackcoin.exe --run_test=$suite --log_level=nothing -- -printtoconsole=1" 2>&1 |
+                  grep -iE 'error|unable|cannot|failed|refus' | tail -n 400 || true
+                echo "::endgroup::"
+              done
+              if (( ${#failed_suites[@]} )); then
+                echo "Failed suites under Wine: ${failed_suites[*]}" >&2
+                exit 1
+              fi
               ;;
           esac
 
@@ -1006,10 +1032,16 @@ jobs:
             printf 'target=%s\n' "$target" >> "$report"
             while IFS= read -r file; do
               printf '%s  %s/%s\n' \
-                "$(sha256sum "$primary/$file" | awk '{print $1}')" "$target" "$file"
+                "$(sha256sum "$primary/$file" | awk '{print $1}')" "$target" "$file" >> "$report"
             done < <(cd "$primary" && find . -type f -printf '%P\n' | sort)
           done
           printf 'source_commit=%s\n' "$TARGET_SHA" >> "$report"
+          python3 ci/release/validate_reproducibility_report.py \
+            --report "$report" --artifacts artifacts \
+            --package-label "$PACKAGE_LABEL" \
+            --prerelease-channel "$PRERELEASE_CHANNEL" \
+            --configured-version "$CONFIGURED_VERSION" \
+            --source-sha "$TARGET_SHA"
 
       - name: Download both isolated Windows installer recipes
         if: ${{ needs.select-targets.outputs.windows_selected == 'true' }}
@@ -1118,7 +1150,7 @@ jobs:
           retention-days: 7
 
   signed-final-preflight:
-    name: Require explicit v30.1.6 signed-source publication acknowledgement
+    name: Require explicit v30.1.7 signed-source publication acknowledgement
     needs:
       - resolve-target
       - safety-gate
@@ -1132,9 +1164,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          expected='V30.1.6'
+          expected='V30.1.7'
           test "$UNSIGNED_FINAL_ACK" = "$expected" || {
-            echo '::error::Protected UNSIGNED_FINAL_ACK does not authorize this v30.1.6 release'
+            echo '::error::Protected UNSIGNED_FINAL_ACK does not authorize this v30.1.7 release'
             exit 1
           }
 
@@ -1199,7 +1231,7 @@ jobs:
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$TARGET_SHA"
-          expected_ack='V30.1.6'
+          expected_ack='V30.1.7'
           test "$UNSIGNED_FINAL_ACK" = "$expected_ack"
           mkdir -p dist
           shopt -s nullglob

@@ -1,3 +1,17 @@
+30.1.7 Release Notes
+====================
+
+This release is an efficiency and cleanup release on top of the published
+30.1.6, with clearer behaviour around the migration to quantum outputs, the
+Final phase and the end of Gold Rush. Consensus and storage formats are
+unchanged.
+
+The final source is RC0 with `CLIENT_VERSION_IS_RELEASE=true`. See
+`doc/release-notes/release-notes-30.1.7.md` for the changes, the pre-release
+operation, the compatibility notes and the known limitations.
+
+The following sections preserve prior release history.
+
 30.1.6 Release Notes
 ====================
 

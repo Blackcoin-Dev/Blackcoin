@@ -29,8 +29,10 @@
 #endif
 #include <wallet/coincontrol.h>
 #include <wallet/display_balance.h>
+#include <wallet/quantum_return_backup.h>
 #include <wallet/scheduler_stats.h>
 #include <wallet/shadow_pow_claim_recovery_args.h>
+#include <wallet/staking.h>
 #include <wallet/wallet.h>
 #include <walletinitinterface.h>
 
@@ -109,6 +111,12 @@ void WalletInit::AddWalletOptions(ArgsManager& argsman) const
     argsman.AddArg("-autostartstaking=<true/false>", strprintf("Automatically start staking for every eligible private-key wallet loaded by this process (default: %u). This explicit process-wide setting takes precedence over legacy -staking autostart consent and does not unlock encrypted wallets.", wallet::DEFAULT_AUTOSTART_STAKING), ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
     argsman.AddArg("-qqautoshadowsignal=<true/false>", strprintf("Automatically submit eligible fee-paying Gold Rush PoS QQSIGNAL transactions from every eligible loaded wallet (default: %u). This is process-wide optional wallet automation, not a consensus activation switch, and does not unlock wallets.", wallet::DEFAULT_AUTO_SHADOW_SIGNAL), ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
     argsman.AddArg("-qqautodemurrageattest=<true/false>", strprintf("Automatically submit eligible fee-paying demurrage liveness attestations from every eligible loaded wallet after Final activation (default: %u). This is process-wide optional wallet automation. Consensus demurrage and its burn activate independently and cannot be disabled by this option.", wallet::DEFAULT_AUTO_DEMURRAGE_ATTEST), ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
+    argsman.AddArg("-finalstakereserve=<true/false>", strprintf("Hold back part of this wallet's quantum stake outputs from staking and from every automatic spend during the last maturity period of Migration, so that enough of them are still mature when the first Final block is staked (up to %d outputs, half of the wallet's qualifying outputs; default: %u). Wallet policy only: no block or transaction is judged by it. Explicit coin control can still spend them. Only the bare flag and the values 0, 1, true and false are accepted; anything else stops the start.", wallet::MAX_FINAL_STAKE_RESERVE_OUTPUTS, wallet::DEFAULT_FINAL_STAKE_RESERVE), ArgsManager::ALLOW_ANY | ArgsManager::STRICT_BOOL, OptionsCategory::WALLET);
+    argsman.AddArg("-quantumkeybackupdir=<dir>", "Directory for the wallet backups made before a new quantum stake return key becomes active (default: <datadir>/quantum-key-backups). Each wallet uses a sub-directory named from its name (\"default\" for the unnamed wallet); files are private (directory 0700, files 0600 on POSIX), keep the wallet's encryption, and carry a UTC timestamp, the block height and a random suffix. The three newest verified backups are kept, plus any older one that holds a key this wallet does not know (made by another node that shares the folder, or removed since) and any older one that holds a key no newer kept backup holds, so such backups can accumulate beyond three. Give every node its own folder: copies of the same wallet that evolve independently on different nodes should not share one. A relative path is relative to the data directory. On Windows the folder must be a full local NTFS path (a drive letter and a separator, or a path relative to the data directory), at most 137 characters with the wallet's folder name (a backup is made in folders below it).", ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
+    argsman.AddArg("-quantumreturnfailcommit=<name>", "Test chains only: make the durable commit of the entry of the new backup directory called <name> fail, as a disk error would, so that the quantum stake return key stays pending", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::WALLET_DEBUG_TEST);
+    argsman.AddArg("-finalstakereservecommitdelaymillis=<n>", "Test chains only: wait this many milliseconds (at most 10000) at the start of committing a wallet transaction, before any lock is taken, so a test can move the chain between building a transaction and committing it (default: 0)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::WALLET_DEBUG_TEST);
+    argsman.AddArg("-qqcommitwritefailure", "Test chains only: make every wallet transaction commit fail as if its database write had failed, after the record was added in memory (default: 0)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::WALLET_DEBUG_TEST);
+    argsman.AddArg("-quantumreturncrashpoint=<name>", "Test chains only: end the process without cleanup at one point of the quantum stake return preparation (after_key_insertion, after_backup_install, before_activation, after_activation)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::WALLET_DEBUG_TEST);
     argsman.AddArg("-stakecache=<true/false>", strprintf("Enables or disables the staking cache; significantly improves staking performance, but can use a lot of memory (default: %u)", node::DEFAULT_STAKE_CACHE), ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
     argsman.AddArg("-staketimio=<n>", strprintf("Proof of stake timeout. (default: %u)", node::DEFAULT_STAKETIMIO), ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
     argsman.AddArg("-solostaking=<true/false>", strprintf("Stake on an isolated private chain without peers or a public-chain sync estimate (testnet/regtest only on this branch) (default: %u)", node::DEFAULT_SOLO_STAKING), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::WALLET);
@@ -173,6 +181,13 @@ bool WalletInit::ParameterInteraction() const
         }
 
         return true;
+    }
+
+    // The spelling of the quantum key backup directory is checked here, from the option's text alone: nothing is
+    // looked up, created or written, so this does not show that the directory is writable, has room, is on a
+    // supported volume or that a backup will be durable. The length is checked for each wallet when it is loaded.
+    if (const std::optional<std::string> rejection = wallet::QuantumKeyBackupSpellingRejection(gArgs.GetArg("-quantumkeybackupdir", ""))) {
+        return InitError(Untranslated(strprintf("-quantumkeybackupdir=%s: %s", gArgs.GetArg("-quantumkeybackupdir", ""), *rejection)));
     }
 
     if (gArgs.GetBoolArg("-blocksonly", DEFAULT_BLOCKSONLY) && gArgs.SoftSetBoolArg("-walletbroadcast", false)) {

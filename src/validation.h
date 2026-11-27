@@ -152,6 +152,27 @@ std::optional<int64_t> GetNextBlockPoSTime(Chainstate& active_chainstate,
                                            const CBlockIndex* pindex_prev,
                                            const Consensus::Params& consensus_params,
                                            int64_t adjusted_time);
+/** Reject reasons of the explicit Quantum Quasar lifecycle gates: refusals that
+ * depend only on the phase of the block being evaluated. The producers in
+ * validation.cpp and the mempool classifier (IsQuantumLifecycleGateRejectReason)
+ * both use these constants. The unit test pins every text against what the
+ * producing functions return, so renaming a reason fails a test instead of
+ * silently making the refusal punitive. */
+namespace quantum_reject {
+inline constexpr const char* LEGACY_SPEND_DISABLED{"legacy-spend-disabled"};
+inline constexpr const char* LEGACY_OUTPUT_DISABLED{"legacy-output-disabled"};
+inline constexpr const char* MIGRATION_SPEND_PREMATURE{"blackcoin-migration-spend-premature"};
+inline constexpr const char* GOLDRUSH_PAYOUT_SPEND_PREMATURE{"goldrush-payout-spend-premature"};
+inline constexpr const char* LINEAGE_ANCHOR_REQUIRED{"quantum-lineage-anchor-required"};
+inline constexpr const char* TIER_OUTPUT_PREMATURE{"quantum-tier-output-premature"};
+inline constexpr const char* NESTED_WITNESS_SPEND{"unsupported-nested-witness-spend"};
+inline constexpr const char* WITNESS_V1_SPEND{"unsupported-witness-v1-spend"};
+inline constexpr const char* WITNESS_V1_OUTPUT{"unsupported-witness-v1-output"};
+inline constexpr const char* UNKNOWN_WITNESS_SPEND{"unknown-quantum-witness-spend"};
+inline constexpr const char* UNKNOWN_WITNESS_OUTPUT{"unknown-quantum-witness-output"};
+inline constexpr const char* EUTXO_SPEND_DISABLED{"eutxo-spend-disabled"};
+inline constexpr const char* EUTXO_OUTPUT_DISABLED{"eutxo-output-disabled"};
+} // namespace quantum_reject
 /** Output-only lifecycle rules, usable by offline signing/PSBT workflows that
  * do not have authoritative input provenance. */
 bool CheckQuantumQuasarOutputs(const CTransaction& tx, unsigned int flags,
@@ -162,6 +183,38 @@ bool CheckQuantumQuasarTransaction(const CTransaction& tx, const CCoinsViewCache
                                    unsigned int flags, int spend_height,
                                    const Consensus::Params& consensus_params,
                                    int64_t spend_time, std::string& reject_reason);
+/** True when a Quantum Quasar rejection reason names a lifecycle gate: the
+ * transaction is refused only because of the phase the next block is in (too
+ * early or too late for this kind of spend or output). Mempool acceptance
+ * reports such a rejection as TX_RECENT_CONSENSUS_CHANGE so a peer that relays
+ * a transaction that was valid one block earlier is not punished. Block
+ * validation never uses this and stays exactly as strict. */
+bool IsQuantumLifecycleGateRejectReason(const std::string& reject_reason);
+/** Mempool only. Called after Consensus::CheckTxInputs (or the mempool's own
+ * minimum-fee check) rejected a transaction with bad-txns-in-belowout,
+ * bad-txns-spends-locked-coin or bad-txns-fee-not-enough. Returns true when the
+ * input-value, lock and minimum-fee requirements all held at the preceding
+ * evaluation point (spend height of the current tip, demurrage time of the
+ * tip's parent), so only the demurrage curve moving by one block made it fail.
+ * `fee_time` is the transaction time the fee rule used. The helper reads the
+ * current coin and attestation view with the preceding height and time; it is
+ * one linear pass over the inputs, runs no script, and does not claim that the
+ * whole transaction was valid one block earlier. A transaction already short
+ * at the preceding point returns false and stays punitive. */
+bool DemurrageRejectionDependsOnNextBlock(const CTransaction& tx, const CCoinsViewCache& inputs,
+                                          const CBlockIndex& tip, const Consensus::Params& consensus_params,
+                                          const std::string& reject_reason, int64_t fee_time);
+/** Mempool only. The cheap look at a transaction's demurrage attestations that
+ * runs before any ML-DSA verification (Consensus::PreflightDemurrageAttestations).
+ * Returns true to go on to the full check. A stale referenced state, a locked
+ * target or an attestation that came too soon is rejected as
+ * TX_RECENT_CONSENSUS_CHANGE (an honest peer may relay such a transaction after
+ * another one confirmed, so it is not punished) and a cheap structural
+ * invalidity as TX_CONSENSUS. Block validation never calls this. */
+bool PreflightMempoolDemurrageAttestations(const CTransaction& tx, const CCoinsViewCache& view,
+                                           const Consensus::Params& consensus_params,
+                                           int spend_height, int64_t spend_time,
+                                           TxValidationState& state);
 bool CheckInputScripts(const CTransaction& tx, TxValidationState& state,
                        const CCoinsViewCache& inputs, unsigned int flags,
                        bool cacheSigStore, bool cacheFullScriptStore,
@@ -169,6 +222,15 @@ bool CheckInputScripts(const CTransaction& tx, TxValidationState& state,
                        std::vector<CScriptCheck>* pvChecks = nullptr,
                        std::atomic_bool* mldsa_internal_error = nullptr)
                        EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+/** Mempool only: CheckInputScripts with the script error of the first failing
+ * input under the mandatory flags (SCRIPT_ERR_OK on success or when a failure
+ * is not a script failure). Result and reject reason are those of
+ * CheckInputScripts. */
+bool CheckInputScriptsWithError(const CTransaction& tx, TxValidationState& state,
+                                const CCoinsViewCache& inputs, unsigned int flags,
+                                bool cacheSigStore, bool cacheFullScriptStore,
+                                PrecomputedTransactionData& txdata, ScriptError* mandatory_error)
+                                EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 
 CAmount GetBlockSubsidy(int nHeight, const Consensus::Params& consensusParams, bool fProofOfStake = false);
 CAmount GetProofOfWorkSubsidy();

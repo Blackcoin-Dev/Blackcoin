@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <assert.h>
+#include <optional>
 #include <string.h>
 
 /// Maximum witness length for Bech32 addresses.
@@ -84,7 +85,9 @@ public:
     std::string operator()(const PubKeyDestination& pk) const { return {}; }
 };
 
-CTxDestination DecodeDestination(const std::string& str, const CChainParams& params, std::string& error_str, std::vector<int>* error_locations)
+/** Decode by the string's leading characters: a string that starts with the Bech32 prefix (compared
+ *  without case) is decoded as Bech32 only, every other string as Base58 only. */
+CTxDestination DecodeDestinationByPrefix(const std::string& str, const CChainParams& params, std::string& error_str, std::vector<int>* error_locations)
 {
     std::vector<unsigned char> data;
     uint160 hash;
@@ -206,6 +209,43 @@ CTxDestination DecodeDestination(const std::string& str, const CChainParams& par
     error_str = res.first;
     if (error_locations) *error_locations = std::move(res.second);
     return CNoDestination();
+}
+
+/** A Base58 P2PKH or P2SH address of this network, or nothing. */
+std::optional<CTxDestination> DecodeBase58Address(const std::string& str, const CChainParams& params)
+{
+    std::vector<unsigned char> data;
+    uint160 hash;
+    if (!DecodeBase58Check(str, data, 21)) return std::nullopt;
+    const std::vector<unsigned char>& pubkey_prefix = params.Base58Prefix(CChainParams::PUBKEY_ADDRESS);
+    if (data.size() == hash.size() + pubkey_prefix.size() && std::equal(pubkey_prefix.begin(), pubkey_prefix.end(), data.begin())) {
+        std::copy(data.begin() + pubkey_prefix.size(), data.end(), hash.begin());
+        return PKHash(hash);
+    }
+    const std::vector<unsigned char>& script_prefix = params.Base58Prefix(CChainParams::SCRIPT_ADDRESS);
+    if (data.size() == hash.size() + script_prefix.size() && std::equal(script_prefix.begin(), script_prefix.end(), data.begin())) {
+        std::copy(data.begin() + script_prefix.size(), data.end(), hash.begin());
+        return ScriptHash(hash);
+    }
+    return std::nullopt;
+}
+
+CTxDestination DecodeDestination(const std::string& str, const CChainParams& params, std::string& error_str, std::vector<int>* error_locations)
+{
+    CTxDestination destination{DecodeDestinationByPrefix(str, params, error_str, error_locations)};
+    if (IsValidDestination(destination)) return destination;
+    // A valid Base58 address of this network can begin with the letters of the Bech32 prefix (mainnet
+    // "BLK..." and "BLk..."). The decoder above treats such a string as Bech32 and rejects it. A string that
+    // is a valid Bech32 destination keeps that meaning; only one that is not is given its Base58 reading.
+    const bool has_bech32_prefix{ToLower(str.substr(0, params.Bech32HRP().size())) == params.Bech32HRP()};
+    if (has_bech32_prefix) {
+        if (std::optional<CTxDestination> base58{DecodeBase58Address(str, params)}) {
+            error_str.clear();
+            if (error_locations) error_locations->clear();
+            return *base58;
+        }
+    }
+    return destination;
 }
 } // namespace
 

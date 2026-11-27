@@ -1006,29 +1006,22 @@ class GoldRushInfoTest(BitcoinTestFramework):
             node.get_deterministic_priv_key().address,
         )
         assert_equal(len(inactive_wallet.listunspent(1, 9999999, [inactive_target])), 1)
-        inactive_payout = inactive_wallet.getnewquantumaddress("PoW - Quantum Claim Address")["address"]
+        inactive_wallet.getnewquantumaddress("PoW - Quantum Claim Address")["address"]
 
-        self.log.info("An enabled miner reports epoch_inactive after the Gold Rush height window")
+        self.log.info("The claim miner refuses to start after the Gold Rush height window")
         remaining = GOLD_RUSH_END_HEIGHT - node.getblockcount()
         if remaining > 0:
             self._generate_with_peer_offline(node, remaining, node.get_deterministic_priv_key().address)
         try:
-            started = inactive_wallet.setpowmining(True, 1, 100)
-            assert_equal(started["created_payout_key"], False)
-            assert_equal(started["payout_address"], inactive_payout)
-            self.wait_until(
-                lambda: inactive_wallet.getpowmininginfo()["state"] == "epoch_inactive",
-                timeout=10,
-            )
+            assert_raises_rpc_error(-4, "Gold Rush has ended", inactive_wallet.setpowmining, True, 1, 100)
             inactive = inactive_wallet.getpowmininginfo()
-            assert_equal(inactive["enabled"], True)
-            assert_equal(inactive["state"], "epoch_inactive")
-            assert_equal(inactive["epoch_active"], False)
+            assert_equal(inactive["enabled"], False)
+            assert_equal(inactive["gold_rush_ended"], True)
             assert_equal(inactive["quarantined_claims"], 0)
             assert_equal(inactive["hashrate"], 0)
         finally:
             inactive_wallet.setpowmining(False)
-        assert_equal(inactive_wallet.getpowmininginfo()["state"], "disabled")
+        assert_equal(inactive_wallet.getpowmininginfo()["state"], "gold_rush_ended")
 
     def run_test(self):
         node = self.nodes[0]

@@ -99,6 +99,7 @@ static ScriptErrorDesc script_errors[]={
     {SCRIPT_ERR_WITNESS_PUBKEYTYPE, "WITNESS_PUBKEYTYPE"},
     {SCRIPT_ERR_OP_CODESEPARATOR, "OP_CODESEPARATOR"},
     {SCRIPT_ERR_SIG_FINDANDDELETE, "SIG_FINDANDDELETE"},
+    {SCRIPT_ERR_SIG_FORKID_MISSING, "SIG_FORKID_MISSING"},
 };
 
 static std::string FormatScriptError(ScriptError_t err)

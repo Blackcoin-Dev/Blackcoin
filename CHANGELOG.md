@@ -1,5 +1,30 @@
 # Changelog
 
+## v30.1.7
+
+- Final release that follows the published v30.1.6. The numeric client
+  version is 300107.
+- Fix a newly created encrypted legacy-format wallet missing incoming
+  confirmed transactions, and the recognition of valid legacy addresses that
+  begin with `BLK` or `BLk`.
+- Pay legacy stakes made near the end of Migration as quantum outputs when a
+  quantum stake return address is ready, keep a final stake reserve of
+  quantum outputs for the first Final block, and back up a new return key
+  before it becomes the return address (`-quantumkeybackupdir`).
+- Let large wallets migrate in bounded batches, and report the leftover
+  legacy inventory, the staking readiness and the demurrage status in the
+  RPCs and the Staking page.
+- Do not penalize a peer for relaying a transaction that a lifecycle boundary
+  made invalid, and turn away stale or early demurrage attestations before
+  the signature check.
+- Handle the end of Gold Rush: report and release a claim input that can no
+  longer confirm, stop the claim miner and drop the resource-envelope
+  warning.
+- Load wallets and record spends with less database and index work.
+- No consensus rules or wallet and chainstate formats change. See
+  `doc/release-notes/release-notes-30.1.7.md` for the details, the
+  pre-release operation and the known limitations.
+
 ## v30.1.6
 
 - Final release of the source line developed as 30.1.5.3rc1 through

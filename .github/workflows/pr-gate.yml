@@ -1015,6 +1015,43 @@ jobs:
             --ci --jobs=1 --failfast --combinedlogslen=2000 \
             feature_goldrush_v3014_same_anchor_mixed.py --previous-releases --descriptors
 
+      - name: Run the tests that need the exact published v30.1.6 daemon
+        env:
+          PREVIOUS_RELEASES_DIR: ${{ github.workspace }}/.ci/previous-releases
+          PREVIOUS_RELEASES_HOST: ${{ env.HOST }}
+        run: |
+          set -euo pipefail
+          baseline="$PWD/.ci/previous-releases/v30.1.6/bin/blackcoind"
+          if [ ! -x "$baseline" ]; then
+            echo "::error::the pinned v30.1.6 daemon is missing: $baseline"
+            exit 1
+          fi
+          export BLACKCOIN_V30_1_6_BINARY="$baseline"
+          tests=(
+            'feature_3017_upgrade.py --descriptors'
+            wallet_first_final_block_kernels.py
+            wallet_legacy_stake_opportunistic_return.py
+            wallet_legacy_stake_quantum_return.py
+            wallet_quantum_return_pending_downgrade.py
+            wallet_quantum_stake_maturity.py
+            wallet_quantum_stake_return_downgrade.py
+            wallet_quantum_stake_return_durability.py
+          )
+          python3 test/functional/test_runner.py \
+            --ci --jobs=1 --failfast --combinedlogslen=2000 \
+            "${tests[@]}" --previous-releases | tee "$RUNNER_TEMP/v30.1.6-baseline-tests.log"
+          # A skipped test is a failure here: the point of this step is that
+          # every one of these tests really ran against the v30.1.6 daemon.
+          if grep -q 'Skipped' "$RUNNER_TEMP/v30.1.6-baseline-tests.log"; then
+            echo "::error::a v30.1.6 baseline test was skipped"
+            exit 1
+          fi
+          passed="$(grep -cE '\.py.*\| .*Passed' "$RUNNER_TEMP/v30.1.6-baseline-tests.log" || true)"
+          if [ "$passed" -lt "${#tests[@]}" ]; then
+            echo "::error::expected at least ${#tests[@]} passed v30.1.6 baseline tests, saw $passed"
+            exit 1
+          fi
+
       - name: Upload historical binary provenance
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:

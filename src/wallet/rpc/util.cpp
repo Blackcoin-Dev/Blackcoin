@@ -9,6 +9,7 @@
 
 #include <common/args.h>
 #include <common/url.h>
+#include <core_io.h>
 #include <rpc/util.h>
 #include <util/any.h>
 #include <util/translation.h>
@@ -213,6 +214,41 @@ void AppendLastProcessedBlock(UniValue& entry, const CWallet& wallet) EXCLUSIVE_
     lastprocessedblock.pushKV("hash", wallet.GetLastBlockHash().GetHex());
     lastprocessedblock.pushKV("height", wallet.GetLastBlockHeight());
     entry.pushKV("lastprocessedblock", lastprocessedblock);
+}
+
+UniValue ClosedClaimReservationToJSON(const ShadowPowClosedClaimReservation& reservation)
+{
+    UniValue result(UniValue::VOBJ);
+    result.pushKV("amount", ValueFromAmount(reservation.amount));
+    result.pushKV("anchors", static_cast<uint64_t>(reservation.anchors));
+    result.pushKV("claims", static_cast<uint64_t>(reservation.claims));
+    result.pushKV("reason", reservation.amount > 0
+        ? "Gold Rush has ended. These claims can no longer confirm on this chain, but each still holds its funding input reserved (a peer may still hold the claim and a reorganisation below the end could confirm it), so the amount is missing from the spendable balance."
+        : "No funds are held by closed Gold Rush claims.");
+    result.pushKV("release_command", reservation.amount > 0
+        ? "resolveallshadowpowclaims (preview first, then commit_and_broadcast with the plan id; the Staking & Mining page offers Review claim recovery)"
+        : "");
+    return result;
+}
+
+std::vector<RPCResult> ClosedClaimReservationResults()
+{
+    return {
+        {RPCResult::Type::STR_AMOUNT, "amount", "Funding inputs reserved by Gold Rush claims that can no longer confirm"},
+        {RPCResult::Type::NUM, "anchors", "Number of reserved funding inputs"},
+        {RPCResult::Type::NUM, "claims", "Number of closed claim transactions holding them"},
+        {RPCResult::Type::STR, "reason", "Why the amount is not spendable"},
+        {RPCResult::Type::STR, "release_command", "The command or screen that releases it, or an empty string"},
+    };
+}
+
+void AppendClosedClaimReservation(UniValue& entry, const CWallet& wallet)
+{
+    AssertLockHeld(wallet.cs_wallet);
+    const ShadowPowClosedClaimReservation reservation = wallet.GetClosedClaimReservationLocked();
+    if (reservation.amount > 0) {
+        entry.pushKV("closed_claim_reserved", ClosedClaimReservationToJSON(reservation));
+    }
 }
 
 } // namespace wallet

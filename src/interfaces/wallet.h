@@ -17,6 +17,7 @@
 #include <util/fs.h>
 #include <util/message.h>
 #include <util/result.h>
+#include <util/translation.h>
 #include <util/ui_change_type.h>
 
 #include <chrono>
@@ -25,6 +26,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <tuple>
 #include <type_traits>
@@ -49,6 +51,15 @@ using isminefilter = std::underlying_type<isminetype>::type;
 } // namespace wallet
 
 namespace interfaces {
+
+//! Thrown by Wallet::commitTransaction when the wallet refused the transaction and left nothing of it behind (no
+//! record, no coin lock of the operation), so the caller may report the refusal and carry on. A storage failure or any
+//! other error is not this type: it stays a plain exception and is not to be treated as recoverable.
+class WalletCommitRejected : public std::runtime_error
+{
+public:
+    using std::runtime_error::runtime_error;
+};
 
 class Handler;
 struct WalletAddress;
@@ -218,8 +229,11 @@ public:
         int& change_pos,
         CAmount& fee) = 0;
 
-    //! Commit transaction.
-    virtual void commitTransaction(CTransactionRef tx,
+    //! Commit transaction. Returns a warning to show the user (empty when there is none): that the transaction was
+    //! stored but could not be relayed yet, that it spent outputs the final stake reserve holds back, or both. The
+    //! text is translated (its `translated` member is what a user interface shows). Throws WalletCommitRejected when the wallet refused it and kept nothing; any other exception (a storage
+    //! failure, for one) means the wallet state cannot be trusted and is not to be recovered from.
+    virtual bilingual_str commitTransaction(CTransactionRef tx,
         WalletValueMap value_map,
         WalletOrderForm order_form) = 0;
 
@@ -390,12 +404,6 @@ public:
                                           const std::string& recipient,
                                           std::string& error) = 0;
 
-    //! Try get the stake weight
-    virtual bool tryGetStakeWeight(uint64_t& nWeight) = 0;
-
-    //! Get the stake weight
-    virtual uint64_t getStakeWeight() = 0;
-
     //! Get last coin stake search interval
     virtual int64_t getLastCoinStakeSearchInterval() = 0;
 
@@ -554,11 +562,13 @@ public:
     //! lightweight GUI guard fails closed if chain state is unavailable.
     virtual WalletQuantumFundingStatus getQuantumFundingStatus() = 0;
 
-    //! Sweep spendable legacy coins into a wallet-backed quantum address.
-    virtual util::Result<WalletQuantumActionTx> migrateLegacyToQuantum(bool allow_new_quantum_key) = 0;
+    //! Move one bounded batch of spendable legacy coins into a wallet-backed
+    //! quantum address (existing_address, or a new key when empty and allowed).
+    //! The result reports how many outputs remain for a further batch.
+    virtual util::Result<WalletQuantumActionTx> migrateLegacyToQuantum(bool allow_new_quantum_key, const std::string& existing_address = "") = 0;
 
-    //! Optionally consolidate matured wallet-owned Gold Rush reward outputs to a fresh quantum address.
-    virtual util::Result<WalletQuantumActionTx> migrateGoldRushRewards(bool allow_new_quantum_key) = 0;
+    //! Optionally consolidate one bounded batch of matured wallet-owned Gold Rush reward outputs.
+    virtual util::Result<WalletQuantumActionTx> migrateGoldRushRewards(bool allow_new_quantum_key, const std::string& existing_address = "") = 0;
 
     //! List wallet-owned RGB assets and assignments.
     virtual std::vector<WalletRGBAssetInfo> listRGBAssets(bool include_spent = false, bool* available = nullptr) = 0;
@@ -777,6 +787,8 @@ struct WalletMigrationResult
     std::optional<std::string> watchonly_wallet_name;
     std::optional<std::string> solvables_wallet_name;
     fs::path backup_path;
+    //! Warnings to show with the result (see wallet::MigrationResult::warnings).
+    std::vector<std::string> warnings;
 };
 
 //! Status of the in-process (built-in) Gold Rush Proof-of-Work miner. No external miner exists.
@@ -790,6 +802,9 @@ struct WalletPowMiningInfo
     int workers_error{0};           //!< workers in a local-error retry state
     double hashrate{0.0};           //!< Argon2id tries per second (aggregate)
     int current_height{-1};         //!< active-chain tip used for Gold Rush state, or -1 if unavailable
+    bool gold_rush_ended{false};    //!< the next block is past the reward window on the current chain
+    CAmount closed_claim_reserved_amount{0}; //!< funding inputs held by claims the closed window left unconfirmable
+    int64_t closed_claim_reserved_claims{0}; //!< claim transactions holding them
     bool epoch_active{false};       //!< whether the Gold Rush reward window is currently open
     int blocks_remaining{0};        //!< blocks left in the Gold Rush window (0 if inactive)
     std::string payout_address;     //!< auto-created quantum (ML-DSA) payout address (empty until created)
@@ -1068,6 +1083,8 @@ struct WalletPowClaimRecoveryReview
     size_t quarantined_claim_objects{0};
     size_t blocking_components{0};
     size_t resolved_components{0};
+    CAmount closed_claim_reserved_amount{0}; //!< funding inputs held by claims the closed window left unconfirmable
+    size_t closed_claim_reserved_claims{0};
     std::vector<WalletPowClaimRecoveryComponent> components;
     std::vector<std::string> unanchored_claim_txids;
     WalletPowClaimRecoveryPlan plan;
@@ -1249,7 +1266,7 @@ struct WalletQuantumOperatorBondTx
     std::string migration_address;
     CAmount migration_amount{0};
     CAmount migration_fee{0};
-    std::string warning;
+    bilingual_str warning; //! translated for a user interface; the RPC reports `original`
 };
 
 //! Result of a planned or executed Quantum Cold-Stake redelegation.
@@ -1317,6 +1334,10 @@ struct WalletMigrationStatus
     CAmount goldrush_reward_amount_needing_move{0};
     bool goldrush_remigration_active{false};
     bool quantum_spends_active{false};
+    //! Last height at which the wallet still creates a legacy coinstake; -1 when no height schedule exists.
+    int64_t legacy_staking_last_height{-1};
+    //! Plain-language legacy staking cutoff notice; empty when none applies.
+    std::string legacy_staking_notice;
     std::string advice;
 };
 
@@ -1330,6 +1351,24 @@ struct WalletQuantumActionTx
     int vsize{0};
     unsigned int selected_inputs{0};
     CAmount selected_amount{0};
+    //! Eligible inputs before this batch, and what is left for further batches.
+    unsigned int total_eligible_inputs{0};
+    unsigned int remaining_inputs{0};
+    CAmount remaining_amount{0};
+    //! Legacy outputs this sweep could not consider (immature, locked, unconfirmed or not
+    //! spendable): "no remaining eligible inputs" is not "no legacy outputs remain".
+    unsigned int excluded_legacy_outputs{0};
+    CAmount excluded_legacy_amount{0};
+    //! The excluded outputs by reason (protected asset, locked, immature, unconfirmed, no signer here, other); empty when none.
+    std::string excluded_legacy_breakdown;
+    //! Later batches the continuation plan needs, and the fewest blocks, counting this batch's, in which the migration can finish.
+    unsigned int continuation_batches{0};
+    unsigned int continuation_min_blocks{1};
+    //! First height at which an excluded immature output becomes spendable; 0 when none is waiting for maturity.
+    int64_t next_maturity_height{0};
+    //! Confirmed quantum outputs of this wallet used as anchor or fee source (value not counted as legacy moved).
+    unsigned int auxiliary_inputs{0};
+    CAmount auxiliary_amount{0};
     std::string warning;
 };
 
@@ -1387,7 +1426,12 @@ struct WalletDemurrageOutputInfo
     CAmount burned_if_spent_amount{0};
     bool locked{false};
     bool attestation_due{false};
+    //! End of the grace period; stays 0 afterwards even before any reduction.
     int blocks_until_decay{0};
+    //! Blocks until the value is first reduced (0 once it is); meaningful only when
+    //! first_reduction_known (not for an exempt output or an activation not given by height).
+    int blocks_until_first_reduction{0};
+    bool first_reduction_known{false};
     int blocks_until_lock{0};
     std::string action;
 };

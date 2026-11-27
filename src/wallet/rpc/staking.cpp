@@ -136,7 +136,10 @@ static void CommitWalletTransactionOrThrow(
     const std::optional<CTxDestination>& created_destination = std::nullopt,
     const std::optional<ShadowPowClaimCommitAuthority>&
         shadow_pow_authority = std::nullopt)
+    LOCKS_EXCLUDED(wallet.cs_wallet)
 {
+    // CommitTransaction takes cs_main and then cs_wallet itself.
+    AssertLockNotHeld(wallet.cs_wallet);
     std::string broadcast_error;
     bool committed{false};
     try {
@@ -604,7 +607,7 @@ static UniValue QuantumStakeTxToJSON(const interfaces::WalletQuantumOperatorBond
     if (!tx.migration_address.empty()) obj.pushKV("migration_address", tx.migration_address);
     if (tx.migration_amount > 0) obj.pushKV("migration_amount", ValueFromAmount(tx.migration_amount));
     if (tx.migration_fee > 0) obj.pushKV("migration_fee", ValueFromAmount(tx.migration_fee));
-    if (!tx.warning.empty()) obj.pushKV("warning", tx.warning);
+    if (!tx.warning.empty()) obj.pushKV("warning", tx.warning.original);
     return obj;
 }
 
@@ -741,6 +744,398 @@ static UniValue ThrowOrReturnQuantumStakeTx(util::Result<interfaces::WalletQuant
     return QuantumStakeTxToJSON(*result);
 }
 
+void AddLegacyStakeReturnStatus(UniValue& obj, const CWallet& wallet, const Consensus::Params& consensus, int64_t next_height)
+{
+    const std::optional<int64_t> last = LastLegacyStakeHeight(consensus);
+    if (!last) return;
+    LegacyStakeQuantumReturn quantum_return;
+    {
+        LOCK(wallet.cs_wallet);
+        quantum_return = ResolveLegacyStakeQuantumReturn(wallet);
+    }
+    // The window runs from the first return height through the last Migration block. At the first Final
+    // block legacy kernels are rejected, so legacy staking has stopped whatever the return address says.
+    const bool final_started = next_height > int64_t{consensus.nQuantumMigrationEndHeight};
+    const bool in_window = next_height > *last && !final_started;
+    obj.pushKV("legacy_staking_window_start_height", *last + 1);
+    obj.pushKV("legacy_staking_in_window", in_window);
+    obj.pushKV("legacy_staking_pays_quantum", true);
+    if (const std::optional<int64_t> first_opportunistic = FirstOpportunisticLegacyReturnHeight(consensus)) {
+        obj.pushKV("legacy_staking_opportunistic_start_height", *first_opportunistic);
+        obj.pushKV("legacy_staking_in_opportunistic_window", IsLegacyStakeInOpportunisticReturnWindow(consensus, static_cast<int>(next_height)));
+    }
+    obj.pushKV("legacy_stake_return_ready", quantum_return.available);
+    if (quantum_return.available) {
+        obj.pushKV("legacy_stake_return_address", quantum_return.address);
+        obj.pushKV("legacy_stake_return_backup_verified", quantum_return.backup_verified);
+        if (!quantum_return.backup_verified) obj.pushKV("legacy_stake_return_backup_action", QuantumStakeReturnBackupAction());
+    } else {
+        obj.pushKV("legacy_stake_return_action", quantum_return.reason);
+    }
+    // A new key made for the return address and not yet in a verified backup: reported apart from the
+    // readiness of the active destination above.
+    obj.pushKV("legacy_stake_return_pending", quantum_return.pending);
+    if (quantum_return.pending) {
+        obj.pushKV("legacy_stake_return_pending_address", quantum_return.pending_address);
+        if (!quantum_return.pending_error.empty()) obj.pushKV("legacy_stake_return_pending_error", quantum_return.pending_error);
+        obj.pushKV("legacy_stake_return_pending_action", QuantumStakeReturnPendingAction());
+    }
+    // Stopped in the window without a ready return address, and always once Final has started.
+    obj.pushKV("legacy_staking_stopped", final_started || (in_window && !quantum_return.available));
+    const std::string notice = LegacyStakingNotice(consensus, static_cast<int>(next_height), quantum_return);
+    if (!notice.empty()) obj.pushKV("legacy_staking_notice", notice);
+}
+
+static RPCHelpMan setquantumstakereturn()
+{
+    return RPCHelpMan{"setquantumstakereturn",
+        "\nChoose the quantum address that receives the principal and reward of a legacy stake made in the last blocks of\n"
+        "the Migration phase (see legacy_staking_window_start_height in getstakinginfo). From that height a legacy stake\n"
+        "would reach maturity only in the last Migration block (the first window height, kept as a margin) or after it, so\n"
+        "it is paid to this address instead and leaves as quantum coins. The first such quantum output can stake again in\n"
+        "the last Migration block; one made a block later, from the first Final block on.\n"
+        "The address must already be an ordinary quantum address of this wallet, or be created here with\n"
+        "allow_new_quantum_key (needs a normal unlock). A wallet unlocked for staking only cannot create a key,\n"
+        "so set the address before the window starts. With no address and no key creation, an existing quantum\n"
+        "address of this wallet is chosen, in this order: the saved address, the one -qqpospayoutaddress, the wallet's\n"
+        "Gold Rush claim payout key, then another quantum receive address of the wallet (label, oldest, address).\n"
+        "A NEW key is saved as the return address only after a wallet backup into -quantumkeybackupdir (default\n"
+        "<datadir>/quantum-key-backups/<wallet>/) verified it: the key is stored with a pending record, the backup\n"
+        "reopens it and signs with it, and then the address becomes active. If the backup fails this call fails,\n"
+        "the key stays pending (it cannot be used as the return address, with existing_address either), the\n"
+        "previous address stays active, and the next call, the wallet's own retry or a restart retries the same key.\n"
+        "The three newest verified backups are kept, and an older one only while it is the only backup of a key.\n",
+        {
+            {"options", RPCArg::Type::OBJ_NAMED_PARAMS, RPCArg::Optional::OMITTED, "",
+                {
+                    {"existing_address", RPCArg::Type::STR, RPCArg::Default{""}, "Use this already-owned quantum address."},
+                    {"allow_new_quantum_key", RPCArg::Type::BOOL, RPCArg::Default{false}, "When no address exists, create one new non-HD ML-DSA key; it becomes the address once its verified wallet backup succeeded. Keep the backup."},
+                },
+                RPCArgOptions{.oneline_description = "options"}},
+        },
+        RPCResult{RPCResult::Type::OBJ, "", "", {
+            {RPCResult::Type::STR, "address", "the saved quantum stake return address"},
+            {RPCResult::Type::BOOL, "created", "whether a new quantum key was created"},
+            {RPCResult::Type::BOOL, "ready", "whether legacy stakes in the window will be paid to it"},
+            {RPCResult::Type::BOOL, "backup_verified", "whether a verified wallet backup was made after this address's key was created"},
+            {RPCResult::Type::STR, "backup_action", /*optional=*/true, "present while no verified backup holds the key: make a fresh wallet backup now"},
+        }},
+        RPCExamples{
+            HelpExampleCli("setquantumstakereturn", "'{\"existing_address\":\"<addr>\"}'")
+          + HelpExampleRpc("setquantumstakereturn", "{\"allow_new_quantum_key\":true}")
+        },
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
+{
+    std::shared_ptr<CWallet> const pwallet = GetWalletForJSONRPCRequest(request);
+    if (!pwallet) return UniValue::VNULL;
+    const UniValue options = request.params[0].isNull() ? UniValue(UniValue::VOBJ) : request.params[0].get_obj();
+    const std::string existing = options.exists("existing_address") ? options["existing_address"].get_str() : "";
+    const bool allow_new = options.exists("allow_new_quantum_key") && options["allow_new_quantum_key"].get_bool();
+    bool created{false};
+    CTxDestination dest;
+    if (!existing.empty()) {
+        dest = DecodeDestination(existing);
+    } else {
+        const QuantumStakeReturnPreparation prep = PrepareQuantumStakeReturn(*pwallet, QuantumStakeReturnTrigger::EXPLICIT, allow_new);
+        // A key the preparation made counts as created, even when it did not become the address: it needs a backup.
+        if (prep.key_created) created = true;
+        if (prep.outcome == QuantumStakeReturnPreparation::Outcome::PENDING_BACKUP) {
+            throw JSONRPCError(RPC_WALLET_ERROR, strprintf(
+                "A new ML-DSA key (%s) was created for the stake return address but its wallet backup failed: %s. "
+                "The key stays in the wallet as PENDING and is not the return address; the previous return address "
+                "(if any) stays in use. Fix the backup directory (-quantumkeybackupdir) and call setquantumstakereturn "
+                "again: the same key is retried. It also retries automatically and after a restart.",
+                prep.address, prep.detail));
+        }
+        if (prep.key_created && !prep.Saved() && prep.outcome == QuantumStakeReturnPreparation::Outcome::FAILED) {
+            throw JSONRPCError(RPC_WALLET_ERROR, strprintf(
+                "A new ML-DSA key was created for the stake return address (%s) but the address could not be saved: %s. "
+                "The key stays in the wallet database: back up the wallet now, then retry with existing_address set to it.",
+                prep.address, prep.detail));
+        }
+        if (prep.Saved()) {
+            LOCK(pwallet->cs_wallet);
+            dest = DecodeDestination(pwallet->m_quantum_stake_return);
+        } else {
+            LegacyStakeQuantumReturn current;
+            {
+                LOCK(pwallet->cs_wallet);
+                current = ResolveLegacyStakeQuantumReturn(*pwallet);
+                if (current.available) dest = DecodeDestination(current.address);
+            }
+            if (!IsValidDestination(dest)) {
+                if (current.pending) {
+                    throw JSONRPCError(RPC_WALLET_ERROR, strprintf(
+                        "The new ML-DSA key %s is waiting for its wallet backup and cannot be made the return address yet: %s. "
+                        "The backup needs the wallet unlocked normally (not locked, not for staking only).",
+                        current.pending_address, prep.detail));
+                }
+                if (!allow_new) {
+                    throw JSONRPCError(RPC_WALLET_ERROR, "This wallet has no quantum address to use. Retry with {\"allow_new_quantum_key\":true} after authorizing key creation (needs a normal unlock; back up the wallet afterwards), or pass existing_address.");
+                }
+                throw JSONRPCError(RPC_WALLET_ERROR, strprintf("The quantum stake return address was not set: %s.", prep.detail));
+            }
+        }
+    }
+    bilingual_str error;
+    if (!SetQuantumStakeReturn(*pwallet, dest, error)) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, error.original);
+    }
+    UniValue result(UniValue::VOBJ);
+    result.pushKV("address", EncodeDestination(dest));
+    result.pushKV("created", created);
+    LOCK(pwallet->cs_wallet);
+    const LegacyStakeQuantumReturn state = ResolveLegacyStakeQuantumReturn(*pwallet);
+    result.pushKV("ready", state.available);
+    result.pushKV("backup_verified", state.available && state.backup_verified);
+    if (!state.backup_verified) result.pushKV("backup_action", QuantumStakeReturnBackupAction());
+    return result;
+},
+    };
+}
+
+static std::vector<RPCResult> StakeHorizonReadinessDoc()
+{
+    const auto tally = [](const std::string& name, const std::string& what) {
+        return RPCResult{RPCResult::Type::OBJ, name, "", {
+            {RPCResult::Type::NUM, "count", "number of outputs " + what},
+            {RPCResult::Type::STR_AMOUNT, "amount", "their value"},
+        }};
+    };
+    return {
+        {RPCResult::Type::NUM, "height", "the block this describes"},
+        {RPCResult::Type::NUM, "eligible_outputs", "quantum outputs the staker selects for that block"},
+        {RPCResult::Type::STR_AMOUNT, "eligible_nominal", "their face value (what the reserve balance counts)"},
+        {RPCResult::Type::STR_AMOUNT, "eligible_effective", "the kernel principal they would give at that block, after any scheduled demurrage"},
+        {RPCResult::Type::NUM, "reserve_withheld_outputs", "of those, the outputs the final stake reserve withholds from that block (the staker leaves them alone); only the next block has any, and only while the guard is active"},
+        {RPCResult::Type::STR_AMOUNT, "reserve_withheld_nominal", "their face value, which candidate_total leaves out"},
+        {RPCResult::Type::STR_AMOUNT, "candidate_total", "face value of everything the staker can use for that block, legacy outputs included and the withheld reserve left out: the set the reserve balance is taken from"},
+        {RPCResult::Type::STR_AMOUNT, "allowed_balance", "candidate_total less the reserve balance (0 when it does not exceed it): the most one coinstake may use"},
+        {RPCResult::Type::NUM, "stakeable_outputs", "eligible outputs whose effective principal fits in allowed_balance. A kernel is one whole output, so an output larger than allowed_balance cannot stake at all, whatever its share of the reserve"},
+        {RPCResult::Type::STR_AMOUNT, "stakeable_effective", "the effective principal of those outputs"},
+        {RPCResult::Type::STR_AMOUNT, "largest_kernel", "the largest single effective principal that can stake (0 when none)"},
+        {RPCResult::Type::OBJ, "excluded", "quantum outputs the staker does not select, by the first rule that stops them", {
+            tally("immature", "unconfirmed or too young to be a kernel at that block"),
+            tally("locked", "coin-locked, a locked Gold Rush payout or locked by demurrage"),
+            tally("below_minimum", "under the staking minimum"),
+            tally("signer_unavailable", "with no signing key available in the wallet's current unlock state"),
+            tally("other", "stopped by another staking rule"),
+        }},
+    };
+}
+
+static UniValue StakeHorizonReadinessToJSON(const StakeHorizonReadiness& horizon)
+{
+    UniValue obj(UniValue::VOBJ);
+    obj.pushKV("height", horizon.height);
+    obj.pushKV("eligible_outputs", horizon.eligible_outputs);
+    obj.pushKV("eligible_nominal", ValueFromAmount(horizon.eligible_nominal));
+    obj.pushKV("eligible_effective", ValueFromAmount(horizon.eligible_effective));
+    obj.pushKV("reserve_withheld_outputs", horizon.reserved_outputs);
+    obj.pushKV("reserve_withheld_nominal", ValueFromAmount(horizon.reserved_nominal));
+    obj.pushKV("candidate_total", ValueFromAmount(horizon.candidate_total));
+    obj.pushKV("allowed_balance", ValueFromAmount(horizon.allowed_balance));
+    obj.pushKV("stakeable_outputs", horizon.stakeable_outputs);
+    obj.pushKV("stakeable_effective", ValueFromAmount(horizon.stakeable_effective));
+    obj.pushKV("largest_kernel", ValueFromAmount(horizon.largest_kernel));
+    UniValue excluded(UniValue::VOBJ);
+    for (const StakeExclusion reason : {StakeExclusion::IMMATURE, StakeExclusion::LOCKED, StakeExclusion::BELOW_MINIMUM,
+                                        StakeExclusion::SIGNER_UNAVAILABLE, StakeExclusion::OTHER}) {
+        StakeExclusionTally tally;
+        if (const auto it = horizon.excluded.find(reason); it != horizon.excluded.end()) tally = it->second;
+        UniValue entry(UniValue::VOBJ);
+        entry.pushKV("count", tally.count);
+        entry.pushKV("amount", ValueFromAmount(tally.value));
+        excluded.pushKV(StakeExclusionName(reason), std::move(entry));
+    }
+    obj.pushKV("excluded", std::move(excluded));
+    return obj;
+}
+
+static std::vector<RPCResult> FinalStakeReserveDoc()
+{
+    const auto tally = [](const std::string& name, const std::string& what) {
+        return RPCResult{RPCResult::Type::OBJ, name, "", {
+            {RPCResult::Type::NUM, "count", "number of outputs " + what},
+            {RPCResult::Type::STR_AMOUNT, "amount", "their value"},
+        }};
+    };
+    return {
+        {RPCResult::Type::BOOL, "enabled", "whether the guard is on (-finalstakereserve)"},
+        {RPCResult::Type::BOOL, "active", "whether the guard holds outputs back at the next block: from one maturity before the first Final block up to the last Migration block, released for the first Final block itself"},
+        {RPCResult::Type::BOOL, "schedule_known", "whether a complete height schedule gives the first Final block; false means the guard never acts"},
+        {RPCResult::Type::NUM, "guard_first_height", /*optional=*/true, "first block at which the guard holds outputs back (absent when schedule_known is false)"},
+        {RPCResult::Type::NUM, "final_height", /*optional=*/true, "the first Final block, for which the reserve is kept (absent when schedule_known is false)"},
+        {RPCResult::Type::NUM, "n", "N: the wallet's qualifying quantum stake sources, unspent and able to stake at the first Final block, plus those its confirmed coinstakes consumed since the guard began"},
+        {RPCResult::Type::NUM, "target", "R: the number of outputs to hold back: min(32, ceil(N / 2)) for two or more sources; for exactly one source, 1 when its outpoint is assigned to the reserve and 0 when released (see single_output_rule); 0 for none."},
+        {RPCResult::Type::STR, "single_output_rule", /*optional=*/true, "present only when N is 1: \"held\" when the rule, a fixed hash of the one source's outpoint, assigns it to the reserve, \"released\" when it does not. This is the policy assignment only. Whether the output is actually withheld shows only in active together with reserved_count and reserved_outpoints (nothing is withheld before the guard starts or from the first Final block on)"},
+        {RPCResult::Type::NUM, "reserved_count", "outputs in the reserve plan (R, or fewer when too few outputs are available). Before the guard starts this is the plan only; the outputs are held back only while active is true. It is 0 for candidate F and later, where nothing is held back"},
+        {RPCResult::Type::ARR, "reserved_outpoints", "the outputs of the reserve plan, enforced (held back from staking and automatic spending) only while active is true and empty for candidate F and later, largest effective value at the first Final block first. Equal effective values are ordered by the outpoint's internal byte order (the transaction hash as stored, not the displayed transaction id text), then by output index, both ascending", {
+            {RPCResult::Type::OBJ, "", "", {
+                {RPCResult::Type::STR_HEX, "txid", "transaction id"},
+                {RPCResult::Type::NUM, "vout", "output index"},
+                {RPCResult::Type::STR_AMOUNT, "effective_value", "kernel value at the first Final block"},
+            }},
+        }},
+        {RPCResult::Type::STR_AMOUNT, "reserved_weight", "the effective kernel value of the reserve at the first Final block"},
+        {RPCResult::Type::NUM, "eligible_count", "unspent outputs able to stake at the first Final block (mature by then, even if not mature now). Reported for the first Final block itself too, where the guard is released and nothing is held back"},
+        {RPCResult::Type::STR_AMOUNT, "eligible_weight", "their effective kernel value at the first Final block"},
+        {RPCResult::Type::NUM, "consumed_count", "qualifying sources consumed by this wallet's confirmed coinstakes since the guard began"},
+        {RPCResult::Type::NUM, "shortfall", "target less reserved_count"},
+        {RPCResult::Type::BOOL, "wallet_locked", "the wallet is fully locked: signing is temporarily unavailable, which is not the same as a missing key"},
+        {RPCResult::Type::OBJ, "exclusions", "quantum outputs that cannot be counted for the first Final block, by the first rule that stops them", {
+            tally("immature", "too young to be a kernel at the first Final block, or unconfirmed"),
+            tally("locked", "coin-locked by the user, or locked by a Gold Rush payout lock or demurrage"),
+            tally("below_minimum", "under the staking minimum"),
+            tally("missing_keys", "with no signing key in the wallet (a cold-stake output with the owner key but not the staker key is counted here)"),
+            tally("no_effective_value", "with no kernel value left at the first Final block"),
+            tally("other", "stopped by another staking rule"),
+        }},
+    };
+}
+
+static UniValue FinalStakeReserveToJSON(const FinalStakeReserve& reserve, bool wallet_locked)
+{
+    UniValue obj(UniValue::VOBJ);
+    obj.pushKV("enabled", reserve.enabled);
+    obj.pushKV("active", reserve.active);
+    obj.pushKV("schedule_known", reserve.schedule_known);
+    if (reserve.schedule_known) {
+        obj.pushKV("guard_first_height", reserve.guard_first_height);
+        obj.pushKV("final_height", reserve.final_height);
+    }
+    obj.pushKV("n", reserve.n);
+    obj.pushKV("target", reserve.target);
+    if (reserve.single_output) obj.pushKV("single_output_rule", reserve.single_output_held ? "held" : "released");
+    obj.pushKV("reserved_count", static_cast<int64_t>(reserve.reserved.size()));
+    UniValue outpoints(UniValue::VARR);
+    for (const FinalStakeReserveSource& source : reserve.reserved) {
+        UniValue entry(UniValue::VOBJ);
+        entry.pushKV("txid", source.outpoint.hash.GetHex());
+        entry.pushKV("vout", static_cast<int64_t>(source.outpoint.n));
+        entry.pushKV("effective_value", ValueFromAmount(source.effective_value));
+        outpoints.push_back(std::move(entry));
+    }
+    obj.pushKV("reserved_outpoints", std::move(outpoints));
+    obj.pushKV("reserved_weight", ValueFromAmount(reserve.reserved_weight));
+    obj.pushKV("eligible_count", reserve.eligible_count);
+    obj.pushKV("eligible_weight", ValueFromAmount(reserve.eligible_weight));
+    obj.pushKV("consumed_count", reserve.consumed);
+    obj.pushKV("shortfall", reserve.shortfall);
+    obj.pushKV("wallet_locked", wallet_locked);
+    const auto tally_json = [](const StakeExclusionTally& tally) {
+        UniValue entry(UniValue::VOBJ);
+        entry.pushKV("count", tally.count);
+        entry.pushKV("amount", ValueFromAmount(tally.value));
+        return entry;
+    };
+    const auto scan_tally = [&reserve](StakeExclusion reason) {
+        const auto it = reserve.excluded.find(reason);
+        return it == reserve.excluded.end() ? StakeExclusionTally{} : it->second;
+    };
+    StakeExclusionTally missing_keys = scan_tally(StakeExclusion::SIGNER_UNAVAILABLE);
+    missing_keys.count += reserve.missing_staker_key.count;
+    missing_keys.value += reserve.missing_staker_key.value;
+    UniValue exclusions(UniValue::VOBJ);
+    exclusions.pushKV("immature", tally_json(scan_tally(StakeExclusion::IMMATURE)));
+    exclusions.pushKV("locked", tally_json(scan_tally(StakeExclusion::LOCKED)));
+    exclusions.pushKV("below_minimum", tally_json(scan_tally(StakeExclusion::BELOW_MINIMUM)));
+    exclusions.pushKV("missing_keys", tally_json(missing_keys));
+    exclusions.pushKV("no_effective_value", tally_json(reserve.no_effective_value));
+    exclusions.pushKV("other", tally_json(scan_tally(StakeExclusion::OTHER)));
+    obj.pushKV("exclusions", std::move(exclusions));
+    return obj;
+}
+
+static RPCHelpMan getquantumstakereadiness()
+{
+    return RPCHelpMan{"getquantumstakereadiness",
+        "\nRead-only report of how much quantum stake this wallet can stake at the next block and at the first Final\n"
+        "block, computed by the staker's own candidate scan (the same code that selects its kernels), so it uses the\n"
+        "wallet's actual reserve balance, minimum, locks and unlock state. An output is counted under the first rule\n"
+        "that excludes it. Value that will become eligible by Final counts outputs as they will be then, given their\n"
+        "current confirmations, and the Gold Rush payout lock and demurrage as they will be then; unconfirmed outputs\n"
+        "are not counted as eligible. The reserve balance is held back from the staker's whole selected set and a\n"
+        "kernel is one whole output, so an output stakes only if its effective principal fits in allowed_balance\n"
+        "(candidate_total less the reserve): stakeable_outputs counts exactly those. Nothing is changed.\n",
+        {},
+        RPCResult{RPCResult::Type::OBJ, "", "", {
+            {RPCResult::Type::NUM, "next_height", "height of the next block"},
+            {RPCResult::Type::BOOL, "final_height_known", "whether a complete height-authoritative schedule gives the first Final block; false for a time-only or absent schedule, in which case there is no final_height, blocks_to_final or at_final"},
+            {RPCResult::Type::NUM, "final_height", /*optional=*/true, "first Final block (absent when final_height_known is false)"},
+            {RPCResult::Type::NUM, "blocks_to_final", /*optional=*/true, "blocks from the next block to the first Final block; 0 once Final has started (absent when final_height_known is false)"},
+            {RPCResult::Type::STR_AMOUNT, "quantum_total", "value of every quantum output the staker's scan considers, eligible or not"},
+            {RPCResult::Type::NUM, "quantum_outputs", "their number"},
+            {RPCResult::Type::OBJ, "next_block", "quantum stake for the next block", StakeHorizonReadinessDoc()},
+            {RPCResult::Type::OBJ, "at_final", /*optional=*/true, "quantum stake for the first Final block, with current maturities and the Gold Rush lock and demurrage as they will be then (the same as next_block once Final has started; absent when final_height_known is false)", StakeHorizonReadinessDoc()},
+            {RPCResult::Type::STR_AMOUNT, "legacy_to_migrate", "legacy value still to migrate (spendable now, or waiting to mature or unlock)"},
+            {RPCResult::Type::NUM, "legacy_outputs", "number of those legacy outputs"},
+            {RPCResult::Type::OBJ, "stake_return", "the quantum stake return address of legacy stakes", {
+                {RPCResult::Type::BOOL, "ready", "whether a usable address is saved"},
+                {RPCResult::Type::STR, "address", /*optional=*/true, "the saved address, when ready"},
+                {RPCResult::Type::STR, "action", /*optional=*/true, "what to do when it is not ready"},
+                {RPCResult::Type::BOOL, "backup_verified", "whether a verified backup was made after its key was created"},
+                {RPCResult::Type::STR, "backup_action", /*optional=*/true, "present while no verified backup holds the key"},
+                {RPCResult::Type::BOOL, "pending", "whether a new key made for the return address is waiting for its verified wallet backup; it is not the address yet, and ready, address and backup_verified describe only the active address"},
+                {RPCResult::Type::STR, "pending_address", /*optional=*/true, "the pending key's address, while pending is true"},
+                {RPCResult::Type::STR, "pending_error", /*optional=*/true, "the last backup error of the pending key, once an attempt has failed"},
+                {RPCResult::Type::STR, "pending_action", /*optional=*/true, "what to do about the pending key"},
+            }},
+            {RPCResult::Type::BOOL, "wallet_locked", "fully locked: no signer is available and staking waits"},
+            {RPCResult::Type::BOOL, "staking_only_unlock", "unlocked for staking only"},
+            {RPCResult::Type::STR_AMOUNT, "reserve_balance", "the reserve balance held back from staking"},
+            {RPCResult::Type::STR_AMOUNT, "minimum_stake_amount", "the smallest output the wallet stakes"},
+            {RPCResult::Type::OBJ, "final_stake_reserve", "the final stake reserve: quantum outputs held back from staking and from automatic spending in the last maturity period of Migration so that they are mature and can stake the first Final block. Derived on every pass from the wallet and the chain; nothing is stored. Outputs spent by explicit coin control reduce it, and the outputs affected are listed in reserved_outpoints", FinalStakeReserveDoc()},
+        }},
+        RPCExamples{HelpExampleCli("getquantumstakereadiness", "") + HelpExampleRpc("getquantumstakereadiness", "")},
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
+{
+    std::shared_ptr<CWallet> const pwallet = GetWalletForJSONRPCRequest(request);
+    if (!pwallet) return UniValue::VNULL;
+    QuantumStakeReadiness readiness;
+    {
+        LOCK2(::cs_main, pwallet->cs_wallet);
+        readiness = AssessQuantumStakeReadiness(*pwallet);
+    }
+    UniValue result(UniValue::VOBJ);
+    result.pushKV("next_height", readiness.next_height);
+    result.pushKV("final_height_known", readiness.final_height_known);
+    if (readiness.final_height_known) {
+        result.pushKV("final_height", readiness.final_height);
+        result.pushKV("blocks_to_final", readiness.blocks_to_final);
+    }
+    result.pushKV("quantum_total", ValueFromAmount(readiness.quantum_total));
+    result.pushKV("quantum_outputs", readiness.quantum_outputs);
+    result.pushKV("next_block", StakeHorizonReadinessToJSON(readiness.next_block));
+    if (readiness.final_height_known) result.pushKV("at_final", StakeHorizonReadinessToJSON(readiness.at_final));
+    result.pushKV("legacy_to_migrate", ValueFromAmount(readiness.legacy_to_migrate));
+    result.pushKV("legacy_outputs", readiness.legacy_outputs);
+    UniValue stake_return(UniValue::VOBJ);
+    stake_return.pushKV("ready", readiness.stake_return.available);
+    if (readiness.stake_return.available) {
+        stake_return.pushKV("address", readiness.stake_return.address);
+    } else {
+        stake_return.pushKV("action", readiness.stake_return.reason);
+    }
+    stake_return.pushKV("backup_verified", readiness.stake_return.available && readiness.stake_return.backup_verified);
+    if (!readiness.stake_return.backup_verified) stake_return.pushKV("backup_action", QuantumStakeReturnBackupAction());
+    stake_return.pushKV("pending", readiness.stake_return.pending);
+    if (readiness.stake_return.pending) {
+        stake_return.pushKV("pending_address", readiness.stake_return.pending_address);
+        if (!readiness.stake_return.pending_error.empty()) stake_return.pushKV("pending_error", readiness.stake_return.pending_error);
+        stake_return.pushKV("pending_action", QuantumStakeReturnPendingAction());
+    }
+    result.pushKV("stake_return", std::move(stake_return));
+    result.pushKV("wallet_locked", readiness.wallet_locked);
+    result.pushKV("staking_only_unlock", readiness.staking_only_unlock);
+    result.pushKV("reserve_balance", ValueFromAmount(readiness.reserve_balance));
+    result.pushKV("minimum_stake_amount", ValueFromAmount(readiness.min_stake_amount));
+    result.pushKV("final_stake_reserve", FinalStakeReserveToJSON(readiness.final_reserve, readiness.wallet_locked));
+    return result;
+},
+    };
+}
+
 static RPCHelpMan getstakinginfo()
 {
     return RPCHelpMan{"getstakinginfo",
@@ -778,6 +1173,26 @@ static RPCHelpMan getstakinginfo()
                         {RPCResult::Type::NUM, "expectedtime", "Expected time to earn reward"},
                         {RPCResult::Type::BOOL, "chainstate_cached", "Whether chain statistics were served from the last non-blocking snapshot"},
                         {RPCResult::Type::STR, "chain", "Current chain name"},
+                        {RPCResult::Type::BOOL, "legacy_staking_scheduled", "Whether the chain has a height-authoritative Migration end, so that a last height for legacy staking is known"},
+                        {RPCResult::Type::NUM, "legacy_staking_last_height", /*optional=*/true, "Last block height at which this wallet still creates a legacy coinstake that pays a legacy output. The wallet stops creating legacy return outputs one block before the last height from which they could mature for spending in Migration. From the next height a wallet with a ready quantum stake return address keeps staking legacy kernels but pays the stake to that address (a quantum return), and a wallet without one stops legacy staking. Quantum staking is not affected."},
+                        {RPCResult::Type::NUM, "legacy_staking_blocks_remaining", /*optional=*/true, "Blocks left, counting the next block, at which legacy staking is still allowed; 0 once it has stopped"},
+                        {RPCResult::Type::BOOL, "legacy_staking_stopped", /*optional=*/true, "Whether legacy staking has already stopped at the next block height: in the window without a ready return address, and always once the first Final block is next (legacy kernels are rejected there, whatever the return address)"},
+                        {RPCResult::Type::NUM, "legacy_migration_end_height", /*optional=*/true, "Last Migration block; legacy coins cannot be spent from the next height on"},
+                        {RPCResult::Type::STR, "legacy_staking_notice", /*optional=*/true, "Plain-language notice: from legacy_staking_window_start_height legacy stakes are paid to a quantum address of this wallet, whether that return address is ready, what to do if not, and the need to migrate legacy coins that do not stake before Final"},
+                        {RPCResult::Type::NUM, "legacy_staking_window_start_height", /*optional=*/true, "First block height at which a legacy stake is paid to a quantum address instead of a legacy one"},
+                        {RPCResult::Type::BOOL, "legacy_staking_in_window", /*optional=*/true, "Whether the next block is already inside that window; the window ends with the last Migration block"},
+                        {RPCResult::Type::NUM, "legacy_staking_opportunistic_start_height", /*optional=*/true, "First block height at which a legacy self-stake is already paid to a quantum address of this wallet when its return address is ready; without one it stakes as before. Runs up to the block before legacy_staking_window_start_height, where paying quantum becomes mandatory"},
+                        {RPCResult::Type::BOOL, "legacy_staking_in_opportunistic_window", /*optional=*/true, "Whether the next block is inside that opportunistic window"},
+                        {RPCResult::Type::BOOL, "legacy_staking_pays_quantum", /*optional=*/true, "Always true when a schedule exists: legacy stakes in the window are paid to a quantum address"},
+                        {RPCResult::Type::BOOL, "legacy_stake_return_ready", /*optional=*/true, "Whether a usable quantum stake return address is saved in this wallet"},
+                        {RPCResult::Type::STR, "legacy_stake_return_address", /*optional=*/true, "The saved quantum stake return address, when ready"},
+                        {RPCResult::Type::STR, "legacy_stake_return_action", /*optional=*/true, "What to do before the window starts, when the return address is not ready"},
+                        {RPCResult::Type::BOOL, "legacy_stake_return_backup_verified", /*optional=*/true, "Whether a verified wallet backup (backupwallet) was made after the return address key was created, when the address is ready"},
+                        {RPCResult::Type::STR, "legacy_stake_return_backup_action", /*optional=*/true, "Make a fresh wallet backup now: a backup made before the return key existed cannot recover coins paid to it"},
+                        {RPCResult::Type::BOOL, "legacy_stake_return_pending", /*optional=*/true, "Whether a new key made for the return address is waiting for its verified wallet backup. It is not the return address yet; this is separate from legacy_stake_return_ready, which describes the active address"},
+                        {RPCResult::Type::STR, "legacy_stake_return_pending_address", /*optional=*/true, "The pending key's address, while legacy_stake_return_pending is true"},
+                        {RPCResult::Type::STR, "legacy_stake_return_pending_error", /*optional=*/true, "The last backup error of the pending key, once an attempt has failed"},
+                        {RPCResult::Type::STR, "legacy_stake_return_pending_action", /*optional=*/true, "What to do about the pending key"},
                         {RPCResult::Type::STR, "warnings", "Current network and wallet warnings"},
                     }
                 },
@@ -905,6 +1320,17 @@ static RPCHelpMan getstakinginfo()
     obj.pushKV("chainstate_cached", chainstate_cached);
 
     obj.pushKV("chain", chainman.GetParams().GetChainTypeString());
+    {
+        const std::optional<int64_t> legacy_last = LastLegacyStakeHeight(consensusParams);
+        const int64_t next_height = int64_t{active_blocks} + 1;
+        obj.pushKV("legacy_staking_scheduled", legacy_last.has_value());
+        if (legacy_last) {
+            obj.pushKV("legacy_staking_last_height", *legacy_last);
+            obj.pushKV("legacy_staking_blocks_remaining", std::max<int64_t>(0, *legacy_last - next_height + 1));
+            obj.pushKV("legacy_migration_end_height", consensusParams.nQuantumMigrationEndHeight);
+            AddLegacyStakeReturnStatus(obj, *pwallet, consensusParams, next_height);
+        }
+    }
     obj.pushKV("warnings", GetWarnings(false).original);
     return obj;
 },
@@ -4329,6 +4755,7 @@ static RPCHelpMan getpowclaimrecoveryinfo()
         },
         RPCResult{RPCResult::Type::OBJ, "", "", {
             {RPCResult::Type::OBJ, "policy", /*optional=*/true, "Authoritative wallet-scoped policy. Omitted when the durable database outcome is ambiguous.", ShadowPowClaimRecoveryPolicyResults()},
+            {RPCResult::Type::OBJ, "closed_claim_reserved", "Funds still reserved by Gold Rush claims that can no longer confirm because the reward window closed, why, and the command that releases them. Zero before the window closes.", ClosedClaimReservationResults()},
             {RPCResult::Type::BOOL, "policy_authoritative", "Whether the displayed policy is proven to match a durable wallet record."},
             {RPCResult::Type::STR, "policy_state_status", "Stable typed policy-state status."},
             {RPCResult::Type::STR, "policy_state_detail", "Human-readable policy authority detail."},
@@ -4430,6 +4857,7 @@ static RPCHelpMan getpowclaimrecoveryinfo()
     ShadowPowClaimRecoveryPolicyMutationResult policy_state;
     bool database_ambiguous{false};
     bool chain_ready{false};
+    ShadowPowClosedClaimReservation closed_claim_reservation;
     for (int attempt = 1;; ++attempt) {
     inventory = pwallet->GetShadowPowClaimRecoveryInventory();
     bool coherent{false};
@@ -4452,6 +4880,7 @@ static RPCHelpMan getpowclaimrecoveryinfo()
             BuildShadowPowClaimCompatibilityInventory(inventory);
         usage = pwallet->GetShadowPowClaimRecoveryUsageFromInventoryLocked(
             inventory, policy.rolling_fee_window_seconds);
+        closed_claim_reservation = pwallet->GetClosedClaimReservationLocked();
         coherent = true;
         }
     }
@@ -4464,6 +4893,8 @@ static RPCHelpMan getpowclaimrecoveryinfo()
     UninterruptibleSleep(std::chrono::milliseconds{10 * attempt});
     }
     UniValue result(UniValue::VOBJ);
+    result.pushKV("closed_claim_reserved",
+                  ClosedClaimReservationToJSON(closed_claim_reservation));
     if (policy_state.authoritative_state_available) {
         result.pushKV("policy", ShadowPowClaimRecoveryPolicyToJSON(policy));
     }
@@ -4745,7 +5176,9 @@ static RPCHelpMan getpowmininginfo()
             {RPCResult::Type::BOOL, "enabled", "Whether in-process PoW mining is enabled."},
             {RPCResult::Type::BOOL, "autostart", "Whether process-wide persistent consent was given to start PoW mining for every eligible loaded wallet."},
             {RPCResult::Type::BOOL, "allow_automatic_quantum_key_creation", "Whether process-wide background automation may create new non-HD keys in loaded wallets."},
-            {RPCResult::Type::STR, "state", "Bounded worker state: disabled, starting, chain_unavailable, wallet_locked_or_staking_only, no_spendable_legacy_fee_utxo, stake_reserve_protected, epoch_inactive, claim_in_flight, claim_quarantined, claim_evaluation_pending, claim_evaluation_capacity, ready, hashing, or error."},
+            {RPCResult::Type::STR, "state", "Bounded worker state: disabled, starting, chain_unavailable, wallet_locked_or_staking_only, no_spendable_legacy_fee_utxo, stake_reserve_protected, epoch_inactive, claim_in_flight, claim_quarantined, claim_evaluation_pending, claim_evaluation_capacity, ready, hashing, error, or gold_rush_ended (the reward window has closed and the miner is stopped)."},
+            {RPCResult::Type::BOOL, "gold_rush_ended", "Whether the next block is past the Gold Rush reward window on the current chain."},
+            {RPCResult::Type::OBJ, "closed_claim_reserved", "Funds still reserved by Gold Rush claims that can no longer confirm, why, and the command that releases them. Zero before the window closes.", ClosedClaimReservationResults()},
             {RPCResult::Type::NUM, "threads", "Worker threads configured."},
             {RPCResult::Type::NUM, "cpu_percent", "Per-worker active-work duty target, including selection and proof preparation. Explicit waits count toward the idle period. The budget is spent work first: after a new tip the worker does not sleep until its claim is submitted, then sleeps off what it owes; it may run ahead by at most two target block spacings of budget before it falls back to sleeping after every batch."},
             {RPCResult::Type::NUM, "workers_hashing", "Workers currently inside a proof batch."},
@@ -4902,6 +5335,8 @@ static RPCHelpMan getpowmininginfo()
     bool pow_mining_enabled{false};
     interfaces::WalletPowMiningState pow_mining_state{
         interfaces::WalletPowMiningState::DISABLED};
+    ShadowPowClosedClaimReservation closed_claim_reservation;
+    bool gold_rush_ended{false};
     for (int attempt = 1;; ++attempt) {
     recovery_inventory =
         pwallet->GetShadowPowClaimRecoveryInventory();
@@ -4920,6 +5355,9 @@ static RPCHelpMan getpowmininginfo()
         mining_gate_telemetry_action =
             pwallet->GetShadowPowClaimMiningGateTelemetryActionLocked(
                 mining_gate, pow_mining_enabled, pow_mining_state);
+        closed_claim_reservation = pwallet->GetClosedClaimReservationLocked();
+        gold_rush_ended = IsShadowGoldRushWindowClosedAtTip(
+            recovery_inventory.active_height);
         for (const ShadowPowClaimRecoveryComponent& component :
              recovery_inventory.components) {
             for (const ShadowPowClaimRecoveryNode& node : component.nodes) {
@@ -4958,7 +5396,14 @@ static RPCHelpMan getpowmininginfo()
     obj.pushKV("enabled", pow_mining_enabled);
     obj.pushKV("autostart", gArgs.GetBoolArg("-powmining", false));
     obj.pushKV("allow_automatic_quantum_key_creation", gArgs.GetBoolArg("-qqallowautokeycreation", DEFAULT_ALLOW_AUTO_QUANTUM_KEY_CREATION));
-    obj.pushKV("state", std::string(interfaces::WalletPowMiningStateName(pow_mining_state)));
+    // A stopped miner after the window closed is a final state, not "disabled".
+    obj.pushKV("state", std::string(interfaces::WalletPowMiningStateName(
+        gold_rush_ended && !pow_mining_enabled
+            ? interfaces::WalletPowMiningState::GOLD_RUSH_ENDED
+            : pow_mining_state)));
+    obj.pushKV("gold_rush_ended", gold_rush_ended);
+    obj.pushKV("closed_claim_reserved",
+               ClosedClaimReservationToJSON(closed_claim_reservation));
     obj.pushKV("threads", pwallet->m_pow_threads.load());
     obj.pushKV("cpu_percent", pwallet->m_pow_cpu_percent.load());
     obj.pushKV("workers_hashing", pwallet->m_pow_workers_hashing.load());
@@ -5573,7 +6018,8 @@ static RPCHelpMan getdemurragewalletinfo()
                     {RPCResult::Type::STR_AMOUNT, "burned_if_spent_amount", "Amount burned if this output is spent now"},
                     {RPCResult::Type::BOOL, "locked", "Whether this output has reached the 24-month lock"},
                     {RPCResult::Type::STR, "exemption", "Reason the output is currently whole, or empty when decaying"},
-                    {RPCResult::Type::NUM, "blocks_until_decay", "Blocks until decay starts; zero if already decaying"},
+                    {RPCResult::Type::NUM, "blocks_until_decay", "Blocks until the grace period ends; zero once it has ended. The value does not drop yet when the grace period ends: the first real reduction comes later (see blocks_until_first_reduction). Kept for compatibility."},
+                    {RPCResult::Type::NUM, "blocks_until_first_reduction", /*optional=*/true, "Blocks from evaluation_height until the output's value is first reduced; zero if it is already reduced. Before demurrage activates it includes the blocks left until activation. Absent when no countdown exists: the output is exempt (permanently whole), or activation is not given by a block height."},
                     {RPCResult::Type::NUM, "blocks_until_lock", "Blocks until hard lock; zero if already locked"},
                     {RPCResult::Type::BOOL, "attestation_due", "Whether this output is beyond the 3-month auto-attestation policy threshold"},
                     {RPCResult::Type::STR, "action", "Suggested wallet action"},
@@ -5666,6 +6112,9 @@ static RPCHelpMan getdemurragewalletinfo()
         entry.pushKV("locked", eval.locked);
         entry.pushKV("exemption", eval.exemption);
         entry.pushKV("blocks_until_decay", std::max(0, consensus.DemurrageGraceBlocks() - eval.inactive_blocks));
+        if (const auto countdown = DemurrageFirstReductionCountdown(consensus, coin.out.scriptPubKey, eval, evaluation_height, evaluation_time)) {
+            entry.pushKV("blocks_until_first_reduction", *countdown);
+        }
         entry.pushKV("blocks_until_lock", std::max(0, consensus.DemurrageZeroBlocks() - eval.inactive_blocks));
         entry.pushKV("attestation_due", attestation_due);
         std::string action;
@@ -5777,230 +6226,239 @@ static RPCHelpMan sweepdemurragedecay()
             "sweepdemurragedecay without destination_address creates a new non-HD ML-DSA key that an older wallet backup cannot recover. Retry with {\"allow_new_quantum_key\":true}, or supply an existing wallet-owned direct quantum destination_address. Back up the wallet after key creation. No key, transaction, or wallet metadata was created.");
     }
 
-    LOCK2(cs_main, pwallet->cs_wallet);
-    if (!dry_run) {
-        EnsureWalletIsUnlocked(*pwallet);
-        if (pwallet->m_wallet_unlock_staking_only) {
-            throw JSONRPCError(RPC_WALLET_ERROR, "Wallet unlocked for staking only, unable to sweep demurrage outputs");
-        }
-        if (pwallet->IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS)) {
-            throw JSONRPCError(RPC_WALLET_ERROR, "Error: Private keys are disabled for this wallet");
-        }
-    }
-
-    const Consensus::Params& consensus = Params().GetConsensus();
-    const CBlockIndex* tip = pwallet->chain().getTip();
-    const int tip_height = tip ? tip->nHeight : -1;
-    const int evaluation_height = tip_height >= 0 ? tip_height + 1 : 0;
-    const int64_t evaluation_time = tip ? tip->GetMedianTimePast() : 0;
-    if (!consensus.IsDemurrageActive(evaluation_height, evaluation_time)) {
-        throw JSONRPCError(RPC_WALLET_ERROR, "demurrage is not active for the next block");
-    }
-
-    std::optional<CScript> source_script;
-    if (!source_address.empty()) {
-        std::string error_msg;
-        const CTxDestination source_dest = DecodeDestination(source_address, error_msg);
-        const auto* witness = std::get_if<WitnessUnknown>(&source_dest);
-        if (!IsValidDestination(source_dest) || !witness ||
-            !IsQuantumMigrationWitnessProgram(witness->GetWitnessVersion(), witness->GetWitnessProgram())) {
-            throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, error_msg.empty() ? "source_address is not a Blackcoin migration address" : error_msg);
-        }
-        if (!pwallet->GetQuantumKeyInfo(source_dest).has_value()) {
-            throw JSONRPCError(RPC_WALLET_ERROR, "source_address is not wallet-backed");
-        }
-        source_script = GetScriptForDestination(source_dest);
-    }
-
-    CTxDestination dest;
+    // The construction needs cs_main and cs_wallet. The commit takes them itself and must find neither held, so the
+    // transaction and the reply are made inside this block and both locks are released before the commit.
+    CTransactionRef tx;
+    std::optional<CTxDestination> created_destination;
     bool newly_generated{false};
-    if (!destination_address.empty()) {
-        std::string error_msg;
-        dest = DecodeDestination(destination_address, error_msg);
-        const auto* witness = std::get_if<WitnessUnknown>(&dest);
-        if (!IsValidDestination(dest) || !witness ||
-            !IsQuantumMigrationWitnessProgram(witness->GetWitnessVersion(), witness->GetWitnessProgram())) {
-            throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, error_msg.empty() ? "destination_address is not a Blackcoin migration address" : error_msg);
-        }
-        if (!pwallet->GetQuantumKeyInfo(dest).has_value()) {
-            throw JSONRPCError(RPC_WALLET_ERROR, "destination_address is not wallet-backed");
-        }
-    } else {
-        auto op_dest = pwallet->GetNewQuantumDestination(label);
-        if (!op_dest) throw JSONRPCError(RPC_WALLET_ERROR, util::ErrorString(op_dest).original);
-        dest = *op_dest;
-        newly_generated = true;
-    }
-    const std::optional<CTxDestination> created_destination = newly_generated
-        ? std::optional<CTxDestination>{dest}
-        : std::nullopt;
-    if (!pwallet->GetQuantumKeyInfo(dest).has_value()) {
-        ThrowQuantumActionError(
-            RPC_WALLET_ERROR,
-            "Demurrage sweep",
-            "Refusing to sweep: destination ML-DSA key is not confirmed stored in the wallet",
-            created_destination);
-    }
-
-    CCoinControl coin_control;
-    coin_control.m_allow_other_inputs = false;
-    coin_control.m_include_unsafe_inputs = include_unsafe;
-    coin_control.destChange = dest;
-    if (requested_fee_rate) {
-        coin_control.m_feerate = *requested_fee_rate;
-        coin_control.fOverrideFeeRate = true;
-    }
-
-    CoinFilterParams filter;
-    filter.only_spendable = true;
-    filter.skip_locked = true;
-    filter.include_immature_coinbase = false;
-
-    CoinsResult available = AvailableCoins(*pwallet, &coin_control, std::nullopt, filter);
-    std::map<COutPoint, Coin> chain_coins;
-    std::vector<COutput> candidates;
-    for (const COutput& out : available.All()) {
-        if (!IsQuantumMigrationScript(out.txout.scriptPubKey)) continue;
-        if (source_script && out.txout.scriptPubKey != *source_script) continue;
-        CTxDestination out_dest;
-        if (!ExtractDestination(out.txout.scriptPubKey, out_dest) || !pwallet->GetQuantumKeyInfo(out_dest).has_value()) continue;
-        chain_coins.emplace(out.outpoint, Coin{});
-        candidates.push_back(out);
-    }
-    pwallet->chain().findCoins(chain_coins);
-
-    CAmount nominal_amount{0};
-    CAmount effective_amount{0};
-    CAmount burned_amount{0};
-    CAmount skipped_locked_amount{0};
-    int selected_inputs{0};
-    int skipped_locked_outputs{0};
-    std::vector<COutPoint> selected_outpoints;
-    const CCoinsViewCache& view = pwallet->chain().getCoinsTip();
-    for (const COutput& out : candidates) {
-        const auto coin_it = chain_coins.find(out.outpoint);
-        if (coin_it == chain_coins.end() || coin_it->second.IsSpent()) continue;
-        const std::optional<Consensus::DemurrageAttestationState> latest_attestation =
-            Consensus::LatestDemurrageAttestationStateForScript(view, out.txout.scriptPubKey);
-        const Consensus::DemurrageEvaluation eval = Consensus::EvaluateDemurrage(
-            coin_it->second, consensus, evaluation_height, evaluation_time,
-            latest_attestation ? std::optional<int>{latest_attestation->height} : std::nullopt,
-            latest_attestation ? std::optional<int>{static_cast<int>(latest_attestation->coverage_start_height)} : std::nullopt);
-        if (eval.locked) {
-            ++skipped_locked_outputs;
-            skipped_locked_amount += eval.nominal_value;
-            continue;
-        }
-        if (eval.burned_value <= 0) continue;
-        selected_outpoints.push_back(out.outpoint);
-        nominal_amount += eval.nominal_value;
-        effective_amount += eval.effective_value;
-        burned_amount += eval.burned_value;
-        ++selected_inputs;
-    }
-    if (selected_inputs == 0) {
-        ThrowQuantumActionError(
-            RPC_WALLET_INSUFFICIENT_FUNDS,
-            "Demurrage sweep",
-            "No spendable wallet-owned quantum outputs are currently decaying",
-            created_destination);
-    }
-    if (effective_amount <= 0) {
-        ThrowQuantumActionError(
-            RPC_WALLET_INSUFFICIENT_FUNDS,
-            "Demurrage sweep",
-            "Selected decaying outputs have no spendable effective value",
-            created_destination);
-    }
-
-    const int64_t current_time = GetAdjustedTimeSeconds();
-    const CFeeRate fee_rate = GetMinimumFeeRate(*pwallet, coin_control, current_time);
-    if (coin_control.m_feerate && fee_rate > *coin_control.m_feerate) {
-        ThrowQuantumActionError(
-            RPC_INVALID_PARAMETER,
-            "Demurrage sweep",
-            strprintf("Fee rate (%s) is lower than the minimum fee rate setting (%s)", coin_control.m_feerate->ToString(FeeEstimateMode::SAT_VB), fee_rate.ToString(FeeEstimateMode::SAT_VB)),
-            created_destination);
-    }
-
-    CMutableTransaction sweep_tx;
-    sweep_tx.nVersion = CTransaction::CURRENT_VERSION;
-    sweep_tx.nTime = current_time;
-    static constexpr uint32_t MAX_SEQUENCE_NONFINAL = 0xfffffffe;
-    for (const COutPoint& outpoint : selected_outpoints) {
-        sweep_tx.vin.emplace_back(outpoint, CScript(), MAX_SEQUENCE_NONFINAL);
-    }
-    sweep_tx.vout.emplace_back(effective_amount, GetScriptForDestination(dest));
-
-    const TxSize tx_size = CalculateMaximumSignedTxSize(CTransaction(sweep_tx), pwallet.get(), &coin_control);
-    if (tx_size.vsize <= 0) {
-        ThrowQuantumActionError(
-            RPC_WALLET_ERROR,
-            "Demurrage sweep",
-            "Unable to estimate demurrage sweep transaction size",
-            created_destination);
-    }
-    const CAmount fee = std::max(GetMinFee(static_cast<size_t>(tx_size.vsize), static_cast<uint32_t>(current_time)), fee_rate.GetFee(static_cast<uint32_t>(tx_size.vsize)));
-    if (fee > pwallet->m_default_max_tx_fee) {
-        ThrowQuantumActionError(
-            RPC_WALLET_ERROR,
-            "Demurrage sweep",
-            strprintf("Fee exceeds wallet max transaction fee (%s)", FormatMoney(pwallet->m_default_max_tx_fee)),
-            created_destination);
-    }
-    const CAmount output_amount = effective_amount - fee;
-    if (!MoneyRange(output_amount) || output_amount <= 0) {
-        ThrowQuantumActionError(
-            RPC_WALLET_INSUFFICIENT_FUNDS,
-            "Demurrage sweep",
-            "Selected decaying outputs cannot pay the sweep fee",
-            created_destination);
-    }
-    sweep_tx.vout[0].nValue = output_amount;
-
-    if (IsDust(sweep_tx.vout[0], pwallet->chain().relayDustFee())) {
-        ThrowQuantumActionError(
-            RPC_WALLET_INSUFFICIENT_FUNDS,
-            "Demurrage sweep",
-            "Demurrage sweep would strand the effective value below dust after fees",
-            created_destination);
-    }
-    if (!dry_run) {
-        std::map<int, bilingual_str> input_errors;
-        if (!pwallet->SignTransaction(sweep_tx, input_errors)) {
-            if (!input_errors.empty()) {
-                ThrowQuantumActionError(
-                    RPC_WALLET_ERROR,
-                    "Demurrage sweep",
-                    strprintf("Signing demurrage sweep failed: %s", input_errors.begin()->second.original),
-                    created_destination);
+    UniValue obj(UniValue::VOBJ);
+    {
+        LOCK2(cs_main, pwallet->cs_wallet);
+        if (!dry_run) {
+            EnsureWalletIsUnlocked(*pwallet);
+            if (pwallet->m_wallet_unlock_staking_only) {
+                throw JSONRPCError(RPC_WALLET_ERROR, "Wallet unlocked for staking only, unable to sweep demurrage outputs");
             }
+            if (pwallet->IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS)) {
+                throw JSONRPCError(RPC_WALLET_ERROR, "Error: Private keys are disabled for this wallet");
+            }
+        }
+
+        const Consensus::Params& consensus = Params().GetConsensus();
+        const CBlockIndex* tip = pwallet->chain().getTip();
+        const int tip_height = tip ? tip->nHeight : -1;
+        const int evaluation_height = tip_height >= 0 ? tip_height + 1 : 0;
+        const int64_t evaluation_time = tip ? tip->GetMedianTimePast() : 0;
+        if (!consensus.IsDemurrageActive(evaluation_height, evaluation_time)) {
+            throw JSONRPCError(RPC_WALLET_ERROR, "demurrage is not active for the next block");
+        }
+
+        std::optional<CScript> source_script;
+        if (!source_address.empty()) {
+            std::string error_msg;
+            const CTxDestination source_dest = DecodeDestination(source_address, error_msg);
+            const auto* witness = std::get_if<WitnessUnknown>(&source_dest);
+            if (!IsValidDestination(source_dest) || !witness ||
+                !IsQuantumMigrationWitnessProgram(witness->GetWitnessVersion(), witness->GetWitnessProgram())) {
+                throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, error_msg.empty() ? "source_address is not a Blackcoin migration address" : error_msg);
+            }
+            if (!pwallet->GetQuantumKeyInfo(source_dest).has_value()) {
+                throw JSONRPCError(RPC_WALLET_ERROR, "source_address is not wallet-backed");
+            }
+            source_script = GetScriptForDestination(source_dest);
+        }
+
+        CTxDestination dest;
+        if (!destination_address.empty()) {
+            std::string error_msg;
+            dest = DecodeDestination(destination_address, error_msg);
+            const auto* witness = std::get_if<WitnessUnknown>(&dest);
+            if (!IsValidDestination(dest) || !witness ||
+                !IsQuantumMigrationWitnessProgram(witness->GetWitnessVersion(), witness->GetWitnessProgram())) {
+                throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, error_msg.empty() ? "destination_address is not a Blackcoin migration address" : error_msg);
+            }
+            if (!pwallet->GetQuantumKeyInfo(dest).has_value()) {
+                throw JSONRPCError(RPC_WALLET_ERROR, "destination_address is not wallet-backed");
+            }
+            if (WITH_LOCK(pwallet->cs_wallet, return pwallet->IsQuantumStakeReturnPendingKey(dest))) {
+                throw JSONRPCError(RPC_WALLET_ERROR, "destination_address is the quantum stake return key, a new key still waiting for its first verified wallet backup; it cannot be selected as this sweep destination until that backup succeeds");
+            }
+        } else {
+            auto op_dest = pwallet->GetNewQuantumDestination(label);
+            if (!op_dest) throw JSONRPCError(RPC_WALLET_ERROR, util::ErrorString(op_dest).original);
+            dest = *op_dest;
+            newly_generated = true;
+        }
+        if (newly_generated) created_destination = dest;
+        if (!pwallet->GetQuantumKeyInfo(dest).has_value()) {
             ThrowQuantumActionError(
                 RPC_WALLET_ERROR,
                 "Demurrage sweep",
-                "Signing demurrage sweep failed",
+                "Refusing to sweep: destination ML-DSA key is not confirmed stored in the wallet",
                 created_destination);
         }
-    }
-    CTransactionRef tx = MakeTransactionRef(std::move(sweep_tx));
-    const int result_vsize = dry_run ? static_cast<int>(tx_size.vsize) : static_cast<int>(GetVirtualTransactionSize(*tx, 0, 0));
 
-    UniValue obj(UniValue::VOBJ);
-    obj.pushKV("dry_run", dry_run);
-    obj.pushKV("evaluation_height", evaluation_height);
-    obj.pushKV("evaluation_time", evaluation_time);
-    obj.pushKV("selected_inputs", selected_inputs);
-    obj.pushKV("skipped_locked_outputs", skipped_locked_outputs);
-    obj.pushKV("nominal_amount", ValueFromAmount(nominal_amount));
-    obj.pushKV("effective_amount", ValueFromAmount(effective_amount));
-    obj.pushKV("burned_amount", ValueFromAmount(burned_amount));
-    obj.pushKV("skipped_locked_amount", ValueFromAmount(skipped_locked_amount));
-    obj.pushKV("destination", EncodeDestination(dest));
-    obj.pushKV("newly_generated", newly_generated);
-    obj.pushKV("amount", ValueFromAmount(tx->vout[0].nValue));
-    obj.pushKV("fee", ValueFromAmount(fee));
-    obj.pushKV("vsize", result_vsize);
-    obj.pushKV("hex", EncodeHexTx(*tx));
+        CCoinControl coin_control;
+        coin_control.m_allow_other_inputs = false;
+        coin_control.m_include_unsafe_inputs = include_unsafe;
+        coin_control.destChange = dest;
+        if (requested_fee_rate) {
+            coin_control.m_feerate = *requested_fee_rate;
+            coin_control.fOverrideFeeRate = true;
+        }
+
+        CoinFilterParams filter;
+        filter.only_spendable = true;
+        filter.skip_locked = true;
+        filter.include_immature_coinbase = false;
+        // The sweep picks its inputs itself: it leaves the final stake reserve alone, as the commit would refuse it.
+        filter.avoid_final_stake_reserve = true;
+
+        CoinsResult available = AvailableCoins(*pwallet, &coin_control, std::nullopt, filter);
+        std::map<COutPoint, Coin> chain_coins;
+        std::vector<COutput> candidates;
+        for (const COutput& out : available.All()) {
+            if (!IsQuantumMigrationScript(out.txout.scriptPubKey)) continue;
+            if (source_script && out.txout.scriptPubKey != *source_script) continue;
+            CTxDestination out_dest;
+            if (!ExtractDestination(out.txout.scriptPubKey, out_dest) || !pwallet->GetQuantumKeyInfo(out_dest).has_value()) continue;
+            chain_coins.emplace(out.outpoint, Coin{});
+            candidates.push_back(out);
+        }
+        pwallet->chain().findCoins(chain_coins);
+
+        CAmount nominal_amount{0};
+        CAmount effective_amount{0};
+        CAmount burned_amount{0};
+        CAmount skipped_locked_amount{0};
+        int selected_inputs{0};
+        int skipped_locked_outputs{0};
+        std::vector<COutPoint> selected_outpoints;
+        const CCoinsViewCache& view = pwallet->chain().getCoinsTip();
+        for (const COutput& out : candidates) {
+            const auto coin_it = chain_coins.find(out.outpoint);
+            if (coin_it == chain_coins.end() || coin_it->second.IsSpent()) continue;
+            const std::optional<Consensus::DemurrageAttestationState> latest_attestation =
+                Consensus::LatestDemurrageAttestationStateForScript(view, out.txout.scriptPubKey);
+            const Consensus::DemurrageEvaluation eval = Consensus::EvaluateDemurrage(
+                coin_it->second, consensus, evaluation_height, evaluation_time,
+                latest_attestation ? std::optional<int>{latest_attestation->height} : std::nullopt,
+                latest_attestation ? std::optional<int>{static_cast<int>(latest_attestation->coverage_start_height)} : std::nullopt);
+            if (eval.locked) {
+                ++skipped_locked_outputs;
+                skipped_locked_amount += eval.nominal_value;
+                continue;
+            }
+            if (eval.burned_value <= 0) continue;
+            selected_outpoints.push_back(out.outpoint);
+            nominal_amount += eval.nominal_value;
+            effective_amount += eval.effective_value;
+            burned_amount += eval.burned_value;
+            ++selected_inputs;
+        }
+        if (selected_inputs == 0) {
+            ThrowQuantumActionError(
+                RPC_WALLET_INSUFFICIENT_FUNDS,
+                "Demurrage sweep",
+                "No spendable wallet-owned quantum outputs are currently decaying",
+                created_destination);
+        }
+        if (effective_amount <= 0) {
+            ThrowQuantumActionError(
+                RPC_WALLET_INSUFFICIENT_FUNDS,
+                "Demurrage sweep",
+                "Selected decaying outputs have no spendable effective value",
+                created_destination);
+        }
+
+        const int64_t current_time = GetAdjustedTimeSeconds();
+        const CFeeRate fee_rate = GetMinimumFeeRate(*pwallet, coin_control, current_time);
+        if (coin_control.m_feerate && fee_rate > *coin_control.m_feerate) {
+            ThrowQuantumActionError(
+                RPC_INVALID_PARAMETER,
+                "Demurrage sweep",
+                strprintf("Fee rate (%s) is lower than the minimum fee rate setting (%s)", coin_control.m_feerate->ToString(FeeEstimateMode::SAT_VB), fee_rate.ToString(FeeEstimateMode::SAT_VB)),
+                created_destination);
+        }
+
+        CMutableTransaction sweep_tx;
+        sweep_tx.nVersion = CTransaction::CURRENT_VERSION;
+        sweep_tx.nTime = current_time;
+        static constexpr uint32_t MAX_SEQUENCE_NONFINAL = 0xfffffffe;
+        for (const COutPoint& outpoint : selected_outpoints) {
+            sweep_tx.vin.emplace_back(outpoint, CScript(), MAX_SEQUENCE_NONFINAL);
+        }
+        sweep_tx.vout.emplace_back(effective_amount, GetScriptForDestination(dest));
+
+        const TxSize tx_size = CalculateMaximumSignedTxSize(CTransaction(sweep_tx), pwallet.get(), &coin_control);
+        if (tx_size.vsize <= 0) {
+            ThrowQuantumActionError(
+                RPC_WALLET_ERROR,
+                "Demurrage sweep",
+                "Unable to estimate demurrage sweep transaction size",
+                created_destination);
+        }
+        const CAmount fee = std::max(GetMinFee(static_cast<size_t>(tx_size.vsize), static_cast<uint32_t>(current_time)), fee_rate.GetFee(static_cast<uint32_t>(tx_size.vsize)));
+        if (fee > pwallet->m_default_max_tx_fee) {
+            ThrowQuantumActionError(
+                RPC_WALLET_ERROR,
+                "Demurrage sweep",
+                strprintf("Fee exceeds wallet max transaction fee (%s)", FormatMoney(pwallet->m_default_max_tx_fee)),
+                created_destination);
+        }
+        const CAmount output_amount = effective_amount - fee;
+        if (!MoneyRange(output_amount) || output_amount <= 0) {
+            ThrowQuantumActionError(
+                RPC_WALLET_INSUFFICIENT_FUNDS,
+                "Demurrage sweep",
+                "Selected decaying outputs cannot pay the sweep fee",
+                created_destination);
+        }
+        sweep_tx.vout[0].nValue = output_amount;
+
+        if (IsDust(sweep_tx.vout[0], pwallet->chain().relayDustFee())) {
+            ThrowQuantumActionError(
+                RPC_WALLET_INSUFFICIENT_FUNDS,
+                "Demurrage sweep",
+                "Demurrage sweep would strand the effective value below dust after fees",
+                created_destination);
+        }
+        if (!dry_run) {
+            std::map<int, bilingual_str> input_errors;
+            if (!pwallet->SignTransaction(sweep_tx, input_errors)) {
+                if (!input_errors.empty()) {
+                    ThrowQuantumActionError(
+                        RPC_WALLET_ERROR,
+                        "Demurrage sweep",
+                        strprintf("Signing demurrage sweep failed: %s", input_errors.begin()->second.original),
+                        created_destination);
+                }
+                ThrowQuantumActionError(
+                    RPC_WALLET_ERROR,
+                    "Demurrage sweep",
+                    "Signing demurrage sweep failed",
+                    created_destination);
+            }
+        }
+        tx = MakeTransactionRef(std::move(sweep_tx));
+        const int result_vsize = dry_run ? static_cast<int>(tx_size.vsize) : static_cast<int>(GetVirtualTransactionSize(*tx, 0, 0));
+
+        obj.pushKV("dry_run", dry_run);
+        obj.pushKV("evaluation_height", evaluation_height);
+        obj.pushKV("evaluation_time", evaluation_time);
+        obj.pushKV("selected_inputs", selected_inputs);
+        obj.pushKV("skipped_locked_outputs", skipped_locked_outputs);
+        obj.pushKV("nominal_amount", ValueFromAmount(nominal_amount));
+        obj.pushKV("effective_amount", ValueFromAmount(effective_amount));
+        obj.pushKV("burned_amount", ValueFromAmount(burned_amount));
+        obj.pushKV("skipped_locked_amount", ValueFromAmount(skipped_locked_amount));
+        obj.pushKV("destination", EncodeDestination(dest));
+        obj.pushKV("newly_generated", newly_generated);
+        obj.pushKV("amount", ValueFromAmount(tx->vout[0].nValue));
+        obj.pushKV("fee", ValueFromAmount(fee));
+        obj.pushKV("vsize", result_vsize);
+        obj.pushKV("hex", EncodeHexTx(*tx));
+    }
     if (!dry_run) {
         mapValue_t map_value;
         map_value["comment"] = "Blackcoin demurrage sweep";
@@ -6022,6 +6480,8 @@ static const CRPCCommand commands[] =
 { //  category              actor (function)
   //  ------------------    ------------------------
     { "staking",            &getstakinginfo,                 },
+    { "staking",            &setquantumstakereturn,          },
+    { "staking",            &getquantumstakereadiness,       },
     { "staking",            &getstakingdonationinfo,         },
     { "staking",            &setstakingdonation,             },
     { "staking",            &getqqdevelopmentdonationinfo,   },

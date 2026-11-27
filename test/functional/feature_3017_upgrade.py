@@ -2,11 +2,11 @@
 # Copyright (c) 2026 The Blackcoin developers
 # Distributed under the MIT software license, see the accompanying
 # file COPYING or https://www.opensource.org/licenses/mit-license.php.
-"""Exercise 30.1.5.2 -> 30.1.6 -> 30.1.5.2 on synthetic regtest wallets.
+"""Exercise 30.1.6 -> 30.1.7 -> 30.1.6 on synthetic regtest wallets.
 
-Requires --baseline-bitcoind or BLACKCOIN_30152_BITCOIND pointing to an
-independently built 30.1.5.2 daemon. The baseline reports numeric RPC version
-300105 and the candidate 300106; the public subversion is checked as well. No historical wallet,
+Requires --baseline-bitcoind or BLACKCOIN_V30_1_6_BINARY pointing to the
+unmodified published 30.1.6 daemon. The baseline reports numeric RPC version
+300106 and the candidate 300107; the public subversion is checked as well. No historical wallet,
 production datadir, RPC endpoint or secret is accepted as input. This is a
 bounded compatibility fixture, not a guarantee of arbitrary downgrade safety.
 """
@@ -23,16 +23,16 @@ from test_framework.blocktools import COINBASE_MATURITY
 from test_framework.test_framework import BitcoinTestFramework, SkipTest
 from test_framework.util import assert_equal
 
-BASELINE = "30.1.5.2"
-CANDIDATE = "30.1.6"
-RPC_VERSIONS = {BASELINE: 300105, CANDIDATE: 300106}
+BASELINE = "30.1.6"
+CANDIDATE = "30.1.7"
+RPC_VERSIONS = {BASELINE: 300106, CANDIDATE: 300107}
 
 
-class Upgrade3016Test(BitcoinTestFramework):
+class Upgrade3017Test(BitcoinTestFramework):
     def add_options(self, parser):
         self.add_wallet_options(parser, descriptors=True, legacy=False)
-        parser.add_argument("--baseline-bitcoind", default=os.getenv("BLACKCOIN_30152_BITCOIND"),
-                            help="Explicit independently built 30.1.5.2 daemon")
+        parser.add_argument("--baseline-bitcoind", default=os.getenv("BLACKCOIN_V30_1_6_BINARY"),
+                            help="Explicit unmodified published 30.1.6 daemon")
         parser.add_argument("--require-bdb", action="store_true",
                             help="Fail unless both builds exercise a legacy BDB wallet too")
 
@@ -47,7 +47,7 @@ class Upgrade3016Test(BitcoinTestFramework):
     def skip_test_if_missing_module(self):
         self.skip_if_no_wallet()
         if not self.options.baseline_bitcoind:
-            raise SkipTest("explicit 30.1.5.2 --baseline-bitcoind is required")
+            raise SkipTest("explicit 30.1.6 --baseline-bitcoind is required")
         baseline = Path(self.options.baseline_bitcoind).resolve(strict=True)
         candidate = Path(self.options.bitcoind).resolve(strict=True)
         assert baseline != candidate, "baseline and candidate must be distinct binaries"
@@ -80,9 +80,9 @@ class Upgrade3016Test(BitcoinTestFramework):
         assert set(self.wallets).issubset(node.listwallets())
 
     def _amounts(self, wallet):
-        # 30.1.6 also reports which snapshot the amounts come from. 30.1.5.2
-        # does not, so wait for an exact snapshot at the tip and compare the
-        # amounts alone.
+        # Both builds may report which snapshot the amounts come from. Wait for
+        # an exact snapshot at the tip when they do, and compare the amounts
+        # alone.
         def exact_at_tip():
             balances = wallet.getbalances()
             return "balance_exact" not in balances or (
@@ -104,7 +104,7 @@ class Upgrade3016Test(BitcoinTestFramework):
                               if key in address_info}
             # A fresh signature proves retained private key ownership without
             # exporting key material. Addresses here are ordinary legacy P2PKH.
-            message = "isolated 30.1.6 compatibility fixture"
+            message = "isolated 30.1.7 compatibility fixture"
             assert node.verifymessage(address, wallet.signmessage(address, message), message)
         quantum = wallet.getquantumkeyinventory()
         assert_equal(quantum["total"], 1)
@@ -229,4 +229,4 @@ class Upgrade3016Test(BitcoinTestFramework):
 
 
 if __name__ == '__main__':
-    Upgrade3016Test().main()
+    Upgrade3017Test().main()

@@ -121,6 +121,8 @@ public:
     bool m_commit_records_on_failure{false};
     bool m_fail_abort{false};
     size_t m_commit_calls{0};
+    // Number of batches handed out (a test seam for code that must not open one).
+    size_t m_batches_made{0};
     size_t m_abort_calls{0};
     bool m_fail_commit_after_apply{false};
     bool m_fail_cursor_create{false};
@@ -148,7 +150,7 @@ public:
     std::string Filename() override { return "mockable"; }
     std::vector<fs::path> Files() override { return {fs::PathFromString(Filename())}; }
     std::string Format() override { return "mock"; }
-    std::unique_ptr<DatabaseBatch> MakeBatch(bool flush_on_close = true) override { return std::make_unique<MockableBatch>(*this); }
+    std::unique_ptr<DatabaseBatch> MakeBatch(bool flush_on_close = true) override { ++m_batches_made; return std::make_unique<MockableBatch>(*this); }
 };
 
 std::unique_ptr<WalletDatabase> CreateMockableWalletDatabase(MockableData records = {});

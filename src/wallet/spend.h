@@ -565,6 +565,12 @@ struct CoinFilterParams {
     bool only_spendable{true};
     // By default, do not include immature coinbase outputs
     bool include_immature_coinbase{false};
+    // Include coinbase and coinstake outputs that become mature in the
+    // candidate next block. Consensus allows spending them there (depth equal
+    // to the maturity), although the wallet's display formula still counts
+    // one block to go. Used by the legacy migration, whose last block is a
+    // hard deadline.
+    bool include_next_block_mature_coinbase{false};
     // By default, skip locked UTXOs
     bool skip_locked{true};
     // Ordinary wallet funding must not consume Gold Rush rewards while v16
@@ -576,6 +582,14 @@ struct CoinFilterParams {
     // Fully decayed demurrage outputs are consensus-locked. Listing views opt in
     // so users can diagnose them, but ordinary funding skips them.
     bool include_demurrage_locked_outputs{false};
+    // Automatic selection leaves the final stake reserve alone (outputs held back for the first Final block while the
+    // reserve guard is on, see FinalStakeReserve). Always read fresh. Explicitly selected coins are not affected
+    // because they never pass through this scan.
+    bool avoid_final_stake_reserve{false};
+    // Outputs whose coin lock the staking scan ignores. Only the commit-time reserve check sets it: a lock the wallet
+    // itself put on the automatic inputs of the transaction it is committing (lock_unspents) must not take them out
+    // of the reserve. Not owned; the set outlives the scan.
+    const std::set<COutPoint>* staking_scan_ignores_lock_of{nullptr};
     // Optional cooperative cancellation for long read-only listings. Checked
     // every INTERRUPT_CHECK_INTERVAL transaction/output visits; when true
     // the walk stops early and CoinsResult::interrupted is set. Funding paths
@@ -749,7 +763,8 @@ util::Result<CreatedTransactionResult> CreateUTXOOptimizationTransaction(CWallet
 
 /**
  * Insert additional inputs into the transaction by
- * calling CreateTransaction();
+ * calling CreateTransaction(). With lockUnspents the inputs are locked; operation_locks, when given, receives
+ * the ones this call locked itself (an input that was locked before is not listed).
  */
 bool FundTransaction(
     CWallet& wallet,
@@ -760,7 +775,8 @@ bool FundTransaction(
     bool lockUnspents,
     const std::set<int>& setSubtractFeeFromOutputs,
     CCoinControl,
-    std::optional<CTxDestination>* created_quantum_change = nullptr);
+    std::optional<CTxDestination>* created_quantum_change = nullptr,
+    std::set<COutPoint>* operation_locks = nullptr);
 } // namespace wallet
 
 #endif // BITCOIN_WALLET_SPEND_H

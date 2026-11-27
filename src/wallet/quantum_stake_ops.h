@@ -9,6 +9,7 @@
 #include <interfaces/wallet.h>
 #include <primitives/transaction.h>
 #include <util/result.h>
+#include <wallet/wallet.h>
 
 #include <optional>
 #include <string>
@@ -30,7 +31,7 @@ util::Result<interfaces::WalletQuantumOperatorBondTx> FundTieredStakeAddress(
     CAmount amount,
     bool require_operator_lock,
     std::string comment,
-    bool allow_new_quantum_key);
+    bool allow_new_quantum_key) LOCKS_EXCLUDED(wallet.cs_wallet);
 
 util::Result<interfaces::WalletQuantumOperatorBondTx> WithdrawTieredStakeAddress(
     CWallet& wallet,
@@ -42,20 +43,20 @@ util::Result<interfaces::WalletQuantumOperatorBondTx> WithdrawTieredStakeAddress
     std::string withdrawal_comment,
     std::optional<COutPoint> selected_outpoint = std::nullopt,
     bool allow_all_outputs = true,
-    bool allow_new_quantum_key = false);
+    bool allow_new_quantum_key = false) LOCKS_EXCLUDED(wallet.cs_wallet);
 
 util::Result<interfaces::WalletQuantumOperatorBondTx> FundColdStakeDelegationAddress(
     CWallet& wallet,
     const std::string& address,
     CAmount amount,
     bool allow_goldrush_migration,
-    bool allow_new_quantum_key);
+    bool allow_new_quantum_key) LOCKS_EXCLUDED(wallet.cs_wallet);
 util::Result<interfaces::WalletQuantumOperatorBondTx> WithdrawColdStakeDelegationAddress(
     CWallet& wallet,
     const std::string& address,
     std::optional<COutPoint> selected_outpoint = std::nullopt,
     bool allow_all_outputs = true,
-    bool allow_new_quantum_key = false);
+    bool allow_new_quantum_key = false) LOCKS_EXCLUDED(wallet.cs_wallet);
 
 util::Result<interfaces::WalletQuantumActionTx> CreateQuantumMigrationSweep(
     CWallet& wallet,
@@ -63,7 +64,11 @@ util::Result<interfaces::WalletQuantumActionTx> CreateQuantumMigrationSweep(
     bool allow_goldrush_epoch = false,
     const std::string& destination_label = "",
     const std::string& comment_override = "",
-    bool allow_new_quantum_key = false);
+    bool allow_new_quantum_key = false,
+    //! Reuse this wallet-owned quantum address instead of creating a key.
+    const std::string& existing_address = "",
+    //! 0 means the default batch size for the action.
+    size_t max_inputs = 0) LOCKS_EXCLUDED(wallet.cs_wallet);
 
 } // namespace wallet
 

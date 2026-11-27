@@ -39,6 +39,7 @@ struct RGBOwnedAssignmentRecord;
 struct RGBTransitionProofRecord;
 struct RGBTransitionRecord;
 struct QuantumColdStakeDelegationRecord;
+struct QuantumStakeReturnPendingRecord;
 struct WalletContext;
 
 /**
@@ -107,6 +108,9 @@ extern const std::string QUANTUM_COLDSTAKE;
 extern const std::string QUANTUM_KEY_BACKUP_STATE;
 extern const std::string QUANTUM_KEY;
 extern const std::string QUANTUM_REDELEGATION_AUTO_SCAN;
+extern const std::string QUANTUM_REDELEGATION_AUTO_SCAN_TIP;
+extern const std::string QUANTUM_STAKE_RETURN;
+extern const std::string QUANTUM_STAKE_RETURN_PENDING;
 extern const std::string QUANTUM_REDELEGATION_LAST_ATTEMPT;
 extern const std::string QUANTUM_REDELEGATION_LAST_SUCCESS;
 extern const std::string QUANTUM_REDELEGATION_LAST_WIN;
@@ -334,10 +338,19 @@ public:
     bool WriteQuantumKeyBackupState(const std::vector<unsigned char>& witness_program, bool verified);
     bool WriteQuantumColdStakeDelegation(const std::vector<unsigned char>& witness_program, const QuantumColdStakeDelegationRecord& record);
     bool WriteQuantumRedelegationAutoScanHeight(int height);
+    /** Companion of the scan height: the tip the scan ran on. Wallet software
+     *  that only knows the height record leaves this one stale, which the
+     *  loader detects by its height and treats as "scan again". */
+    bool WriteQuantumRedelegationAutoScanTip(int height, const uint256& tip);
+    bool WriteQuantumStakeReturn(const std::string& address);
+    bool WriteQuantumStakeReturnPending(const QuantumStakeReturnPendingRecord& record);
+    bool EraseQuantumStakeReturnPending();
     bool WriteQuantumRedelegationLastAttemptHeight(const std::vector<unsigned char>& witness_program, int height);
     bool WriteQuantumRedelegationLastSuccessHeight(const std::vector<unsigned char>& witness_program, int height);
     bool WriteQuantumRedelegationLastWinHeight(const std::vector<unsigned char>& witness_program, int height);
     bool EraseQuantumRedelegationLastWinHeight(const std::vector<unsigned char>& witness_program);
+    bool EraseQuantumRedelegationLastAttemptHeight(const std::vector<unsigned char>& witness_program);
+    bool EraseQuantumRedelegationLastSuccessHeight(const std::vector<unsigned char>& witness_program);
     bool WriteRGBContract(const uint256& contract_id, const RGBContractRecord& record);
     bool WriteRGBAssignment(const uint256& contract_id, const COutPoint& outpoint, const RGBOwnedAssignmentRecord& record);
     bool WriteRGBGenesisProof(const uint256& contract_id, const RGBGenesisProofRecord& record);

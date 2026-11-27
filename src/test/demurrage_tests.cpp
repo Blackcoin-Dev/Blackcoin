@@ -19,6 +19,7 @@
 #include <span.h>
 #include <streams.h>
 #include <test/util/setup_common.h>
+#include <validation.h>
 
 #include <boost/test/unit_test.hpp>
 
@@ -250,6 +251,39 @@ BOOST_AUTO_TEST_CASE(curve_boundaries_and_flooring)
     BOOST_CHECK_EQUAL(DemurrageEffectiveValue(1 * COIN, 750000), 75000000);
     BOOST_CHECK_EQUAL(DemurrageEffectiveValue(1, 999999), 0);
     BOOST_CHECK_EQUAL(DemurrageEffectiveValue(MAX_MONEY, DEMURRAGE_PPM), MAX_MONEY);
+}
+
+BOOST_AUTO_TEST_CASE(blocks_until_first_reduction_matches_the_curve)
+{
+    using namespace Consensus;
+
+    for (const int blocks_per_month : {1, 7, 100, 40500}) {
+        Consensus::Params params;
+        params.nDemurrageBlocksPerMonth = blocks_per_month;
+        const int grace = params.DemurrageGraceBlocks();
+        const int zero = params.DemurrageZeroBlocks();
+        // Brute force: the first inactive count whose remaining fraction is below 100%.
+        int first_reduced{-1};
+        for (int inactive = 0; inactive <= zero; ++inactive) {
+            if (DemurrageRemainingPpm(inactive, params) < DEMURRAGE_PPM) {
+                first_reduced = inactive;
+                break;
+            }
+        }
+        BOOST_REQUIRE(first_reduced > grace);
+        BOOST_CHECK_EQUAL(DemurrageBlocksUntilFirstReduction(0, params), first_reduced);
+        // The old status value reaches zero at the end of grace, which is still before any reduction.
+        BOOST_CHECK_EQUAL(DemurrageBlocksUntilFirstReduction(grace, params), first_reduced - grace);
+        BOOST_CHECK(DemurrageBlocksUntilFirstReduction(grace, params) > 0);
+        BOOST_CHECK_EQUAL(DemurrageBlocksUntilFirstReduction(first_reduced - 1, params), 1);
+        BOOST_CHECK_EQUAL(DemurrageBlocksUntilFirstReduction(first_reduced, params), 0);
+        BOOST_CHECK_EQUAL(DemurrageBlocksUntilFirstReduction(zero + 5, params), 0);
+        BOOST_CHECK(DemurrageRemainingPpm(first_reduced - 1, params) == DEMURRAGE_PPM);
+    }
+    // Mainnet shape: the first reduction is 729 blocks after the end of grace.
+    Consensus::Params mainnet_shape;
+    mainnet_shape.nDemurrageBlocksPerMonth = 40500;
+    BOOST_CHECK_EQUAL(DemurrageBlocksUntilFirstReduction(mainnet_shape.DemurrageGraceBlocks(), mainnet_shape), 729);
 }
 
 BOOST_AUTO_TEST_CASE(decay_is_destroyed_and_never_reclassified_as_transaction_fee)
@@ -1078,6 +1112,189 @@ BOOST_AUTO_TEST_CASE(adjusted_value_in_uses_attestation_index)
     BOOST_REQUIRE(ApplyDemurrageBlock(view, attest_block, &attest_index, params, reject_reason));
 
     BOOST_CHECK_EQUAL(GetDemurrageAdjustedValueIn(spend, view, params, spend_height, TEST_POST_MIGRATION_TIME), 10 * COIN);
+}
+
+namespace {
+//! A transaction carrying one attestation for the default target, signed over the stated previous state.
+CTransaction AttestationTx(const std::vector<unsigned char>& private_key, const std::vector<unsigned char>& public_key,
+                           const COutPoint& anchor, std::optional<int> previous_height = std::nullopt,
+                           uint32_t previous_time = 0, uint32_t previous_coverage = 0,
+                           std::optional<Consensus::DemurrageAttestationSource> previous_source = std::nullopt,
+                           bool break_signature = false)
+{
+    std::vector<unsigned char> signature = SignAttestation(private_key, anchor, public_key, DefaultAttestationTarget(),
+                                                           previous_height, previous_time, previous_coverage, previous_source);
+    if (break_signature) signature[0] ^= 0x01;
+    CMutableTransaction mtx;
+    mtx.vin.emplace_back(anchor);
+    mtx.vout.emplace_back(0, BuildTestAttestationScript(anchor, public_key, signature, DefaultAttestationTarget(),
+                                                        previous_height, previous_time, previous_coverage, previous_source));
+    return CTransaction{mtx};
+}
+} // namespace
+
+// The mempool looks at an attestation's state before it pays for the ML-DSA verification. A payload
+// that names an old state, a locked target or a too-early attestation is turned away without any
+// verification and without punishing the relaying peer; a bad signature on a current state still costs
+// one verification and is punitive; block validation is unchanged.
+BOOST_AUTO_TEST_CASE(attestation_preflight_spares_verification_for_stale_locked_and_early_candidates)
+{
+    using namespace Consensus;
+
+    std::vector<unsigned char> public_key, private_key;
+    BOOST_REQUIRE(ML_DSA::KeyGen(public_key, private_key));
+    const int height = 1234;
+    Consensus::Params params = ActiveParams(/*activation_height=*/1);
+
+    // A first attestation is in a block: the key has a state at `height`.
+    const COutPoint first_anchor{uint256::ONE, 0};
+    const CTransaction first = AttestationTx(private_key, public_key, first_anchor);
+    CBlock block;
+    block.vtx.push_back(MakeTransactionRef(first));
+    const uint256 block_hash = block.GetHash();
+    CBlockIndex index;
+    InitTestIndex(index, height, block_hash);
+    CCoinsView base;
+    CCoinsViewCache view(&base);
+    view.AddCoin(DefaultAttestationTarget(), TestCoin(COIN, /*height=*/1, QuantumMigrationScriptForPubkey(public_key)), false);
+    CBlockIndex activation_predecessor;
+    const uint256 activation_predecessor_hash = uint256S("01");
+    AttachActivationPredecessor(view, index, params, activation_predecessor, activation_predecessor_hash);
+    std::string reject_reason;
+    BOOST_REQUIRE(ApplyDemurrageBlock(view, block, &index, params, reject_reason));
+    const DemurrageAttestationSource source{index.GetBlockHash(), first.GetHash(), /*output_index=*/0};
+
+    const int64_t t = TEST_POST_MIGRATION_TIME;
+    // 1. Stale: a validly signed attestation over "no previous state" arrives after another confirmed.
+    const CTransaction stale = AttestationTx(private_key, public_key, COutPoint{uint256::ONE, 1});
+    const uint64_t before = ML_DSA::VerifyCallCount();
+    for (int i = 0; i < 50; ++i) {
+        reject_reason.clear();
+        BOOST_CHECK(PreflightDemurrageAttestations(stale, view, params, height + 100, t, reject_reason) ==
+                    DemurrageAttestationPreflightResult::NON_PUNITIVE);
+        BOOST_CHECK_EQUAL(reject_reason, "stale-demurrage-attestation-state");
+    }
+    BOOST_CHECK_EQUAL(ML_DSA::VerifyCallCount(), before); // a flood of stale candidates verifies nothing
+    // The full check (what the mempool ran before, and block validation still runs) pays for one.
+    std::set<uint256> keys;
+    size_t count{0};
+    reject_reason.clear();
+    BOOST_CHECK(CheckDemurrageAttestationsDetailed(stale, view, params, height + 100, t, keys, count, reject_reason) ==
+                DemurrageAttestationValidationResult::INVALID);
+    BOOST_CHECK_EQUAL(reject_reason, "stale-demurrage-attestation-state");
+    BOOST_CHECK_EQUAL(ML_DSA::VerifyCallCount(), before + 1);
+
+    // 2. Too early: the current state is referenced correctly but the interval has not passed.
+    const CTransaction early = AttestationTx(private_key, public_key, COutPoint{uint256::ONE, 2},
+                                             height, index.GetBlockTime(), height, source);
+    const uint64_t before_early = ML_DSA::VerifyCallCount();
+    reject_reason.clear();
+    BOOST_CHECK(PreflightDemurrageAttestations(early, view, params, height + 1, t, reject_reason) ==
+                DemurrageAttestationPreflightResult::NON_PUNITIVE);
+    BOOST_CHECK_EQUAL(reject_reason, "demurrage-attestation-too-soon");
+    BOOST_CHECK_EQUAL(ML_DSA::VerifyCallCount(), before_early);
+
+    // 3. A current state, a good signature and enough time: passes the preflight and the full check.
+    const int ok_height = height + params.DemurrageAutoAttestBlocks();
+    const CTransaction honest = AttestationTx(private_key, public_key, COutPoint{uint256::ONE, 3},
+                                              height, index.GetBlockTime(), height, source);
+    reject_reason.clear();
+    BOOST_CHECK(PreflightDemurrageAttestations(honest, view, params, ok_height, t, reject_reason) ==
+                DemurrageAttestationPreflightResult::PASS);
+    keys.clear();
+    count = 0;
+    BOOST_CHECK(CheckDemurrageAttestationsDetailed(honest, view, params, ok_height, t, keys, count, reject_reason) ==
+                DemurrageAttestationValidationResult::VALID);
+
+    // 4. Bad-signature control: the cheap checks pass, so the signature is verified (once) and the
+    // result stays punitive (INVALID from the full check; the mempool maps it to TX_CONSENSUS).
+    const CTransaction forged = AttestationTx(private_key, public_key, COutPoint{uint256::ONE, 4},
+                                              height, index.GetBlockTime(), height, source, /*break_signature=*/true);
+    const uint64_t before_forged = ML_DSA::VerifyCallCount();
+    reject_reason.clear();
+    BOOST_CHECK(PreflightDemurrageAttestations(forged, view, params, ok_height, t, reject_reason) ==
+                DemurrageAttestationPreflightResult::PASS);
+    BOOST_CHECK_EQUAL(ML_DSA::VerifyCallCount(), before_forged);
+    keys.clear();
+    count = 0;
+    BOOST_CHECK(CheckDemurrageAttestationsDetailed(forged, view, params, ok_height, t, keys, count, reject_reason) ==
+                DemurrageAttestationValidationResult::INVALID);
+    BOOST_CHECK_EQUAL(reject_reason, "bad-demurrage-attestation-signature");
+    BOOST_CHECK_EQUAL(ML_DSA::VerifyCallCount(), before_forged + 1);
+
+    // 5. Cheap structural invalidity is classed invalid: the attesting key does not control the target.
+    std::vector<unsigned char> other_public, other_private;
+    BOOST_REQUIRE(ML_DSA::KeyGen(other_public, other_private));
+    const CTransaction wrong_key = AttestationTx(other_private, other_public, COutPoint{uint256::ONE, 5});
+    reject_reason.clear();
+    BOOST_CHECK(PreflightDemurrageAttestations(wrong_key, view, params, ok_height, t, reject_reason) ==
+                DemurrageAttestationPreflightResult::INVALID);
+    BOOST_CHECK_EQUAL(reject_reason, "bad-demurrage-attestation-target");
+
+    // 6. Block validation is unchanged: the stale attestation in a block is still refused by the full path.
+    CBlock stale_block;
+    stale_block.vtx.push_back(MakeTransactionRef(stale));
+    const uint256 stale_block_hash = stale_block.GetHash();
+    CBlockIndex stale_index;
+    InitTestIndex(stale_index, height + 100, stale_block_hash);
+    stale_index.pprev = &index;
+    reject_reason.clear();
+    BOOST_CHECK(!ApplyDemurrageBlock(view, stale_block, &stale_index, params, reject_reason));
+    BOOST_CHECK_EQUAL(reject_reason, "stale-demurrage-attestation-state");
+
+    // 7. The mempool mapping: stale is not punitive (recent consensus change), a structural fault is.
+    {
+        TxValidationState state;
+        BOOST_CHECK(!PreflightMempoolDemurrageAttestations(stale, view, params, height + 100, t, state));
+        BOOST_CHECK(state.GetResult() == TxValidationResult::TX_RECENT_CONSENSUS_CHANGE);
+        BOOST_CHECK_EQUAL(state.GetRejectReason(), "stale-demurrage-attestation-state");
+    }
+    {
+        TxValidationState state;
+        BOOST_CHECK(!PreflightMempoolDemurrageAttestations(wrong_key, view, params, ok_height, t, state));
+        BOOST_CHECK(state.GetResult() == TxValidationResult::TX_CONSENSUS);
+    }
+    {
+        TxValidationState state;
+        BOOST_CHECK(PreflightMempoolDemurrageAttestations(honest, view, params, ok_height, t, state));
+        BOOST_CHECK(state.IsValid());
+    }
+}
+
+BOOST_AUTO_TEST_CASE(attestation_preflight_refuses_a_locked_target_without_verification)
+{
+    using namespace Consensus;
+
+    std::vector<unsigned char> public_key, private_key;
+    BOOST_REQUIRE(ML_DSA::KeyGen(public_key, private_key));
+    Consensus::Params params = ActiveParams(/*activation_height=*/1);
+    CCoinsView base;
+    CCoinsViewCache view(&base);
+    view.AddCoin(DefaultAttestationTarget(), TestCoin(COIN, /*height=*/1, QuantumMigrationScriptForPubkey(public_key)), false);
+    const int locked_height = 1 + DEMURRAGE_ZERO_BLOCKS;
+    BOOST_REQUIRE(EvaluateDemurrage(TestCoin(COIN, 1, QuantumMigrationScriptForPubkey(public_key)), params,
+                                    locked_height, TEST_POST_MIGRATION_TIME).locked);
+
+    const CTransaction tx = AttestationTx(private_key, public_key, COutPoint{uint256::ONE, 9});
+    const uint64_t before = ML_DSA::VerifyCallCount();
+    std::string reject_reason;
+    BOOST_CHECK(PreflightDemurrageAttestations(tx, view, params, locked_height, TEST_POST_MIGRATION_TIME, reject_reason) ==
+                DemurrageAttestationPreflightResult::NON_PUNITIVE);
+    BOOST_CHECK_EQUAL(reject_reason, "demurrage-attestation-target-locked");
+    BOOST_CHECK_EQUAL(ML_DSA::VerifyCallCount(), before);
+    TxValidationState state;
+    BOOST_CHECK(!PreflightMempoolDemurrageAttestations(tx, view, params, locked_height, TEST_POST_MIGRATION_TIME, state));
+    BOOST_CHECK(state.GetResult() == TxValidationResult::TX_RECENT_CONSENSUS_CHANGE);
+    // Before the target is locked the same attestation passes.
+    reject_reason.clear();
+    BOOST_CHECK(PreflightDemurrageAttestations(tx, view, params, 1 + DEMURRAGE_ZERO_BLOCKS - 10, TEST_POST_MIGRATION_TIME,
+                                               reject_reason) == DemurrageAttestationPreflightResult::PASS);
+    // A transaction without attestations is not this function's business.
+    CMutableTransaction plain;
+    plain.vin.emplace_back(COutPoint{uint256::ONE, 11});
+    plain.vout.emplace_back(1, CScript() << OP_TRUE);
+    BOOST_CHECK(PreflightDemurrageAttestations(CTransaction{plain}, view, params, locked_height, TEST_POST_MIGRATION_TIME,
+                                               reject_reason) == DemurrageAttestationPreflightResult::PASS);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

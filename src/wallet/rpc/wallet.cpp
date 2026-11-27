@@ -100,6 +100,7 @@ static RPCHelpMan getwalletinfo()
                                 }},
                             }},
                         }},
+                        {RPCResult::Type::OBJ, "closed_claim_reserved", /*optional=*/true, "only present while Gold Rush claims that can no longer confirm keep a funding input reserved: the amount missing from the spendable balance and the command that releases it", ClosedClaimReservationResults()},
                         RESULT_BALANCE_EXACT,
                         RESULT_BALANCE_HEIGHT,
                         RESULT_BALANCE_BLOCKHASH,
@@ -163,6 +164,7 @@ static RPCHelpMan getwalletinfo()
     obj.pushKV("immature_balance", ValueFromAmount(bal.m_mine_immature));
     obj.pushKV("lifecycle", WalletLifecycleInfoToJSON(
         lifecycle.mine, lifecycle.evaluation_height, lifecycle.evaluation_mtp));
+    AppendClosedClaimReservation(obj, *pwallet);
     AppendPolledBalanceState(obj, *pwallet, polled);
     obj.pushKV("txcount",       (int)pwallet->mapWallet.size());
     const auto kp_oldest = pwallet->GetOldestKeyPoolTime();
@@ -841,6 +843,10 @@ static RPCHelpMan migratewallet()
                 {RPCResult::Type::STR, "watchonly_name", /*optional=*/true, "The name of the migrated wallet containing the watchonly scripts"},
                 {RPCResult::Type::STR, "solvables_name", /*optional=*/true, "The name of the migrated wallet containing solvable but not watched scripts"},
                 {RPCResult::Type::STR, "backup_path", "The location of the backup of the original wallet"},
+                {RPCResult::Type::ARR, "warnings", /*optional=*/true, "Warnings about the migration, for example that the default quantum key backup directory of a migrated wallet is too long for automatic backups on Windows (the wallets are migrated and usable)",
+                    {
+                        {RPCResult::Type::STR, "", "A warning"},
+                    }},
             }
         },
         RPCExamples{
@@ -882,6 +888,11 @@ static RPCHelpMan migratewallet()
                 r.pushKV("solvables_name", res->solvables_wallet->GetName());
             }
             r.pushKV("backup_path", res->backup_path.u8string());
+            if (!res->warnings.empty()) {
+                UniValue warnings{UniValue::VARR};
+                for (const bilingual_str& warning : res->warnings) warnings.push_back(warning.original);
+                r.pushKV("warnings", std::move(warnings));
+            }
 
             return r;
         },

@@ -207,8 +207,15 @@ BOOST_AUTO_TEST_CASE(scheduler_client_is_busy_while_a_callback_is_blocked)
 
 BOOST_FIXTURE_TEST_CASE(chain_reports_busy_while_a_validation_callback_is_blocked, TestingSetup)
 {
-    SyncWithValidationInterfaceQueue();
-    BOOST_CHECK(!m_node.chain->validationCallbacksBusy());
+    {
+        SyncWithValidationInterfaceQueue();
+        const auto deadline = std::chrono::steady_clock::now() + 1s;
+        while (m_node.chain->validationCallbacksBusy() &&
+               std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(1ms);
+        }
+        BOOST_CHECK(!m_node.chain->validationCallbacksBusy());
+    }
     std::promise<void> entered, release;
     CallFunctionInValidationInterfaceQueue([&] {
         entered.set_value();
@@ -221,8 +228,15 @@ BOOST_FIXTURE_TEST_CASE(chain_reports_busy_while_a_validation_callback_is_blocke
         std::this_thread::sleep_for(2ms);
     }
     release.set_value();
-    SyncWithValidationInterfaceQueue();
-    BOOST_CHECK(!m_node.chain->validationCallbacksBusy());
+    {
+        SyncWithValidationInterfaceQueue();
+        const auto deadline = std::chrono::steady_clock::now() + 1s;
+        while (m_node.chain->validationCallbacksBusy() &&
+               std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(1ms);
+        }
+        BOOST_CHECK(!m_node.chain->validationCallbacksBusy());
+    }
 }
 
 // ---- The worker and the published snapshot ---------------------------------

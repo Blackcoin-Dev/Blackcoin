@@ -96,6 +96,12 @@ typedef enum ScriptError_t
     SCRIPT_ERR_OP_CODESEPARATOR,
     SCRIPT_ERR_SIG_FINDANDDELETE,
 
+    /** A legacy ECDSA signature without SIGHASH_FORKID while the flag is
+     * required. Reported with the same text as SCRIPT_ERR_SIG_HASHTYPE; the
+     * separate value only lets mempool acceptance tell it from an undefined
+     * hash type. */
+    SCRIPT_ERR_SIG_FORKID_MISSING,
+
     SCRIPT_ERR_ERROR_COUNT
 } ScriptError;
 

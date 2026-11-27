@@ -107,8 +107,25 @@ static constexpr size_t MAX_DEMURRAGE_ATTESTATIONS_PER_BLOCK = 16;
 
 int64_t DemurrageRemainingPpm(int inactive_blocks);
 int64_t DemurrageRemainingPpm(int inactive_blocks, const Params& params);
+/**
+ * Status only; no consensus rule reads it. Number of further inactive blocks
+ * before the remaining fraction first falls below 100%. DemurrageRemainingPpm
+ * stays at 100% for the grace period and then for the first stretch of the
+ * decay window, because its quadratic term rounds down to zero until the
+ * elapsed time reaches one thousandth of the window. Returns 0 once the
+ * remaining fraction is already below 100%.
+ */
+int DemurrageBlocksUntilFirstReduction(int inactive_blocks, const Params& params);
 CAmount DemurrageEffectiveValue(CAmount nominal_value, int64_t remaining_ppm);
 bool IsDemurrageTreasuryExemptScript(const CScript& script_pub_key, const Params& params);
+/**
+ * The exemption an output's script has for good, whenever demurrage is evaluated: "treasury" (a configured
+ * treasury script) or "non_quantum" (a script demurrage never applies to), or "" when the script can decay.
+ * It does not look at activation, age or attestations, so it answers the question EvaluateDemurrage cannot
+ * before activation (it returns before classifying) and it is not the temporary grace ("young", "attested")
+ * that also sets DemurrageEvaluation::exempt. Reporting only: EvaluateDemurrage does not call it.
+ */
+std::string DemurragePermanentExemption(const CScript& script_pub_key, const Params& params);
 uint256 DemurragePubKeyHash(const std::vector<unsigned char>& pubkey);
 uint256 DemurrageAttestationMessageHash(const COutPoint& replay_anchor,
                                         const COutPoint& target_outpoint,
@@ -146,6 +163,32 @@ DemurrageAttestationValidationResult CheckDemurrageAttestationsDetailed(
                                 std::set<uint256>& attested_keys,
                                 size_t& attestation_count,
                                 std::string& reject_reason);
+/**
+ * Result of the cheap, mempool-only look at attestation payloads that runs before the expensive
+ * ML-DSA verification: PASS (go on to the full check), NON_PUNITIVE (the payload is well formed but
+ * names a state that moved or a target that cannot be attested now: a stale referenced state, a
+ * locked target, an attestation that came too soon; an honest peer can relay any of these after
+ * another transaction confirmed, so the relaying peer is not at fault) or INVALID (cheap structural
+ * invalidity: a bad payload, a target the transaction itself spends, a missing target or one whose
+ * controlling key is not the attesting key).
+ */
+enum class DemurrageAttestationPreflightResult {
+    PASS,
+    NON_PUNITIVE,
+    INVALID,
+};
+/**
+ * Look at every attestation of tx with checks that cost no signature verification: target identity,
+ * controlling key, referenced state, target lock state and the minimum interval. Mempool policy
+ * only: block validation does not call this and its result is unchanged. A local state read failure
+ * is not classified here (PASS) so the full check reports it as before.
+ */
+DemurrageAttestationPreflightResult PreflightDemurrageAttestations(const CTransaction& tx,
+                                                                   const CCoinsViewCache& view,
+                                                                   const Params& params,
+                                                                   int spend_height,
+                                                                   int64_t spend_time,
+                                                                   std::string& reject_reason);
 bool CheckDemurrageAttestations(const CTransaction& tx,
                                 const CCoinsViewCache& view,
                                 const Params& params,

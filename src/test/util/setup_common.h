@@ -46,6 +46,29 @@ std::ostream& operator<<(typename std::enable_if<std::is_enum<T>::value, std::os
 // Blackcoin
 // static constexpr CAmount CENT{1000000};
 
+/** A test may set this to translate every string that goes through _() (see G_TRANSLATION_FUN in setup_common.cpp);
+ *  it must restore it to an empty function. */
+extern std::function<std::string(const char*)> g_test_translation;
+
+/** Installs a translator for the scope and restores the previous one on every exit, an exception or a fatal assertion
+ *  included. Use this, not an assignment to g_test_translation. */
+class ScopedTestTranslation
+{
+public:
+    explicit ScopedTestTranslation(std::function<std::string(const char*)> translator) : m_previous{std::move(g_test_translation)}
+    {
+        g_test_translation = std::move(translator);
+    }
+    //! The marking translator the tests use: every translated string starts with "[T] ".
+    ScopedTestTranslation() : ScopedTestTranslation{[](const char* psz) { return std::string{"[T] "} + psz; }} {}
+    ~ScopedTestTranslation() { g_test_translation = std::move(m_previous); }
+    ScopedTestTranslation(const ScopedTestTranslation&) = delete;
+    ScopedTestTranslation& operator=(const ScopedTestTranslation&) = delete;
+
+private:
+    std::function<std::string(const char*)> m_previous;
+};
+
 /** Basic testing setup.
  * This just configures logging, data dir and chain parameters.
  */

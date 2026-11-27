@@ -84,7 +84,11 @@ using node::LoadChainstate;
 using node::RegenerateCommitments;
 using node::VerifyLoadedChainstate;
 
-const std::function<std::string(const char*)> G_TRANSLATION_FUN = nullptr;
+std::function<std::string(const char*)> g_test_translation;
+// Untranslated unless a test installs g_test_translation (to see that translated text, not the original, reaches a caller).
+const std::function<std::string(const char*)> G_TRANSLATION_FUN = [](const char* psz) {
+    return g_test_translation ? g_test_translation(psz) : std::string{psz};
+};
 UrlDecodeFn* const URL_DECODE = nullptr;
 
 /** Random context to get unique temp data dirs. Separate from g_insecure_rand_ctx, which can be seeded from a const env var */
@@ -97,7 +101,13 @@ std::ostream& operator<<(std::ostream& os, const uint256& num)
 }
 
 BasicTestingSetup::BasicTestingSetup(const ChainType chainType, const std::vector<const char*>& extra_args)
+#ifdef WIN32
+      // A short random component: the wallet backup tests build paths several folders deep under this root, and
+      // Windows refuses a path of 260 characters.
+    : m_path_root{fs::temp_directory_path() / "test_common_" PACKAGE_NAME / g_insecure_rand_ctx_temp_path.rand256().ToString().substr(0, 16)},
+#else
     : m_path_root{fs::temp_directory_path() / "test_common_" PACKAGE_NAME / g_insecure_rand_ctx_temp_path.rand256().ToString()},
+#endif
       m_args{}
 {
     m_node.args = &gArgs;

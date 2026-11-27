@@ -149,4 +149,31 @@ BOOST_AUTO_TEST_CASE(key_io_invalid)
     }
 }
 
+// A mainnet Base58 address can begin with the letters of the Bech32 prefix ("blk", compared without case).
+// It is still a Base58 address and must decode as one.
+BOOST_AUTO_TEST_CASE(base58_addresses_that_start_like_the_bech32_prefix_round_trip)
+{
+    SelectParams(ChainType::MAIN);
+    const std::vector<std::pair<std::string, std::string>> vectors{
+        {"BLK", "ae130a2ec0c92a0ce0b6718c772f48cdaa718de1"},
+        {"BLk", "b2cd70568c71987841b938ed0e11d397738989b7"},
+        {"BLK1", "adfb3fc9ddb5b300b42b2d8aa7c5aae2f251ebe3"},
+        {"BLk1", "b2b5a5f1a95e216c152df4eb3ea835acbb69e7b9"},
+    };
+    for (const auto& [prefix, hash_hex] : vectors) {
+        const std::vector<unsigned char> bytes{ParseHex(hash_hex)};
+        BOOST_REQUIRE_EQUAL(bytes.size(), 20U);
+        uint160 hash;
+        std::copy(bytes.begin(), bytes.end(), hash.begin());
+        const CTxDestination destination{PKHash(hash)};
+        const std::string encoded{EncodeDestination(destination)};
+        BOOST_CHECK_MESSAGE(encoded.substr(0, prefix.size()) == prefix, encoded << " does not start with " << prefix);
+        std::string error;
+        const CTxDestination decoded{DecodeDestination(encoded, error)};
+        BOOST_CHECK_MESSAGE(IsValidDestination(decoded), encoded << ": " << error);
+        BOOST_CHECK(decoded == destination);
+        BOOST_CHECK(IsValidDestinationString(encoded));
+    }
+}
+
 BOOST_AUTO_TEST_SUITE_END()

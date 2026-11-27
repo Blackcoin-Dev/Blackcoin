@@ -30,7 +30,7 @@ from test_framework.util import assert_equal
 
 
 V30_1_4_VERSION = 300104
-CANDIDATE_VERSION = 300106
+CANDIDATE_VERSION = 300107
 REQUIRED_HISTORICAL_VERSIONS = ["v30.1.4"]
 CLAIM_WALLET = "v3014_upgrade_claims"
 POW_PAYOUT_LABEL = "PoW - Quantum Claim Address"

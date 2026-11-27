@@ -681,6 +681,96 @@ static bool CheckInputsFromMempoolAndCache(const CTransaction& tx, TxValidationS
     return CheckInputScripts(tx, state, view, flags, /* cacheSigStore= */ true, /* cacheFullScriptStore= */ true, txdata);
 }
 
+bool IsQuantumLifecycleGateRejectReason(const std::string& reject_reason)
+{
+    // Exactly the explicit phase gates. quantum-output-downgrade, the tier and
+    // covenant rules, attestation rules and bad-goldrush-payout-marker are not
+    // phase gates and stay punitive.
+    static const std::set<std::string> gate_reasons{
+        quantum_reject::LEGACY_SPEND_DISABLED,
+        quantum_reject::LEGACY_OUTPUT_DISABLED,
+        quantum_reject::MIGRATION_SPEND_PREMATURE,
+        quantum_reject::GOLDRUSH_PAYOUT_SPEND_PREMATURE,
+        quantum_reject::LINEAGE_ANCHOR_REQUIRED,
+        quantum_reject::TIER_OUTPUT_PREMATURE,
+        quantum_reject::NESTED_WITNESS_SPEND,
+        quantum_reject::WITNESS_V1_SPEND,
+        quantum_reject::WITNESS_V1_OUTPUT,
+        quantum_reject::UNKNOWN_WITNESS_SPEND,
+        quantum_reject::UNKNOWN_WITNESS_OUTPUT,
+        quantum_reject::EUTXO_SPEND_DISABLED,
+        quantum_reject::EUTXO_OUTPUT_DISABLED,
+    };
+    return gate_reasons.count(reject_reason) != 0;
+}
+
+bool PreflightMempoolDemurrageAttestations(const CTransaction& tx, const CCoinsViewCache& view,
+                                           const Consensus::Params& consensus_params,
+                                           int spend_height, int64_t spend_time,
+                                           TxValidationState& state)
+{
+    std::string reason;
+    switch (Consensus::PreflightDemurrageAttestations(tx, view, consensus_params, spend_height, spend_time, reason)) {
+    case Consensus::DemurrageAttestationPreflightResult::PASS:
+        return true;
+    case Consensus::DemurrageAttestationPreflightResult::NON_PUNITIVE:
+        return state.Invalid(TxValidationResult::TX_RECENT_CONSENSUS_CHANGE, reason,
+                             "the attestation names a state, target or interval that is not current at the next-block evaluation point; no signature was verified");
+    case Consensus::DemurrageAttestationPreflightResult::INVALID:
+        return state.Invalid(TxValidationResult::TX_CONSENSUS, reason);
+    }
+    return true;
+}
+
+bool DemurrageRejectionDependsOnNextBlock(const CTransaction& tx, const CCoinsViewCache& inputs,
+                                          const CBlockIndex& tip, const Consensus::Params& consensus_params,
+                                          const std::string& reject_reason, int64_t fee_time)
+{
+    if (reject_reason != Consensus::REJECT_TX_IN_BELOW_OUT &&
+        reject_reason != Consensus::REJECT_TX_SPENDS_LOCKED_COIN &&
+        reject_reason != Consensus::REJECT_TX_FEE_NOT_ENOUGH) {
+        return false;
+    }
+    if (tx.IsCoinBase() || !inputs.HaveInputs(tx)) return false;
+    // The preceding evaluation point: the spend height of the tip and the
+    // demurrage time of the tip's parent (the next block uses the tip's own
+    // median time past). The input coins and attestation state are read from
+    // the current view, including anything the tip itself committed, so this
+    // is the effect of the demurrage curve moving by one block on the current
+    // inputs, not a replay of the previous chain state.
+    if (!tip.pprev) return false;
+    const int prior_height = tip.nHeight;
+    const int64_t prior_time = tip.pprev->GetMedianTimePast();
+    CAmount value_in{0};
+    for (const CTxIn& txin : tx.vin) {
+        const Coin& coin = inputs.AccessCoin(txin.prevout);
+        if (coin.IsSpent() || !MoneyRange(coin.out.nValue)) return false;
+        const std::optional<Consensus::DemurrageAttestationState> latest_attestation =
+            Consensus::LatestDemurrageAttestationStateForScript(inputs, coin.out.scriptPubKey);
+        const Consensus::DemurrageEvaluation eval = Consensus::EvaluateDemurrage(
+            coin, consensus_params, prior_height, prior_time,
+            latest_attestation ? std::optional<int>{latest_attestation->height} : std::nullopt,
+            latest_attestation ? std::optional<int>{static_cast<int>(latest_attestation->coverage_start_height)} : std::nullopt);
+        // Already locked at the preceding point: not a next-block effect.
+        if (eval.locked) return false;
+        if (!MoneyRange(eval.effective_value)) return false;
+        value_in += eval.effective_value;
+        if (!MoneyRange(value_in)) return false;
+    }
+    // A coinstake has no value-in or fee requirement in CheckTxInputs.
+    if (tx.IsCoinStake()) return reject_reason == Consensus::REJECT_TX_SPENDS_LOCKED_COIN;
+    // The input-value and minimum-fee requirements CheckTxInputs applies must
+    // all have been met at the preceding point, for every supported reason.
+    // This is what keeps a transaction that was already short (more output than
+    // the decayed input, or a fee under the minimum) punitive.
+    const CAmount value_out = tx.GetValueOut();
+    if (value_in < value_out) return false;
+    const CAmount fee = value_in - value_out;
+    if (!MoneyRange(fee)) return false;
+    if (consensus_params.IsProtocolV3_1(fee_time) && fee < GetMinFee(tx, fee_time)) return false;
+    return true;
+}
+
 namespace {
 
 class MemPoolAccept
@@ -877,7 +967,25 @@ private:
     // Looks up inputs, calculates feerate, considers replacement, evaluates
     // package limits, etc. As this function can be invoked for "free" by a peer,
     // only tests that are fast should be done here (to avoid CPU DoS).
-    bool PreChecks(ATMPArgs& args, Workspace& ws) EXCLUSIVE_LOCKS_REQUIRED(cs_main, m_pool.cs);
+    /**
+     * @param[in] verify_attestations When false the ML-DSA verification of demurrage attestations is
+     * left to the caller, which runs VerifyDemurrageAttestations() once every cheap decision has
+     * passed (the package path does so for the whole package).
+     */
+    bool PreChecks(ATMPArgs& args, Workspace& ws, bool verify_attestations = true) EXCLUSIVE_LOCKS_REQUIRED(cs_main, m_pool.cs);
+
+    /**
+     * Full demurrage attestation verification (ML-DSA signatures included) for mempool admission.
+     * It runs after every cheap decision that can reject non-punitively (input value, locks,
+     * minimum fee, standardness, sequence locks, feerate, mempool chain limits), so no signature
+     * is verified for a transaction that one of those decisions turns away without punishing its
+     * sender. It is not a guarantee about every later rejection: script-policy failures and the
+     * final mempool trimming can still reject a transaction whose signatures were verified.
+     * Reads through the view with its mempool backend, exactly as the check did when it ran earlier.
+     */
+    Consensus::DemurrageAttestationValidationResult VerifyDemurrageAttestations(
+        const CTransaction& tx, std::set<uint256>& attested_keys, size_t& attestation_count,
+        std::string& reject_reason) EXCLUSIVE_LOCKS_REQUIRED(cs_main, m_pool.cs);
 
     /*
     // Blackcoin
@@ -894,6 +1002,13 @@ private:
     // Run the script checks using our policy flags. As this can be slow, we should
     // only invoke this on transactions that have otherwise passed policy checks.
     bool PolicyScriptChecks(const ATMPArgs& args, Workspace& ws) EXCLUSIVE_LOCKS_REQUIRED(cs_main, m_pool.cs);
+
+    /** After CheckInputScripts failed with TX_CONSENSUS, reclassify (mempool
+     * only) the failures that only the phase of the next block caused: an
+     * explicit lifecycle gate reason, or the typed missing-SIGHASH_FORKID
+     * script error. */
+    void ClassifyLifecycleScriptFailure(const CTransaction& tx, TxValidationState& state,
+                                        ScriptError mandatory_error) EXCLUSIVE_LOCKS_REQUIRED(cs_main, m_pool.cs);
 
     // Re-run the script checks, using consensus flags, and try to cache the
     // result in the scriptcache. This should be done after
@@ -952,7 +1067,33 @@ static void CollectMempoolDemurrageAttestationState(const CTxMemPool& pool,
     pool.GetDemurrageAttestationState(attested_keys, attestation_count);
 }
 
-bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
+Consensus::DemurrageAttestationValidationResult MemPoolAccept::VerifyDemurrageAttestations(
+    const CTransaction& tx, std::set<uint256>& attested_keys, size_t& attestation_count,
+    std::string& reject_reason)
+{
+    AssertLockHeld(cs_main);
+    AssertLockHeld(m_pool.cs);
+    const CBlockIndex* tip = m_active_chainstate.m_chain.Tip();
+    const Consensus::Params& consensus = m_active_chainstate.m_chainman.GetConsensus();
+    const int next_height = tip ? tip->nHeight + 1 : 0;
+    const int64_t next_block_mtp = tip ? tip->GetMedianTimePast() : GetAdjustedTimeSeconds();
+    // One line per verification pass: the functional tests assert that a transaction turned away by a
+    // cheap decision never reaches this point.
+    if (!Consensus::ExtractDemurrageAttestations(tx).empty()) {
+        LogPrint(BCLog::MEMPOOL, "Verifying demurrage attestation signatures of %s\n", tx.GetHash().ToString());
+    }
+    // PreChecks has switched the view to its dummy backend by now; the check reads the attestation
+    // state through the same backend it always read it through.
+    m_view.SetBackend(m_viewmempool);
+    const Consensus::DemurrageAttestationValidationResult result =
+        Consensus::CheckDemurrageAttestationsDetailed(
+            tx, m_view, consensus, next_height, next_block_mtp,
+            attested_keys, attestation_count, reject_reason);
+    m_view.SetBackend(m_dummy);
+    return result;
+}
+
+bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws, bool verify_attestations)
 {
     AssertLockHeld(cs_main);
     AssertLockHeld(m_pool.cs);
@@ -1163,6 +1304,13 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
     if (!CheckQuantumQuasarTransaction(tx, m_view, script_verify_flags, next_height,
                                        consensus, next_block_mtp,
                                        quantum_reject_reason)) {
+        // A phase gate refusal depends on which block comes next, so a peer
+        // that relayed a transaction valid one block earlier is not
+        // misbehaving. Mempool acceptance only: blocks keep the strict result.
+        if (IsQuantumLifecycleGateRejectReason(quantum_reject_reason)) {
+            return state.Invalid(TxValidationResult::TX_RECENT_CONSENSUS_CHANGE, quantum_reject_reason,
+                                 "the transaction conflicts with lifecycle-dependent rules at the current next-block evaluation point");
+        }
         return state.Invalid(TxValidationResult::TX_CONSENSUS, quantum_reject_reason);
     }
     const std::vector<Consensus::DemurrageAttestation> demurrage_attestations =
@@ -1171,13 +1319,6 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
         if (!consensus.IsDemurrageActive(next_height, next_block_mtp)) {
             return state.Invalid(TxValidationResult::TX_MEMPOOL_POLICY, "demurrage-attestation-premature");
         }
-        std::set<uint256> attested_keys;
-        size_t ignored_mempool_attestation_count{0};
-        CollectMempoolDemurrageAttestationState(m_pool, attested_keys, ignored_mempool_attestation_count);
-        // The 16-attestation cap is a block-construction/consensus cap, not a
-        // global mempool slot limit. Keeping more unique candidates prevents
-        // the first 16 relay arrivals from monopolizing all future blocks.
-        size_t transaction_attestation_count{0};
         for (const Consensus::DemurrageAttestation& attestation : demurrage_attestations) {
             Coin confirmed_target;
             if (!coins_cache.GetCoin(attestation.target_outpoint, confirmed_target) ||
@@ -1190,17 +1331,12 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
                                      "demurrage-attestation-target-conflict");
             }
         }
-        std::string demurrage_reject_reason;
-        const Consensus::DemurrageAttestationValidationResult attestation_result =
-            Consensus::CheckDemurrageAttestationsDetailed(
-                tx, m_view, consensus, next_height, next_block_mtp,
-                attested_keys, transaction_attestation_count, demurrage_reject_reason);
-        if (attestation_result == Consensus::DemurrageAttestationValidationResult::LOCAL_INTERNAL_ERROR) {
-            return state.Error(demurrage_reject_reason);
+        // Cheap state checks first, so stale or locked candidates never reach ML-DSA verification.
+        if (!PreflightMempoolDemurrageAttestations(tx, m_view, consensus, next_height, next_block_mtp, state)) {
+            return false;
         }
-        if (attestation_result == Consensus::DemurrageAttestationValidationResult::INVALID) {
-            return state.Invalid(TxValidationResult::TX_CONSENSUS, demurrage_reject_reason);
-        }
+        // The full verification, ML-DSA included, runs at the end of PreChecks, after the cheap
+        // decisions below (VerifyDemurrageAttestations).
     }
 
     // we have all inputs cached now, so switch back to dummy (to protect
@@ -1231,12 +1367,27 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
     // The mempool holds txs for the next block, so pass height+1 to CheckTxInputs
     if (!Consensus::CheckTxInputs(tx, state, m_view, m_active_chainstate.m_chain.Height() + 1,
                                   next_block_spend_time, next_block_mtp, ws.m_base_fees)) {
-        return false; // state filled in by CheckTxInputs
+        // state filled in by CheckTxInputs. A value, locked-coin or minimum-fee
+        // failure that only the demurrage state of the next block caused is
+        // not evidence against the relaying peer (mempool acceptance only).
+        const std::string input_reject_reason{state.GetRejectReason()};
+        const int64_t input_fee_time{tx.nVersion >= 2 ? next_block_spend_time : static_cast<int64_t>(tx.nTime)};
+        if (state.GetResult() == TxValidationResult::TX_CONSENSUS && tip &&
+            DemurrageRejectionDependsOnNextBlock(tx, m_view, *tip, consensus, input_reject_reason, input_fee_time)) {
+            return state.Invalid(TxValidationResult::TX_RECENT_CONSENSUS_CHANGE, input_reject_reason,
+                                 "the transaction conflicts with the demurrage state at the current next-block evaluation point");
+        }
+        return false;
     }
 
     // Blackcoin: Minimum fee check
-    if (Params().GetConsensus().IsProtocolV3_1(nTimeTx) && ws.m_base_fees < GetMinFee(tx, nTimeTx))
-        return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-txns-fee-not-enough");
+    if (Params().GetConsensus().IsProtocolV3_1(nTimeTx) && ws.m_base_fees < GetMinFee(tx, nTimeTx)) {
+        if (tip && DemurrageRejectionDependsOnNextBlock(tx, m_view, *tip, consensus, Consensus::REJECT_TX_FEE_NOT_ENOUGH, nTimeTx)) {
+            return state.Invalid(TxValidationResult::TX_RECENT_CONSENSUS_CHANGE, Consensus::REJECT_TX_FEE_NOT_ENOUGH,
+                                 "the transaction conflicts with the demurrage state at the current next-block evaluation point");
+        }
+        return state.Invalid(TxValidationResult::TX_CONSENSUS, Consensus::REJECT_TX_FEE_NOT_ENOUGH);
+    }
 
     if (m_pool.m_require_standard && !AreInputsStandard(tx, m_view)) {
         return state.Invalid(TxValidationResult::TX_INPUTS_NOT_STANDARD, "bad-txns-nonstandard-inputs");
@@ -1352,6 +1503,28 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
 
     ws.m_ancestors = *ancestors;
 
+    // Every cheap decision that can turn the transaction away without punishing its sender has
+    // passed: only now pay for the attestation signatures (ML-DSA). The package path defers this to
+    // one pass over the whole package after its own cheap checks.
+    if (verify_attestations && !demurrage_attestations.empty()) {
+        std::set<uint256> attested_keys;
+        size_t ignored_mempool_attestation_count{0};
+        CollectMempoolDemurrageAttestationState(m_pool, attested_keys, ignored_mempool_attestation_count);
+        // The 16-attestation cap is a block-construction/consensus cap, not a
+        // global mempool slot limit. Keeping more unique candidates prevents
+        // the first 16 relay arrivals from monopolizing all future blocks.
+        size_t transaction_attestation_count{0};
+        std::string demurrage_reject_reason;
+        const Consensus::DemurrageAttestationValidationResult attestation_result =
+            VerifyDemurrageAttestations(tx, attested_keys, transaction_attestation_count, demurrage_reject_reason);
+        if (attestation_result == Consensus::DemurrageAttestationValidationResult::LOCAL_INTERNAL_ERROR) {
+            return state.Error(demurrage_reject_reason);
+        }
+        if (attestation_result == Consensus::DemurrageAttestationValidationResult::INVALID) {
+            return state.Invalid(TxValidationResult::TX_CONSENSUS, demurrage_reject_reason);
+        }
+    }
+
     // Blackcoin
     /*
     // A transaction that spends outputs that would be replaced by it is invalid. Now
@@ -1437,6 +1610,33 @@ bool MemPoolAccept::PackageMempoolChecks(const std::vector<CTransactionRef>& txn
    return true;
 }
 
+void MemPoolAccept::ClassifyLifecycleScriptFailure(const CTransaction& tx, TxValidationState& state,
+                                                   ScriptError mandatory_error)
+{
+    AssertLockHeld(cs_main);
+    AssertLockHeld(m_pool.cs);
+    if (state.GetResult() != TxValidationResult::TX_CONSENSUS) return;
+
+    const std::string reject_reason{state.GetRejectReason()};
+    if (IsQuantumLifecycleGateRejectReason(reject_reason)) {
+        state.Invalid(TxValidationResult::TX_RECENT_CONSENSUS_CHANGE, reject_reason,
+                      "the transaction conflicts with lifecycle-dependent rules at the current next-block evaluation point");
+        return;
+    }
+
+    // Missing SIGHASH_FORKID: the script check itself reports a distinct typed
+    // error (SCRIPT_ERR_SIG_FORKID_MISSING) for the first failing input, with
+    // the same public reason text as before. No second script evaluation runs
+    // and no height or time window decides anything: a bad signature, a
+    // malformed encoding or any other script failure carries another error
+    // value and stays punitive. Only that input is classified; the node
+    // rejects the transaction either way.
+    if (mandatory_error == SCRIPT_ERR_SIG_FORKID_MISSING) {
+        state.Invalid(TxValidationResult::TX_RECENT_CONSENSUS_CHANGE, reject_reason,
+                      "a signature does not carry the SIGHASH_FORKID flag required at the current next-block evaluation point");
+    }
+}
+
 bool MemPoolAccept::PolicyScriptChecks(const ATMPArgs& args, Workspace& ws)
 {
     AssertLockHeld(cs_main);
@@ -1448,7 +1648,8 @@ bool MemPoolAccept::PolicyScriptChecks(const ATMPArgs& args, Workspace& ws)
 
     // Check input scripts and signatures.
     // This is done last to help prevent CPU exhaustion denial-of-service attacks.
-    if (!CheckInputScripts(tx, state, m_view, scriptVerifyFlags, true, false, ws.m_precomputed_txdata)) {
+    ScriptError mandatory_script_error{SCRIPT_ERR_OK};
+    if (!CheckInputScriptsWithError(tx, state, m_view, scriptVerifyFlags, true, false, ws.m_precomputed_txdata, &mandatory_script_error)) {
         // SCRIPT_VERIFY_CLEANSTACK requires SCRIPT_VERIFY_WITNESS, so we
         // need to turn both off, and compare against just turning off CLEANSTACK
         // to see if the failure is specifically due to witness validation.
@@ -1459,6 +1660,7 @@ bool MemPoolAccept::PolicyScriptChecks(const ATMPArgs& args, Workspace& ws)
             state.Invalid(TxValidationResult::TX_WITNESS_STRIPPED,
                     state.GetRejectReason(), state.GetDebugMessage());
         }
+        ClassifyLifecycleScriptFailure(tx, state, mandatory_script_error);
         return false; // state filled in by CheckInputScripts
     }
 
@@ -1694,7 +1896,9 @@ PackageMempoolAcceptResult MemPoolAccept::AcceptMultipleTransactions(const std::
 
     // Do all PreChecks first and fail fast to avoid running expensive script checks when unnecessary.
     for (Workspace& ws : workspaces) {
-        if (!PreChecks(args, ws)) {
+        // Attestation signatures are verified once for the package below, after the package's own
+        // cheap checks, not inside a member's PreChecks ahead of the other members' decisions.
+        if (!PreChecks(args, ws, /*verify_attestations=*/false)) {
             if (ws.m_state.IsError()) {
                 package_state.Error(ws.m_state.GetRejectReason());
             } else {
@@ -1782,26 +1986,9 @@ PackageMempoolAcceptResult MemPoolAccept::AcceptMultipleTransactions(const std::
         }
 
         if (consensus.IsDemurrageActive(next_height, next_block_mtp)) {
-            std::set<uint256> attested_keys;
-            size_t ignored_mempool_attestation_count{0};
-            CollectMempoolDemurrageAttestationState(m_pool, attested_keys, ignored_mempool_attestation_count);
-            size_t package_attestation_count{0};
             for (Workspace& ws : workspaces) {
-                std::string demurrage_reject_reason;
-                const Consensus::DemurrageAttestationValidationResult attestation_result =
-                    Consensus::CheckDemurrageAttestationsDetailed(
-                        *ws.m_ptx, m_view, consensus, next_height, next_block_mtp,
-                        attested_keys, package_attestation_count, demurrage_reject_reason);
-                if (attestation_result != Consensus::DemurrageAttestationValidationResult::VALID) {
-                    if (attestation_result == Consensus::DemurrageAttestationValidationResult::LOCAL_INTERNAL_ERROR) {
-                        ws.m_state.Error(demurrage_reject_reason);
-                        package_state.Error(demurrage_reject_reason);
-                    } else {
-                        ws.m_state.Invalid(TxValidationResult::TX_CONSENSUS,
-                                           demurrage_reject_reason);
-                        package_state.Invalid(PackageValidationResult::PCKG_TX,
-                                              "transaction failed");
-                    }
+                if (!PreflightMempoolDemurrageAttestations(*ws.m_ptx, m_view, consensus, next_height, next_block_mtp, ws.m_state)) {
+                    package_state.Invalid(PackageValidationResult::PCKG_TX, "transaction failed");
                     results.emplace(ws.m_ptx->GetWitnessHash(), MempoolAcceptResult::Failure(ws.m_state));
                     return PackageMempoolAcceptResult(package_state, std::move(results));
                 }
@@ -1858,6 +2045,40 @@ PackageMempoolAcceptResult MemPoolAccept::AcceptMultipleTransactions(const std::
     std::string err_string;
     if (txns.size() > 1 && !PackageMempoolChecks(txns, m_total_vsize, package_state)) {
         return PackageMempoolAcceptResult(package_state, std::move(results));
+    }
+
+    // Every cheap package decision has passed (member PreChecks, package feerate, package limits):
+    // verify the attestation signatures now, in one pass over the package with the same accumulated
+    // key set and count the earlier in-line check used.
+    {
+        const CBlockIndex* tip = m_active_chainstate.m_chain.Tip();
+        const Consensus::Params& consensus = m_active_chainstate.m_chainman.GetConsensus();
+        const int next_height = tip ? tip->nHeight + 1 : 0;
+        const int64_t next_block_mtp = tip ? tip->GetMedianTimePast() : args.m_accept_time;
+        if (consensus.IsDemurrageActive(next_height, next_block_mtp)) {
+            std::set<uint256> attested_keys;
+            size_t ignored_mempool_attestation_count{0};
+            CollectMempoolDemurrageAttestationState(m_pool, attested_keys, ignored_mempool_attestation_count);
+            size_t package_attestation_count{0};
+            for (Workspace& ws : workspaces) {
+                std::string demurrage_reject_reason;
+                const Consensus::DemurrageAttestationValidationResult attestation_result =
+                    VerifyDemurrageAttestations(*ws.m_ptx, attested_keys, package_attestation_count, demurrage_reject_reason);
+                if (attestation_result != Consensus::DemurrageAttestationValidationResult::VALID) {
+                    if (attestation_result == Consensus::DemurrageAttestationValidationResult::LOCAL_INTERNAL_ERROR) {
+                        ws.m_state.Error(demurrage_reject_reason);
+                        package_state.Error(demurrage_reject_reason);
+                    } else {
+                        ws.m_state.Invalid(TxValidationResult::TX_CONSENSUS,
+                                           demurrage_reject_reason);
+                        package_state.Invalid(PackageValidationResult::PCKG_TX,
+                                              "transaction failed");
+                    }
+                    results.emplace(ws.m_ptx->GetWitnessHash(), MempoolAcceptResult::Failure(ws.m_state));
+                    return PackageMempoolAcceptResult(package_state, std::move(results));
+                }
+            }
+        }
     }
 
     std::vector<uint256> all_package_wtxids;
@@ -2435,12 +2656,42 @@ bool InitScriptExecutionCache(size_t max_size_bytes)
  */
 static std::optional<int> GetP2SHRedeemWitnessVersion(const CScript& script, const CTxIn& input);
 
+static bool CheckInputScriptsImpl(const CTransaction& tx, TxValidationState& state,
+                                  const CCoinsViewCache& inputs, unsigned int flags, bool cacheSigStore,
+                                  bool cacheFullScriptStore, PrecomputedTransactionData& txdata,
+                                  std::vector<CScriptCheck>* pvChecks,
+                                  std::atomic_bool* mldsa_internal_error,
+                                  ScriptError* mandatory_error) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+
 bool CheckInputScripts(const CTransaction& tx, TxValidationState& state,
                        const CCoinsViewCache& inputs, unsigned int flags, bool cacheSigStore,
                        bool cacheFullScriptStore, PrecomputedTransactionData& txdata,
                        std::vector<CScriptCheck>* pvChecks,
                        std::atomic_bool* mldsa_internal_error)
 {
+    // Block validation, the assembler and every other caller: same function,
+    // same result and reject reason as before the typed error existed.
+    return CheckInputScriptsImpl(tx, state, inputs, flags, cacheSigStore, cacheFullScriptStore, txdata,
+                                 pvChecks, mldsa_internal_error, nullptr);
+}
+
+bool CheckInputScriptsWithError(const CTransaction& tx, TxValidationState& state,
+                                const CCoinsViewCache& inputs, unsigned int flags, bool cacheSigStore,
+                                bool cacheFullScriptStore, PrecomputedTransactionData& txdata,
+                                ScriptError* mandatory_error)
+{
+    return CheckInputScriptsImpl(tx, state, inputs, flags, cacheSigStore, cacheFullScriptStore, txdata,
+                                 nullptr, nullptr, mandatory_error);
+}
+
+static bool CheckInputScriptsImpl(const CTransaction& tx, TxValidationState& state,
+                                  const CCoinsViewCache& inputs, unsigned int flags, bool cacheSigStore,
+                                  bool cacheFullScriptStore, PrecomputedTransactionData& txdata,
+                                  std::vector<CScriptCheck>* pvChecks,
+                                  std::atomic_bool* mldsa_internal_error,
+                                  ScriptError* mandatory_error)
+{
+    if (mandatory_error) *mandatory_error = SCRIPT_ERR_OK;
     if (tx.IsCoinBase()) return true;
 
     if (pvChecks) {
@@ -2489,7 +2740,7 @@ bool CheckInputScripts(const CTransaction& tx, TxValidationState& state,
             GetP2SHRedeemWitnessVersion(txdata.m_spent_outputs[i].scriptPubKey, tx.vin[i]);
         if (quantum_rules_active && nested_witness_version && *nested_witness_version > 0) {
             return state.Invalid(TxValidationResult::TX_CONSENSUS,
-                                 "unsupported-nested-witness-spend",
+                                 quantum_reject::NESTED_WITNESS_SPEND,
                                  "Nested witness versions above v0 are disabled after quantum activation");
         }
         CScript generated_payout_script;
@@ -2504,21 +2755,21 @@ bool CheckInputScripts(const CTransaction& tx, TxValidationState& state,
         const bool is_eutxo_spend = (flags & SCRIPT_VERIFY_EUTXO) && is_eutxo_script;
         if (quantum_rules_active && is_eutxo_script) {
             return state.Invalid(TxValidationResult::TX_CONSENSUS,
-                                 "eutxo-spend-disabled",
+                                 quantum_reject::EUTXO_SPEND_DISABLED,
                                  "EUTXO v15 lacks quantum ownership authorization");
         }
         if (quantum_rules_active && is_future_witness_spend &&
             !is_quantum_spend && !is_eutxo_spend) {
             return state.Invalid(TxValidationResult::TX_CONSENSUS,
-                                 "unknown-quantum-witness-spend",
+                                 quantum_reject::UNKNOWN_WITNESS_SPEND,
                                  "Only exact Blackcoin v14 and v16 witness programs are spendable after quantum activation");
         }
         if (is_generated_quantum_spend && !(flags & SCRIPT_VERIFY_QUANTUM_ML_DSA)) {
-            return state.Invalid(TxValidationResult::TX_CONSENSUS, "blackcoin-migration-spend-premature", "Quantum migration spends are not active until the post-Gold-Rush migration window");
+            return state.Invalid(TxValidationResult::TX_CONSENSUS, quantum_reject::MIGRATION_SPEND_PREMATURE, "Quantum migration spends are not active until the post-Gold-Rush migration window");
         }
         spends_quantum_migration_output = spends_quantum_migration_output || is_quantum_spend;
         if (!is_quantum_spend && !is_eutxo_spend && (flags & SCRIPT_VERIFY_LEGACY_ECDSA_LOCKOUT)) {
-            return state.Invalid(TxValidationResult::TX_CONSENSUS, "legacy-spend-disabled", "Legacy spends are disabled after the Quantum Quasar migration deadline");
+            return state.Invalid(TxValidationResult::TX_CONSENSUS, quantum_reject::LEGACY_SPEND_DISABLED, "Legacy spends are disabled after the Quantum Quasar migration deadline");
         }
     }
 
@@ -2567,6 +2818,9 @@ bool CheckInputScripts(const CTransaction& tx, TxValidationState& state,
         if (pvChecks) {
             pvChecks->emplace_back(std::move(check));
         } else if (!check()) {
+            // The error of the first failing input under the mandatory flags
+            // (the one reported below unless a non-mandatory flag came first).
+            ScriptError mandatory_script_error = check.GetScriptError();
             if (check.GetScriptError() == SCRIPT_ERR_ML_DSA_INTERNAL) {
                 return state.Error("local-mldsa-verification-error");
             }
@@ -2583,6 +2837,7 @@ bool CheckInputScripts(const CTransaction& tx, TxValidationState& state,
                         flags & ~STANDARD_NOT_MANDATORY_VERIFY_FLAGS, cacheSigStore, &txdata,
                         mldsa_internal_error);
                 const bool mandatory_valid = check2();
+                if (!mandatory_valid) mandatory_script_error = check2.GetScriptError();
                 if (!mandatory_valid && check2.GetScriptError() == SCRIPT_ERR_ML_DSA_INTERNAL) {
                     return state.Error("local-mldsa-verification-error");
                 }
@@ -2598,6 +2853,7 @@ bool CheckInputScripts(const CTransaction& tx, TxValidationState& state,
             // support, to avoid splitting the network (but this
             // depends on the details of how net_processing handles
             // such errors).
+            if (mandatory_error) *mandatory_error = mandatory_script_error;
             return state.Invalid(TxValidationResult::TX_CONSENSUS, strprintf("mandatory-script-verify-flag-failed (%s)", ScriptErrorString(check.GetScriptError())));
         }
     }
@@ -2945,17 +3201,17 @@ static bool CheckQuantumMigrationSpendIsolation(const CTransaction& tx, const CC
             // P2SH hides the witness version from the top-level classifier.
             // Only nested v0 has established ownership semantics. Nested v1+
             // would otherwise be consensus-true as an unknown witness program.
-            reject_reason = "unsupported-nested-witness-spend";
+            reject_reason = quantum_reject::NESTED_WITNESS_SPEND;
             return false;
         }
         if (quantum_rules_active && witness_version == 1 && is_witness_input &&
             !(flags & SCRIPT_VERIFY_TAPROOT)) {
-            reject_reason = "unsupported-witness-v1-spend";
+            reject_reason = quantum_reject::WITNESS_V1_SPEND;
             return false;
         }
         if (quantum_rules_active && is_witness_input && witness_version > 1 &&
             !is_quantum_input && !is_eutxo_input) {
-            reject_reason = "unknown-quantum-witness-spend";
+            reject_reason = quantum_reject::UNKNOWN_WITNESS_SPEND;
             return false;
         }
         if (is_eutxo_input) {
@@ -2963,11 +3219,11 @@ static bool CheckQuantumMigrationSpendIsolation(const CTransaction& tx, const CC
             // quantum-authenticated covenant model exists, accepting it would
             // permit permissionless theft even if downgrade outputs were
             // forbidden.
-            reject_reason = "eutxo-spend-disabled";
+            reject_reason = quantum_reject::EUTXO_SPEND_DISABLED;
             return false;
         }
         if (final_lockout_active && !is_quantum_input) {
-            reject_reason = "legacy-spend-disabled";
+            reject_reason = quantum_reject::LEGACY_SPEND_DISABLED;
             return false;
         }
         if (is_quantum_input) {
@@ -2984,7 +3240,7 @@ static bool CheckQuantumMigrationSpendIsolation(const CTransaction& tx, const CC
         if (payout_status == GoldRushPayoutStatus::AUTHENTICATED) {
             has_protected_lineage = true;
             if (!(flags & SCRIPT_VERIFY_QUANTUM_ML_DSA)) {
-                reject_reason = "goldrush-payout-spend-premature";
+                reject_reason = quantum_reject::GOLDRUSH_PAYOUT_SPEND_PREMATURE;
                 return false;
             }
             if (!IsQuantumMigrationScript(coin.out.scriptPubKey) || payout_script != coin.out.scriptPubKey) {
@@ -3013,7 +3269,7 @@ static bool CheckQuantumMigrationSpendIsolation(const CTransaction& tx, const CC
     // authenticated Gold Rush payout or post-G migration descendant, both
     // covered above.
     if (quantum_rules_active && !has_protected_lineage) {
-        reject_reason = "quantum-lineage-anchor-required";
+        reject_reason = quantum_reject::LINEAGE_ANCHOR_REQUIRED;
         return false;
     }
 
@@ -3054,28 +3310,28 @@ bool CheckQuantumQuasarOutputs(const CTransaction& tx, unsigned int flags, std::
         const std::optional<QuantumStakeTierProgram> tier = GetQuantumStakeTierProgram(txout.scriptPubKey);
         if ((flags & SCRIPT_VERIFY_QUANTUM_ML_DSA) && tier && tier->tiered &&
             !(flags & SCRIPT_VERIFY_QUANTUM_STAKE_TIERS)) {
-            reject_reason = "quantum-tier-output-premature";
+            reject_reason = quantum_reject::TIER_OUTPUT_PREMATURE;
             return false;
         }
         if ((flags & SCRIPT_VERIFY_QUANTUM_ML_DSA) && IsEUTXOScript(txout.scriptPubKey)) {
-            reject_reason = "eutxo-output-disabled";
+            reject_reason = quantum_reject::EUTXO_OUTPUT_DISABLED;
             return false;
         }
         if ((flags & SCRIPT_VERIFY_QUANTUM_ML_DSA) && witness_version == 1 &&
             !(flags & SCRIPT_VERIFY_TAPROOT)) {
-            reject_reason = "unsupported-witness-v1-output";
+            reject_reason = quantum_reject::WITNESS_V1_OUTPUT;
             return false;
         }
         if ((flags & SCRIPT_VERIFY_QUANTUM_ML_DSA) &&
             is_future_witness_output && !is_recognized_quantum_output) {
-            reject_reason = "unknown-quantum-witness-output";
+            reject_reason = quantum_reject::UNKNOWN_WITNESS_OUTPUT;
             return false;
         }
         if (!(flags & SCRIPT_VERIFY_LEGACY_ECDSA_LOCKOUT)) continue;
         if (txout.IsEmpty()) continue;
         if (IsOpReturnOutput(txout) && txout.nValue == 0) continue;
         if (is_recognized_quantum_output) continue;
-        reject_reason = "legacy-output-disabled";
+        reject_reason = quantum_reject::LEGACY_OUTPUT_DISABLED;
         return false;
     }
     return true;

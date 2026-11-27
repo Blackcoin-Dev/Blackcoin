@@ -22,6 +22,14 @@ class TxValidationState;
 /** Transaction validation functions */
 
 namespace Consensus {
+/** Reject reasons produced by CheckTxInputs that depend on the demurrage state
+ * of the evaluation point. Mempool acceptance reads them (validation.cpp) to
+ * decide whether a failure is only the effect of the next block; the producers
+ * in tx_verify.cpp use the same constants, so the two cannot drift apart. */
+inline constexpr const char* REJECT_TX_IN_BELOW_OUT{"bad-txns-in-belowout"};
+inline constexpr const char* REJECT_TX_SPENDS_LOCKED_COIN{"bad-txns-spends-locked-coin"};
+inline constexpr const char* REJECT_TX_FEE_NOT_ENOUGH{"bad-txns-fee-not-enough"};
+
 /**
  * Check whether all inputs of this transaction are valid (no double spends and amounts)
  * This does not modify the UTXO set. This does not check scripts and sigs.

@@ -93,6 +93,7 @@
 #include <wallet/external_signer_scriptpubkeyman.h>
 #include <wallet/fees.h>
 #include <wallet/scheduler_stats.h>
+#include <wallet/quantum_return_backup.h>
 #include <wallet/scriptpubkeyman.h>
 #include <wallet/shadow_pow_claim_recovery_args.h>
 #include <wallet/spend.h>
@@ -1582,8 +1583,20 @@ void PublishRuntimeWallet(
     context.claim_maintenance->Register(wallet);
 }
 
-std::shared_ptr<CWallet> LoadWalletInternal(WalletContext& context, const std::string& name, std::optional<bool> load_on_start, const DatabaseOptions& options, DatabaseStatus& status, bilingual_str& error, std::vector<bilingual_str>& warnings)
+std::shared_ptr<CWallet> LoadWalletInternal(WalletContext& context, const std::string& name, std::optional<bool> load_on_start, const DatabaseOptions& options, DatabaseStatus& status, bilingual_str& error, std::vector<bilingual_str>& warnings, bool check_backup_path)
 {
+    // A wallet whose configured quantum key backup directory could never be used is refused before it can create a key.
+    // A default directory that is too long only warns. A migration that already checked its names, and the restoration
+    // that undoes a failed migration, skip this check: it must never be what keeps a wallet from coming back.
+    if (check_backup_path) {
+        const QuantumKeyBackupPathCheck backup_path = CheckQuantumKeyBackupWalletPath(name);
+        if (backup_path.error) {
+            error = Untranslated(strprintf("Wallet loading failed. %s", *backup_path.error));
+            status = DatabaseStatus::FAILED_LOAD;
+            return nullptr;
+        }
+        if (backup_path.warning) warnings.push_back(Untranslated(*backup_path.warning));
+    }
     try {
         std::unique_ptr<WalletDatabase> database = MakeWalletDatabase(name, options, status, error);
         if (!database) {
@@ -1687,7 +1700,7 @@ private:
 };
 } // namespace
 
-std::shared_ptr<CWallet> LoadWallet(WalletContext& context, const std::string& name, std::optional<bool> load_on_start, const DatabaseOptions& options, DatabaseStatus& status, bilingual_str& error, std::vector<bilingual_str>& warnings)
+std::shared_ptr<CWallet> LoadWallet(WalletContext& context, const std::string& name, std::optional<bool> load_on_start, const DatabaseOptions& options, DatabaseStatus& status, bilingual_str& error, std::vector<bilingual_str>& warnings, bool check_backup_path)
 {
     auto result = WITH_LOCK(g_loading_wallet_mutex, return g_loading_wallet_set.insert(name));
     if (!result.second) {
@@ -1695,13 +1708,22 @@ std::shared_ptr<CWallet> LoadWallet(WalletContext& context, const std::string& n
         status = DatabaseStatus::FAILED_LOAD;
         return nullptr;
     }
-    auto wallet = LoadWalletInternal(context, name, load_on_start, options, status, error, warnings);
+    auto wallet = LoadWalletInternal(context, name, load_on_start, options, status, error, warnings, check_backup_path);
     WITH_LOCK(g_loading_wallet_mutex, g_loading_wallet_set.erase(result.first));
     return wallet;
 }
 
 std::shared_ptr<CWallet> CreateWallet(WalletContext& context, const std::string& name, std::optional<bool> load_on_start, DatabaseOptions& options, DatabaseStatus& status, bilingual_str& error, std::vector<bilingual_str>& warnings)
 {
+    {
+        const QuantumKeyBackupPathCheck backup_path = CheckQuantumKeyBackupWalletPath(name);
+        if (backup_path.error) {
+            error = Untranslated(strprintf("Wallet creation failed. %s", *backup_path.error));
+            status = DatabaseStatus::FAILED_CREATE;
+            return nullptr;
+        }
+        if (backup_path.warning) warnings.push_back(Untranslated(*backup_path.warning));
+    }
     uint64_t wallet_creation_flags = options.create_flags;
     const SecureString& passphrase = options.create_passphrase;
 
@@ -1782,6 +1804,10 @@ std::shared_ptr<CWallet> CreateWallet(WalletContext& context, const std::string&
                             status = DatabaseStatus::FAILED_CREATE;
                             return nullptr;
                         }
+                        // The initial keys exist before the wallet is published and its first-key
+                        // notification is connected: record their creation time as the wallet's
+                        // birth time here, or a block that pays one of them can be skipped.
+                        wallet->MaybeUpdateBirthTime(spk_man->GetTimeFirstKey());
                     }
                 }
             }
@@ -1816,7 +1842,7 @@ std::shared_ptr<CWallet> CreateWallet(WalletContext& context, const std::string&
     return wallet;
 }
 
-std::shared_ptr<CWallet> RestoreWallet(WalletContext& context, const fs::path& backup_file, const std::string& wallet_name, std::optional<bool> load_on_start, DatabaseStatus& status, bilingual_str& error, std::vector<bilingual_str>& warnings)
+std::shared_ptr<CWallet> RestoreWallet(WalletContext& context, const fs::path& backup_file, const std::string& wallet_name, std::optional<bool> load_on_start, DatabaseStatus& status, bilingual_str& error, std::vector<bilingual_str>& warnings, bool check_backup_path)
 {
     DatabaseOptions options;
     ReadDatabaseArgs(*context.args, options);
@@ -1864,7 +1890,7 @@ std::shared_ptr<CWallet> RestoreWallet(WalletContext& context, const fs::path& b
         fs::copy_file(backup_file, wallet_file, fs::copy_options::none);
         wallet_file_copied = true;
 
-        wallet = LoadWallet(context, wallet_name, load_on_start, options, status, error, warnings);
+        wallet = LoadWallet(context, wallet_name, load_on_start, options, status, error, warnings, check_backup_path);
     } catch (const std::exception& e) {
         assert(!wallet);
         if (!error.empty()) error += Untranslated("\n");
@@ -2461,12 +2487,14 @@ void CWallet::AddToSpends(const COutPoint& outpoint, const uint256& wtxid, Walle
     mapTxSpends.insert(std::make_pair(outpoint, wtxid));
     MarkShadowPowClaimCandidateStateChangedLocked();
 
-    RefreshLiveUnspentStakeOutpoint(outpoint);
+    if (!m_defer_live_unspent_index) RefreshLiveUnspentStakeOutpoint(outpoint);
 
     if (!preserve_existing_spent_anchor_hold) {
         if (batch) {
             UnlockCoin(outpoint, batch);
-        } else {
+        } else if (setLockedCoins.count(outpoint) != 0) {
+            // UnlockCoin only uses the batch to erase a locked coin, so the
+            // database batch is created only when the coin is locked.
             WalletBatch temp_batch(GetDatabase());
             UnlockCoin(outpoint, &temp_batch);
         }
@@ -3002,7 +3030,15 @@ bool CWallet::LoadToWallet(const uint256& hash, const UpdateWalletTxFn& fill_wtx
     if (/* insertion took place */ ins.second) {
         wtx.m_it_wtxOrdered = wtxOrdered.insert(std::make_pair(wtx.nOrderPos, &wtx));
     }
-    AddToSpends(wtx);
+    // The database load rebuilds the live-unspent indexes once the whole
+    // wallet is in memory, so they are not maintained per transaction here.
+    const bool defer_live_unspent_index = !reconcile_chainstate;
+    {
+        const bool previous_defer = m_defer_live_unspent_index;
+        m_defer_live_unspent_index = defer_live_unspent_index;
+        AddToSpends(wtx);
+        m_defer_live_unspent_index = previous_defer;
+    }
     for (const CTxIn& txin : wtx.tx->vin) {
         auto it = mapWallet.find(txin.prevout.hash);
         if (it != mapWallet.end()) {
@@ -3018,7 +3054,7 @@ bool CWallet::LoadToWallet(const uint256& hash, const UpdateWalletTxFn& fill_wtx
     UpdatePendingShadowSignalIndex(wtx);
     IndexOwnedLegacyShadowScripts(wtx);
     UpdateConfirmedSyntheticPayoutIndex(wtx);
-    RefreshLiveUnspentStakeOutpoints(wtx);
+    if (!defer_live_unspent_index) RefreshLiveUnspentStakeOutpoints(wtx);
     MarkShadowPowClaimCandidateStateChangedLocked();
 
     return true;
@@ -3972,6 +4008,33 @@ void CWallet::blockDisconnected(const interfaces::BlockInfo& block)
     if (redelegation_win_disconnected) {
         work.coinstakes_visited += RecomputeQuantumRedelegationWinHistory(batch);
     }
+    // Retry state recorded while the disconnected block was the tip belongs to
+    // the disconnected history: an attempt at height h read the tip at h, and
+    // a demurrage attempt at evaluation height h + 1 read it too. Dropping it
+    // lets the competing branch be evaluated at once; a transaction that was
+    // really created still holds its inputs, so nothing is created twice.
+    for (auto it = m_demurrage_last_auto_attest_attempt_height.begin();
+         it != m_demurrage_last_auto_attest_attempt_height.end();) {
+        it = it->second > block.height
+            ? m_demurrage_last_auto_attest_attempt_height.erase(it)
+            : std::next(it);
+    }
+    for (auto* retry_map : {&m_redelegation_last_auto_attempt_height,
+                            &m_redelegation_last_auto_success_height}) {
+        const bool attempts = retry_map == &m_redelegation_last_auto_attempt_height;
+        for (auto it = retry_map->begin(); it != retry_map->end();) {
+            if (it->second < block.height) {
+                ++it;
+                continue;
+            }
+            if (attempts) {
+                batch.EraseQuantumRedelegationLastAttemptHeight(it->first);
+            } else {
+                batch.EraseQuantumRedelegationLastSuccessHeight(it->first);
+            }
+            it = retry_map->erase(it);
+        }
+    }
     end_phase(work.redelegation);
 
     if (block_writes && !block_writes->Commit()) {
@@ -3995,14 +4058,27 @@ void CWallet::updatedBlockTip()
 {
     m_best_block_time = GetTime();
     LOCK(cs_wallet);
-    if (!m_shadow_pow_unconfirmed_claim_txids.empty() ||
+    // The end of the Gold Rush window, in either direction, is a transition
+    // the wallet must act on without a miner: queue one recovery evaluation,
+    // and let the maintenance thread stop (or restart) the claim miner.
+    const bool window_closed = IsShadowGoldRushWindowClosedAtTip(m_last_block_processed_height);
+    const bool window_changed = m_gold_rush_end_observed.exchange(window_closed) != window_closed;
+    const bool miner_follows_window = window_closed
+        ? m_pow_mining_enabled.load(std::memory_order_acquire)
+        : m_pow_resume_below_end.load(std::memory_order_acquire);
+    const bool claims_pending = !m_shadow_pow_unconfirmed_claim_txids.empty() ||
         !m_shadow_pow_unconfirmed_implicit_claim_txids.empty() ||
-        !m_shadow_pow_unclassified_claim_txids.empty()) {
+        !m_shadow_pow_unclassified_claim_txids.empty();
+    if (claims_pending || window_changed || miner_follows_window) {
         // A retained proof can become eligible on an ordinary forward tip.
         // Do not depend on mining enablement or the 12-36 hour resend timer,
         // and do not revisit inert confirmed claim history on every block.
+        // After the window closes no claim can confirm: ask for a recovery
+        // pass on every block while claims remain, since the stale-depth
+        // gate of the standing policy advances with each block.
         RequestWalletClaimMaintenance(m_claim_maintenance,
-                                      /*resolve=*/false, /*relay=*/true);
+                                      /*resolve=*/window_closed && (claims_pending || window_changed),
+                                      /*relay=*/claims_pending);
     }
 }
 
@@ -6532,9 +6608,22 @@ OutputType CWallet::TransactionChangeType(const std::optional<OutputType>& chang
 
 bool CWallet::CommitTransaction(CTransactionRef tx, mapValue_t mapValue, std::vector<std::pair<std::string, std::string>> orderForm,
                                 std::string* broadcast_error, WalletCommitStatus* commit_status,
-                                std::optional<ShadowPowClaimCommitAuthority> shadow_pow_authority)
+                                std::optional<ShadowPowClaimCommitAuthority> shadow_pow_authority,
+                                const CommitSpendProvenance* provenance,
+                                FinalStakeReserveSpendReport* reserve_report)
 {
+    // Entry contract (see the declaration): cs_main is taken below, before cs_wallet, so no wallet lock may be held.
+    AssertLockNotHeld(cs_wallet);
     if (commit_status) *commit_status = WalletCommitStatus::REJECTED_NOT_ADDED;
+    if (Params().IsTestChain()) {
+        // Test chains only: a pause before any lock is taken, in which a test moves the chain after a transaction was
+        // built and before it is committed.
+        const int64_t delay_ms = std::clamp<int64_t>(gArgs.GetIntArg("-finalstakereservecommitdelaymillis", 0), 0, 10000);
+        if (delay_ms > 0) {
+            WalletLogPrintf("Wallet commit test pause reached for %s; waiting %dms\n", tx->GetHash().ToString(), delay_ms);
+            std::this_thread::sleep_for(std::chrono::milliseconds{delay_ms});
+        }
+    }
     const bool shadow_pow_claim = TransactionHasShadowProof(*tx);
     std::optional<ShadowPowClaimRecoveryBroadcastGuard>
         shadow_pow_broadcast_guard;
@@ -6571,14 +6660,40 @@ bool CWallet::CommitTransaction(CTransactionRef tx, mapValue_t mapValue, std::ve
     }
 
     {
-        // A guarded QQSPROOF commit must revalidate the complete cheap gate
-        // identity at the same wallet-publication boundary as AddToWallet.
-        // Acquire cs_main first only for this optional path; ordinary wallet
-        // commits retain their existing wallet-only critical section.
-        UniqueLock<RecursiveMutex> shadow_pow_chain_lock(
-            shadow_pow_authority ? &::cs_main : nullptr,
+        // cs_main is taken first, and kept with cs_wallet to the end of the publication of the wallet record. A guarded
+        // QQSPROOF commit needs it to revalidate the complete cheap gate identity at the same boundary as
+        // AddToWallet. The final stake reserve needs it too: whether the guard is on, the reserve itself and the
+        // publication of the record must all see the same chain, so a block, a reorganisation or another wallet
+        // operation after the transaction was built cannot slip a reserved input through. Whether the guard is on is
+        // decided below, under this lock and never before it; a decision taken before the lock is not a decision.
+        UniqueLock<RecursiveMutex> commit_chain_lock(
+            (shadow_pow_authority || HaveChain()) ? &::cs_main : nullptr,
             "::cs_main", __FILE__, __LINE__);
         LOCK(cs_wallet);
+        std::optional<FinalStakeReserve> reserve_before;
+        if (commit_chain_lock.owns_lock() && FinalStakeReserveGuardActiveNow(*this)) {
+            AssertLockHeld(::cs_main);
+            // Locks this operation put on its own inputs (lock_unspents) must not take them out of the reserve.
+            const std::set<COutPoint>* operation_locks = provenance ? &provenance->operation_locks : nullptr;
+            const auto is_explicit = [&](const COutPoint& outpoint) {
+                return provenance && provenance->explicit_inputs.count(outpoint) > 0;
+            };
+            reserve_before = ComputeFinalStakeReserve(*this, operation_locks);
+            const auto spends_reserve = std::any_of(tx->vin.begin(), tx->vin.end(), [&](const CTxIn& txin) {
+                return reserve_before->enforced.count(txin.prevout) > 0 && !is_explicit(txin.prevout);
+            });
+            if (spends_reserve) {
+                if (broadcast_error) *broadcast_error = FINAL_STAKE_RESERVE_COMMIT_ERROR;
+                WalletLogPrintf("CommitTransaction(): refusing %s, %s\n", tx->GetHash().ToString(), FINAL_STAKE_RESERVE_COMMIT_ERROR);
+                // A refused commit leaves nothing of this operation behind: the locks it took are released here.
+                if (operation_locks) {
+                    for (const COutPoint& outpoint : *operation_locks) {
+                        if (!UnlockCoin(outpoint)) WalletLogPrintf("CommitTransaction(): could not release the lock on %s\n", outpoint.ToString());
+                    }
+                }
+                return false;
+            }
+        }
         BumpBalanceScanMarker();
         // Formatting the whole transaction is not worth doing under both
         // locks; the txid finds it. The dump stays available for debugging.
@@ -6809,6 +6924,11 @@ bool CWallet::CommitTransaction(CTransactionRef tx, mapValue_t mapValue, std::ve
             wtx = nullptr;
         }
         commit_writes.reset();
+        // Test chains only: the storage failure above, on request, so a test sees what a caller does with it.
+        if (wtx && Params().IsTestChain() && gArgs.GetBoolArg("-qqcommitwritefailure", false)) {
+            WalletLogPrintf("Injecting a wallet commit write failure for %s\n", tx->GetHash().ToString());
+            wtx = nullptr;
+        }
 
         // wtx can only be null if the db write failed.
         if (!wtx) {
@@ -6818,6 +6938,14 @@ bool CWallet::CommitTransaction(CTransactionRef tx, mapValue_t mapValue, std::ve
                     "Gold Rush PoW claim wallet write failed after an in-memory record may have been installed; mining and recovery remain fail-closed until wallet reload\n");
             }
             throw std::runtime_error(std::string(__func__) + ": Wallet db error, transaction commit failed");
+        }
+
+        // The consumed-reserve report is made here, from the inventory derived before the record was added and the
+        // one derived now, in the same critical section.
+        if (reserve_report && reserve_before) {
+            AssertLockHeld(::cs_main);
+            *reserve_report = MakeFinalStakeReserveSpendReport(*this, *reserve_before, *tx,
+                                                               provenance ? &provenance->operation_locks : nullptr);
         }
 
         if (shadow_pow_claim) {
@@ -7725,14 +7853,6 @@ bool CWallet::MoveAddressBook(const CTxDestination& old_address, const CTxDestin
         new_address, name, new_is_mine,
         notification_purpose, CT_NEW});
     return true;
-}
-
-uint64_t CWallet::GetStakeWeight() const
-{
-    if (HaveChain()) {
-        return chain().getStakeWeight(*this);
-    }
-    return 0;
 }
 
 size_t CWallet::KeypoolCountExternalKeys() const
@@ -8903,13 +9023,53 @@ util::Result<CTxDestination> CWallet::GetNewQuantumChangeDestination()
     return AddQuantumKey(std::vector<unsigned char>(public_key.begin(), public_key.end()), private_key, "", GetTime(), /*record_as_receive=*/false);
 }
 
+util::Result<CTxDestination> CWallet::AddQuantumStakeReturnKey(const std::string& label, const std::string& consent)
+{
+    std::vector<uint8_t> public_key;
+    std::vector<uint8_t> generated_private_key;
+    if (!ML_DSA::KeyGen(public_key, generated_private_key)) {
+        return util::Error{_("Error: ML-DSA key generation failed")};
+    }
+    CKeyingMaterial private_key(generated_private_key.begin(), generated_private_key.end());
+    CleanseVector(generated_private_key);
+    return AddQuantumKeyInternal(std::vector<unsigned char>(public_key.begin(), public_key.end()), private_key, label,
+                                 GetTime(), /*record_as_receive=*/true, std::nullopt, &consent);
+}
+
+std::set<std::vector<unsigned char>> CWallet::GetQuantumKeyPrograms() const
+{
+    AssertLockHeld(cs_wallet);
+    std::set<std::vector<unsigned char>> programs;
+    for (const auto& [program, record] : m_quantum_keys) programs.insert(program);
+    return programs;
+}
+
+bool CWallet::IsQuantumStakeReturnPendingKey(const CTxDestination& dest) const
+{
+    AssertLockHeld(cs_wallet);
+    if (!m_quantum_return_pending) return false;
+    const auto info = GetQuantumKeyInfo(dest);
+    if (!info) return false;
+    const auto pending_key = m_quantum_keys.find(m_quantum_return_pending->witness_program);
+    return pending_key != m_quantum_keys.end() && pending_key->second.public_key == info->public_key;
+}
+
+bool CWallet::LoadQuantumStakeReturnPending(const QuantumStakeReturnPendingRecord& record)
+{
+    AssertLockHeld(cs_wallet);
+    const auto key = m_quantum_keys.find(record.witness_program);
+    if (record.version != 1 || key == m_quantum_keys.end() || !key->second.durably_stored) return false;
+    m_quantum_return_pending = record;
+    return true;
+}
+
 util::Result<CTxDestination> CWallet::AddQuantumKey(const std::vector<unsigned char>& public_key, const CKeyingMaterial& private_key, const std::string& label, int64_t creation_time, bool record_as_receive)
 {
     return AddQuantumKeyInternal(public_key, private_key, label, creation_time,
                                  record_as_receive, std::nullopt);
 }
 
-util::Result<CTxDestination> CWallet::AddQuantumKeyInternal(const std::vector<unsigned char>& public_key, const CKeyingMaterial& private_key, const std::string& label, int64_t creation_time, bool record_as_receive, const std::optional<CTxDestination>& receive_destination)
+util::Result<CTxDestination> CWallet::AddQuantumKeyInternal(const std::vector<unsigned char>& public_key, const CKeyingMaterial& private_key, const std::string& label, int64_t creation_time, bool record_as_receive, const std::optional<CTxDestination>& receive_destination, const std::string* stake_return_consent)
 {
     CTxDestination dest;
     CTxDestination address_book_dest;
@@ -8934,6 +9094,9 @@ util::Result<CTxDestination> CWallet::AddQuantumKeyInternal(const std::vector<un
         }
         if (m_wallet_unlock_staking_only) {
             return util::Error{_("Error: Wallet is unlocked for staking only.")};
+        }
+        if (stake_return_consent && m_quantum_return_pending) {
+            return util::Error{_("Error: A quantum key for the stake return address is already waiting for its backup.")};
         }
         if (!QuantumWalletPrivateKeyMatches(public_key, private_key)) {
             return util::Error{_("Error: ML-DSA key failed integrity check")};
@@ -9017,6 +9180,18 @@ util::Result<CTxDestination> CWallet::AddQuantumKeyInternal(const std::vector<un
                     return abort_with_error(_("Error: Failed to write address book entry"));
                 }
             }
+            // The pending-return record goes into the same transaction as the key, so a crash leaves
+            // either neither or both: a key made for the return address is never without its record.
+            std::optional<QuantumStakeReturnPendingRecord> pending_record;
+            if (stake_return_consent) {
+                pending_record.emplace();
+                pending_record->witness_program = witness_program;
+                pending_record->consent = *stake_return_consent;
+                pending_record->creation_time = key_time;
+                if (!batch.WriteQuantumStakeReturnPending(*pending_record)) {
+                    return abort_with_error(_("Error: Failed to write the pending stake return record"));
+                }
+            }
 
             if (!batch.TxnCommit()) {
                 mark_ambiguous();
@@ -9031,6 +9206,10 @@ util::Result<CTxDestination> CWallet::AddQuantumKeyInternal(const std::vector<un
             record.backup_verified = false;
             m_wallet_flags = new_flags;
             m_quantum_keys.emplace(witness_program, std::move(record));
+            if (pending_record) {
+                m_quantum_return_pending = std::move(pending_record);
+                m_quantum_return_pending_error.clear();
+            }
             NotifyOwnershipChanged();
             InvalidateShadowPowClaimImplicitOwnershipLocked();
             MaybeUpdateBirthTime(key_time);
@@ -10265,6 +10444,8 @@ bool CWallet::UpgradeWallet(int version, bilingual_str& error)
 void CWallet::ReportLegacyClaimSourceCapacity(bool force)
 {
     LOCK(cs_wallet);
+    // After the Gold Rush window the advice to consolidate outputs is moot.
+    if (IsShadowGoldRushWindowClosedAtTip(m_last_block_processed_height)) return;
     const auto now = std::chrono::steady_clock::now();
     if (!force && m_legacy_source_capacity_reported &&
         now - *m_legacy_source_capacity_reported < std::chrono::hours{1}) {
@@ -10310,7 +10491,10 @@ void CWallet::postInitProcess()
     if (IsStakingAutostartEnabled()) {
         StartStake();
     }
-    if (gArgs.GetBoolArg("-powmining", false)) {
+    if (gArgs.GetBoolArg("-powmining", false) &&
+        IsShadowGoldRushWindowClosedAtTip(WITH_LOCK(cs_wallet, return m_last_block_processed_height))) {
+        WalletLogPrintf("Gold Rush has ended: -powmining is ignored and the PoW miner is not started\n");
+    } else if (gArgs.GetBoolArg("-powmining", false)) {
         bilingual_str pow_error;
         const int pow_threads = static_cast<int>(gArgs.GetIntArg("-powminingthreads", 1));
         const int pow_cpu = static_cast<int>(gArgs.GetIntArg("-powminingcpu", 1));
@@ -10366,13 +10550,13 @@ bool CWallet::VerifyQuantumBackup(const fs::path& backup_path, const QuantumKeyS
         const fs::path scratch_random = GetUniquePath(backup_path.parent_path());
         fs::path scratch_dir{backup_path.parent_path()};
         scratch_dir /= fs::PathFromString(
-            ".blackcoin-quantum-backup-verify-" + fs::PathToString(scratch_random.filename()));
+            std::string{QUANTUM_BACKUP_VERIFY_FOLDER_PREFIX} + fs::PathToString(scratch_random.filename()));
         if (!TryCreateDirectories(scratch_dir)) {
             error = _("Quantum-key backup verification could not create an isolated verification directory");
             return false;
         }
         ScopedDirectoryRemoval remove_scratch{scratch_dir};
-        const fs::path scratch_wallet = scratch_dir / "wallet.dat";
+        const fs::path scratch_wallet = scratch_dir / fs::PathFromString(std::string{QUANTUM_BACKUP_COPY_FILE_NAME});
         fs::copy_file(backup_path, scratch_wallet, fs::copy_options::none);
 
         DatabaseOptions options;
@@ -10503,8 +10687,11 @@ bool CWallet::SetQuantumKeyBackupState(const QuantumKeySnapshot& expected_keys, 
     return true;
 }
 
-bool CWallet::BackupWallet(const std::string& strDest, bilingual_str* error_out, bool verify_quantum_keys)
+bool CWallet::BackupWallet(const std::string& strDest, bilingual_str* error_out, bool verify_quantum_keys, std::set<std::vector<unsigned char>>* verified_inventory)
 {
+    // The promotion mutex comes before cs_wallet, so a caller that holds the wallet lock could deadlock with another
+    // backup of this wallet that holds the mutex and waits for the lock.
+    AssertLockNotHeld(cs_wallet);
     class ScopedDirectoryRemoval
     {
     public:
@@ -10527,6 +10714,11 @@ bool CWallet::BackupWallet(const std::string& strDest, bilingual_str* error_out,
         local_error = Untranslated(strprintf("Injected quantum wallet backup failure at %s", point));
         return true;
     };
+    if (verified_inventory) verified_inventory->clear();
+    if (failpoint("before_inventory_snapshot")) {
+        if (error_out) *error_out = local_error;
+        return false;
+    }
     QuantumKeySnapshot expected_keys;
     CKeyingMaterial master_key;
     bool source_was_crypted{false};
@@ -10586,7 +10778,7 @@ bool CWallet::BackupWallet(const std::string& strDest, bilingual_str* error_out,
     for (int attempt = 0; attempt < 10; ++attempt) {
         const fs::path random_path = GetUniquePath(backup_directory);
         const fs::path candidate = backup_directory / fs::PathFromString(
-            ".blackcoin-wallet-backup-stage-" + fs::PathToString(random_path.filename()));
+            std::string{QUANTUM_BACKUP_STAGE_FOLDER_PREFIX} + fs::PathToString(random_path.filename()));
         bool created{false};
 #ifndef WIN32
         // mkdir(0700) is one atomic operation. A create-then-chmod sequence
@@ -10612,7 +10804,7 @@ bool CWallet::BackupWallet(const std::string& strDest, bilingual_str* error_out,
 #endif
         if (created) {
             staged_directory = candidate;
-            staged_path = staged_directory / "wallet.dat";
+            staged_path = staged_directory / fs::PathFromString(std::string{QUANTUM_BACKUP_COPY_FILE_NAME});
             break;
         }
     }
@@ -10674,7 +10866,37 @@ bool CWallet::BackupWallet(const std::string& strDest, bilingual_str* error_out,
         return commit_stage(/*marked_stage=*/false);
     };
 
-    const auto promote_stage = [&](const WalletBackupFileIdentity& verified_identity, bool require_unchanged_quantum_snapshot = false) {
+    // The wallet's encryption state and quantum key inventory are what the verified copy was made from. Called with
+    // cs_wallet held, and only for a short check: no file system work runs under the lock.
+    const auto quantum_snapshot_unchanged = [&]() EXCLUSIVE_LOCKS_REQUIRED(cs_wallet) {
+        AssertLockHeld(cs_wallet);
+        if (IsCrypted() != source_was_crypted || m_quantum_keys.size() != expected_keys.size()) {
+            local_error = _("Quantum key inventory changed while finalizing the wallet backup");
+            return false;
+        }
+        for (const auto& [witness_program, expected_public_key] : expected_keys) {
+            const auto it = m_quantum_keys.find(witness_program);
+            if (it == m_quantum_keys.end() || it->second.public_key != expected_public_key ||
+                !it->second.durably_stored) {
+                local_error = _("Quantum key inventory changed while finalizing the wallet backup");
+                return false;
+            }
+        }
+        return true;
+    };
+
+    // Installs the verified stage as the destination file. The promotion mutex is taken before anything is
+    // decided about the wallet and is held through the check of the snapshot, the rename, both directory commits,
+    // the check of the installed file and the publication of the source markers, so no other backup of this wallet
+    // can install a file between this backup's check and its rename. Before the file is replaced, the wallet's
+    // encryption state and exact quantum key inventory must still be those the copy was made from, whether or not the
+    // copy was verified and whether or not the inventory is empty. After it is installed and its identity checked, the
+    // same comparison is made again: a change during the installation is reported as a failure, and the complete file
+    // that was installed stays. Only the markers are conditional: publish_verified_markers is true when the copy was
+    // verified key by key.
+    const auto promote_stage = [&](const WalletBackupFileIdentity& verified_identity, bool publish_verified_markers) {
+        if (failpoint("before_promotion_mutex")) return false;
+        LOCK(m_backup_promotion_mutex);
         if (failpoint("before_final_identity_revalidation")) return false;
         WalletBackupFileIdentity current_identity;
         if (!GetWalletBackupFileIdentity(staged_path, current_identity, local_error)) return false;
@@ -10683,24 +10905,21 @@ bool CWallet::BackupWallet(const std::string& strDest, bilingual_str* error_out,
             return false;
         }
 
-        std::unique_lock<RecursiveMutex> wallet_lock;
-        if (require_unchanged_quantum_snapshot) {
-            wallet_lock = std::unique_lock<RecursiveMutex>{cs_wallet};
-            if (IsCrypted() != source_was_crypted || m_quantum_keys.size() != expected_keys.size()) {
-                local_error = _("Quantum key inventory changed while finalizing the wallet backup");
-                return false;
-            }
-            for (const auto& [witness_program, expected_public_key] : expected_keys) {
-                const auto it = m_quantum_keys.find(witness_program);
-                if (it == m_quantum_keys.end() || it->second.public_key != expected_public_key ||
-                    !it->second.durably_stored) {
-                    local_error = _("Quantum key inventory changed while finalizing the wallet backup");
-                    return false;
-                }
-            }
+        {
+            // Before anything is installed: a wallet whose keys changed since the copy was made gets no backup
+            // installed at all. A brief look under the wallet lock, no file system work.
+            LOCK(cs_wallet);
+            if (!quantum_snapshot_unchanged()) return false;
         }
-        if (failpoint("fail_rename") || !RenameOver(staged_path, backup_path)) {
+        // The rename, the directory commits and the inspection of the installed file are file system work on a
+        // destination that can be slow or stalled (a removable or network disk). They run WITHOUT cs_wallet, so
+        // wallet operations and the threads waiting behind them are never held up by that disk.
+        std::string rename_error;
+        if (failpoint("fail_rename") || !RenameOver(staged_path, backup_path, &rename_error)) {
             local_error = _("Unable to atomically install the verified wallet backup");
+            if (!rename_error.empty()) {
+                local_error = local_error + Untranslated(strprintf(" (%s)", rename_error));
+            }
             return false;
         }
         const bool injected_destination_commit_failure = failpoint("before_final_directory_commit");
@@ -10719,13 +10938,21 @@ bool CWallet::BackupWallet(const std::string& strDest, bilingual_str* error_out,
             local_error = _("The installed wallet backup changed during atomic promotion");
             return false;
         }
-        if (require_unchanged_quantum_snapshot &&
-            (failpoint("before_source_marker_commit") ||
-             !SetQuantumKeyBackupState(expected_keys, /*verified=*/true, local_error))) {
-            // The promoted file is complete and independently verified. A
-            // source-marker failure remains conservative and is reported so
-            // the caller can retry; it must never delete the good backup.
-            return false;
+        {
+            // The wallet is looked at once more, under the lock that the marker write takes. The keys and the encryption
+            // state were checked before the file was replaced; if they changed while it was being installed (the wallet
+            // lock is free during the file system work) that is reported here, whether or not the copy was verified,
+            // and no marker is written for keys the copy does not hold. The installed file is complete for the inventory
+            // it was made from and is kept: it is never deleted here, and the caller can back up again.
+            LOCK(cs_wallet);
+            if (!quantum_snapshot_unchanged()) return false;
+            if (publish_verified_markers &&
+                (failpoint("before_source_marker_commit") ||
+                 !SetQuantumKeyBackupState(expected_keys, /*verified=*/true, local_error))) {
+                // A source-marker failure remains conservative and is reported so the caller can retry; it must never
+                // delete the good backup.
+                return false;
+            }
         }
         return true;
     };
@@ -10740,7 +10967,7 @@ bool CWallet::BackupWallet(const std::string& strDest, bilingual_str* error_out,
             if (error_out) *error_out = local_error;
             return false;
         }
-        const bool promoted = promote_stage(staged_identity);
+        const bool promoted = promote_stage(staged_identity, /*publish_verified_markers=*/false);
         if (!promoted && error_out) *error_out = local_error;
         return promoted;
     }
@@ -10777,10 +11004,15 @@ bool CWallet::BackupWallet(const std::string& strDest, bilingual_str* error_out,
     WalletBackupFileIdentity verified_identity;
     if (!GetWalletBackupFileIdentity(staged_path, verified_identity, local_error) ||
         failpoint("before_promote") ||
-        !promote_stage(verified_identity, /*require_unchanged_quantum_snapshot=*/true)) {
+        !promote_stage(verified_identity, /*publish_verified_markers=*/true)) {
         if (local_error.empty()) local_error = _("Final verified wallet database copy failed");
         if (error_out) *error_out = local_error;
         return false;
+    }
+    // The inventory this verified file holds: what its copy was made from and every key of which was reopened and
+    // challenged. It is the only inventory a caller may record for the file.
+    if (verified_inventory) {
+        for (const auto& [witness_program, public_key] : expected_keys) verified_inventory->insert(witness_program);
     }
     return true;
 }
@@ -11730,13 +11962,24 @@ static std::string MigrationPrefixName(CWallet& wallet)
     return name.empty() ? "default_wallet" : name;
 }
 
-bool DoMigration(CWallet& wallet, WalletContext& context, bilingual_str& error, MigrationResult& res) EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet)
+//! Tests only: ends a migration with an error at a named point inside DoMigration, to exercise its rollback.
+static std::function<bool(std::string_view)> g_migration_failpoint;
+void SetWalletMigrationFailpointForTest(std::function<bool(std::string_view)> failpoint)
+{
+    g_migration_failpoint = std::move(failpoint);
+}
+
+//! Carry out a migration whose descriptors (the plan) were produced, and whose auxiliary wallet names were checked against
+//! the quantum key backup directory policy, before any auxiliary wallet is created: the wallets created here are exactly the
+//! ones that were checked.
+bool DoMigration(CWallet& wallet, WalletContext& context, bilingual_str& error, MigrationResult& res, MigrationData& plan) EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet)
 {
     AssertLockHeld(wallet.cs_wallet);
-
-    // Get all of the descriptors from the legacy wallet
-    std::optional<MigrationData> data = wallet.GetDescriptorsForLegacy(error);
-    if (data == std::nullopt) return false;
+    if (g_migration_failpoint && g_migration_failpoint("before_auxiliary_wallets")) {
+        error = Untranslated("Injected wallet migration failure before the auxiliary wallets");
+        return false;
+    }
+    std::optional<MigrationData> data{std::move(plan)};
 
     // Create the watchonly and solvable wallets if necessary
     if (data->watch_descs.size() > 0 || data->solvable_descs.size() > 0) {
@@ -11846,6 +12089,10 @@ bool DoMigration(CWallet& wallet, WalletContext& context, bilingual_str& error, 
         }
     }
 
+    if (g_migration_failpoint && g_migration_failpoint("before_apply_migration_data")) {
+        error = Untranslated("Injected wallet migration failure before the descriptors are applied");
+        return false;
+    }
     // Add the descriptors to wallet, remove LegacyScriptPubKeyMan, and cleanup txs and address book data
     if (!wallet.ApplyMigrationData(*data, error)) {
         return false;
@@ -11858,6 +12105,12 @@ util::Result<MigrationResult> MigrateLegacyToDescriptor(const std::string& walle
     MigrationResult res;
     bilingual_str error;
     std::vector<bilingual_str> warnings;
+
+    // The wallet's own name is checked against the configured quantum key backup directory first, while it is still loaded
+    // as it was: a name that could never be backed up is refused with nothing unloaded, converted or created.
+    if (const QuantumKeyBackupPathCheck own_path = CheckQuantumKeyBackupMigrationPaths(wallet_name, false, false); own_path.error) {
+        return util::Error{Untranslated(strprintf("Wallet migration refused before any change was made: %s", *own_path.error))};
+    }
 
     // If the wallet is still loaded, unload it so that nothing else tries to use it while we're changing it
     if (auto wallet = GetWallet(context, wallet_name)) {
@@ -11926,11 +12179,33 @@ util::Result<MigrationResult> MigrateLegacyToDescriptor(const std::string& walle
             }
         }
 
-        // First change to using SQLite
+        // First change to using SQLite. This comes before the descriptors are produced (producing them writes descriptor
+        // records into this wallet's database), so that a failure here leaves the database without any.
+        if (g_migration_failpoint && g_migration_failpoint("fail_sqlite_conversion")) {
+            return util::Error{Untranslated("Injected wallet migration failure in the conversion to SQLite")};
+        }
         if (!local_wallet->MigrateToSQLite(error)) return util::Error{error};
 
+        // The descriptors are produced now. The wallets this migration creates are exactly the ones these descriptors need,
+        // and their names are checked against the quantum key backup directory policy before any of them is created. The
+        // wallet's own name was checked before it was unloaded (before any change); by this point the wallet's database has
+        // been converted. A refusal here leaves success false, like a failure inside DoMigration or while the migrated
+        // wallets are reloaded, and those go through the rollback below, which restores the wallet from the safety copy and
+        // loads it (whether or not it was loaded before). A failed conversion above and an exception do not.
+        std::optional<MigrationData> plan = local_wallet->GetDescriptorsForLegacy(error);
+        if (plan) {
+            const QuantumKeyBackupPathCheck backup_paths = CheckQuantumKeyBackupMigrationPaths(
+                wallet_name, !plan->watch_descs.empty(), !plan->solvable_descs.empty());
+            if (backup_paths.error) {
+                error = Untranslated(strprintf("Wallet migration refused before any auxiliary wallet was created: %s. The wallet will be restored from its safety copy.", *backup_paths.error));
+                plan.reset();
+            } else if (backup_paths.warning) {
+                res.warnings.push_back(Untranslated(*backup_paths.warning));
+            }
+        }
+
         // Do the migration, and cleanup if it fails
-        success = DoMigration(*local_wallet, context, error, res);
+        if (plan) success = DoMigration(*local_wallet, context, error, res, *plan);
     }
 
     // In case of loading failure, we need to remember the wallet files we have created to remove.
@@ -11961,7 +12236,7 @@ util::Result<MigrationResult> MigrateLegacyToDescriptor(const std::string& walle
             track_for_cleanup(*to_reload);
             std::string name = to_reload->GetName();
             to_reload.reset();
-            to_reload = LoadWallet(context, name, /*load_on_start=*/std::nullopt, options, status, error, warnings);
+            to_reload = LoadWallet(context, name, /*load_on_start=*/std::nullopt, options, status, error, warnings, /*check_backup_path=*/false);
             return to_reload != nullptr;
         };
         // Reload the main wallet
@@ -12031,7 +12306,7 @@ util::Result<MigrationResult> MigrateLegacyToDescriptor(const std::string& walle
         bilingual_str restore_error;
         DatabaseStatus status;
         std::vector<bilingual_str> warnings;
-        if (!RestoreWallet(context, backup_path, wallet_name, /*load_on_start=*/std::nullopt, status, restore_error, warnings)) {
+        if (!RestoreWallet(context, backup_path, wallet_name, /*load_on_start=*/std::nullopt, status, restore_error, warnings, /*check_backup_path=*/false)) {
             return util::Error{
                 migration_error + _("\nUnable to restore backup of wallet: ") +
                 restore_error};
@@ -12071,7 +12346,7 @@ void CWallet::PublishStakingTelemetry(
     m_staking_telemetry.tip_height = tip_height;
     m_staking_telemetry.weight_cache_height =
         m_cached_stake_weight_height.load(std::memory_order_acquire);
-    // GetStakeWeight publishes this pair while holding the same mutex, so the
+    // The staking worker publishes this pair while holding the same mutex, so the
     // snapshot cannot combine weight and height from different scans.
     m_staking_telemetry.weight =
         m_cached_stake_weight.load(std::memory_order_relaxed);
@@ -13678,7 +13953,8 @@ ShadowPowClaimInputSelectionResult CWallet::SelectShadowPowClaimInput(
 bool CWallet::SetPowMining(bool enabled, int threads, int cpu_percent, bilingual_str& error,
                            bool* created_payout, bool allow_new_payout_key,
                            bool wait_for_normal_unlock,
-                           const std::function<bool()>& cancelled)
+                           const std::function<bool()>& cancelled,
+                           const uint64_t* automatic_restart_consent)
 {
     if (created_payout) *created_payout = false;
     bool created_payout_local{false};
@@ -13704,8 +13980,31 @@ bool CWallet::SetPowMining(bool enabled, int threads, int cpu_percent, bilingual
         return true;
     };
     if (cancellation_requested()) return false;
+    if (enabled && HaveChain()) {
+        const std::optional<int> tip_height = chain().getHeight();
+        if (tip_height && IsShadowGoldRushWindowClosedAtTip(*tip_height)) {
+            error = _("Gold Rush has ended: the next block is past the reward window, so the PoW claim miner cannot start.");
+            return false;
+        }
+    }
     LOCK(m_pow_recovery_authority_mutex);
     if (cancellation_requested()) return false;
+    if (automatic_restart_consent) {
+        // An automatic restart is honoured only while its consent is intact:
+        // no explicit request has completed since it was recorded, and the
+        // restart is still queued. Both are decided here, under the same
+        // mutex explicit control holds, immediately before enabling.
+        if (m_pow_explicit_generation.load(std::memory_order_acquire) != *automatic_restart_consent ||
+            !m_pow_resume_below_end.exchange(false, std::memory_order_acq_rel)) {
+            m_pow_auto_restart_refusals.fetch_add(1);
+            error = _("The automatic Gold Rush PoW miner restart was superseded by an explicit miner request.");
+            return false;
+        }
+    } else {
+        // An explicit request replaces any restart queued for a reorganisation.
+        m_pow_explicit_generation.fetch_add(1, std::memory_order_acq_rel);
+        m_pow_resume_below_end.store(false, std::memory_order_release);
+    }
     // Reject an interactive start/reconfiguration without changing an
     // already-enabled startup worker. In particular, an encrypted wallet may
     // intentionally retain a zero-work worker while locked or staking-only so
@@ -14069,6 +14368,8 @@ void CWallet::StopPowMiningLocked()
         m_pow_claim_inflight = false;
         m_pow_wallet_wide_tip_wait = false;
     }
+    // Test-only synchronization point: the stop flag is set and the workers are not joined yet.
+    if (m_pow_reconcile_test_hook) m_pow_reconcile_test_hook("before_end_stop_join");
     if (group) {
         for (std::thread& thread : *group) {
             if (thread.joinable()) thread.join();
@@ -14085,6 +14386,106 @@ void CWallet::StopPowMiningLocked()
         m_pow_state = WalletPowMiningState::DISABLED;
     }
     m_stop_pow_mining_thread = false;
+}
+
+void CWallet::ReconcilePowMinerWithGoldRushWindow()
+{
+    if (!HaveChain()) return;
+    const std::optional<int> tip_height = chain().getHeight();
+    if (!tip_height) return;
+    ReconcilePowMinerWithWindowState(IsShadowGoldRushWindowClosedAtTip(*tip_height), *tip_height);
+}
+
+void CWallet::ReconcilePowMinerWithWindowState(bool closed, int tip_height)
+{
+    if (closed && m_pow_mining_enabled.load(std::memory_order_acquire)) {
+        if (m_pow_reconcile_test_hook) m_pow_reconcile_test_hook("before_end_stop_lock");
+        bool stopped{false};
+        {
+            LOCK(m_pow_recovery_authority_mutex);
+            // Decide under the mutex explicit control holds: an explicit
+            // disable that completed since the unlocked check above has
+            // already stopped the miner and must not leave a restart queued.
+            if (m_pow_mining_enabled.load(std::memory_order_acquire)) {
+                // Remember the settings only for a miner that was running; a
+                // later explicit request clears the memory.
+                m_pow_resume_threads.store(m_pow_threads.load());
+                m_pow_resume_cpu_percent.store(m_pow_cpu_percent.load());
+                m_pow_resume_below_end.store(true, std::memory_order_release);
+                StopPowMiningLocked();
+                stopped = true;
+            }
+        }
+        if (stopped) {
+            WalletLogPrintf("Gold Rush has ended at height %d: the PoW claim miner was stopped and its workers joined\n",
+                            tip_height);
+        }
+    } else if (!closed && m_pow_resume_below_end.load(std::memory_order_acquire)) {
+        // Record the explicit-request count first; SetPowMining re-checks it,
+        // and that the restart is still queued, under the authority mutex.
+        const uint64_t consent = m_pow_explicit_generation.load(std::memory_order_acquire);
+        if (m_pow_reconcile_test_hook) m_pow_reconcile_test_hook("before_restart");
+        bilingual_str error;
+        if (SetPowMining(/*enabled=*/true, m_pow_resume_threads.load(),
+                         m_pow_resume_cpu_percent.load(), error,
+                         /*created_payout=*/nullptr,
+                         /*allow_new_payout_key=*/false,
+                         /*wait_for_normal_unlock=*/true,
+                         /*cancelled=*/{}, &consent)) {
+            WalletLogPrintf("The chain is back below the end of Gold Rush: the PoW claim miner was restarted\n");
+        } else {
+            WalletLogPrintf("The chain is back below the end of Gold Rush but the PoW claim miner could not restart: %s\n",
+                            error.original);
+        }
+    }
+}
+
+ShadowPowClosedClaimReservation CWallet::GetClosedClaimReservationLocked() const
+{
+    AssertLockHeld(cs_wallet);
+    ShadowPowClosedClaimReservation result;
+    if (!IsShadowGoldRushWindowClosedAtTip(m_last_block_processed_height)) return result;
+    std::set<COutPoint> anchors;
+    const auto visit = [&](const std::set<uint256>& txids) {
+        for (const uint256& txid : txids) {
+            const auto it = mapWallet.find(txid);
+            if (it == mapWallet.end() || !it->second.tx) continue;
+            const CWalletTx& wtx = it->second;
+            if (wtx.isConfirmed() || wtx.isConflicted() ||
+                !TransactionHasShadowProof(*wtx.tx) || wtx.tx->vin.size() != 1) {
+                continue;
+            }
+            const COutPoint& prevout = wtx.tx->vin.front().prevout;
+            const auto prev = mapWallet.find(prevout.hash);
+            if (prev == mapWallet.end() || !prev->second.tx ||
+                prevout.n >= prev->second.tx->vout.size()) {
+                continue;
+            }
+            // A claim that spends another claim's change is counted through
+            // the family's root anchor.
+            if (TransactionHasShadowProof(*prev->second.tx)) continue;
+            if (IsMine(prev->second.tx->vout[prevout.n]) == ISMINE_NO) continue;
+            bool anchor_spent_on_chain{false};
+            const auto spenders = mapTxSpends.equal_range(prevout);
+            for (auto spender = spenders.first; spender != spenders.second; ++spender) {
+                const auto spend_tx = mapWallet.find(spender->second);
+                if (spend_tx != mapWallet.end() && spend_tx->second.isConfirmed()) {
+                    anchor_spent_on_chain = true;
+                    break;
+                }
+            }
+            if (anchor_spent_on_chain) continue;
+            ++result.claims;
+            if (anchors.insert(prevout).second) {
+                result.amount += prev->second.tx->vout[prevout.n].nValue;
+            }
+        }
+    };
+    visit(m_shadow_pow_unconfirmed_claim_txids);
+    visit(m_shadow_pow_unconfirmed_implicit_claim_txids);
+    visit(m_shadow_pow_unclassified_claim_txids);
+    result.anchors = anchors.size();
+    return result;
 }
 
 bool CWallet::IsPowMiningClosing() const
@@ -14355,6 +14756,14 @@ QuantumAddressBindingResult CWallet::ResolveConfiguredQuantumAddress(
                 option, purpose));
             return QuantumAddressBindingResult::INVALID;
         }
+        // A key made for the quantum stake return address is not adopted as a configured destination until its first
+        // verified wallet backup succeeded. (It still signs for, and stakes, funds already on it.)
+        if (IsQuantumStakeReturnPendingKey(candidate)) {
+            error = Untranslated(strprintf(
+                "%s for %s is a new quantum key still waiting for its first verified wallet backup.",
+                option, purpose));
+            return QuantumAddressBindingResult::INVALID;
+        }
     }
 
     destination = candidate;
@@ -14429,6 +14838,10 @@ bool CWallet::EnsurePowPayoutAddress(bilingual_str& error, bool* created, bool a
                 IsDirectQuantumMigrationScript(
                     GetScriptForDestination(existing)) &&
                 key_info && key_info->durably_stored) {
+                if (IsQuantumStakeReturnPendingKey(existing)) {
+                    error = _("Stored Gold Rush PoW payout address is a new quantum key still waiting for its first verified wallet backup.");
+                    return false;
+                }
                 return true;
             }
             if (IsValidDestination(existing) &&
@@ -14453,6 +14866,7 @@ bool CWallet::EnsurePowPayoutAddress(bilingual_str& error, bool* created, bool a
             }
             const auto key_info = GetQuantumKeyInfo(dest);
             if (!key_info || !key_info->durably_stored) continue;
+            if (IsQuantumStakeReturnPendingKey(dest)) continue;
             const int label_priority =
                 label == POW_PAYOUT_LABEL ? 2 :
                 label == OLD_POW_PAYOUT_LABEL ? 1 : 0;
@@ -14510,6 +14924,50 @@ bool CWallet::EnsurePowPayoutAddress(bilingual_str& error, bool* created, bool a
     }
     WalletLogPrintf("Gold Rush PoW miner created payout address %s. Back up the wallet.\n", encoded);
     return true;
+}
+
+CTxDestination CWallet::GetRecordedPowPayoutKey() const
+{
+    AssertLockHeld(cs_wallet);
+    const auto usable = [&](const CTxDestination& dest) {
+        if (!IsValidDestination(dest) || !IsQuantumMigrationDestination(dest) ||
+            !IsDirectQuantumMigrationScript(GetScriptForDestination(dest))) {
+            return false;
+        }
+        const auto info = GetQuantumKeyInfo(dest);
+        return info && info->durably_stored && !IsQuantumStakeReturnPendingKey(dest);
+    };
+    // 1. The payout key the claim miner is bound to (configured, restored or created).
+    if (!m_pow_payout_quantum.empty()) {
+        const CTxDestination bound = DecodeDestination(m_pow_payout_quantum);
+        if (usable(bound)) return bound;
+    }
+    // 2. The configured payout key.
+    const std::vector<std::string> configured = gArgs.GetArgs("-qqpowpayoutaddress");
+    if (configured.size() == 1) {
+        const CTxDestination dest = DecodeDestination(configured.front());
+        if (usable(dest)) return dest;
+    }
+    // 3. The key this wallet's confirmed synthetic Gold Rush payouts were paid to.
+    CTxDestination best;
+    int64_t best_time{0};
+    std::string best_encoded;
+    for (const auto& [txid, block_hash] : m_confirmed_synthetic_payout_block_by_txid) {
+        const auto it = mapWallet.find(txid);
+        if (it == mapWallet.end() || !it->second.tx) continue;
+        for (const CTxOut& out : it->second.tx->vout) {
+            CTxDestination dest;
+            if (!ExtractDestination(out.scriptPubKey, dest) || !usable(dest)) continue;
+            const int64_t created = GetQuantumKeyInfo(dest)->creation_time;
+            const std::string encoded = EncodeDestination(dest);
+            if (!IsValidDestination(best) || created < best_time || (created == best_time && encoded < best_encoded)) {
+                best = dest;
+                best_time = created;
+                best_encoded = encoded;
+            }
+        }
+    }
+    return best;
 }
 
 bool CWallet::EnsureShadowSignalPayoutAddress(
@@ -14583,6 +15041,8 @@ bool CWallet::EnsureShadowSignalPayoutAddress(
             }
             const auto key_info = GetQuantumKeyInfo(dest);
             if (!key_info || !key_info->durably_stored) continue;
+            // The return key waiting for its backup carries this very label; it is not reused.
+            if (IsQuantumStakeReturnPendingKey(dest)) continue;
             const int label_priority =
                 label == SHADOW_SIGNAL_PAYOUT_LABEL ? 2 :
                 label == OLD_SHADOW_SIGNAL_PAYOUT_LABEL ? 1 : 0;

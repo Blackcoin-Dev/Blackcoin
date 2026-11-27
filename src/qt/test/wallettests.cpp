@@ -45,7 +45,9 @@
 #include <rpc/util.h>
 #include <script/solver.h>
 #include <shadow.h>
+#include <test/util/allocator_statistics.h>
 #include <test/util/setup_common.h>
+#include <node/interface_ui.h>
 #include <util/strencodings.h>
 #include <util/string.h>
 #include <validation.h>
@@ -53,6 +55,7 @@
 #include <univalue.h>
 #include <wallet/test/util.h>
 #include <wallet/spend.h>
+#include <wallet/staking.h>
 #include <wallet/scriptpubkeyman.h>
 #include <wallet/wallet.h>
 #include <wallet/walletdb.h>
@@ -1487,6 +1490,50 @@ void TestStakingMiningPageControls(MiniGUI& mini_gui, const std::shared_ptr<CWal
 
     pow_enable->click();
     QTRY_COMPARE_WITH_TIMEOUT(walletModel.wallet().getPowMiningInfo().state, interfaces::WalletPowMiningState::DISABLED, 5000);
+}
+
+//! After the Gold Rush reward window closes the page says so, in the PoW
+//! status line and the shadow-ledger line, instead of "off" or "not active".
+void TestGoldRushEndStatusStrings(MiniGUI& mini_gui, const std::shared_ptr<CWallet>& core_wallet, const PlatformStyle* platform_style)
+{
+    WalletModel& wallet_model = *mini_gui.walletModel;
+    std::string error;
+    QVERIFY(wallet_model.wallet().setPowMining(false, 1, 10, error));
+
+    // The reward end height is a runtime parameter: place it below the test
+    // chain tip so the next block is past the window, and restore it after.
+    struct EndHeightGuard {
+        int saved{SHADOW_REWARD_END_HEIGHT};
+        ~EndHeightGuard() { SHADOW_REWARD_END_HEIGHT = saved; }
+    } guard;
+    const int tip_height = WITH_LOCK(core_wallet->cs_wallet, return core_wallet->GetLastBlockHeight());
+    QVERIFY(tip_height > 1);
+    SHADOW_REWARD_END_HEIGHT = tip_height - 1;
+    QVERIFY(wallet::IsShadowGoldRushWindowClosedAtTip(tip_height));
+
+    StakingMiningPage page(platform_style);
+    page.setClientModel(mini_gui.clientModel.get());
+    page.setWalletModel(&wallet_model);
+    page.show();
+    qApp->processEvents();
+
+    QLabel* pow_status = page.findChild<QLabel*>("powStatus");
+    QLabel* pow_dashboard = page.findChild<QLabel*>("stakingMiningDashboardPow");
+    QPushButton* refresh_details = page.findChild<QPushButton*>("stakingMiningRefresh");
+    QLabel* refresh_hint = page.findChild<QLabel*>("stakingMiningRefreshHint");
+    QVERIFY(pow_status);
+    QVERIFY(pow_dashboard);
+    QVERIFY(refresh_details);
+    QVERIFY(refresh_hint);
+
+    SettleChainTip(mini_gui, core_wallet);
+    refresh_details->click();
+    QTRY_VERIFY_WITH_TIMEOUT(refresh_hint->text().contains(QString("Detail panels updated")), 10000);
+    QTRY_VERIFY_WITH_TIMEOUT(pow_status->text().contains(QStringLiteral("Gold Rush has ended")), 10000);
+    QVERIFY(pow_status->text().contains(QStringLiteral("cannot be started again")) ||
+            pow_status->text().contains(QStringLiteral("reserved by")));
+    QVERIFY(!pow_status->text().contains(QStringLiteral("not active")));
+    QVERIFY(pow_dashboard->text().contains(QStringLiteral("Gold Rush has ended")));
 }
 
 void TestPowClaimRecoveryPolicyControls(
@@ -5128,6 +5175,7 @@ void TestGUI(interfaces::Node& node, const std::shared_ptr<CWallet>& wallet)
         return;
     }
     if (lane != QStringLiteral("recovery-ui")) TestStakingMiningPageControls(mini_gui, wallet, platformStyle.get());
+    TestGoldRushEndStatusStrings(mini_gui, wallet, platformStyle.get());
     if (lane == QStringLiteral("pow-controls")) return;
     TestPowClaimRecoveryPolicyControls(node, mini_gui, wallet, platformStyle.get());
     TestPowClaimRecoveryStakingOnlyRequiresFullUnlock(node, platformStyle.get());
@@ -5817,10 +5865,13 @@ void TestHistoryRowAllocations()
     };
     const auto legacy = per_row(legacy_before, legacy_after);
     const auto current = per_row(current_before, current_after);
-    qInfo("History row cost (malloc zones, %d rows): rc11 layout %.2f allocations %.1f bytes per row; now %.2f allocations %.1f bytes per row; sizeof %zu -> %zu",
+    if (NATIVE_ALLOCATOR_STATISTICS) qInfo("History row cost (malloc zones, %d rows): rc11 layout %.2f allocations %.1f bytes per row; now %.2f allocations %.1f bytes per row; sizeof %zu -> %zu",
         ROWS, legacy.first, legacy.second, current.first, current.second, sizeof(LegacyRecord), sizeof(TransactionRecord));
-    QVERIFY(current.first < legacy.first / 2);
-    QVERIFY(current.second < legacy.second * 0.7);
+    // Only the native allocator's statistics measure the heap; a sanitizer replaces it.
+    if (NATIVE_ALLOCATOR_STATISTICS) {
+        QVERIFY(current.first < legacy.first / 2);
+        QVERIFY(current.second < legacy.second * 0.7);
+    }
 }
 #endif
 
@@ -6969,6 +7020,362 @@ QList<TransactionRecord> SyntheticHistory(size_t first, size_t count, size_t tot
     return records;
 }
 } // namespace
+
+namespace {
+//! A quantum stake source of `value` for `dest`, confirmed at `height` in the wallet and present in the coin view.
+COutPoint AddReserveSource(TestChain100Setup& test, CWallet& wallet, const CTxDestination& dest, CAmount value, int height, uint32_t salt,
+                           std::optional<bool> held = std::nullopt)
+{
+    // With `held` given, the transaction is varied until the singleton rule gives that answer for the source's
+    // outpoint (the rule is by outpoint, and the outpoint depends on the wallet's random key).
+    CTransactionRef tx;
+    for (uint32_t extra = 0; extra < 4000; ++extra) {
+        CMutableTransaction mtx;
+        const uint32_t varied = salt + 256 * extra;
+        mtx.vin.emplace_back(COutPoint{uint256{static_cast<uint8_t>(salt)}, varied});
+        mtx.vout.emplace_back(value, GetScriptForDestination(dest));
+        tx = MakeTransactionRef(std::move(mtx));
+        if (!held || wallet::SingleOutputReserveBit(COutPoint{tx->GetHash(), 0}) == *held) break;
+    }
+    assert(tx);
+    assert(!held || wallet::SingleOutputReserveBit(COutPoint{tx->GetHash(), 0}) == *held);
+    const CBlockIndex* index = WITH_LOCK(::cs_main, return test.m_node.chainman->ActiveChain()[height]);
+    assert(index);
+    LOCK2(::cs_main, wallet.cs_wallet);
+    const bool added = wallet.AddToWallet(tx, wallet::TxStateConfirmed{index->GetBlockHash(), height, 0}) != nullptr;
+    assert(added);
+    wallet.chain().getCoinsTip().AddCoin(COutPoint{tx->GetHash(), 0}, Coin(tx->vout[0], height, false, false, index->nTime), true);
+    return COutPoint{tx->GetHash(), 0};
+}
+
+//! Click "Yes" in the confirmation dialog, after `before_confirm` ran (the guard begins while the user decides).
+void ConfirmSendAfter(std::function<void()> before_confirm)
+{
+    QTimer::singleShot(0, [before_confirm = std::move(before_confirm)]() {
+        for (QWidget* widget : QApplication::topLevelWidgets()) {
+            if (widget->inherits("SendConfirmationDialog")) {
+                before_confirm();
+                SendConfirmationDialog* dialog = qobject_cast<SendConfirmationDialog*>(widget);
+                QAbstractButton* button = dialog->button(QMessageBox::Yes);
+                button->setEnabled(true);
+                button->click();
+            }
+        }
+    });
+}
+
+//! The text of the exception a commit raises, or an empty string when it did not raise one.
+std::string CommitFailure(interfaces::Wallet& wallet, const CTransactionRef& tx, std::string* warning = nullptr)
+{
+    try {
+        const bilingual_str text = wallet.commitTransaction(tx, {}, {});
+        if (warning) *warning = text.translated;
+    } catch (const std::runtime_error& e) {
+        return e.what();
+    }
+    return {};
+}
+} // namespace
+
+//! The staking page's withdrawal of a selected staking output shows the warnings of the withdrawal: the new key to back
+//! up and the reserve the output was held in, in the translated text.
+void WalletTests::finalStakeReserveWithdrawalStatus()
+{
+#ifdef Q_OS_MACOS
+    if (QApplication::platformName() == "minimal") QSKIP("Cocoa wallet fixture requires a supported platform");
+#endif
+    TestChain100Setup test{ChainType::REGTEST, {"-shadowwhitelistheight=20", "-shadowgoldrushstartheight=30", "-shadowgoldrushendheight=60", "-qqgoldrushendheight=60", "-qqmigrationendheight=110", "-qqstaketierheight=61"}};
+    auto* previous = m_node.context();
+    auto restore = interfaces::MakeCleanupHandler([&] {
+        m_node.setContext(previous);
+        gArgs.ForceSetArg("-finalstakereserve", "1");
+    });
+    // Before anything that can stop the test: the hook is restored on every exit.
+    const ScopedTestTranslation translation;
+    auto loader = interfaces::MakeWalletLoader(*test.m_node.chain, *Assert(test.m_node.args));
+    test.m_node.wallet_loader = loader.get();
+    m_node.setContext(&test.m_node);
+    const std::unique_ptr<const PlatformStyle> style{PlatformStyle::instantiate("other")};
+    gArgs.ForceSetArg("-finalstakereserve", "1");
+
+    // The wallet holds the node's coinbases (legacy coins, the fee input) and two bonded outputs (N = 2, R = 1).
+    std::shared_ptr<CWallet> wallet = wallet::CreateSyncedWallet(*test.m_node.chain,
+        WITH_LOCK(Assert(test.m_node.chainman)->GetMutex(), return test.m_node.chainman->ActiveChain()), test.coinbaseKey);
+    wallet->SetBroadcastTransactions(false);
+    const auto big_bond = wallet->GetNewTieredQuantumDestination("bond-big", 9450);
+    const auto small_bond = wallet->GetNewTieredQuantumDestination("bond-small", 9450);
+    QVERIFY(big_bond && small_bond);
+    const COutPoint big = AddReserveSource(test, *wallet, *big_bond, 20 * COIN, 70, 1);
+    AddReserveSource(test, *wallet, *small_bond, 10 * COIN, 71, 2);
+    {
+        LOCK2(::cs_main, wallet->cs_wallet);
+        const wallet::FinalStakeReserve reserve = wallet::ComputeFinalStakeReserve(*wallet);
+        QVERIFY(reserve.active);
+        QCOMPARE(reserve.enforced.count(big), size_t{1});
+    }
+
+    MiniGUI gui(m_node, style.get());
+    gui.initModelForWallet(m_node, wallet, style.get());
+    StakingMiningPage page(style.get());
+    page.setClientModel(gui.clientModel.get());
+    page.setWalletModel(gui.walletModel.get());
+    page.show();
+    QLineEdit* address = page.findChild<QLineEdit*>("selfStakeAddress");
+    QComboBox* output_selector = page.findChild<QComboBox*>("selfStakeOutputSelector");
+    QPushButton* withdraw = page.findChild<QPushButton*>("selfStakeWithdraw");
+    QLabel* status = page.findChild<QLabel*>("selfStakeStatus");
+    QVERIFY(address && output_selector && withdraw && status);
+    address->setText(QString::fromStdString(EncodeDestination(*big_bond)));
+    QPushButton* refresh = page.findChild<QPushButton*>("stakingMiningRefresh");
+    QLabel* hint = page.findChild<QLabel*>("stakingMiningRefreshHint");
+    QVERIFY(refresh && hint);
+    const auto find_output = [&] {
+        for (int i = 0; i < output_selector->count(); ++i) {
+            if (output_selector->itemData(i).toString().contains(QString::fromStdString(big.hash.GetHex()))) return i;
+        }
+        return -1;
+    };
+    SettleChainTip(gui, wallet);
+    refresh->click();
+    WaitForDetailPanels(refresh, hint, [&] { return find_output() >= 0; }, 20000);
+    QVERIFY2(find_output() >= 0, "the staking output did not appear in the output selector");
+    output_selector->setCurrentIndex(find_output());
+
+    const auto confirm_yes = [] {
+        QTimer::singleShot(0, [] {
+            for (QWidget* widget : QApplication::topLevelWidgets()) {
+                if (auto* box = qobject_cast<QMessageBox*>(widget)) {
+                    if (QAbstractButton* yes = box->button(QMessageBox::Yes)) yes->click();
+                }
+            }
+        });
+    };
+    confirm_yes();
+    withdraw->click();
+    const QString shown = status->text();
+    QVERIFY2(shown.contains(QStringLiteral("Cold staking unbonding started")), qPrintable(shown));
+    QVERIFY2(shown.contains(QStringLiteral("[T] This transaction spends")), qPrintable(shown));
+    QVERIFY2(shown.contains(QStringLiteral("final stake reserve")), qPrintable(shown));
+    QVERIFY2(shown.contains(QStringLiteral("[T] A new non-HD ML-DSA quantum change key was created")), qPrintable(shown));
+    QVERIFY2(shown.contains(QStringLiteral("Back up this wallet now")), qPrintable(shown));
+}
+
+void WalletTests::finalStakeReservePreparedTransactions()
+{
+#ifdef Q_OS_MACOS
+    if (QApplication::platformName() == "minimal") QSKIP("Cocoa wallet fixture requires a supported platform");
+#endif
+    // Regtest schedule: Migration ends at 110, so the first Final block is 111 and the guard covers the candidates 101
+    // to 110. The chain is at 100 and the guard begins with the next block. Each case is prepared while the option is
+    // off (the guard not on) and committed with it on: the transaction is prepared before the guard and committed in it.
+    TestChain100Setup test{ChainType::REGTEST, {"-shadowwhitelistheight=20", "-shadowgoldrushstartheight=30", "-shadowgoldrushendheight=60", "-qqgoldrushendheight=60", "-qqmigrationendheight=110"}};
+    auto* previous = m_node.context();
+    auto restore_node = interfaces::MakeCleanupHandler([&] {
+        m_node.setContext(previous);
+        gArgs.ForceSetArg("-finalstakereserve", "1");
+    });
+    auto loader = interfaces::MakeWalletLoader(*test.m_node.chain, *Assert(test.m_node.args));
+    test.m_node.wallet_loader = loader.get();
+    m_node.setContext(&test.m_node);
+    const std::unique_ptr<const PlatformStyle> style{PlatformStyle::instantiate("other")};
+
+    // A key of its own: the wallet holds the two quantum sources and no spendable coinbase.
+    CKey wallet_key;
+    wallet_key.MakeNewKey(/*fCompressed=*/true);
+    std::shared_ptr<CWallet> wallet = wallet::CreateSyncedWallet(*test.m_node.chain,
+        WITH_LOCK(Assert(test.m_node.chainman)->GetMutex(), return test.m_node.chainman->ActiveChain()), wallet_key);
+    wallet->SetBroadcastTransactions(false);
+    const auto dest_big = wallet->GetNewQuantumDestination("big");
+    const auto dest_small = wallet->GetNewQuantumDestination("small");
+    const auto payee = wallet->GetNewQuantumDestination("payee");
+    QVERIFY(dest_big && dest_small && payee);
+    // N = 2, R = 1: the larger source is the reserve once the guard is on.
+    const COutPoint big = AddReserveSource(test, *wallet, *dest_big, 20 * COIN, 70, 1);
+    // Once the larger source is spent (step 5) the smaller one is the wallet's only source (N = 1); the singleton rule holds
+    // it back only when its outpoint says so, so it is made one the rule holds.
+    const COutPoint small = AddReserveSource(test, *wallet, *dest_small, 10 * COIN, 71, 2, /*held=*/true);
+
+    MiniGUI gui(m_node, style.get());
+    gui.initModelForWallet(m_node, wallet, style.get());
+    interfaces::Wallet& iface = gui.walletModel->wallet();
+    SendCoinsDialog& dialog = gui.sendCoinsDialog;
+
+    // The Send page funds from the quantum balance (the wallet's two sources).
+    for (QComboBox* combo : dialog.findChildren<QComboBox*>()) {
+        if (combo->findText(QStringLiteral("Quantum BLK funds")) >= 0) combo->setCurrentIndex(combo->findText(QStringLiteral("Quantum BLK funds")));
+    }
+    const auto guard_off = [] { gArgs.ForceSetArg("-finalstakereserve", "0"); };
+    const auto guard_on = [] { gArgs.ForceSetArg("-finalstakereserve", "1"); };
+    const auto prepare = [&](wallet::CCoinControl coin_control, CAmount amount) -> CTransactionRef {
+        guard_off();
+        coin_control.destChange = *dest_small; // quantum inputs need quantum change; fixed, so the id varies only with the input order and the lock time
+        int change_pos{1};
+        CAmount fee{0};
+        auto created = iface.createTransaction({wallet::CRecipient{*payee, amount, false}}, coin_control, /*sign=*/true, change_pos, fee);
+        if (!created) {
+            QTest::qFail(util::ErrorString(created).original.c_str(), __FILE__, __LINE__);
+            return nullptr;
+        }
+        return *created;
+    };
+    const auto recorded = [&](const CTransactionRef& tx) { return WITH_LOCK(wallet->cs_wallet, return wallet->mapWallet.count(tx->GetHash()) > 0); };
+    const auto refused_text = QString::fromStdString(wallet::FINAL_STAKE_RESERVE_COMMIT_ERROR);
+
+    // 1. Automatic inputs (both sources) refused at the commit: the wallet's own choice may not take the reserve.
+    {
+        CTransactionRef tx;
+        {
+            tx = prepare({}, 25 * COIN);
+            QVERIFY(tx);
+            QCOMPARE(static_cast<int>(tx->vin.size()), 2);
+            guard_on();
+            QCOMPARE(QString::fromStdString(CommitFailure(iface, tx)), refused_text);
+            QVERIFY(!recorded(tx));
+            QVERIFY(!WITH_LOCK(wallet->cs_wallet, return wallet->IsLockedCoin(big)));
+        }
+    }
+    // 2. One explicit, one the wallet added: the automatic input is enforced.
+    {
+        wallet::CCoinControl selected;
+        selected.Select(small);
+        const CTransactionRef tx = prepare(selected, 25 * COIN);
+        QVERIFY(tx);
+        QCOMPARE(static_cast<int>(tx->vin.size()), 2);
+        guard_on();
+        QCOMPARE(QString::fromStdString(CommitFailure(iface, tx)), refused_text);
+        QVERIFY(!recorded(tx));
+    }
+    // 3. A cancelled explicit preparation, then an automatic one with the same transaction id. The explicit choice
+    //    belonged to the first preparation only: the automatic transaction is refused.
+    {
+        wallet::CCoinControl both;
+        both.Select(big);
+        both.Select(small);
+        both.m_allow_other_inputs = false;
+        // One preparation in ten takes a random earlier lock time, which an automatic preparation would match only by
+        // chance: prepare the explicit one again until it carries the usual lock time, the wallet's tip height.
+        const uint32_t usual_lock_time{static_cast<uint32_t>(WITH_LOCK(wallet->cs_wallet, return wallet->GetLastBlockHeight()))};
+        CTransactionRef cancelled;
+        for (int attempt = 0; attempt < 60 && !(cancelled && cancelled->nLockTime == usual_lock_time); ++attempt) {
+            cancelled = prepare(both, 25 * COIN);
+            QVERIFY(cancelled);
+        }
+        QCOMPARE(cancelled->nLockTime, usual_lock_time);
+        // The wallet orders the two inputs at random: prepare again until the order and the lock time, and so the id,
+        // are the same.
+        CTransactionRef automatic;
+        for (int attempt = 0; attempt < 60 && !(automatic && automatic->GetHash() == cancelled->GetHash()); ++attempt) {
+            automatic = prepare({}, 25 * COIN);
+            QVERIFY(automatic);
+        }
+        QVERIFY2(automatic->GetHash() == cancelled->GetHash(),
+                 qPrintable(QStringLiteral("the two preparations must give one transaction id (lock times %1 and %2, first inputs %3 and %4)")
+                     .arg(cancelled->nLockTime).arg(automatic->nLockTime)
+                     .arg(QString::fromStdString(cancelled->vin.at(0).prevout.ToString()), QString::fromStdString(automatic->vin.at(0).prevout.ToString()))));
+        QVERIFY(cancelled.get() != automatic.get());
+        guard_on();
+        QCOMPARE(QString::fromStdString(CommitFailure(iface, automatic)), refused_text);
+        QVERIFY(!recorded(automatic));
+    }
+    // 4. The same through the dialog: the guard begins while the user reads the confirmation, the commit is refused,
+    //    the user is told why and nothing is left in the wallet.
+    {
+        guard_off();
+        dialog.getCoinControl()->destChange = *dest_small;
+        QVBoxLayout* entries = dialog.findChild<QVBoxLayout*>("entries");
+        SendCoinsEntry* entry = qobject_cast<SendCoinsEntry*>(entries->itemAt(0)->widget());
+        entry->findChild<QValidatedLineEdit*>("payTo")->setText(QString::fromStdString(EncodeDestination(*payee)));
+        entry->findChild<BitcoinAmountField*>("payAmount")->setValue(25 * COIN);
+        // The dialog checks the amount against the cached balance: let the model learn the two sources first.
+        gui.walletModel->pollBalanceChanged();
+        QTRY_VERIFY_WITH_TIMEOUT(gui.walletModel->getCachedBalance().balance >= 30 * COIN, 10000);
+        QSignalSpy messages(&dialog, &SendCoinsDialog::message);
+        int sent_count{0};
+        const QMetaObject::Connection sent_connection = QObject::connect(&dialog, &SendCoinsDialog::coinsSent, &dialog, [&sent_count](const uint256&) { ++sent_count; });
+        const size_t records_before = WITH_LOCK(wallet->cs_wallet, return wallet->mapWallet.size());
+        ConfirmSendAfter(guard_on);
+        QVERIFY(QMetaObject::invokeMethod(&dialog, "sendButtonClicked", Q_ARG(bool, false)));
+        QObject::disconnect(sent_connection);
+        QCOMPARE(sent_count, 0);
+        QVERIFY2(messages.count() >= 1, "the refusal was not presented to the user");
+        QVERIFY2(messages.last().at(1).toString().contains(QStringLiteral("final stake reserve")), qPrintable(messages.last().at(1).toString()));
+        QCOMPARE(static_cast<int>(messages.last().at(2).toUInt()), static_cast<int>(CClientUIInterface::MSG_ERROR));
+        QCOMPARE(WITH_LOCK(wallet->cs_wallet, return wallet->mapWallet.size()), records_before);
+        QCOMPARE(static_cast<int>(test.m_node.mempool->size()), 0);
+        dialog.clear();
+    }
+    // 5. An explicit selection of the reserved source goes through, and the user is told what it took.
+    {
+        wallet::CCoinControl selected;
+        selected.Select(big);
+        selected.m_allow_other_inputs = false;
+        const CTransactionRef tx = prepare(selected, 15 * COIN);
+        QVERIFY(tx);
+        QCOMPARE(static_cast<int>(tx->vin.size()), 1);
+        guard_on();
+        std::string warning;
+        QVERIFY2(CommitFailure(iface, tx, &warning).empty(), "an explicit input must keep its right to spend the reserve");
+        QVERIFY(recorded(tx));
+        QVERIFY2(QString::fromStdString(warning).contains(QStringLiteral("final stake reserve")), warning.c_str());
+    }
+    // 6. The same through the dialog (the other source: the reserve is the one that is left, so it is explicit too).
+    {
+        guard_off();
+        dialog.getCoinControl()->destChange = *payee;
+        dialog.getCoinControl()->Select(small);
+        dialog.getCoinControl()->m_allow_other_inputs = false;
+        QVBoxLayout* entries = dialog.findChild<QVBoxLayout*>("entries");
+        SendCoinsEntry* entry = qobject_cast<SendCoinsEntry*>(entries->itemAt(0)->widget());
+        entry->findChild<QValidatedLineEdit*>("payTo")->setText(QString::fromStdString(EncodeDestination(*payee)));
+        entry->findChild<BitcoinAmountField*>("payAmount")->setValue(5 * COIN);
+        QSignalSpy model_messages(gui.walletModel.get(), &WalletModel::message);
+        int sent_count{0};
+        const QMetaObject::Connection sent_connection = QObject::connect(&dialog, &SendCoinsDialog::coinsSent, &dialog, [&sent_count](const uint256&) { ++sent_count; });
+        // A translator that marks every translated string: the text the dialog shows must be the translated one.
+        const ScopedTestTranslation translation;
+        ConfirmSendAfter(guard_on);
+        QVERIFY(QMetaObject::invokeMethod(&dialog, "sendButtonClicked", Q_ARG(bool, false)));
+        QObject::disconnect(sent_connection);
+        QCOMPARE(sent_count, 1);
+        QVERIFY2(model_messages.count() == 1, "the explicit spend of the reserve was not reported to the user");
+        QVERIFY(model_messages.first().at(1).toString().contains(QStringLiteral("final stake reserve")));
+        QVERIFY2(model_messages.first().at(1).toString().startsWith(QStringLiteral("[T] This transaction spends")), qPrintable(model_messages.first().at(1).toString()));
+        QCOMPARE(static_cast<int>(model_messages.first().at(2).toUInt()), static_cast<int>(CClientUIInterface::MSG_WARNING));
+    }
+    // 7. A storage failure in the commit is not a refusal the dialog may present and recover from: the wallet can hold
+    //    a record the disk does not. The failure leaves the dialog as an exception (the application treats it as fatal),
+    //    the user is not told that nothing happened, and nothing is reported as sent.
+    {
+        guard_off();
+        const COutPoint fresh = AddReserveSource(test, *wallet, *dest_small, 10 * COIN, 72, 3);
+        dialog.getCoinControl()->UnSelectAll();
+        dialog.getCoinControl()->Select(fresh);
+        dialog.getCoinControl()->m_allow_other_inputs = false;
+        dialog.getCoinControl()->destChange = *payee;
+        QVBoxLayout* entries = dialog.findChild<QVBoxLayout*>("entries");
+        SendCoinsEntry* entry = qobject_cast<SendCoinsEntry*>(entries->itemAt(0)->widget());
+        entry->findChild<QValidatedLineEdit*>("payTo")->setText(QString::fromStdString(EncodeDestination(*payee)));
+        entry->findChild<BitcoinAmountField*>("payAmount")->setValue(5 * COIN);
+        QSignalSpy messages(&dialog, &SendCoinsDialog::message);
+        int sent_count{0};
+        const QMetaObject::Connection sent_connection = QObject::connect(&dialog, &SendCoinsDialog::coinsSent, &dialog, [&sent_count](const uint256&) { ++sent_count; });
+        gArgs.ForceSetArg("-qqcommitwritefailure", "1");
+        auto clear_injection = interfaces::MakeCleanupHandler([] { gArgs.ForceSetArg("-qqcommitwritefailure", "0"); });
+        ConfirmSendAfter([] {});
+        bool escaped{false};
+        try {
+            QMetaObject::invokeMethod(&dialog, "sendButtonClicked", Q_ARG(bool, false));
+        } catch (const interfaces::WalletCommitRejected&) {
+            QFAIL("a storage failure was reported as a recoverable rejection");
+        } catch (const std::runtime_error& e) {
+            escaped = QString::fromStdString(e.what()).contains(QStringLiteral("Wallet db error"));
+        }
+        QObject::disconnect(sent_connection);
+        QVERIFY2(escaped, "the storage failure did not leave the dialog");
+        QCOMPARE(sent_count, 0);
+        QCOMPARE(messages.count(), 0);
+    }
+}
 
 void WalletTests::historyScaleBenchmark_data()
 {

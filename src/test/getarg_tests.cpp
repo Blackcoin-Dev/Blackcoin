@@ -13,6 +13,8 @@
 #include <util/strencodings.h>
 
 #include <limits>
+#include <optional>
+#include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
@@ -453,6 +455,188 @@ BOOST_AUTO_TEST_CASE(logargs)
     BOOST_CHECK(str.find("Command-line arg: okaylog=\"public\"") != std::string::npos);
     BOOST_CHECK(str.find("dontlog=****") != std::string::npos);
     BOOST_CHECK(str.find("private42") == std::string::npos);
+}
+
+namespace {
+struct ConfigArgs : ArgsManager {
+    bool Read(const std::string& text, std::string& error)
+    {
+        std::istringstream stream{text};
+        return ReadConfigStream(stream, "", error);
+    }
+};
+
+void SetupStrictAndPlain(ArgsManager& args, unsigned int strict_flags = ArgsManager::ALLOW_ANY | ArgsManager::STRICT_BOOL)
+{
+    SetupArgs(args, {{"-strict", strict_flags}, {"-plain", ArgsManager::ALLOW_ANY}});
+}
+
+bool ParseCommandLine(ArgsManager& args, const std::vector<std::string>& options, std::string& error)
+{
+    std::vector<const char*> argv{"testbitcoin"};
+    for (const std::string& option : options) argv.push_back(option.c_str());
+    return args.ParseParameters(argv.size(), argv.data(), error);
+}
+} // namespace
+
+// A STRICT_BOOL option takes the bare flag and the values 0, 1, true and false in any letter case, positive and
+// negated, and refuses every other text (an empty assignment included) while the text is still known. A positive
+// assignment stays a string ("1" or "0") and only a negated key is a boolean, as for an ordinary option.
+BOOST_AUTO_TEST_CASE(strict_bool_option)
+{
+    const auto read_command_line = [](const std::string& arg, std::string& error) -> std::optional<common::SettingsValue> {
+        ArgsManager local_args;
+        SetupStrictAndPlain(local_args);
+        if (!ParseCommandLine(local_args, {arg}, error)) return std::nullopt;
+        return local_args.GetSetting("strict");
+    };
+    const auto read_config = [](const std::string& line, std::string& error) -> std::optional<common::SettingsValue> {
+        ConfigArgs local_args;
+        SetupStrictAndPlain(local_args);
+        if (!local_args.Read(line + "\n", error)) return std::nullopt;
+        return local_args.GetSetting("strict");
+    };
+
+    // (text, boolean meaning, negated)
+    struct Case { std::string text; bool value; bool negated; };
+    const std::vector<Case> accepted{
+        {"strict", true, false}, {"nostrict", false, true},
+        {"strict=1", true, false}, {"strict=0", false, false}, {"strict=true", true, false}, {"strict=false", false, false},
+        {"strict=TRUE", true, false}, {"strict=False", false, false}, {"strict=tRuE", true, false},
+        {"nostrict=1", false, true}, {"nostrict=0", true, true}, {"nostrict=true", false, true}, {"nostrict=false", true, true},
+        {"nostrict=TRUE", false, true}, {"nostrict=FALSE", true, true},
+    };
+    for (const auto& [text, expected, negated] : accepted) {
+        std::string error;
+        const auto from_command_line = read_command_line("-" + text, error);
+        BOOST_REQUIRE_MESSAGE(from_command_line, text + ": " + error);
+        if (negated) {
+            BOOST_CHECK_MESSAGE(from_command_line->isBool() && from_command_line->get_bool() == expected, text);
+        } else {
+            // A positive assignment is a string, "1" or "0".
+            BOOST_CHECK_MESSAGE(from_command_line->isStr() && from_command_line->get_str() == (expected ? "1" : "0"), text);
+        }
+        // A bare flag is not valid in a configuration file the way it is on the command line; the assignment forms are.
+        if (text.find('=') != std::string::npos) {
+            const auto from_config = read_config(text, error);
+            BOOST_REQUIRE_MESSAGE(from_config, text + ": " + error);
+            BOOST_CHECK_MESSAGE(from_config->write() == from_command_line->write(), text);
+        }
+    }
+    const std::vector<std::string> rejected{
+        "strict=", "nostrict=", "strict=2", "strict=-1", "strict=yes", "strict=no", "strict=on", "strict=off", "strict=01",
+        "strict=t", "strict= 1", "strict=1 ", "strict=abc", "nostrict=abc", "nostrict=2", "nostrict=yes", "nostrict=00",
+    };
+    for (const std::string& text : rejected) {
+        std::string error;
+        BOOST_CHECK_MESSAGE(!read_command_line("-" + text, error), "command line accepted " + text);
+        BOOST_CHECK_MESSAGE(error.find("only 0, 1, true or false") != std::string::npos, text + ": " + error);
+        error.clear();
+        // A configuration file trims the whitespace around a value, so a value that is only padded is the accepted one.
+        if (text == "strict= 1" || text == "strict=1 ") continue;
+        BOOST_CHECK_MESSAGE(!read_config(text, error), "configuration accepted " + text);
+    }
+    // Unset stays unset, and another option keeps the lenient reading it always had.
+    ArgsManager local_args;
+    SetupStrictAndPlain(local_args);
+    ResetArgs(local_args, "-noplain=abc");
+    BOOST_CHECK(local_args.GetSetting("strict").isNull());
+    BOOST_CHECK(local_args.GetSetting("plain").isTrue()); // the old double-negative reading of an unreadable value
+}
+
+// The strict option has the precedence of an ordinary option, for repeated, mixed and sectioned assignments in the
+// configuration file and on the command line: the answer is the one an ordinary option gives for the same text.
+BOOST_AUTO_TEST_CASE(strict_bool_option_keeps_ordinary_precedence)
+{
+    const std::vector<std::vector<std::string>> sequences{
+        {"=0", "=1"}, {"=1", "=0"}, {"=0", "=0"}, {"=1", "=1"},
+        {"=0", "no=1"}, {"=1", "no=1"}, {"no=1", "=1"}, {"no=1", "=0"}, {"no=0", "=0"}, {"=1", "no=0"},
+        {"=0", "=1", "=0"}, {"=1", "=0", "=1"}, {"=0", "=1", "no=1"}, {"no=1", "=1", "=0"},
+    };
+    const auto text_of = [](const std::vector<std::string>& sequence, const std::string& name, const std::string& prefix = "") {
+        std::string text;
+        for (const std::string& item : sequence) {
+            text += prefix + (item.rfind("no", 0) == 0 ? "no" + name + item.substr(2) : name + item) + "\n";
+        }
+        return text;
+    };
+    for (const auto& sequence : sequences) {
+        for (const bool default_value : {false, true}) {
+            // Configuration file, default section, then a network section that has its own assignments.
+            std::string error;
+            ConfigArgs both;
+            SetupStrictAndPlain(both);
+            both.SelectConfigNetwork("regtest");
+            const std::string config = text_of(sequence, "strict") + text_of(sequence, "plain") +
+                                       "[regtest]\n" + text_of(sequence, "strict") + text_of(sequence, "plain");
+            BOOST_REQUIRE_MESSAGE(both.Read(config, error), error);
+            BOOST_CHECK_EQUAL(both.GetBoolArg("strict", default_value), both.GetBoolArg("plain", default_value));
+            // Network section only.
+            ConfigArgs sectioned;
+            SetupStrictAndPlain(sectioned);
+            sectioned.SelectConfigNetwork("regtest");
+            BOOST_REQUIRE_MESSAGE(sectioned.Read(text_of(sequence, "strict", "regtest.") + text_of(sequence, "plain", "regtest."), error), error);
+            BOOST_CHECK_EQUAL(sectioned.GetBoolArg("strict", default_value), sectioned.GetBoolArg("plain", default_value));
+            // Command line: the last assignment wins, and the command line beats the configuration file.
+            ArgsManager cli;
+            SetupStrictAndPlain(cli);
+            std::vector<std::string> strict_options, plain_options;
+            for (const std::string& item : sequence) {
+                const std::string negate = item.rfind("no", 0) == 0 ? "no" : "";
+                const std::string value = item.substr(item.find('='));
+                strict_options.push_back("-" + negate + "strict" + value);
+                plain_options.push_back("-" + negate + "plain" + value);
+            }
+            std::vector<std::string> options = strict_options;
+            options.insert(options.end(), plain_options.begin(), plain_options.end());
+            BOOST_REQUIRE_MESSAGE(ParseCommandLine(cli, options, error), error);
+            BOOST_CHECK_EQUAL(cli.GetBoolArg("strict", default_value), cli.GetBoolArg("plain", default_value));
+        }
+    }
+    // The command line over the configuration file.
+    for (const char* config_value : {"0", "1"}) {
+        for (const char* cli_value : {"0", "1"}) {
+            ConfigArgs args;
+            SetupStrictAndPlain(args);
+            std::string error;
+            BOOST_REQUIRE(args.Read(std::string{"strict="} + config_value + "\nplain=" + config_value + "\n", error));
+            BOOST_REQUIRE(ParseCommandLine(args, {std::string{"-strict="} + cli_value, std::string{"-plain="} + cli_value}, error));
+            BOOST_CHECK_EQUAL(args.GetBoolArg("strict", false), args.GetBoolArg("plain", false));
+            BOOST_CHECK_EQUAL(args.GetBoolArg("strict", true), std::string{cli_value} == "1");
+        }
+    }
+    // An invalid occurrence fails even when a valid one follows it, on both inputs.
+    for (const char* bad : {"maybe", "", "2"}) {
+        std::string error;
+        ArgsManager cli;
+        SetupStrictAndPlain(cli);
+        BOOST_CHECK(!ParseCommandLine(cli, {std::string{"-strict="} + bad, "-strict=1"}, error));
+        ConfigArgs config;
+        SetupStrictAndPlain(config);
+        BOOST_CHECK(!config.Read(std::string{"strict="} + bad + "\nstrict=1\n", error));
+        ConfigArgs negated;
+        SetupStrictAndPlain(negated);
+        BOOST_CHECK(!negated.Read(std::string{"nostrict="} + bad + "\nstrict=1\n", error));
+    }
+}
+
+// The flags compose: negation and elision are refused before the strict reading.
+BOOST_AUTO_TEST_CASE(strict_bool_option_composes_with_the_other_flags)
+{
+    std::string error;
+    ArgsManager no_negation;
+    SetupStrictAndPlain(no_negation, ArgsManager::ALLOW_ANY | ArgsManager::STRICT_BOOL | ArgsManager::DISALLOW_NEGATION);
+    BOOST_CHECK(!ParseCommandLine(no_negation, {"-nostrict"}, error));
+    BOOST_CHECK(error.find("Negating of -strict is meaningless") != std::string::npos);
+    BOOST_CHECK(!ParseCommandLine(no_negation, {"-nostrict=maybe"}, error));
+    BOOST_CHECK(error.find("Negating of -strict is meaningless") != std::string::npos);
+    BOOST_CHECK(ParseCommandLine(no_negation, {"-strict=1"}, error));
+
+    ArgsManager no_elision;
+    SetupStrictAndPlain(no_elision, ArgsManager::ALLOW_ANY | ArgsManager::STRICT_BOOL | ArgsManager::DISALLOW_ELISION);
+    BOOST_CHECK(!ParseCommandLine(no_elision, {"-strict"}, error));
+    BOOST_CHECK(error.find("Can not set -strict with no value") != std::string::npos);
+    BOOST_CHECK(ParseCommandLine(no_elision, {"-strict=0"}, error));
 }
 
 BOOST_AUTO_TEST_SUITE_END()

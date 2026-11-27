@@ -7,6 +7,7 @@
 #include <primitives/transaction.h>
 #include <random.h>
 #include <streams.h>
+#include <test/util/allocator_statistics.h>
 #include <test/util/random.h>
 #include <test/util/setup_common.h>
 #include <util/fs.h>
@@ -638,14 +639,17 @@ BOOST_AUTO_TEST_CASE(memory_per_claim_measurement)
         const double map_blocks{double(with_maps.blocks - start.blocks) / RECORDS};
         const double packed_bytes{double(with_both.bytes - with_maps.bytes) / RECORDS};
         const double packed_blocks{double(with_both.blocks - with_maps.blocks) / RECORDS};
-        BOOST_TEST_MESSAGE(strprintf(
+        if (NATIVE_ALLOCATOR_STATISTICS) BOOST_TEST_MESSAGE(strprintf(
             "%s x %u (%.1f pairs each): std::map %.0f heap bytes in %.1f allocations per record (+%u inline); "
             "packed %.0f heap bytes in %.1f allocations per record (+%u inline); saved %.0f bytes, %.1f allocations per record",
             claims ? "claim-shaped mapValue" : "payout-shaped mapValue", RECORDS, double(pairs) / RECORDS,
             map_bytes, map_blocks, unsigned(sizeof(mapValue_t)), packed_bytes, packed_blocks, unsigned(sizeof(WalletTxValueMap)),
             map_bytes + sizeof(mapValue_t) - packed_bytes - sizeof(WalletTxValueMap), map_blocks - packed_blocks));
-        BOOST_CHECK(packed_blocks < 1.01);
-        BOOST_CHECK(packed_bytes * (claims ? 5 : 2) < map_bytes);
+        // Only the native allocator's statistics measure the heap; a sanitizer replaces it.
+        if (NATIVE_ALLOCATOR_STATISTICS) {
+            BOOST_CHECK(packed_blocks < 1.01);
+            BOOST_CHECK(packed_bytes * (claims ? 5 : 2) < map_bytes);
+        }
         for (uint32_t i{0}; i < RECORDS; i += 997) BOOST_CHECK(after[i] == before[i]);
     }
     BOOST_TEST_MESSAGE(strprintf("sizeof(CWalletTx) = %u", unsigned(sizeof(CWalletTx))));
@@ -691,7 +695,7 @@ BOOST_AUTO_TEST_CASE(memory_per_claim_measurement)
         new_records.push_back(std::move(record));
     }
     const HeapUse records_new{CurrentHeapUse()};
-    BOOST_TEST_MESSAGE(strprintf(
+    if (NATIVE_ALLOCATOR_STATISTICS) BOOST_TEST_MESSAGE(strprintf(
         "claim record x %u, without its transaction: rc12 layout (sizeof %u) %.0f heap bytes in %.1f allocations; now (sizeof %u) %.0f heap bytes in %.1f allocations",
         RECORDS, unsigned(sizeof(Rc12WalletTxLayout)),
         double(records_old.bytes - records_start.bytes) / RECORDS, double(records_old.blocks - records_start.blocks) / RECORDS,

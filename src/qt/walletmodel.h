@@ -365,8 +365,6 @@ public:
 
     bool isMultiwallet() const;
 
-    uint64_t getStakeWeight();
-
     void refresh(bool pk_hash_only = false);
 
     uint256 getLastBlockProcessed() const;
@@ -503,13 +501,6 @@ private:
     bool m_send_retry_requested{false};
     std::optional<interfaces::WalletDisplayCoinFamily> m_cached_send_family;
     std::optional<CAmount> m_cached_send_balance;
-    //! Stake weight refresh (wallet worker thread), driven from the poll.
-    uint64_t m_stake_weight_generation{1};
-    uint64_t m_stake_weight_applied_generation{0};
-    bool m_stake_weight_poll_in_flight{false};
-    void pollStakeWeight();
-    std::atomic<uint64_t> nWeight;
-    std::atomic<bool> updateStakeWeight;
 
     //! History loading (GUI thread). A wallet's history is read the first time it is shown, one wallet at a time
     //! process-wide, in chunks that each hold the wallet lock briefly.
@@ -655,8 +646,6 @@ public Q_SLOTS:
     void pollBalanceChanged();
     /* The display balance worker published a snapshot or changed its failed state */
     void displayBalancesChanged();
-    /* Update stake weight when changed */
-    void checkStakeWeightChanged();
 };
 
 #endif // BITCOIN_QT_WALLETMODEL_H

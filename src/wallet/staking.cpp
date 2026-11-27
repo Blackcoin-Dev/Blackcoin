@@ -9,13 +9,18 @@
 #include <addresstype.h>
 #include <chain.h>
 #include <common/args.h>
+#include <common/settings.h>
 #include <consensus/demurrage.h>
+#include <crypto/common.h>
 #include <crypto/mldsa.h>
+#include <crypto/sha256.h>
 #include <key_io.h>
 #include <node/quantum_pool.h>
 #include <policy/policy.h>
 #include <wallet/coincontrol.h>
 #include <wallet/fees.h>
+#include <wallet/migration_batch.h>
+#include <wallet/quantum_return_backup.h>
 #include <wallet/receive.h>
 #include <wallet/redelegation.h>
 #include <wallet/staking.h>
@@ -28,21 +33,31 @@
 #include <txmempool.h>
 #include <util/check.h>
 #include <util/moneystr.h>
+#include <util/strencodings.h>
 #include <util/result.h>
 #include <util/time.h>
 #include <util/translation.h>
 #include <undo.h>
+#include <univalue.h>
 #include <validation.h>
 #include <wallet/walletdb.h>
 
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstdlib>
 #include <limits>
 #include <map>
 #include <set>
 #include <string_view>
 #include <thread>
+
+#ifndef WIN32
+#include <csignal>
+#include <unistd.h>
+#else
+#include <windows.h>
+#endif
 
 namespace wallet {
 
@@ -76,14 +91,6 @@ static bool CoinStakeSpendsKnownColdStake(CWallet& wallet, const CMutableTransac
 
 namespace {
 
-struct AutoDemurrageAttestCandidate
-{
-    std::vector<unsigned char> witness_program;
-    uint256 key_hash;
-    int inactive_blocks{0};
-    COutPoint outpoint;
-};
-
 struct AutoRedelegationSource
 {
     CTxDestination source_dest;
@@ -94,13 +101,14 @@ struct AutoRedelegationSource
     int last_win_height{0};
 };
 
-bool IsGeneratedQuantumStakeCandidate(const CWallet& wallet, const COutPoint& outpoint, const CScript& script_pub_key)
+/** Whether the output is a Gold Rush payout that is still locked at the given evaluation point. The
+ *  point is the block the scan describes (the next block for the staker, a later one for a projection):
+ *  a payout that is locked now is not locked in the first Final block. */
+bool IsGeneratedQuantumStakeCandidate(const CWallet& wallet, const COutPoint& outpoint, const CScript& script_pub_key,
+                                      int spend_height, int64_t spend_time)
 {
     if (!IsQuantumMigrationScript(script_pub_key)) return false;
 
-    const CBlockIndex* tip = wallet.chain().getTip();
-    const int spend_height = tip ? tip->nHeight + 1 : 0;
-    const int64_t spend_time = tip ? tip->GetMedianTimePast() : 0;
     CScript marker_script;
     return IsLockedGoldRushPayoutOutput(wallet.chain().getCoinsTip(), outpoint,
         Params().GetConsensus(), spend_time, spend_height, &marker_script) && marker_script == script_pub_key;
@@ -220,6 +228,7 @@ void ResetAutoShadowSignalScanHeight(CWallet& wallet, int scan_height)
     LOCK(wallet.cs_wallet);
     if (wallet.m_shadow_signal_last_auto_scan_height == scan_height) {
         wallet.m_shadow_signal_last_auto_scan_height = scan_height - 1;
+        wallet.m_shadow_signal_last_auto_scan_tip.SetNull();
     }
 }
 
@@ -421,11 +430,15 @@ bool FindAutoShadowSignalCandidate(CWallet& wallet, AutoShadowSignalCandidate& c
             LogPrint(BCLog::COINSTAKE, "Gold Rush PoS auto-signal: skipped because wallet lock is busy\n");
             return false;
         }
-        if (wallet.m_shadow_signal_last_auto_scan_height >= scan_height) {
-            LogPrint(BCLog::COINSTAKE, "Gold Rush PoS auto-signal: already scanned height=%d\n", scan_height);
+        if (DecideAutoScan(wallet.m_shadow_signal_last_auto_scan_height,
+                           wallet.m_shadow_signal_last_auto_scan_tip, scan_height, scan_tip_hash,
+                           wallet.m_shadow_signal_last_reorg_scan,
+                           std::chrono::steady_clock::now()) != AutoScanVerdict::SCAN) {
+            LogPrint(BCLog::COINSTAKE, "Gold Rush PoS auto-signal: already scanned height=%d (or a reorganisation rescan is rate limited)\n", scan_height);
             return false;
         }
         wallet.m_shadow_signal_last_auto_scan_height = scan_height;
+        wallet.m_shadow_signal_last_auto_scan_tip = scan_tip_hash;
         if (HasPendingShadowSignal(wallet)) {
             LogPrint(BCLog::COINSTAKE, "Gold Rush PoS auto-signal: pending signal already exists\n");
             return false;
@@ -774,6 +787,8 @@ std::vector<COutPoint> SafeDemurrageAttestationFeeOutpoints(CWallet& wallet, con
     fee_filter.only_spendable = true;
     fee_filter.skip_locked = true;
     fee_filter.include_immature_coinbase = false;
+    // The wallet's own choice of a fee input never takes the final stake reserve.
+    fee_filter.avoid_final_stake_reserve = true;
     CCoinControl fee_scan_control;
     CoinsResult fee_outputs = AvailableCoins(wallet, &fee_scan_control, std::nullopt, fee_filter);
     std::vector<COutput> sorted_fee_outputs = fee_outputs.All();
@@ -855,6 +870,191 @@ bool ValidateSelectedDemurrageAttestationFeeOutpoints(CWallet& wallet,
 
 } // namespace
 
+namespace {
+//! The comment the automatic path gives the attestation transactions it creates; no other transaction
+//! carries it, so it tells what the automatic path may clean up.
+constexpr const char* AUTO_DEMURRAGE_ATTEST_COMMENT{"Quantum Quasar demurrage auto-attestation"};
+} // namespace
+
+/** The attestations of this wallet's unconfirmed, not abandoned transactions. A retry record is erased when
+ *  a block is disconnected, but the attestation transaction that block held is back in the wallet as
+ *  unconfirmed (or, after a restart, was never confirmed): signing another one for the same key and state
+ *  would only add churn, so the automatic path first looks here. */
+std::vector<PendingWalletAttestation> PendingWalletDemurrageAttestations(const CWallet& wallet)
+{
+    AssertLockHeld(wallet.cs_wallet);
+    std::vector<PendingWalletAttestation> pending;
+    for (const auto& [txid, wtx] : wallet.mapWallet) {
+        if (!wtx.isUnconfirmed() || !wtx.tx || wtx.tx->IsCoinBase()) continue;
+        const auto comment = wtx.mapValue.find("comment");
+        const bool automatic = comment != wtx.mapValue.end() && comment->second == AUTO_DEMURRAGE_ATTEST_COMMENT;
+        for (const Consensus::DemurrageAttestation& attestation : Consensus::ExtractDemurrageAttestations(*wtx.tx)) {
+            if (attestation.height < 0) continue; // not a well-formed payload
+            PendingWalletAttestation entry;
+            entry.key_hash = attestation.pubkey_hash;
+            entry.previous_height = attestation.previous_height;
+            entry.previous_time = attestation.previous_time;
+            entry.previous_coverage_start_height = attestation.previous_coverage_start_height;
+            entry.previous_source = attestation.previous_source;
+            entry.target = attestation.target_outpoint;
+            entry.txid = txid;
+            entry.in_mempool = wtx.InMempool();
+            entry.automatic = automatic;
+            pending.push_back(std::move(entry));
+        }
+    }
+    return pending;
+}
+
+bool PendingAttestationReferencesRecord(const PendingWalletAttestation& entry,
+                                        const std::optional<Consensus::DemurrageAttestationRecord>& record)
+{
+    if (record.has_value() != entry.previous_height.has_value()) return false;
+    if (record.has_value() != entry.previous_source.has_value()) return false;
+    if (!record) return entry.previous_time == 0 && entry.previous_coverage_start_height == 0;
+    // The complete referenced state, source included: equal coordinates on a competing history are a
+    // different state, and the attestation protocol binds the source block, transaction and output.
+    return record->state.height == *entry.previous_height && record->state.time == entry.previous_time &&
+           record->state.coverage_start_height == entry.previous_coverage_start_height &&
+           record->source_block_hash == entry.previous_source->block_hash &&
+           record->source_txid == entry.previous_source->txid &&
+           record->source_output_index == entry.previous_source->output_index;
+}
+
+/** The pending attestation, if any, that refreshes this key from this very state: the same logical action. */
+const PendingWalletAttestation* FindPendingAttestationForState(const std::vector<PendingWalletAttestation>& pending,
+                                                               const uint256& key_hash,
+                                                               const std::optional<Consensus::DemurrageAttestationRecord>& record)
+{
+    for (const PendingWalletAttestation& entry : pending) {
+        if (entry.key_hash != key_hash) continue;
+        if (PendingAttestationReferencesRecord(entry, record)) return &entry;
+    }
+    return nullptr;
+}
+
+PendingAttestationUse ClassifyPendingAttestation(const CWallet& wallet, const CCoinsViewCache& view,
+                                                 const Consensus::Params& consensus, int evaluation_height,
+                                                 int64_t evaluation_time, const PendingWalletAttestation& entry,
+                                                 const std::optional<Consensus::DemurrageAttestationRecord>& record)
+{
+    AssertLockHeld(wallet.cs_wallet);
+    // The referenced state is no longer the key's current state: the mempool would refuse it as stale.
+    if (!PendingAttestationReferencesRecord(entry, record)) return PendingAttestationUse::UNUSABLE;
+
+    // The target must still be a live coin the key controls, and not locked by demurrage.
+    Coin target;
+    if (!view.GetCoin(entry.target, target) || target.IsSpent()) return PendingAttestationUse::UNUSABLE;
+    const std::optional<uint256> controlling_key = Consensus::DemurrageControllingKeyHashForScript(target.out.scriptPubKey);
+    if (!controlling_key || *controlling_key != entry.key_hash) return PendingAttestationUse::UNUSABLE;
+    const Consensus::DemurrageEvaluation eval = Consensus::EvaluateDemurrage(
+        target, consensus, evaluation_height, evaluation_time,
+        record ? std::optional<int>{record->state.height} : std::nullopt,
+        record ? std::optional<int>{static_cast<int>(record->state.coverage_start_height)} : std::nullopt);
+    if (eval.locked) return PendingAttestationUse::UNUSABLE;
+
+    // Every input must still exist: a coin of the chain, or an output of another unconfirmed, not
+    // abandoned transaction of this wallet.
+    const auto wtx_it = wallet.mapWallet.find(entry.txid);
+    if (wtx_it == wallet.mapWallet.end() || !wtx_it->second.tx) return PendingAttestationUse::UNUSABLE;
+    for (const CTxIn& txin : wtx_it->second.tx->vin) {
+        Coin coin;
+        if (view.GetCoin(txin.prevout, coin) && !coin.IsSpent()) continue;
+        const auto parent = wallet.mapWallet.find(txin.prevout.hash);
+        if (parent != wallet.mapWallet.end() && parent->second.isUnconfirmed() &&
+            txin.prevout.n < parent->second.tx->vout.size()) {
+            continue;
+        }
+        return PendingAttestationUse::UNUSABLE;
+    }
+
+    // Still usable, but the wallet cannot offer it to the network now.
+    if (!wallet.GetBroadcastTransactions()) return PendingAttestationUse::TEMPORARILY_UNAVAILABLE;
+    return PendingAttestationUse::REUSABLE;
+}
+
+KeyPendingDecision DecidePendingAttestationsForKey(const CWallet& wallet, const CCoinsViewCache& view,
+                                                   const Consensus::Params& consensus, int evaluation_height,
+                                                   int64_t evaluation_time, const CScript& key_script,
+                                                   const std::vector<const PendingWalletAttestation*>& key_pending)
+{
+    AssertLockHeld(wallet.cs_wallet);
+    KeyPendingDecision decision;
+    // LatestDemurrageAttestationRecord answers "none" for a missing record and for a malformed one alike.
+    // Only an authenticated absence may be matched against; on a malformed local state nothing is decided
+    // from it, so nothing is abandoned and no reservation is released.
+    const std::optional<uint256> key_hash = Consensus::DemurrageControllingKeyHashForScript(key_script);
+    if (!key_hash || !Consensus::IsDemurrageStateSaneForScript(view, key_script)) {
+        decision.local_state_invalid = true;
+        decision.suppress_construction = true;
+        return decision;
+    }
+    const std::optional<Consensus::DemurrageAttestationRecord> record =
+        Consensus::LatestDemurrageAttestationRecord(view, *key_hash);
+    std::vector<const PendingWalletAttestation*> unusable_automatic;
+    const PendingWalletAttestation* resubmit{nullptr};
+    bool usable_in_mempool{false};
+    for (const PendingWalletAttestation* entry : key_pending) {
+        // An entry that references another state is classified unusable by the same call.
+        const PendingAttestationUse use = ClassifyPendingAttestation(
+            wallet, view, consensus, evaluation_height, evaluation_time, *entry, record);
+        if (use == PendingAttestationUse::UNUSABLE) {
+            // Only a transaction the automatic path created is cleaned up, and never one the mempool holds.
+            if (entry->automatic && !entry->in_mempool) unusable_automatic.push_back(entry);
+            continue;
+        }
+        decision.suppress_construction = true;
+        if (!decision.reported || (entry->in_mempool && !decision.reported->in_mempool)) {
+            decision.reported = entry;
+            decision.reported_use = use;
+        }
+        if (entry->in_mempool) {
+            usable_in_mempool = true;
+        } else if (use == PendingAttestationUse::REUSABLE && !resubmit) {
+            resubmit = entry;
+        }
+    }
+    if (resubmit && !usable_in_mempool) decision.to_resubmit.push_back(resubmit->txid);
+    // Whether a candidate has an unconfirmed descendant anywhere in the wallet is decided at execution
+    // (AbandonStaleAutomaticAttestations), across all keys.
+    for (const PendingWalletAttestation* entry : unusable_automatic) decision.to_abandon.push_back(entry->txid);
+    return decision;
+}
+
+size_t AbandonStaleAutomaticAttestations(CWallet& wallet, const std::set<uint256>& candidates)
+{
+    size_t abandoned{0};
+    LOCK(wallet.cs_wallet);
+    for (const uint256& txid : candidates) {
+        // Abandoning a transaction abandons everything in the wallet that spends it, whatever key it
+        // belongs to and whatever its local state. A candidate with any unconfirmed, not abandoned
+        // descendant is left for a later pass.
+        bool has_descendant{false};
+        for (const auto& [other_txid, other] : wallet.mapWallet) {
+            if (other_txid == txid || !other.tx || !other.isUnconfirmed()) continue;
+            for (const CTxIn& txin : other.tx->vin) {
+                if (txin.prevout.hash == txid) {
+                    has_descendant = true;
+                    break;
+                }
+            }
+            if (has_descendant) break;
+        }
+        if (has_descendant) {
+            wallet.WalletLogPrintf("Demurrage auto-attest: stale pending attestation %s kept for now: an unconfirmed transaction of this wallet spends it\n", txid.ToString());
+            continue;
+        }
+        if (wallet.AbandonTransaction(txid)) {
+            ++abandoned;
+            wallet.WalletLogPrintf("Demurrage auto-attest: pending attestation %s can no longer confirm (its state, target or an input is gone); abandoned\n", txid.ToString());
+        } else {
+            wallet.WalletLogPrintf("Demurrage auto-attest: pending attestation %s could not be abandoned\n", txid.ToString());
+        }
+    }
+    return abandoned;
+}
+
+
 std::vector<WalletShadowSolveReference> GetWalletShadowSolveReferences(const CWallet& wallet, int tip_height)
 {
     AssertLockHeld(wallet.cs_wallet);
@@ -867,7 +1067,8 @@ bool CreateDemurrageAttestationTransaction(
     const CCoinControl& coin_control,
     bool sign,
     DemurrageAttestationTxResult& result,
-    bilingual_str& error)
+    bilingual_str& error,
+    const std::optional<COutPoint>& preferred_target)
 {
     result = {};
     result.witness_program = witness_program;
@@ -942,19 +1143,27 @@ bool CreateDemurrageAttestationTransaction(
             if (out.txout.scriptPubKey == target_script) candidates.push_back(out.outpoint);
         }
         std::sort(candidates.begin(), candidates.end());
-        std::map<COutPoint, Coin> target_coins;
-        for (const COutPoint& outpoint : candidates) target_coins.emplace(outpoint, Coin{});
-        wallet.chain().findCoins(target_coins);
-        for (const COutPoint& outpoint : candidates) {
-            const auto it = target_coins.find(outpoint);
-            if (it == target_coins.end() || it->second.IsSpent()) continue;
+        // The target must be a coin of the confirmed chain view: the mempool refuses an attestation whose
+        // target is not (demurrage-attestation-target-unconfirmed), so an unconfirmed output of the key
+        // (trusted change, say) is never chosen. The caller's own candidate output is preferred.
+        const auto usable_target = [&](const COutPoint& outpoint) {
+            Coin target_coin;
+            if (!coins_view.GetCoin(outpoint, target_coin) || target_coin.IsSpent()) return false;
             const Consensus::DemurrageEvaluation target_evaluation = Consensus::EvaluateDemurrage(
-                it->second, consensus, evaluation_height, evaluation_time,
+                target_coin, consensus, evaluation_height, evaluation_time,
                 previous_state ? std::optional<int>{previous_state->height} : std::nullopt,
                 previous_state ? std::optional<int>{static_cast<int>(previous_state->coverage_start_height)} : std::nullopt);
-            if (target_evaluation.locked) continue;
-            target_outpoint = outpoint;
-            break;
+            return !target_evaluation.locked;
+        };
+        if (preferred_target && std::binary_search(candidates.begin(), candidates.end(), *preferred_target) &&
+            usable_target(*preferred_target)) {
+            target_outpoint = *preferred_target;
+        } else {
+            for (const COutPoint& outpoint : candidates) {
+                if (!usable_target(outpoint)) continue;
+                target_outpoint = outpoint;
+                break;
+            }
         }
         if (target_outpoint.IsNull()) {
             cleanse_private_key_bytes();
@@ -1224,6 +1433,7 @@ bool CreateQuantumColdStakeRedelegationTransaction(
         CoinFilterParams filter;
         filter.only_spendable = true;
         filter.skip_locked = true;
+        filter.avoid_final_stake_reserve = options.avoid_final_stake_reserve;
         for (const COutput& out : AvailableCoins(wallet, &coin_control, std::nullopt, filter).All()) {
             CTxDestination dest;
             if (!ExtractDestination(out.txout.scriptPubKey, dest) || !(dest == source_dest) || !out.spendable) continue;
@@ -1361,6 +1571,9 @@ bool CreateQuantumColdStakeRedelegationTransaction(
     result.tx = tx;
 
     if (!options.dry_run) {
+        if (options.avoid_final_stake_reserve && SpendsFinalStakeReserve(wallet, *tx)) {
+            return fail_after_created_key(_("Redelegation would spend the final stake reserve"));
+        }
         mapValue_t map_value;
         map_value["comment"] = "Quantum Quasar cold-stake redelegation";
         std::string broadcast_error;
@@ -1393,12 +1606,14 @@ int MaybeAutoDemurrageAttest(CWallet& wallet)
     const Consensus::Params& consensus = Params().GetConsensus();
     int evaluation_height{-1};
     int64_t evaluation_time{0};
+    uint256 evaluation_tip;
     {
         LOCK(cs_main);
         const CBlockIndex* tip = wallet.chain().getTip();
         if (!tip) return 0;
         evaluation_height = tip->nHeight + 1;
         evaluation_time = tip->GetMedianTimePast();
+        evaluation_tip = tip->GetBlockHash();
     }
     if (!consensus.IsDemurrageActive(evaluation_height, evaluation_time)) {
         return 0;
@@ -1406,14 +1621,21 @@ int MaybeAutoDemurrageAttest(CWallet& wallet)
 
     {
         LOCK(wallet.cs_wallet);
-        if (wallet.m_demurrage_last_auto_attest_scan_height >= evaluation_height) {
+        if (DecideAutoScan(wallet.m_demurrage_last_auto_attest_scan_height,
+                           wallet.m_demurrage_last_auto_attest_scan_tip, evaluation_height, evaluation_tip,
+                           wallet.m_demurrage_last_reorg_scan,
+                           std::chrono::steady_clock::now()) != AutoScanVerdict::SCAN) {
             return 0;
         }
         wallet.m_demurrage_last_auto_attest_scan_height = evaluation_height;
+        wallet.m_demurrage_last_auto_attest_scan_tip = evaluation_tip;
     }
 
     std::vector<AutoDemurrageAttestCandidate> candidates;
     std::vector<COutPoint> fee_outpoints;
+    std::set<uint256> to_resubmit; // pending attestations of the wallet that are not in the mempool
+    std::set<uint256> to_abandon;  // pending attestations of the automatic path that can no longer confirm
+    std::set<COutPoint> pending_targets; // targets of the wallet's pending attestations
     {
         LOCK2(cs_main, wallet.cs_wallet);
         CoinsResult available_list = AvailableCoinsListUnspent(wallet);
@@ -1425,6 +1647,11 @@ int MaybeAutoDemurrageAttest(CWallet& wallet)
 
         const CCoinsViewCache& view = wallet.chain().getCoinsTip();
         std::map<uint256, AutoDemurrageAttestCandidate> by_key;
+        std::vector<PendingWalletAttestation> pending_attestations;
+        bool pending_scanned{false};
+        std::set<uint256> suppressed_keys;
+        std::map<uint256, KeyPendingDecision> key_decisions;
+        std::map<uint256, std::vector<const PendingWalletAttestation*>> pending_by_key;
         for (const COutput& out : available_list.All()) {
             if (!IsQuantumMigrationScript(out.txout.scriptPubKey)) continue;
             CTxDestination dest;
@@ -1453,11 +1680,59 @@ int MaybeAutoDemurrageAttest(CWallet& wallet)
                 continue;
             }
 
+            // An attestation for this key and state that the wallet already holds (made before a block
+            // was disconnected, or before a restart): reuse it instead of signing another.
+            if (!pending_scanned) {
+                pending_attestations = PendingWalletDemurrageAttestations(wallet);
+                // Indexed by key once, so that a wallet with many outputs and many pending transactions does a
+                // lookup per key instead of walking the whole pending list for every output.
+                // Considered in transaction id order, so that the choice among several usable entries does not
+                // depend on the wallet's unordered map.
+                std::sort(pending_attestations.begin(), pending_attestations.end(),
+                          [](const PendingWalletAttestation& a, const PendingWalletAttestation& b) {
+                              return a.txid < b.txid;
+                          });
+                for (const PendingWalletAttestation& entry : pending_attestations) {
+                    pending_by_key[entry.key_hash].push_back(&entry);
+                }
+                pending_scanned = true;
+            }
+            auto decision_it = key_decisions.find(*key_hash);
+            if (decision_it == key_decisions.end()) {
+                // The key-level decision, once per scan: every pending entry for the key is examined, and any
+                // usable one suppresses a new attestation.
+                const auto key_pending_it = pending_by_key.find(*key_hash);
+                const std::vector<const PendingWalletAttestation*> no_pending;
+                decision_it = key_decisions.emplace(*key_hash, DecidePendingAttestationsForKey(
+                    wallet, view, consensus, evaluation_height, evaluation_time, out.txout.scriptPubKey,
+                    key_pending_it == pending_by_key.end() ? no_pending : key_pending_it->second)).first;
+                to_resubmit.insert(decision_it->second.to_resubmit.begin(), decision_it->second.to_resubmit.end());
+                to_abandon.insert(decision_it->second.to_abandon.begin(), decision_it->second.to_abandon.end());
+            }
+            const KeyPendingDecision& key_decision = decision_it->second;
+            if (key_decision.local_state_invalid) {
+                if (suppressed_keys.insert(*key_hash).second) {
+                    wallet.WalletLogPrintf("Demurrage auto-attest suppressed for key %s: its local attestation state is invalid (not merely absent); pending attestations and their inputs are kept untouched until it is repaired\n",
+                                           key_hash->ToString());
+                }
+                continue;
+            }
+            if (key_decision.suppress_construction) {
+                if (suppressed_keys.insert(*key_hash).second) {
+                    const PendingWalletAttestation& pending = *key_decision.reported;
+                    wallet.WalletLogPrintf("Demurrage auto-attest suppressed for key %s: attestation %s for the same state is already pending in this wallet%s\n",
+                                           key_hash->ToString(), pending.txid.ToString(),
+                                           pending.in_mempool ? "" : (key_decision.reported_use == PendingAttestationUse::REUSABLE ? " (submitting it again)" : " (kept: it cannot be submitted now)"));
+                }
+                continue;
+            }
+
             AutoDemurrageAttestCandidate candidate;
             candidate.witness_program = key_info->witness_program;
             candidate.key_hash = *key_hash;
             candidate.inactive_blocks = eval.inactive_blocks;
             candidate.outpoint = out.outpoint;
+            candidate.state = latest_attestation;
 
             auto [it, inserted] = by_key.emplace(*key_hash, candidate);
             if (!inserted && candidate.inactive_blocks > it->second.inactive_blocks) {
@@ -1469,6 +1744,7 @@ int MaybeAutoDemurrageAttest(CWallet& wallet)
         fee_filter.only_spendable = true;
         fee_filter.skip_locked = true;
         fee_filter.include_immature_coinbase = false;
+        fee_filter.avoid_final_stake_reserve = true;
         CCoinControl fee_scan_control;
         CoinsResult fee_outputs = AvailableCoins(wallet, &fee_scan_control, std::nullopt, fee_filter);
         std::vector<COutput> sorted_fee_outputs = fee_outputs.All();
@@ -1486,7 +1762,25 @@ int MaybeAutoDemurrageAttest(CWallet& wallet)
         for (auto& [key_hash, candidate] : by_key) {
             candidates.push_back(std::move(candidate));
         }
+        for (const PendingWalletAttestation& entry : pending_attestations) {
+            pending_targets.insert(entry.target);
+        }
     }
+
+    // Reuse: offer a pending attestation that the mempool does not hold again (after a restart that did not
+    // keep the mempool, or a reorganisation). Outside the wallet and chain locks. A failed submission is not
+    // evidence that it is unusable (broadcasting may be off, the mempool may refuse it for now, the node may
+    // have failed locally): it is kept and offered again on a later scan.
+    for (const uint256& txid : to_resubmit) {
+        std::string submit_error;
+        if (!wallet.SubmitTxMemoryPoolAndRelay(txid, submit_error, /*relay=*/true)) {
+            wallet.WalletLogPrintf("Demurrage auto-attest: pending attestation %s was not accepted again (%s); keeping it\n",
+                                   txid.ToString(), submit_error.empty() ? "not submitted" : submit_error);
+        }
+    }
+    // Clean up: a transaction of the automatic path whose referenced state, target or inputs are gone cannot
+    // confirm and would otherwise keep its inputs reserved.
+    AbandonStaleAutomaticAttestations(wallet, to_abandon);
 
     CCoinControl automatic_change_control;
     if (!candidates.empty()) {
@@ -1497,51 +1791,136 @@ int MaybeAutoDemurrageAttest(CWallet& wallet)
         }
     }
 
-    int submitted{0};
+    const AutoDemurrageAttestAttemptFn attempt = [&](const AutoDemurrageAttestCandidate& candidate, const COutPoint& fee_outpoint) {
+        AutoDemurrageAttestAttempt result;
+        CCoinControl coin_control = automatic_change_control;
+        coin_control.m_allow_other_inputs = false;
+        coin_control.m_avoid_address_reuse = false;
+        coin_control.Select(fee_outpoint);
+
+        DemurrageAttestationTxResult tx_result;
+        bilingual_str error;
+        if (!CreateDemurrageAttestationTransaction(wallet, candidate.witness_program, coin_control, /*sign=*/true, tx_result, error, candidate.outpoint)) {
+            result.error = error.original;
+            return result;
+        }
+        // The recheck before the commit: the attestation's fee input must not be in the final stake reserve.
+        if (SpendsFinalStakeReserve(wallet, *tx_result.tx)) {
+            result.error = "the fee input is in the final stake reserve";
+            return result;
+        }
+
+        mapValue_t map_value;
+        map_value["comment"] = AUTO_DEMURRAGE_ATTEST_COMMENT;
+        std::string broadcast_error;
+        if (!wallet.CommitTransaction(tx_result.tx, std::move(map_value), {}, &broadcast_error)) {
+            if (!wallet.AbandonTransaction(tx_result.tx->GetHash())) {
+                wallet.WalletLogPrintf("Demurrage auto-attestation could not be abandoned after broadcast failure: txid=%s\n", tx_result.tx->GetHash().ToString());
+            }
+            result.reject_reason = broadcast_error;
+            result.error = strprintf("broadcast failed: %s", broadcast_error.empty() ? "transaction was not accepted into the mempool" : broadcast_error);
+            return result;
+        }
+        wallet.WalletLogPrintf("Demurrage auto-attested demurrage key %s at height %d with tx %s (inactive %d blocks, fee %d)\n",
+                               candidate.key_hash.ToString(), evaluation_height, tx_result.tx->GetHash().ToString(), candidate.inactive_blocks, tx_result.fee);
+        result.success = true;
+        result.target = tx_result.target_outpoint;
+        return result;
+    };
+    return RunAutoDemurrageAttestAttempts(wallet, std::move(candidates), fee_outpoints, std::move(pending_targets),
+                                          evaluation_height, attempt).submitted;
+}
+
+bool IsTerminalAutoAttestRejection(const std::string& reject_reason, bool fee_input_is_pending_target)
+{
+    static constexpr std::array<std::string_view, 4> TERMINAL_REJECTS{
+        "demurrage-attestation-target-unconfirmed",
+        "stale-demurrage-attestation-state",
+        "demurrage-attestation-target-locked",
+        "demurrage-attestation-too-soon",
+    };
+    static constexpr std::string_view TARGET_CONFLICT{"demurrage-attestation-target-conflict"};
+    const auto starts_with = [&](std::string_view reason) { return reject_reason.compare(0, reason.size(), reason) == 0; };
+    if (std::any_of(TERMINAL_REJECTS.begin(), TERMINAL_REJECTS.end(), starts_with)) return true;
+    // The mempool also uses the conflict reason when the fee input is a pending attestation's target; another
+    // fee input cures that one.
+    return starts_with(TARGET_CONFLICT) && !fee_input_is_pending_target;
+}
+
+AutoDemurrageAttestPassStats RunAutoDemurrageAttestAttempts(CWallet& wallet,
+                                                            std::vector<AutoDemurrageAttestCandidate> candidates,
+                                                            const std::vector<COutPoint>& fee_outpoints,
+                                                            std::set<COutPoint> pending_targets,
+                                                            int evaluation_height,
+                                                            const AutoDemurrageAttestAttemptFn& attempt)
+{
+    AutoDemurrageAttestPassStats stats;
+    {
+        // Least recently attempted first. Keys the pass could not reach are not stamped, so they come first in
+        // the next pass, and the keys visited (which failed or were given up on) go behind them. Memory only:
+        // the stamps are the existing attempt heights.
+        LOCK(wallet.cs_wallet);
+        std::vector<std::pair<int, AutoDemurrageAttestCandidate>> ordered;
+        ordered.reserve(candidates.size());
+        for (AutoDemurrageAttestCandidate& candidate : candidates) {
+            const auto stamp = wallet.m_demurrage_last_auto_attest_attempt_height.find(candidate.key_hash);
+            const int last = stamp == wallet.m_demurrage_last_auto_attest_attempt_height.end() ? std::numeric_limits<int>::min() : stamp->second;
+            ordered.emplace_back(last, std::move(candidate));
+        }
+        std::stable_sort(ordered.begin(), ordered.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+        candidates.clear();
+        for (auto& entry : ordered) candidates.push_back(std::move(entry.second));
+    }
+
     bool logged_no_fee{false};
+    bool budget_exhausted{false};
     std::set<COutPoint> used_fee_outpoints;
-    for (const AutoDemurrageAttestCandidate& candidate : candidates) {
-        if (submitted >= static_cast<int>(Consensus::MAX_DEMURRAGE_ATTESTATIONS_PER_BLOCK)) {
+    for (size_t index = 0; index < candidates.size(); ++index) {
+        const AutoDemurrageAttestCandidate& candidate = candidates[index];
+        if (stats.submitted >= static_cast<int>(Consensus::MAX_DEMURRAGE_ATTESTATIONS_PER_BLOCK)) {
             wallet.WalletLogPrintf("Demurrage auto-attest deferred %u additional key(s) to a later block to respect the consensus attestation cap\n",
-                                   static_cast<unsigned int>(candidates.size() - submitted));
+                                   static_cast<unsigned int>(candidates.size() - index));
+            stats.deferred_keys = candidates.size() - index;
+            break;
+        }
+        if (stats.failed >= MAX_AUTO_DEMURRAGE_ATTEST_FAILED_ATTEMPTS_PER_PASS) {
+            budget_exhausted = true;
+            stats.deferred_keys = candidates.size() - index;
             break;
         }
         {
             LOCK(wallet.cs_wallet);
             wallet.m_demurrage_last_auto_attest_attempt_height[candidate.key_hash] = evaluation_height;
         }
+        stats.visited.push_back(candidate.key_hash);
 
         bool committed{false};
-        bilingual_str last_error;
+        bool terminal{false};
+        std::string last_error;
         for (const COutPoint& fee_outpoint : fee_outpoints) {
             if (used_fee_outpoints.count(fee_outpoint)) continue;
-
-            CCoinControl coin_control = automatic_change_control;
-            coin_control.m_allow_other_inputs = false;
-            coin_control.m_avoid_address_reuse = false;
-            coin_control.Select(fee_outpoint);
-
-            DemurrageAttestationTxResult tx_result;
-            bilingual_str error;
-            if (!CreateDemurrageAttestationTransaction(wallet, candidate.witness_program, coin_control, /*sign=*/true, tx_result, error)) {
-                last_error = error;
-                continue;
+            if (stats.failed >= MAX_AUTO_DEMURRAGE_ATTEST_FAILED_ATTEMPTS_PER_PASS) {
+                budget_exhausted = true;
+                break;
             }
 
-            mapValue_t map_value;
-            map_value["comment"] = "Quantum Quasar demurrage auto-attestation";
-            std::string broadcast_error;
-            if (!wallet.CommitTransaction(tx_result.tx, std::move(map_value), {}, &broadcast_error)) {
-                if (!wallet.AbandonTransaction(tx_result.tx->GetHash())) {
-                    wallet.WalletLogPrintf("Demurrage auto-attestation could not be abandoned after broadcast failure: txid=%s\n", tx_result.tx->GetHash().ToString());
+            ++stats.attempts;
+            const AutoDemurrageAttestAttempt result = attempt(candidate, fee_outpoint);
+            if (!result.success) {
+                ++stats.failed;
+                last_error = result.error;
+                // The failed attempt has already been cleaned up by `attempt`; a rejection that no other fee
+                // input can cure ends the key's turn.
+                if (IsTerminalAutoAttestRejection(result.reject_reason, pending_targets.count(fee_outpoint) > 0)) {
+                    terminal = true;
+                    ++stats.terminal_keys;
+                    break;
                 }
-                last_error = Untranslated(strprintf("broadcast failed: %s", broadcast_error.empty() ? "transaction was not accepted into the mempool" : broadcast_error));
                 continue;
             }
             used_fee_outpoints.insert(fee_outpoint);
-            wallet.WalletLogPrintf("Demurrage auto-attested demurrage key %s at height %d with tx %s (inactive %d blocks, fee %d)\n",
-                                   candidate.key_hash.ToString(), evaluation_height, tx_result.tx->GetHash().ToString(), candidate.inactive_blocks, tx_result.fee);
-            ++submitted;
+            pending_targets.insert(result.target);
+            ++stats.submitted;
             committed = true;
             break;
         }
@@ -1551,15 +1930,33 @@ int MaybeAutoDemurrageAttest(CWallet& wallet)
                 wallet.WalletLogPrintf("Demurrage auto-attest skipped: no safe spendable fee input is available\n");
                 logged_no_fee = true;
             } else if (!last_error.empty()) {
-                wallet.WalletLogPrintf("Demurrage auto-attest skipped for key %s: %s\n", candidate.key_hash.ToString(), last_error.original);
+                wallet.WalletLogPrintf("Demurrage auto-attest skipped for key %s%s: %s\n", candidate.key_hash.ToString(),
+                                       terminal ? " (no other fee input can cure it)" : "", last_error);
             }
         }
+        if (budget_exhausted) {
+            stats.deferred_keys = candidates.size() - index - 1;
+            break;
+        }
     }
-    return submitted;
+    if (budget_exhausted) {
+        wallet.WalletLogPrintf("Demurrage auto-attest stopped after %d failed attempt(s) in one pass; %u key(s) not reached are tried first in the next pass\n",
+                               stats.failed, static_cast<unsigned int>(stats.deferred_keys));
+    }
+    if (stats.attempts > 0) {
+        wallet.WalletLogPrintf("Demurrage auto-attest pass: attempts=%d submitted=%d failed=%d terminal_keys=%d deferred_keys=%u\n",
+                               stats.attempts, stats.submitted, stats.failed, stats.terminal_keys,
+                               static_cast<unsigned int>(stats.deferred_keys));
+    }
+    return stats;
 }
 
 int MaybeAutoShadowSignal(CWallet& wallet)
 {
+    // Cheap when the return address is already set: the legacy-stake quantum return
+    // must exist before the window opens, so it is kept ready whenever the wallet
+    // is fully unlocked (never creating a key the policy forbids).
+    MaybeAutoSetQuantumStakeReturn(wallet);
     ScopedDisallowShadowSolverActivityFullScan no_full_solver_scan;
     if (!gArgs.GetBoolArg("-qqautoshadowsignal", DEFAULT_AUTO_SHADOW_SIGNAL)) return 0;
     if (!wallet.m_enabled_staking.load() || wallet.IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS)) {
@@ -1723,21 +2120,28 @@ int MaybeAutoRedelegateQuantumColdStake(CWallet& wallet)
     }
 
     int current_height{0};
+    uint256 current_tip;
     {
         LOCK(cs_main);
         const CBlockIndex* tip = wallet.chain().getTip();
         if (!tip) return 0;
         current_height = tip->nHeight;
+        current_tip = tip->GetBlockHash();
     }
 
     {
         LOCK(wallet.cs_wallet);
-        if (wallet.m_redelegation_last_auto_scan_height >= current_height) {
+        if (DecideAutoScan(wallet.m_redelegation_last_auto_scan_height,
+                           wallet.m_redelegation_last_auto_scan_tip, current_height, current_tip,
+                           wallet.m_redelegation_last_reorg_scan,
+                           std::chrono::steady_clock::now()) != AutoScanVerdict::SCAN) {
             return 0;
         }
         wallet.m_redelegation_last_auto_scan_height = current_height;
+        wallet.m_redelegation_last_auto_scan_tip = current_tip;
         WalletBatch batch(wallet.GetDatabase());
         batch.WriteQuantumRedelegationAutoScanHeight(current_height);
+        batch.WriteQuantumRedelegationAutoScanTip(current_height, current_tip);
     }
 
     std::vector<AutoRedelegationSource> sources;
@@ -1747,6 +2151,7 @@ int MaybeAutoRedelegateQuantumColdStake(CWallet& wallet)
         filter.only_spendable = true;
         filter.skip_locked = true;
         filter.include_immature_coinbase = false;
+        filter.avoid_final_stake_reserve = true;
         CCoinControl coin_control;
         const CoinsResult available = AvailableCoins(wallet, &coin_control, std::nullopt, filter);
         std::map<std::vector<unsigned char>, AutoRedelegationSource> grouped;
@@ -1871,6 +2276,7 @@ int MaybeAutoRedelegateQuantumColdStake(CWallet& wallet)
         options.allow_new_quantum_key = gArgs.GetBoolArg("-qqallowautokeycreation", DEFAULT_ALLOW_AUTO_QUANTUM_KEY_CREATION);
         options.enforce_pool_cap = true;
         options.require_verified_operator = true;
+        options.avoid_final_stake_reserve = true;
         options.label = "auto-redelegated-coldstake";
 
         QuantumColdStakeRedelegationResult redelegation;
@@ -1953,35 +2359,16 @@ void StopStake(CWallet& wallet) {
     }
 }
 
-uint64_t GetStakeWeight(const CWallet& wallet)
+bool IsStakeSourceImmatureForNextBlock(const CWallet& wallet, const CWalletTx& wtx, int spend_height)
 {
-    AssertLockHeld(::cs_main);
     AssertLockHeld(wallet.cs_wallet);
-    std::set<std::pair<const CWalletTx*, unsigned int> > setCoins;
-    CAmount nValueIn = 0;
-    CAmount nTargetValue = MAX_MONEY;
-    if (!SelectCoinsForStaking(wallet, nTargetValue, setCoins, nValueIn))
-        return 0;
-
-    if (setCoins.empty() || nValueIn <= wallet.m_reserve_balance)
-        return 0;
-
-    uint64_t nWeight = 0;
-    CAmount nRemaining = nValueIn - wallet.m_reserve_balance;
-
-    for (std::pair<const CWalletTx*,unsigned int> pcoin : setCoins)
-    {
-        if (wallet.GetTxDepthInMainChain(*pcoin.first) >= Params().GetConsensus().nCoinbaseMaturity)
-        {
-            const CAmount nCoinValue = pcoin.first->tx->vout[pcoin.second].nValue;
-            const CAmount nWeightValue = std::min(nCoinValue, nRemaining);
-            nWeight += nWeightValue;
-            nRemaining -= nWeightValue;
-            if (nRemaining <= 0) break;
-        }
-    }
-
-    return nWeight;
+    if (!(wtx.IsCoinBase() || wtx.IsCoinStake())) return false;
+    const TxStateConfirmed* confirmed = wtx.state<TxStateConfirmed>();
+    if (!confirmed) return true;
+    // The condition CheckProofOfStake and the input maturity check apply to a
+    // block at spend_height: its height minus the output's height must reach
+    // the coinbase maturity.
+    return spend_height - confirmed->confirmed_block_height < Params().GetConsensus().nCoinbaseMaturity;
 }
 
 struct StakeTransactionEligibility
@@ -2008,7 +2395,579 @@ struct StakeCandidateScanContext
     bool script_class_prevalidated{false};
     std::set<uint256> trusted_parents;
     std::map<uint256, StakeTransactionEligibility> transaction_eligibility;
+    // Set when a legacy kernel could only return its principal to an output
+    // that cannot mature before Final and the wallet has no quantum stake
+    // return address ready (see IsLegacyStakeBarredByMigrationEnd).
+    bool legacy_stake_barred{false};
+    // The scan looks this many blocks past the next block (readiness reports only;
+    // 0 for the staker). spend_height already includes it.
+    int blocks_ahead{0};
+    // Why the last evaluated output was rejected (the first failing test).
+    StakeExclusion exclusion{StakeExclusion::NONE};
+    // Judge a coinbase or coinstake output mature by the wallet's own rule (CWallet::IsTxImmature: one block
+    // after consensus would accept it as a kernel) instead of the next-block kernel rule. Only the claim
+    // miner's stake reserve sets it: its selection of fee inputs must stay exactly what v30.1.6 did, and
+    // the wallet's claim candidate list uses that same wallet rule (see GetBoundedLegacyStakeCandidates).
+    bool wallet_maturity_rule{false};
 };
+
+static bool StakeSourceImmature(const CWallet& wallet, const CWalletTx& wtx, const StakeCandidateScanContext& context)
+    EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet)
+{
+    return context.wallet_maturity_rule ? wallet.IsTxImmature(wtx)
+                                        : IsStakeSourceImmatureForNextBlock(wallet, wtx, context.spend_height);
+}
+
+std::optional<int64_t> LastLegacyStakeHeight(const Consensus::Params& consensus)
+{
+    // Only the height-authoritative schedule names the Migration end exactly.
+    // A wall-clock-only test schedule cannot be turned into a height.
+    if (!consensus.UsesHeightLifecycle() || !consensus.IsMigrationEndScheduled()) return std::nullopt;
+    return int64_t{consensus.nQuantumMigrationEndHeight} - int64_t{consensus.nCoinbaseMaturity} -
+           int64_t{LEGACY_STAKE_MIGRATION_MARGIN_BLOCKS};
+}
+
+bool IsLegacyStakeBarredByMigrationEnd(const Consensus::Params& consensus, int stake_height)
+{
+    const std::optional<int64_t> last = LastLegacyStakeHeight(consensus);
+    return last && int64_t{stake_height} > *last;
+}
+
+std::optional<int64_t> FirstOpportunisticLegacyReturnHeight(const Consensus::Params& consensus)
+{
+    if (!LastLegacyStakeHeight(consensus)) return std::nullopt;
+    const int64_t final_height = int64_t{consensus.nQuantumMigrationEndHeight} + 1;
+    const int64_t first_migration = int64_t{consensus.nGoldRushEndHeight} + 1;
+    return std::max(first_migration,
+                    final_height - int64_t{LEGACY_STAKE_OPPORTUNISTIC_RETURN_MATURITIES} * int64_t{consensus.nCoinbaseMaturity});
+}
+
+bool IsLegacyStakeInOpportunisticReturnWindow(const Consensus::Params& consensus, int stake_height)
+{
+    const std::optional<int64_t> last = LastLegacyStakeHeight(consensus);
+    const std::optional<int64_t> first = FirstOpportunisticLegacyReturnHeight(consensus);
+    return last && first && int64_t{stake_height} >= *first && int64_t{stake_height} <= *last;
+}
+
+std::optional<int64_t> DemurrageFirstReductionCountdown(const Consensus::Params& consensus,
+                                                        const CScript& script_pub_key,
+                                                        const Consensus::DemurrageEvaluation& eval,
+                                                        int evaluation_height, int64_t evaluation_time)
+{
+    // Permanent exemption comes from the script and holds before activation too.
+    if (!Consensus::DemurragePermanentExemption(script_pub_key, consensus).empty()) return std::nullopt;
+    if (eval.locked) return std::nullopt;
+    if (consensus.IsDemurrageActive(evaluation_height, evaluation_time)) {
+        // Active. An output in grace (young) or protected by an attestation is exempt only for now: its
+        // inactive blocks (counted from its age, the activation or its attestation) say how long is left.
+        return Consensus::DemurrageBlocksUntilFirstReduction(eval.inactive_blocks, consensus);
+    }
+    // Not active yet. Only a height-given activation makes a countdown.
+    if (!consensus.UsesHeightLifecycle()) return std::nullopt;
+    const int activation = consensus.EffectiveDemurrageActivationHeight();
+    if (activation == std::numeric_limits<int>::max() || evaluation_height >= activation) return std::nullopt;
+    return int64_t{activation} - int64_t{evaluation_height} + Consensus::DemurrageBlocksUntilFirstReduction(0, consensus);
+}
+
+std::string QuantumStakeReturnBackupAction()
+{
+    return "Make a fresh wallet backup now (backupwallet, or Backup Wallet in the File menu) and keep it safe. Quantum keys are "
+           "random and are not derived from a seed, so a backup made before this key was created cannot recover coins paid to it.";
+}
+
+std::string QuantumStakeReturnPendingAction()
+{
+    return "Wait for the wallet's own retry, or call setquantumstakereturn again after fixing the backup directory "
+           "(-quantumkeybackupdir). The key stays in the wallet and is retried as it is; it becomes the return address only "
+           "after a verified wallet backup. The previous return address, if any, stays in use.";
+}
+
+std::string LegacyStakingNotice(const Consensus::Params& consensus, int next_height,
+                                const LegacyStakeQuantumReturn& quantum_return)
+{
+    const std::optional<int64_t> last = LastLegacyStakeHeight(consensus);
+    if (!last || int64_t{next_height} > int64_t{consensus.nQuantumMigrationEndHeight}) return "";
+    const int64_t final_height = int64_t{consensus.nQuantumMigrationEndHeight} + 1;
+    const int64_t first_quantum = *last + 1;
+    const std::string unstaked = strprintf(
+        "Legacy coins that never win a stake stay legacy: migrate them to a quantum address before height %d "
+        "(the first Final block) or they can never be spent.", final_height);
+    // A stake at first_quantum matures in the very last Migration block, which the wallet does not
+    // rely on (a margin of one block); from first_quantum + 1 on it could not mature before Final.
+    const std::string why = strprintf(
+        "The wallet starts one block early to keep a migration margin: a legacy stake at height %d would mature only in the "
+        "last Migration block, and from height %d on it could not mature before the Final phase at all.",
+        first_quantum, first_quantum + 1);
+    std::string head;
+    if (int64_t{next_height} > *last) {
+        head = strprintf("Legacy stakes are now paid to a quantum address of this wallet (from height %d). %s", first_quantum, why);
+    } else {
+        head = strprintf("From height %d (%d blocks from now), legacy stakes are paid to a quantum address of this wallet. %s",
+                         first_quantum, first_quantum - int64_t{next_height}, why);
+    }
+    std::string ready;
+    if (quantum_return.available) {
+        // A return made at height h can stake again at h + maturity. The first return (made at first_quantum,
+        // which is the last Migration block minus the maturity) can stake in the last Migration block; one made
+        // a block later only from the first Final block on.
+        ready = strprintf("Return address READY: %s. Legacy coins that stake in the window leave as quantum coins, which "
+                          "can stake again when they are %d blocks old: the first one (made at height %d) in the last Migration "
+                          "block (%d), any later one from the first Final block (%d) on.",
+                          quantum_return.address, consensus.nCoinbaseMaturity, first_quantum,
+                          int64_t{consensus.nQuantumMigrationEndHeight}, final_height);
+        if (!quantum_return.backup_verified) ready += " " + QuantumStakeReturnBackupAction();
+    } else {
+        ready = strprintf("Return address NOT READY: %s Until it is, this wallet will not stake legacy coins from height %d.",
+                          quantum_return.reason, first_quantum);
+    }
+    // A key made for the return address that is not in a verified backup yet: said apart from the readiness of
+    // the active destination above.
+    if (quantum_return.pending) {
+        ready += quantum_return.pending_error.empty()
+            ? strprintf(" A new return key (%s) is waiting for its first verified wallet backup before it becomes the "
+                        "return address.", quantum_return.pending_address)
+            : strprintf(" A new return key (%s) is NOT active: its wallet backup failed (%s). It stays pending and the "
+                        "backup is retried with the same key; fix the backup directory (-quantumkeybackupdir) or run "
+                        "setquantumstakereturn again.", quantum_return.pending_address, quantum_return.pending_error);
+    }
+    // The opportunistic window opens earlier: with a ready return address a legacy stake is already paid as
+    // quantum coins; without one it stakes as before, and the return address is the action to take.
+    std::string opportunistic;
+    if (const std::optional<int64_t> first_opportunistic = FirstOpportunisticLegacyReturnHeight(consensus);
+        first_opportunistic && *first_opportunistic < first_quantum) {
+        if (int64_t{next_height} >= *first_opportunistic) {
+            opportunistic = quantum_return.available
+                ? strprintf("Opportunistic return is ON: since height %d a legacy stake is paid to that address as one quantum output.",
+                            *first_opportunistic)
+                : strprintf("Opportunistic return is OFF since height %d because the return address is not ready, so legacy stakes "
+                            "still pay legacy outputs. Make it ready now: %s",
+                            *first_opportunistic, quantum_return.reason);
+        } else {
+            opportunistic = strprintf("From height %d (%d blocks from now) a legacy stake is already paid to that address as one "
+                                      "quantum output when it is ready; without one it stakes as before.",
+                                      *first_opportunistic, *first_opportunistic - int64_t{next_height});
+        }
+    }
+    return head + " " + ready + (opportunistic.empty() ? "" : " " + opportunistic) + " " + unstaked;
+}
+
+std::optional<CTxDestination> ChooseLegacyStakeQuantumReturn(const std::vector<QuantumReturnCandidate>& candidates)
+{
+    static const std::array<const char*, 3> staker_labels{
+        "PoS - Quantum Stake Address", "Quantum PoS Reward Address", "goldrush-pos"};
+    std::optional<CTxDestination> best;
+    int best_rank{-1};
+    int64_t best_time{0};
+    std::string best_encoded;
+    for (const QuantumReturnCandidate& candidate : candidates) {
+        if (candidate.is_change || !IsValidDestination(candidate.destination)) continue;
+        if (!IsDirectQuantumMigrationScript(GetScriptForDestination(candidate.destination))) continue;
+        int rank{1};
+        for (size_t i = 0; i < staker_labels.size(); ++i) {
+            if (candidate.label == staker_labels[i]) rank = static_cast<int>(10 - i);
+        }
+        const std::string encoded = EncodeDestination(candidate.destination);
+        const bool better = !best || rank > best_rank ||
+                            (rank == best_rank && (candidate.creation_time < best_time ||
+                                                   (candidate.creation_time == best_time && encoded < best_encoded)));
+        if (better) {
+            best = candidate.destination;
+            best_rank = rank;
+            best_time = candidate.creation_time;
+            best_encoded = encoded;
+        }
+    }
+    return best;
+}
+
+QuantumReturnChoice ChooseQuantumStakeReturn(const CTxDestination& saved, const CTxDestination& configured,
+                                             const CTxDestination& claim_key,
+                                             const std::vector<QuantumReturnCandidate>& candidates)
+{
+    if (IsValidDestination(saved)) return {QuantumReturnSource::SAVED, saved};
+    if (IsValidDestination(configured)) return {QuantumReturnSource::CONFIGURED, configured};
+    if (IsValidDestination(claim_key)) return {QuantumReturnSource::CLAIM_KEY, claim_key};
+    if (const auto pick = ChooseLegacyStakeQuantumReturn(candidates)) return {QuantumReturnSource::RANKED, *pick};
+    return {};
+}
+
+namespace {
+//! Why dest cannot be the quantum stake return address; empty when it can.
+std::string QuantumStakeReturnProblem(const CWallet& wallet, const CTxDestination& dest)
+{
+    AssertLockHeld(wallet.cs_wallet);
+    if (!IsValidDestination(dest) || !IsQuantumMigrationDestination(dest) ||
+        !IsDirectQuantumMigrationScript(GetScriptForDestination(dest))) {
+        return "it is not an ordinary quantum address.";
+    }
+    const auto info = wallet.GetQuantumKeyInfo(dest);
+    if (!info) return "it is not backed by a quantum key of this wallet.";
+    if (!info->durably_stored) return "its quantum key is not durably stored yet.";
+    // A key made for the return address stays out of every use as the destination until its backup succeeded.
+    if (wallet.IsQuantumStakeReturnPendingKey(dest)) return "it is a new key still waiting for its first verified wallet backup.";
+    return "";
+}
+} // namespace
+
+LegacyStakeQuantumReturn ResolveLegacyStakeQuantumReturn(const CWallet& wallet)
+{
+    AssertLockHeld(wallet.cs_wallet);
+    LegacyStakeQuantumReturn result;
+    if (wallet.m_quantum_return_pending) {
+        result.pending = true;
+        result.pending_address = EncodeDestination(WitnessUnknown{QUANTUM_MIGRATION_WITNESS_VERSION, wallet.m_quantum_return_pending->witness_program});
+        result.pending_error = wallet.m_quantum_return_pending_error;
+    }
+    if (wallet.IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS)) {
+        result.reason = "this wallet has no private keys.";
+        return result;
+    }
+    if (wallet.m_quantum_stake_return.empty()) {
+        result.reason = "no quantum stake return address is set. Unlock the wallet normally (not for staking only) "
+                        "so it can choose one, or run setquantumstakereturn.";
+        return result;
+    }
+    const CTxDestination dest = DecodeDestination(wallet.m_quantum_stake_return);
+    const std::string problem = QuantumStakeReturnProblem(wallet, dest);
+    if (!problem.empty()) {
+        result.reason = strprintf("the saved quantum stake return address %s cannot be used: %s Run setquantumstakereturn "
+                                  "with another address.", wallet.m_quantum_stake_return, problem);
+        return result;
+    }
+    result.available = true;
+    result.script = GetScriptForDestination(dest);
+    result.address = wallet.m_quantum_stake_return;
+    if (const auto info = wallet.GetQuantumKeyInfo(dest)) result.backup_verified = info->backup_verified;
+    return result;
+}
+
+bool SetQuantumStakeReturn(CWallet& wallet, const CTxDestination& dest, bilingual_str& error)
+{
+    LOCK(wallet.cs_wallet);
+    const std::string problem = QuantumStakeReturnProblem(wallet, dest);
+    if (!problem.empty()) {
+        error = Untranslated("The address cannot be the quantum stake return address: " + problem);
+        return false;
+    }
+    const std::string encoded = EncodeDestination(dest);
+    WalletBatch batch(wallet.GetDatabase());
+    if (!batch.WriteQuantumStakeReturn(encoded)) {
+        error = _("Failed to write the quantum stake return address to the wallet database.");
+        return false;
+    }
+    wallet.m_quantum_stake_return = encoded;
+    // The candidate set depends on it inside the window; never serve a stale selection.
+    DropStakeSlotCache(wallet);
+    if (const auto info = wallet.GetQuantumKeyInfo(dest); info && !info->backup_verified) {
+        wallet.WalletLogPrintf("Quantum stake return address %s is not in a verified wallet backup yet. %s\n",
+                               encoded, QuantumStakeReturnBackupAction());
+    }
+    return true;
+}
+
+/** Whether the wallet holds a live legacy output of a kind the staker can stake: of a script class kernels can
+ *  be built for (not a quantum, cold-stake or EUTXO script), owned by this wallet with a spendable key and
+ *  signable here, and not a protected asset. The live candidate index is only a prefilter on script shape
+ *  (it also holds outputs of other parties that sit in the wallet's transaction history), so ownership and
+ *  signability are decided here, with the tests the staking evaluator applies. Stops at the first one. */
+bool WalletHoldsLegacyStakableCoin(const CWallet& wallet)
+{
+    AssertLockHeld(wallet.cs_wallet);
+    if (wallet.IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS)) return false;
+    const std::set<COutPoint> protected_seals = wallet.GetProtectedRGBSeals();
+    std::map<CScript, bool> signable; // per script, looked up once
+    for (const COutPoint& outpoint : wallet.GetLiveUnspentStakeCandidateOutpoints()) {
+        const auto it = wallet.mapWallet.find(outpoint.hash);
+        if (it == wallet.mapWallet.end() || !it->second.tx || outpoint.n >= it->second.tx->vout.size()) continue;
+        const CTxOut& out = it->second.tx->vout[outpoint.n];
+        if (out.nValue < wallet.m_min_staking_amount) continue;
+        if (IsQuantumMigrationScript(out.scriptPubKey) || IsQuantumColdStakeScript(out.scriptPubKey) ||
+            IsEUTXOScript(out.scriptPubKey)) {
+            continue;
+        }
+        if (!IsStakeCandidateScript(out.scriptPubKey) || protected_seals.count(outpoint)) continue;
+        if ((wallet.IsMine(out) & ISMINE_SPENDABLE) == ISMINE_NO) continue;
+        auto [sign_it, inserted] = signable.try_emplace(out.scriptPubKey, false);
+        if (inserted) sign_it->second = CalculateMaximumSignedInputSize(out, &wallet, /*coin_control=*/nullptr) > 0;
+        if (!sign_it->second) continue;
+        return true;
+    }
+    return false;
+}
+
+namespace {
+//! How long the wallet's own retry waits after a failed backup of the pending key.
+constexpr std::chrono::seconds QUANTUM_RETURN_AUTOMATIC_RETRY_INTERVAL{60};
+
+//! Test-only abrupt termination: the kernel ends the process, so no exit handler, sanitizer finalizer or
+//! stream flush runs (a plain _Exit still enters the sanitizers' exit interceptors, which can block).
+[[noreturn]] void TerminateProcessAbruptly()
+{
+#ifndef WIN32
+    kill(getpid(), SIGKILL);
+    for (;;) pause(); // unreachable: SIGKILL cannot be caught or ignored
+#else
+    TerminateProcess(GetCurrentProcess(), 7);
+    for (;;) Sleep(INFINITE); // unreachable
+#endif
+}
+
+//! A crash point for functional tests: on a test chain, with -quantumreturncrashpoint=<point>, the process
+//! ends here without any cleanup, as a power loss would. Never reachable on a production chain.
+void QuantumReturnCrashPoint(const CWallet& wallet, const char* point)
+{
+    if (!Params().IsTestChain()) return;
+    if (gArgs.GetArg("-quantumreturncrashpoint", "") != point) return;
+    wallet.WalletLogPrintf("Quantum stake return test crash point %s reached; exiting without cleanup.\n", point);
+    TerminateProcessAbruptly();
+}
+
+/** Back the wallet up, with every quantum key reopened and challenged, into the wallet's backup directory and
+ *  record the generation next to it. No wallet or chain lock is held: this is file system work. */
+bool BackupQuantumReturnKey(CWallet& wallet, std::string& error)
+{
+    AssertLockNotHeld(::cs_main);
+    AssertLockNotHeld(wallet.cs_wallet);
+    const fs::path directory = QuantumKeyBackupDirectory(wallet.GetName());
+    if (!EnsureQuantumKeyBackupDirectory(directory, error)) return false;
+    const std::optional<int> height = wallet.HaveChain() ? wallet.chain().getHeight() : std::nullopt;
+    const std::string file_name = QuantumKeyBackupFileName(GetTime(), height.value_or(0), NewQuantumKeyBackupSuffix());
+    const uint64_t sequence = NextQuantumKeyBackupSequence(directory);
+    bilingual_str backup_error;
+    // The manifest records what the verified file holds, as BackupWallet reports it from the snapshot the copy was
+    // made from: an inventory read before or after the call could differ from the file's.
+    QuantumKeyBackupKeySet keys;
+    if (!wallet.BackupWallet(fs::PathToString(directory / fs::PathFromString(file_name)), &backup_error, /*verify_quantum_keys=*/true, &keys)) {
+        error = backup_error.original.empty() ? "the wallet backup failed" : backup_error.original;
+        return false;
+    }
+    QuantumReturnCrashPoint(wallet, "after_backup_install");
+    return WriteQuantumKeyBackupManifest(directory, file_name, sequence, keys, error);
+}
+
+/** Make the pending key the destination (unless a valid destination was saved meanwhile) and clear the pending
+ *  record, in one durable database transaction. Memory follows only after the commit. */
+bool ActivatePendingQuantumStakeReturn(CWallet& wallet, const CTxDestination& dest, bool& became_destination, bilingual_str& error)
+{
+    LOCK(wallet.cs_wallet);
+    became_destination = false;
+    if (!wallet.m_quantum_return_pending) return true;
+    const bool set_destination = !ResolveLegacyStakeQuantumReturn(wallet).available;
+    const std::string encoded = EncodeDestination(dest);
+    WalletBatch batch(wallet.GetDatabase());
+    if (!batch.TxnBegin(/*durable=*/true)) {
+        error = _("Failed to begin the database transaction that activates the quantum stake return address.");
+        return false;
+    }
+    if (set_destination && !batch.WriteQuantumStakeReturn(encoded)) {
+        batch.TxnAbort();
+        error = _("Failed to write the quantum stake return address to the wallet database.");
+        return false;
+    }
+    if (!batch.EraseQuantumStakeReturnPending()) {
+        batch.TxnAbort();
+        error = _("Failed to clear the pending quantum stake return record.");
+        return false;
+    }
+    if (!batch.TxnCommit()) {
+        batch.TxnAbort();
+        error = _("Failed to commit the activation of the quantum stake return address.");
+        return false;
+    }
+    if (set_destination) wallet.m_quantum_stake_return = encoded;
+    wallet.m_quantum_return_pending.reset();
+    wallet.m_quantum_return_pending_error.clear();
+    // The candidate set depends on it inside the window; never serve a stale selection.
+    DropStakeSlotCache(wallet);
+    became_destination = set_destination;
+    return true;
+}
+
+/** The pending key: back it up, then activate it. prep carries what the caller knows already. Holds the
+ *  wallet's preparation mutex (the caller), no other lock. */
+QuantumStakeReturnPreparation FinishPendingQuantumStakeReturn(CWallet& wallet, QuantumStakeReturnPreparation prep)
+    EXCLUSIVE_LOCKS_REQUIRED(wallet.m_quantum_return_prepare_mutex)
+{
+    using Outcome = QuantumStakeReturnPreparation::Outcome;
+    CTxDestination dest;
+    {
+        LOCK(wallet.cs_wallet);
+        if (!wallet.m_quantum_return_pending) {
+            prep.detail = "no key is waiting for its backup";
+            return prep;
+        }
+        dest = WitnessUnknown{QUANTUM_MIGRATION_WITNESS_VERSION, wallet.m_quantum_return_pending->witness_program};
+    }
+    prep.address = EncodeDestination(dest);
+    prep.key_created = true;
+    const auto still_pending = [&](const std::string& why) {
+        {
+            LOCK(wallet.cs_wallet);
+            wallet.m_quantum_return_pending_error = why;
+        }
+        wallet.WalletLogPrintf("The new quantum stake return key %s is not active yet: %s. The key stays in the wallet and the previous return address stays in use; the backup is retried with the same key.\n",
+                               prep.address, why);
+        wallet.m_quantum_return_retry_at = SteadyClock::now() + QUANTUM_RETURN_AUTOMATIC_RETRY_INTERVAL;
+        prep.outcome = Outcome::PENDING_BACKUP;
+        prep.detail = why;
+        return prep;
+    };
+    std::string backup_error;
+    if (!BackupQuantumReturnKey(wallet, backup_error)) return still_pending(backup_error);
+    QuantumReturnCrashPoint(wallet, "before_activation");
+    bool became_destination{false};
+    bilingual_str activation_error;
+    if (!ActivatePendingQuantumStakeReturn(wallet, dest, became_destination, activation_error)) {
+        return still_pending(activation_error.original);
+    }
+    QuantumReturnCrashPoint(wallet, "after_activation");
+    wallet.m_quantum_return_retry_at = {};
+    // Only after the activation is durable: keep the newest generations and the sole protectors of any key.
+    {
+        const QuantumKeyBackupKeySet live = WITH_LOCK(wallet.cs_wallet, return wallet.GetQuantumKeyPrograms());
+        PruneQuantumKeyBackups(QuantumKeyBackupDirectory(wallet.GetName()), live, QUANTUM_KEY_BACKUP_KEEP_GENERATIONS);
+    }
+    if (!became_destination) {
+        prep.outcome = Outcome::NO_ACTION;
+        prep.detail = "the new key is in a verified backup; the return address saved meanwhile stays";
+        return prep;
+    }
+    wallet.WalletLogPrintf("Quantum stake return address set to %s after a verified wallet backup: legacy stakes in the last %d blocks of Migration are paid there.\n",
+                           prep.address, Params().GetConsensus().nCoinbaseMaturity + LEGACY_STAKE_MIGRATION_MARGIN_BLOCKS);
+    prep.outcome = Outcome::CREATED_ADDRESS;
+    return prep;
+}
+} // namespace
+
+QuantumStakeReturnPreparation PrepareQuantumStakeReturn(CWallet& wallet, QuantumStakeReturnTrigger trigger, bool allow_new_key)
+{
+    using Outcome = QuantumStakeReturnPreparation::Outcome;
+    QuantumStakeReturnPreparation prep;
+    const Consensus::Params& consensus = Params().GetConsensus();
+    if (!LastLegacyStakeHeight(consensus)) {
+        prep.detail = "no height-authoritative Migration schedule";
+        return prep;
+    }
+    if (wallet.IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS) || wallet.IsLocked() ||
+        wallet.m_wallet_unlock_staking_only) {
+        prep.detail = "the wallet cannot create or choose a key in its current unlock state";
+        return prep;
+    }
+    // The chain's own height: no wallet lock, and no assertion for a wallet that has not processed a block yet.
+    const std::optional<int> tip_height = wallet.HaveChain() ? wallet.chain().getHeight() : std::nullopt;
+    if (!tip_height) {
+        prep.detail = "the chain has no tip yet";
+        return prep;
+    }
+    // One preparation at a time per wallet, so concurrent callers produce one key. The mutex is taken before
+    // any wallet lock, and the backup below runs with no wallet and no chain lock held.
+    AssertLockNotHeld(::cs_main);
+    AssertLockNotHeld(wallet.cs_wallet);
+    LOCK(wallet.m_quantum_return_prepare_mutex);
+    // A key made earlier whose backup did not finish is completed first, whoever asks and whatever the other
+    // conditions of an automatic preparation are: it already has its consent. Retrying here is also what a
+    // restart does, since the record is loaded with the wallet.
+    if (WITH_LOCK(wallet.cs_wallet, return wallet.m_quantum_return_pending.has_value())) {
+        if (trigger == QuantumStakeReturnTrigger::AUTOMATIC && SteadyClock::now() < wallet.m_quantum_return_retry_at) {
+            prep.detail = "the last backup of the pending key failed a moment ago; it is retried soon";
+            return prep;
+        }
+        return FinishPendingQuantumStakeReturn(wallet, prep);
+    }
+    // After the last Migration block the automatic path makes no new choice. A pending key is handled above, before
+    // this cutoff, so a backup that failed earlier is still completed after Final has started.
+    if (int64_t{*tip_height} + 1 > int64_t{consensus.nQuantumMigrationEndHeight} && trigger == QuantumStakeReturnTrigger::AUTOMATIC) {
+        prep.detail = "the window has passed";
+        return prep;
+    }
+    if (trigger == QuantumStakeReturnTrigger::AUTOMATIC) {
+        // Not before Gold Rush has ended, and only for a wallet with legacy coins to return: a pre-end chain
+        // and a wallet with nothing to stake see no key, record or backup prompt appear on their own.
+        if (int64_t{*tip_height} + 1 <= int64_t{consensus.nGoldRushEndHeight}) {
+            prep.detail = "Gold Rush has not ended; the explicit command is available";
+            return prep;
+        }
+    }
+    QuantumReturnChoice choice;
+    {
+        LOCK(wallet.cs_wallet);
+        // A ready return address ends the preparation before the wallet is scanned for legacy coins: the scan is
+        // needed only when an automatic preparation still has to decide whether to choose or create a key.
+        const LegacyStakeQuantumReturn current = ResolveLegacyStakeQuantumReturn(wallet);
+        if (current.available) {
+            prep.address = current.address;
+            prep.detail = "a quantum stake return address is already saved";
+            return prep;
+        }
+        if (trigger == QuantumStakeReturnTrigger::AUTOMATIC && !WalletHoldsLegacyStakableCoin(wallet)) {
+            prep.detail = "this wallet holds no legacy coin the staker could stake";
+            return prep;
+        }
+        CTxDestination configured_dest;
+        const std::vector<std::string> configured = gArgs.GetArgs("-qqpospayoutaddress");
+        if (configured.size() == 1) {
+            const CTxDestination dest = DecodeDestination(configured.front());
+            if (QuantumStakeReturnProblem(wallet, dest).empty()) configured_dest = dest;
+        }
+        CTxDestination claim_dest;
+        if (!IsValidDestination(configured_dest)) {
+            const CTxDestination dest = wallet.GetRecordedPowPayoutKey();
+            if (QuantumStakeReturnProblem(wallet, dest).empty()) claim_dest = dest;
+        }
+        std::vector<QuantumReturnCandidate> candidates;
+        if (!IsValidDestination(configured_dest) && !IsValidDestination(claim_dest)) {
+            wallet.ForEachAddrBookEntry([&](const CTxDestination& dest, const std::string& label, bool is_change,
+                                            const std::optional<AddressPurpose> purpose) {
+                if (is_change || !purpose || *purpose != AddressPurpose::RECEIVE) return;
+                if (!QuantumStakeReturnProblem(wallet, dest).empty()) return;
+                const auto info = wallet.GetQuantumKeyInfo(dest);
+                candidates.push_back({dest, label, is_change, info ? info->creation_time : 0});
+            });
+        }
+        choice = ChooseQuantumStakeReturn(CTxDestination{}, configured_dest, claim_dest, candidates);
+    }
+    // The wallet lock is not held from here: key generation and the database writes below take
+    // the locks they need themselves.
+    if (choice.source == QuantumReturnSource::NONE) {
+        // The existing key-creation policy decides whether a new key may exist.
+        const bool automatic_consent = gArgs.GetBoolArg("-qqallowautokeycreation", DEFAULT_ALLOW_AUTO_QUANTUM_KEY_CREATION);
+        if (!allow_new_key && !automatic_consent) {
+            prep.detail = "no quantum address to reuse and automatic key creation is not allowed";
+            return prep;
+        }
+        const auto key = wallet.AddQuantumStakeReturnKey("PoS - Quantum Stake Address", allow_new_key ? "explicit" : "automatic");
+        if (!key) {
+            wallet.WalletLogPrintf("Quantum stake return address not created: %s\n", util::ErrorString(key).original);
+            prep.outcome = Outcome::FAILED;
+            prep.detail = util::ErrorString(key).original;
+            return prep;
+        }
+        wallet.WalletLogPrintf("Created quantum stake address %s for legacy stakes paid as quantum coins. It becomes the return address after a verified wallet backup.\n",
+                               EncodeDestination(*key));
+        prep.address = EncodeDestination(*key);
+        prep.key_created = true;
+        QuantumReturnCrashPoint(wallet, "after_key_insertion");
+        return FinishPendingQuantumStakeReturn(wallet, prep);
+    }
+    bilingual_str error;
+    if (!SetQuantumStakeReturn(wallet, choice.destination, error)) {
+        wallet.WalletLogPrintf("Quantum stake return address not set: %s\n", error.original);
+        prep.outcome = Outcome::FAILED;
+        prep.address = EncodeDestination(choice.destination);
+        prep.detail = error.original;
+        return prep;
+    }
+    wallet.WalletLogPrintf("Quantum stake return address set to %s: legacy stakes in the last %d blocks of Migration are paid there.\n",
+                           EncodeDestination(choice.destination), consensus.nCoinbaseMaturity + LEGACY_STAKE_MIGRATION_MARGIN_BLOCKS);
+    prep.outcome = Outcome::REUSED_ADDRESS;
+    prep.address = EncodeDestination(choice.destination);
+    return prep;
+}
+
+bool MaybeAutoSetQuantumStakeReturn(CWallet& wallet)
+{
+    return PrepareQuantumStakeReturn(wallet, QuantumStakeReturnTrigger::AUTOMATIC).Saved();
+}
 
 /**
  * The staking eligibility predicate exactly as it stood before the per-slot
@@ -2029,24 +2988,27 @@ static bool EvaluateStakeCandidateReference(const CWallet& wallet, const COutPoi
         const int depth = wallet.GetTxDepthInMainChain(wtx);
         const bool active = depth >= 0 &&
             !(depth == 0 && !wtx.InMempool()) &&
-            depth >= context.min_depth && depth <= context.max_depth &&
+            (context.blocks_ahead == 0 || depth > 0) &&
+            depth + context.blocks_ahead >= context.min_depth && depth <= context.max_depth &&
             CachedTxIsTrusted(wallet, wtx, context.trusted_parents);
-        eligibility->second = {active, wallet.IsTxImmature(wtx)};
+        eligibility->second = {active, StakeSourceImmature(wallet, wtx, context)};
     }
     if (!eligibility->second.active) return false;
 
     const CTxOut& output = wtx.tx->vout[outpoint.n];
-    if (eligibility->second.immature &&
-        !IsNextBlockMatureGoldRushPayout(wallet, outpoint, context.spend_height, context.spend_time)) {
-        return false;
-    }
+    // Immature for the next block (which also covers a Gold Rush payout, whose
+    // maturity is the same).
+    if (eligibility->second.immature) return false;
 
     if (output.nValue < wallet.m_min_staking_amount ||
         output.nValue < context.params.min_amount ||
         output.nValue > context.params.max_amount) {
         return false;
     }
-    if (wallet.IsLockedCoin(outpoint) && context.params.skip_locked) return false;
+    if (wallet.IsLockedCoin(outpoint) && context.params.skip_locked &&
+        !(context.params.staking_scan_ignores_lock_of && context.params.staking_scan_ignores_lock_of->count(outpoint))) {
+        return false;
+    }
 
     // The exact live-unspent index should make this redundant. Keep the check
     // as a fail-closed invariant guard if a future wallet mutation path is
@@ -2067,11 +3029,13 @@ static bool EvaluateStakeCandidateReference(const CWallet& wallet, const COutPoi
     const bool quantum_output = IsQuantumMigrationScript(output.scriptPubKey) ||
                                 IsQuantumColdStakeScript(output.scriptPubKey);
     if ((quantum_output && !context.lineage_active) ||
-        (context.final_quantum_lockout && !quantum_output)) {
+        (context.final_quantum_lockout && !quantum_output) ||
+        (context.legacy_stake_barred && !quantum_output)) {
         return false;
     }
 
-    if (IsGeneratedQuantumStakeCandidate(wallet, outpoint, output.scriptPubKey) ||
+    if (IsGeneratedQuantumStakeCandidate(wallet, outpoint, output.scriptPubKey,
+                                         context.spend_height, context.spend_time) ||
         IsDemurrageLockedStakeCandidate(wallet, outpoint, output.scriptPubKey,
                                         context.spend_height, context.spend_time) ||
         context.protected_rgb_seals.count(outpoint)) {
@@ -2114,8 +3078,9 @@ static bool EvaluateStakeCandidateReference(const CWallet& wallet, const COutPoi
  * policy and phase rule is evaluated here for both stake weight and kernel
  * selection.
  *
- * Gold Rush synthetic payout maturity remains output-specific, so that
- * exception is evaluated below rather than cached as transaction eligibility.
+ * Maturity is the consensus condition for the next block (see
+ * IsStakeSourceImmatureForNextBlock): a coinbase or coinstake output is a
+ * kernel from the block `maturity` above it, whatever its kind.
  *
  * The result is the conjunction of independent side-effect-free tests. They
  * run cheapest first (amount, lock, ownership) so an output that cannot stake
@@ -2127,39 +3092,52 @@ static bool EvaluateStakeCandidate(const CWallet& wallet, const COutPoint& outpo
                                    bool& spendable)
 {
     spendable = false;
-    if (!wtx.tx || outpoint.n >= wtx.tx->vout.size()) return false;
+    context.exclusion = StakeExclusion::NONE;
+    // Every rejection names its reason (the first failing test) for the readiness
+    // report; the staker itself only looks at the result.
+    const auto exclude = [&context](StakeExclusion reason) {
+        context.exclusion = reason;
+        return false;
+    };
+    if (!wtx.tx || outpoint.n >= wtx.tx->vout.size()) return exclude(StakeExclusion::OTHER);
 
     const CTxOut& output = wtx.tx->vout[outpoint.n];
     if (output.nValue < wallet.m_min_staking_amount ||
-        output.nValue < context.params.min_amount ||
-        output.nValue > context.params.max_amount) {
-        return false;
+        output.nValue < context.params.min_amount) {
+        return exclude(StakeExclusion::BELOW_MINIMUM);
     }
-    if (wallet.IsLockedCoin(outpoint) && context.params.skip_locked) return false;
+    if (output.nValue > context.params.max_amount) return exclude(StakeExclusion::OTHER);
+    if (wallet.IsLockedCoin(outpoint) && context.params.skip_locked &&
+        !(context.params.staking_scan_ignores_lock_of && context.params.staking_scan_ignores_lock_of->count(outpoint))) {
+        return exclude(StakeExclusion::LOCKED);
+    }
 
     const bool quantum_output = IsQuantumMigrationScript(output.scriptPubKey) ||
                                 IsQuantumColdStakeScript(output.scriptPubKey);
     if ((quantum_output && !context.lineage_active) ||
-        (context.final_quantum_lockout && !quantum_output)) {
-        return false;
+        (context.final_quantum_lockout && !quantum_output) ||
+        (context.legacy_stake_barred && !quantum_output)) {
+        return exclude(StakeExclusion::OTHER);
     }
 
     // CreateCoinStake can only construct kernels for these legacy types. Keep
     // status weight and actual kernel selection on the same candidate set.
     if (!quantum_output && !context.script_class_prevalidated &&
         !IsStakeCandidateScript(output.scriptPubKey)) {
-        return false;
+        return exclude(StakeExclusion::OTHER);
     }
 
     const isminetype mine = wallet.IsMine(output);
-    if (mine == ISMINE_NO) return false;
-    if (!context.allow_used_addresses && wallet.IsSpentKey(output.scriptPubKey)) return false;
+    if (mine == ISMINE_NO) return exclude(StakeExclusion::OTHER);
+    if (!context.allow_used_addresses && wallet.IsSpentKey(output.scriptPubKey)) return exclude(StakeExclusion::OTHER);
 
     // Without watch-only access the result cannot depend on solvability.
     const bool watch_only_allowed = (mine & ISMINE_WATCH_ONLY) != ISMINE_NO &&
         context.coin_control && context.coin_control->fAllowWatchOnly;
     const bool mine_spendable = (mine & ISMINE_SPENDABLE) != ISMINE_NO;
-    if (!mine_spendable && !watch_only_allowed && context.params.only_spendable) return false;
+    if (!mine_spendable && !watch_only_allowed && context.params.only_spendable) {
+        return exclude(StakeExclusion::SIGNER_UNAVAILABLE);
+    }
 
     auto [eligibility, inserted] = context.transaction_eligibility.emplace(
         wtx.GetHash(), StakeTransactionEligibility{});
@@ -2167,21 +3145,28 @@ static bool EvaluateStakeCandidate(const CWallet& wallet, const COutPoint& outpo
         const int depth = wallet.GetTxDepthInMainChain(wtx);
         const bool active = depth >= 0 &&
             !(depth == 0 && !wtx.InMempool()) &&
-            depth >= context.min_depth && depth <= context.max_depth &&
+            (context.blocks_ahead == 0 || depth > 0) &&
+            depth + context.blocks_ahead >= context.min_depth && depth <= context.max_depth &&
             CachedTxIsTrusted(wallet, wtx, context.trusted_parents);
-        eligibility->second = {active, wallet.IsTxImmature(wtx)};
+        eligibility->second = {active, StakeSourceImmature(wallet, wtx, context)};
     }
-    if (!eligibility->second.active) return false;
-    if (eligibility->second.immature &&
-        !IsNextBlockMatureGoldRushPayout(wallet, outpoint, context.spend_height, context.spend_time)) {
-        return false;
+    if (!eligibility->second.active) {
+        const int depth = wallet.GetTxDepthInMainChain(wtx);
+        // Waiting to confirm or to age counts as immature; a transaction that is no
+        // longer in the chain or the mempool (replaced by a reorganisation) does not.
+        const bool waiting = depth > 0 ? depth + context.blocks_ahead < context.min_depth
+                                       : (depth == 0 && wtx.InMempool());
+        return exclude(waiting ? StakeExclusion::IMMATURE : StakeExclusion::OTHER);
     }
+    // Immature for the next block (which also covers a Gold Rush payout, whose
+    // maturity is the same).
+    if (eligibility->second.immature) return exclude(StakeExclusion::IMMATURE);
 
     // The exact live-unspent index should make this redundant. Keep the check
     // as a fail-closed invariant guard if a future wallet mutation path is
     // introduced without an index hook.
     if (!context.spend_state_prevalidated && wallet.IsSpent(outpoint)) {
-        return false;
+        return exclude(StakeExclusion::OTHER);
     }
 
     if (context.lineage_active) {
@@ -2189,16 +3174,17 @@ static bool EvaluateStakeCandidate(const CWallet& wallet, const COutPoint& outpo
         if (coin.IsSpent() || !IsWalletProtectedLineageInput(
                 wallet, outpoint, coin, context.consensus,
                 context.spend_time, context.spend_height)) {
-            return false;
+            return exclude(StakeExclusion::OTHER);
         }
     }
 
-    if (IsGeneratedQuantumStakeCandidate(wallet, outpoint, output.scriptPubKey) ||
+    if (IsGeneratedQuantumStakeCandidate(wallet, outpoint, output.scriptPubKey,
+                                         context.spend_height, context.spend_time) ||
         IsDemurrageLockedStakeCandidate(wallet, outpoint, output.scriptPubKey,
-                                        context.spend_height, context.spend_time) ||
-        context.protected_rgb_seals.count(outpoint)) {
-        return false;
+                                        context.spend_height, context.spend_time)) {
+        return exclude(StakeExclusion::LOCKED);
     }
+    if (context.protected_rgb_seals.count(outpoint)) return exclude(StakeExclusion::OTHER);
 
     bool solvable = quantum_output;
     if (!mine_spendable && watch_only_allowed && !solvable) {
@@ -2210,7 +3196,7 @@ static bool EvaluateStakeCandidate(const CWallet& wallet, const COutPoint& outpo
         }
     }
     spendable = mine_spendable || (watch_only_allowed && solvable);
-    if (!spendable && context.params.only_spendable) return false;
+    if (!spendable && context.params.only_spendable) return exclude(StakeExclusion::SIGNER_UNAVAILABLE);
 
     return true;
 }
@@ -2253,6 +3239,9 @@ BoundedLegacyStakeCandidates GetBoundedLegacyStakeCandidates(
         {},
         {},
     };
+    context.legacy_stake_barred = IsLegacyStakeBarredByMigrationEnd(consensus, spend_height) &&
+                                  !ResolveLegacyStakeQuantumReturn(wallet).available;
+    context.wallet_maturity_rule = true;
     result.candidates.reserve(sources.size());
     for (const BoundedLegacyStakeSource& source : sources) {
         const COutPoint& outpoint = source.outpoint;
@@ -2268,9 +3257,9 @@ BoundedLegacyStakeCandidates GetBoundedLegacyStakeCandidates(
             IsQuantumColdStakeScript(script) || IsEUTXOScript(script)) {
             continue;
         }
-        // The only next-block maturity exception is a quantum synthetic
-        // payout, already excluded above. This keeps the shared legacy call
-        // chain-free while preserving the authoritative result.
+        // The wallet's own maturity rule, exactly as in v30.1.6: this list only feeds the claim miner's stake
+        // reserve (which coins stay out of claim fee-input selection), and the claim candidates it is set
+        // against are judged by the same wallet rule. See the note at wallet_maturity_rule.
         if (wallet.IsTxImmature(*wallet_tx)) continue;
         bool spendable{false};
         if (!EvaluateStakeCandidate(
@@ -2290,7 +3279,9 @@ template <bool REFERENCE>
 static void AvailableCoinsForStakingImpl(const CWallet& wallet,
                            std::vector<std::pair<const CWalletTx*, unsigned int> >& vCoins,
                            const CCoinControl* coinControl,
-                           const CoinFilterParams& params)
+                           const CoinFilterParams& params,
+                           int blocks_ahead = 0,
+                           const StakeScanObserver* observer = nullptr)
 {
     AssertLockHeld(::cs_main);
     AssertLockHeld(wallet.cs_wallet);
@@ -2303,7 +3294,7 @@ static void AvailableCoinsForStakingImpl(const CWallet& wallet,
     const int min_depth = std::max(DEFAULT_MIN_DEPTH, Params().GetConsensus().nCoinbaseMaturity);
     const int max_depth = DEFAULT_MAX_DEPTH;
     const CBlockIndex* tip = wallet.chain().getTip();
-    const int spend_height = tip ? tip->nHeight + 1 : 0;
+    const int spend_height = (tip ? tip->nHeight + 1 : 0) + blocks_ahead;
     const int64_t spend_time = tip ? tip->GetMedianTimePast() : 0;
     const Consensus::Params& consensus = Params().GetConsensus();
     const bool lineage_active = IsQuantumWitnessSpendActive(consensus, spend_time, spend_height);
@@ -2329,6 +3320,10 @@ static void AvailableCoinsForStakingImpl(const CWallet& wallet,
         {},
     };
 
+    context.blocks_ahead = blocks_ahead;
+    context.legacy_stake_barred = IsLegacyStakeBarredByMigrationEnd(consensus, spend_height) &&
+                                  !ResolveLegacyStakeQuantumReturn(wallet).available;
+
     // The candidate subset holds exactly the live outpoints whose script can
     // stake, in the same order, so the selected set equals a walk of the full
     // live index; the reference path walks the full index to prove that.
@@ -2342,6 +3337,7 @@ static void AvailableCoinsForStakingImpl(const CWallet& wallet,
         const bool evaluated = REFERENCE
             ? EvaluateStakeCandidateReference(wallet, outpoint, wallet_tx->second, context, spendable)
             : EvaluateStakeCandidate(wallet, outpoint, wallet_tx->second, context, spendable);
+        if (observer) (*observer)(outpoint, wallet_tx->second, evaluated && spendable, context.exclusion);
         if (!evaluated) continue;
 
         const CTxOut& output = wallet_tx->second.tx->vout[outpoint.n];
@@ -2361,6 +3357,16 @@ void AvailableCoinsForStaking(const CWallet& wallet,
     AvailableCoinsForStakingImpl</*REFERENCE=*/false>(wallet, vCoins, coinControl, params);
 }
 
+void AvailableCoinsForStakingAhead(const CWallet& wallet,
+                           std::vector<std::pair<const CWalletTx*, unsigned int> >& vCoins,
+                           const CCoinControl* coinControl,
+                           const CoinFilterParams& params,
+                           int blocks_ahead,
+                           const StakeScanObserver& observer)
+{
+    AvailableCoinsForStakingImpl</*REFERENCE=*/false>(wallet, vCoins, coinControl, params, blocks_ahead, &observer);
+}
+
 void AvailableCoinsForStakingReference(const CWallet& wallet,
                            std::vector<std::pair<const CWalletTx*, unsigned int> >& vCoins,
                            const CCoinControl* coinControl,
@@ -2369,11 +3375,408 @@ void AvailableCoinsForStakingReference(const CWallet& wallet,
     AvailableCoinsForStakingImpl</*REFERENCE=*/true>(wallet, vCoins, coinControl, params);
 }
 
-// Publish the stake weight of a completed full scan for status RPC/GUI readers.
-static void PublishCachedStakeWeight(const CWallet& wallet, CAmount value_in)
+int64_t FinalStakeReserveTarget(int64_t n)
 {
-    const CAmount available = value_in > wallet.m_reserve_balance
-        ? value_in - wallet.m_reserve_balance
+    if (n <= 0) return 0;
+    // n / 2 + n % 2 is ceil(n / 2) without the overflow of n + 1.
+    const int64_t half = n / 2;
+    if (half >= MAX_FINAL_STAKE_RESERVE_OUTPUTS) return MAX_FINAL_STAKE_RESERVE_OUTPUTS;
+    return std::min(MAX_FINAL_STAKE_RESERVE_OUTPUTS, half + n % 2);
+}
+
+bool FinalStakeReserveOptionEnabled()
+{
+    const common::SettingsValue value = gArgs.GetSetting("-finalstakereserve");
+    if (value.isNull()) return DEFAULT_FINAL_STAKE_RESERVE;
+    // The argument parser (ArgsManager::STRICT_BOOL) and the settings file check have already refused every value but
+    // a boolean (the negation marker), 0, 1, "0", "1", "true" and "false". Programmatic settings (ForceSetArg) may also
+    // be the empty string, a bare flag.
+    if (value.isBool()) return value.get_bool();
+    if (value.isNum()) return value.write() != "0";
+    if (value.isStr()) {
+        const std::string text = ToLower(value.get_str());
+        if (text.empty() || text == "1" || text == "true") return true;
+        if (text == "0" || text == "false") return false;
+    }
+    return DEFAULT_FINAL_STAKE_RESERVE;
+}
+
+bool SingleOutputReserveBit(const COutPoint& outpoint)
+{
+    static constexpr char TAG[] = "BLK final stake reserve v1";
+    unsigned char vout[4];
+    WriteLE32(vout, outpoint.n);
+    unsigned char digest[CSHA256::OUTPUT_SIZE];
+    CSHA256()
+        .Write(reinterpret_cast<const unsigned char*>(TAG), sizeof(TAG) - 1)
+        .Write(outpoint.hash.data(), 32)
+        .Write(vout, sizeof(vout))
+        .Finalize(digest);
+    return (digest[CSHA256::OUTPUT_SIZE - 1] & 1) != 0;
+}
+
+/** M and F for the reserve guard, or nullopt without a complete height schedule. */
+static std::optional<int64_t> FinalStakeReserveLastMigrationHeight(const Consensus::Params& consensus)
+{
+    if (!consensus.UsesHeightLifecycle() || !consensus.IsMigrationEndScheduled() ||
+        consensus.nQuantumMigrationEndHeight == std::numeric_limits<int>::max()) {
+        return std::nullopt;
+    }
+    return int64_t{consensus.nQuantumMigrationEndHeight};
+}
+
+bool IsFinalStakeReserveGuardActive(const Consensus::Params& consensus, int candidate_height)
+{
+    const std::optional<int64_t> last = FinalStakeReserveLastMigrationHeight(consensus);
+    if (!last) return false;
+    return int64_t{candidate_height} >= *last + 1 - int64_t{consensus.nCoinbaseMaturity} && int64_t{candidate_height} <= *last;
+}
+
+FinalStakeReservePlan PlanFinalStakeReserve(std::vector<FinalStakeReserveSource> unspent, const std::set<COutPoint>& consumed)
+{
+    // One entry per outpoint, whatever the caller passed.
+    std::set<COutPoint> distinct;
+    unspent.erase(std::remove_if(unspent.begin(), unspent.end(),
+                                 [&distinct](const FinalStakeReserveSource& source) { return !distinct.insert(source.outpoint).second; }),
+                  unspent.end());
+    std::sort(unspent.begin(), unspent.end(), [](const FinalStakeReserveSource& a, const FinalStakeReserveSource& b) {
+        if (a.effective_value != b.effective_value) return a.effective_value > b.effective_value;
+        return a.outpoint < b.outpoint; // transaction hash, then output index, both ascending
+    });
+    std::set<COutPoint> all(consumed);
+    all.insert(distinct.begin(), distinct.end());
+
+    FinalStakeReservePlan plan;
+    plan.n = static_cast<int64_t>(all.size());
+    if (plan.n == 1) {
+        // The only source decides by its own outpoint whether it is held, so that a wallet with a single output keeps
+        // it for the first Final block only when the outpoint says so.
+        plan.single_output = true;
+        plan.single_output_held = SingleOutputReserveBit(*all.begin());
+        plan.target = plan.single_output_held ? 1 : 0;
+    } else {
+        plan.target = FinalStakeReserveTarget(plan.n);
+    }
+    const size_t take = static_cast<size_t>(std::min<int64_t>(plan.target, static_cast<int64_t>(unspent.size())));
+    plan.reserved.assign(unspent.begin(), unspent.begin() + take);
+    plan.shortfall = plan.target - static_cast<int64_t>(take);
+    return plan;
+}
+
+bool IsFinalStakeReserveSourceScript(const CWallet& wallet, const CScript& script)
+{
+    AssertLockHeld(wallet.cs_wallet);
+    if (IsQuantumMigrationScript(script)) {
+        return (wallet.IsMine(script) & ISMINE_SPENDABLE) != ISMINE_NO;
+    }
+    if (IsQuantumColdStakeScript(script)) {
+        int witness_version{0};
+        std::vector<unsigned char> witness_program;
+        if (!script.IsWitnessProgram(witness_version, witness_program)) return false;
+        const auto delegation = wallet.GetQuantumColdStakeDelegationInfo(witness_program);
+        return delegation && delegation->has_staker_key;
+    }
+    return false;
+}
+
+std::set<COutPoint> FinalStakeReserveConsumedSources(const CWallet& wallet, int64_t first_guard_height, int64_t last_height,
+                                                     int64_t last_source_height)
+{
+    AssertLockHeld(wallet.cs_wallet);
+    std::set<COutPoint> consumed;
+    for (const auto& entry : wallet.mapWallet) {
+        const CWalletTx& wtx = entry.second;
+        if (!wtx.tx || !wtx.tx->IsCoinStake()) continue;
+        const TxStateConfirmed* confirmed = wtx.state<TxStateConfirmed>();
+        if (!confirmed) continue;
+        if (int64_t{confirmed->confirmed_block_height} < first_guard_height || int64_t{confirmed->confirmed_block_height} > last_height) continue;
+        if (wallet.GetTxDepthInMainChain(wtx) <= 0) continue;
+        for (const CTxIn& txin : wtx.tx->vin) {
+            const auto parent_it = wallet.mapWallet.find(txin.prevout.hash);
+            if (parent_it == wallet.mapWallet.end() || !parent_it->second.tx) continue;
+            const CWalletTx& parent = parent_it->second;
+            if (txin.prevout.n >= parent.tx->vout.size()) continue;
+            const TxStateConfirmed* parent_state = parent.state<TxStateConfirmed>();
+            if (!parent_state || int64_t{parent_state->confirmed_block_height} > last_source_height) continue;
+            const CTxOut& out = parent.tx->vout[txin.prevout.n];
+            if (out.nValue < wallet.m_min_staking_amount) continue;
+            if (!IsFinalStakeReserveSourceScript(wallet, out.scriptPubKey)) continue;
+            consumed.insert(txin.prevout);
+        }
+    }
+    return consumed;
+}
+
+FinalStakeReserve ComputeFinalStakeReserve(const CWallet& wallet, const std::set<COutPoint>* ignore_lock_of)
+{
+    AssertLockHeld(::cs_main);
+    AssertLockHeld(wallet.cs_wallet);
+    FinalStakeReserve reserve;
+    reserve.enabled = FinalStakeReserveOptionEnabled();
+    const Consensus::Params& consensus = Params().GetConsensus();
+    const CBlockIndex* tip = wallet.chain().getTip();
+    if (!tip) return reserve;
+    reserve.candidate_height = tip->nHeight + 1;
+    const std::optional<int64_t> last_migration = FinalStakeReserveLastMigrationHeight(consensus);
+    if (!last_migration) return reserve;
+    reserve.schedule_known = true;
+    reserve.final_height = *last_migration + 1;
+    reserve.guard_first_height = reserve.final_height - int64_t{consensus.nCoinbaseMaturity};
+    // Beyond the first Final block there is nothing to report. At candidate F itself the guard is released: nothing
+    // is enforced and nothing is held back, but the eligibility at F is still computed and reported below.
+    if (!reserve.enabled || int64_t{reserve.candidate_height} > reserve.final_height) return reserve;
+    reserve.active = int64_t{reserve.candidate_height} >= reserve.guard_first_height && int64_t{reserve.candidate_height} <= *last_migration;
+
+    // U: the staker's own candidate scan evaluated for the first Final block (maturity, lineage, covenants, locks and the
+    // wallet's other staking requirements as they will be at F), restricted to the outputs the wallet stakes quantum with.
+    std::vector<FinalStakeReserveSource> unspent;
+    const int blocks_ahead = static_cast<int>(reserve.final_height - int64_t{reserve.candidate_height});
+    const int64_t scan_time = tip->GetMedianTimePast();
+    const StakeScanObserver observer = [&](const COutPoint& outpoint, const CWalletTx& wtx, bool eligible, StakeExclusion why) {
+        const CScript& script = wtx.tx->vout[outpoint.n].scriptPubKey;
+        const bool cold_stake = IsQuantumColdStakeScript(script);
+        if (!IsQuantumMigrationScript(script) && !cold_stake) return;
+        if (!eligible) {
+            StakeExclusionTally& tally = reserve.excluded[why == StakeExclusion::NONE ? StakeExclusion::OTHER : why];
+            ++tally.count;
+            tally.value += wtx.tx->vout[outpoint.n].nValue;
+            return;
+        }
+        if (!IsFinalStakeReserveSourceScript(wallet, script)) {
+            if (cold_stake) {
+                ++reserve.missing_staker_key.count;
+                reserve.missing_staker_key.value += wtx.tx->vout[outpoint.n].nValue;
+            }
+            return;
+        }
+        CAmount principal{0};
+        if (!GetCoinStakeInputPrincipal(wallet.chain().getCoinsTip(), outpoint, consensus, static_cast<int>(reserve.final_height),
+                                        scan_time, principal)) {
+            ++reserve.no_effective_value.count;
+            reserve.no_effective_value.value += wtx.tx->vout[outpoint.n].nValue;
+            return;
+        }
+        unspent.push_back({outpoint, principal});
+    };
+    std::vector<std::pair<const CWalletTx*, unsigned int>> scanned;
+    CCoinControl coin_control;
+    CoinFilterParams scan_params;
+    scan_params.staking_scan_ignores_lock_of = ignore_lock_of;
+    AvailableCoinsForStakingAhead(wallet, scanned, &coin_control, scan_params, blocks_ahead, observer);
+
+    // S: sources already consumed by this wallet's confirmed coinstakes since the guard began; a source qualifies when it
+    // was created at or before F - maturity.
+    const std::set<COutPoint> consumed = FinalStakeReserveConsumedSources(
+        wallet, reserve.guard_first_height, *last_migration, reserve.guard_first_height);
+
+    for (const FinalStakeReserveSource& source : unspent) reserve.eligible_weight += source.effective_value;
+    reserve.eligible_count = static_cast<int64_t>(unspent.size());
+    reserve.consumed = static_cast<int64_t>(consumed.size());
+    FinalStakeReservePlan plan = PlanFinalStakeReserve(std::move(unspent), consumed);
+    reserve.n = plan.n;
+    reserve.target = plan.target;
+    reserve.single_output = plan.single_output;
+    reserve.single_output_held = plan.single_output_held;
+    // Released at F: n, R and the eligibility are reported, nothing is held back and nothing is short.
+    if (int64_t{reserve.candidate_height} >= reserve.final_height) return reserve;
+    reserve.shortfall = plan.shortfall;
+    reserve.reserved = std::move(plan.reserved);
+    for (const FinalStakeReserveSource& source : reserve.reserved) {
+        reserve.reserved_weight += source.effective_value;
+        if (reserve.active) reserve.enforced.insert(source.outpoint);
+    }
+    return reserve;
+}
+
+std::set<COutPoint> FinalStakeReserveEnforcedOutpoints(const CWallet& wallet, const std::set<COutPoint>* ignore_lock_of)
+{
+    AssertLockHeld(::cs_main);
+    AssertLockHeld(wallet.cs_wallet);
+    if (!FinalStakeReserveOptionEnabled()) return {};
+    const CBlockIndex* tip = wallet.chain().getTip();
+    if (!tip || !IsFinalStakeReserveGuardActive(Params().GetConsensus(), tip->nHeight + 1)) return {};
+    return ComputeFinalStakeReserve(wallet, ignore_lock_of).enforced;
+}
+
+bool SpendsFinalStakeReserve(CWallet& wallet, const CTransaction& tx)
+{
+    LOCK2(::cs_main, wallet.cs_wallet);
+    const std::set<COutPoint> reserve = FinalStakeReserveEnforcedOutpoints(wallet);
+    if (reserve.empty()) return false;
+    return std::any_of(tx.vin.begin(), tx.vin.end(), [&reserve](const CTxIn& txin) { return reserve.count(txin.prevout) > 0; });
+}
+
+FinalStakeReserveSpendReport MakeFinalStakeReserveSpendReport(const CWallet& wallet, const FinalStakeReserve& before,
+                                                              const CTransaction& tx, const std::set<COutPoint>* ignore_lock_of)
+{
+    AssertLockHeld(::cs_main);
+    AssertLockHeld(wallet.cs_wallet);
+    FinalStakeReserveSpendReport report;
+    if (!before.active) return report;
+    for (const FinalStakeReserveSource& source : before.reserved) {
+        if (std::any_of(tx.vin.begin(), tx.vin.end(), [&](const CTxIn& txin) { return txin.prevout == source.outpoint; })) {
+            report.spent.push_back(source);
+            report.spent_effective_value += source.effective_value;
+        }
+    }
+    if (report.spent.empty()) return report;
+    report.reserved_before = static_cast<int64_t>(before.reserved.size());
+    report.eligible_before = before.eligible_count;
+    report.eligible_weight_before = before.eligible_weight;
+    const FinalStakeReserve after = ComputeFinalStakeReserve(wallet, ignore_lock_of);
+    report.reserved_after = static_cast<int64_t>(after.reserved.size());
+    report.eligible_after = after.eligible_count;
+    report.eligible_weight_after = after.eligible_weight;
+    return report;
+}
+
+bool FinalStakeReserveGuardActiveNow(const CWallet& wallet)
+{
+    AssertLockHeld(::cs_main);
+    if (!wallet.HaveChain() || !FinalStakeReserveOptionEnabled()) return false;
+    const CBlockIndex* tip = wallet.chain().getTip();
+    return tip && IsFinalStakeReserveGuardActive(Params().GetConsensus(), tip->nHeight + 1);
+}
+
+const char* StakeExclusionName(StakeExclusion reason)
+{
+    switch (reason) {
+    case StakeExclusion::NONE: return "none";
+    case StakeExclusion::IMMATURE: return "immature";
+    case StakeExclusion::LOCKED: return "locked";
+    case StakeExclusion::BELOW_MINIMUM: return "below_minimum";
+    case StakeExclusion::SIGNER_UNAVAILABLE: return "signer_unavailable";
+    case StakeExclusion::OTHER: return "other";
+    }
+    return "other";
+}
+
+QuantumStakeReadiness AssessQuantumStakeReadiness(const CWallet& wallet)
+{
+    AssertLockHeld(::cs_main);
+    AssertLockHeld(wallet.cs_wallet);
+    const Consensus::Params& consensus = Params().GetConsensus();
+    const CBlockIndex* tip = wallet.chain().getTip();
+
+    QuantumStakeReadiness result;
+    result.next_height = tip ? tip->nHeight + 1 : 0;
+    // A Final height needs a complete height-authoritative schedule. A time-only schedule (or none)
+    // gives no block count, so it is reported as unknown instead of as a height made of default values.
+    result.final_height_known = consensus.UsesHeightLifecycle() && consensus.IsMigrationEndScheduled() &&
+                                consensus.nQuantumMigrationEndHeight < std::numeric_limits<int>::max();
+    result.final_height = result.final_height_known ? consensus.nQuantumMigrationEndHeight + 1 : 0;
+    const int blocks_ahead_final = result.final_height_known && result.final_height > result.next_height
+        ? result.final_height - result.next_height : 0;
+    result.blocks_to_final = blocks_ahead_final;
+    result.wallet_locked = wallet.IsLocked();
+    result.staking_only_unlock = wallet.m_wallet_unlock_staking_only;
+    result.reserve_balance = wallet.m_reserve_balance;
+    result.min_stake_amount = wallet.m_min_staking_amount;
+    result.stake_return = ResolveLegacyStakeQuantumReturn(wallet);
+    result.final_reserve = ComputeFinalStakeReserve(wallet);
+    // A fully locked wallet has no signing key available: the staker idles
+    // (ThreadStakeMiner waits while IsLocked), so nothing it would select can stake.
+    const bool cannot_sign = wallet.IsLocked() || wallet.IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS);
+    const int64_t scan_time = tip ? tip->GetMedianTimePast() : 0;
+
+    const auto scan = [&](int blocks_ahead, StakeHorizonReadiness& horizon, bool count_total) {
+        horizon.height = result.next_height + blocks_ahead;
+        CAmount legacy_eligible{0};
+        // What the staker leaves alone at that block: the reserve, which is enforced for the next block only (the
+        // candidate F scan has none; the guard is released there).
+        static const std::set<COutPoint> NO_RESERVE;
+        const std::set<COutPoint>& withheld = blocks_ahead == 0 ? result.final_reserve.enforced : NO_RESERVE;
+        std::vector<std::pair<CAmount, bool>> effective_principals; // of each selected quantum output, in the scan's order, and whether withheld
+        std::vector<std::pair<const CWalletTx*, unsigned int>> coins;
+        CCoinControl coin_control;
+        // The very scan the staker runs (SelectCoinsForStaking); the observer only listens.
+        const StakeScanObserver observer = [&](const COutPoint& outpoint, const CWalletTx& wtx, bool eligible, StakeExclusion why) {
+            const CTxOut& out = wtx.tx->vout[outpoint.n];
+            const bool quantum = IsQuantumMigrationScript(out.scriptPubKey) || IsQuantumColdStakeScript(out.scriptPubKey);
+            if (quantum && count_total) {
+                ++result.quantum_outputs;
+                result.quantum_total += out.nValue;
+            }
+            if (eligible && cannot_sign) {
+                eligible = false;
+                why = StakeExclusion::SIGNER_UNAVAILABLE;
+            }
+            if (eligible) {
+                if (quantum) {
+                    ++horizon.eligible_outputs;
+                    horizon.eligible_nominal += out.nValue;
+                    CAmount principal{0};
+                    // The constructor's own principal, for the block this describes; a coin it cannot
+                    // use (locked by demurrage, no value left) contributes none and cannot be a kernel.
+                    if (!GetCoinStakeInputPrincipal(wallet.chain().getCoinsTip(), outpoint, consensus, horizon.height,
+                                                    scan_time, principal)) {
+                        principal = 0;
+                    }
+                    const bool reserved = withheld.count(outpoint) > 0;
+                    effective_principals.emplace_back(principal, reserved);
+                    horizon.eligible_effective += principal;
+                    if (reserved) {
+                        ++horizon.reserved_outputs;
+                        horizon.reserved_nominal += out.nValue;
+                    }
+                } else {
+                    legacy_eligible += out.nValue;
+                }
+            } else if (quantum) {
+                StakeExclusionTally& tally = horizon.excluded[why];
+                ++tally.count;
+                tally.value += out.nValue;
+            }
+        };
+        AvailableCoinsForStakingAhead(wallet, coins, &coin_control, CoinFilterParams{}, blocks_ahead, observer);
+        // The constructor's condition (CreateCoinStake): the selected set, less the outputs the final stake reserve
+        // withholds (they are neither a kernel nor value the reserve balance may be taken from), must exceed the
+        // reserve balance; a kernel is one output, and its principal may not exceed what is left of the set after
+        // the reserve balance.
+        horizon.candidate_total = legacy_eligible + horizon.eligible_nominal - horizon.reserved_nominal;
+        horizon.allowed_balance = horizon.candidate_total > wallet.m_reserve_balance
+            ? horizon.candidate_total - wallet.m_reserve_balance : 0;
+        for (const auto& [principal, reserved] : effective_principals) {
+            if (reserved || principal <= 0 || principal > horizon.allowed_balance) continue;
+            ++horizon.stakeable_outputs;
+            horizon.stakeable_effective += principal;
+            horizon.largest_kernel = std::max(horizon.largest_kernel, principal);
+        }
+    };
+    scan(0, result.next_block, /*count_total=*/true);
+    if (!result.final_height_known) {
+        result.at_final = StakeHorizonReadiness{};
+    } else if (blocks_ahead_final > 0) {
+        scan(blocks_ahead_final, result.at_final, /*count_total=*/false);
+    } else {
+        result.at_final = result.next_block;
+    }
+
+    // Legacy coins that still have to move: spendable now (the migration sweep's
+    // own candidates) plus those it cannot consider yet.
+    std::set<COutPoint> considered;
+    const int next_height = result.next_height;
+    for (const COutput& out : AvailableCoinsListUnspent(wallet).All()) {
+        const CScript& spk = out.txout.scriptPubKey;
+        if (IsQuantumMigrationScript(spk) || IsQuantumColdStakeScript(spk) || IsEUTXOScript(spk) || !out.spendable) continue;
+        considered.insert(out.outpoint);
+        ++result.legacy_outputs;
+        result.legacy_to_migrate += out.txout.nValue;
+    }
+    const ExcludedLegacyOutputs excluded = FindExcludedLegacyOutputs(wallet, considered, consensus, next_height);
+    result.legacy_outputs += excluded.count;
+    result.legacy_to_migrate += excluded.amount;
+    return result;
+}
+
+// Publish the stake weight of a completed full scan for status RPC/GUI readers.
+static void PublishCachedStakeWeight(const CWallet& wallet, CAmount value_in, CAmount withheld_value = 0)
+{
+    // What the constructor can use: the selection less the outputs the final stake reserve withholds, less the
+    // reserve balance.
+    const CAmount usable = value_in - withheld_value;
+    const CAmount available = usable > wallet.m_reserve_balance
+        ? usable - wallet.m_reserve_balance
         : 0;
     // Publish the cache pair under the same mutex used to assemble the
     // typed staking snapshot. The atomics keep legacy low-latency readers
@@ -2383,6 +3786,14 @@ static void PublishCachedStakeWeight(const CWallet& wallet, CAmount value_in)
     wallet.m_cached_stake_weight.store(static_cast<uint64_t>(available), std::memory_order_relaxed);
     const CBlockIndex* tip = wallet.chain().getTip();
     wallet.m_cached_stake_weight_height.store(tip ? tip->nHeight : -1, std::memory_order_release);
+}
+
+// A published weight that is no longer to be trusted: no figure and no tip, so a reader shows none until the next scan.
+static void InvalidateCachedStakeWeight(const CWallet& wallet)
+{
+    LOCK(wallet.m_staking_telemetry_mutex);
+    wallet.m_cached_stake_weight.store(0, std::memory_order_relaxed);
+    wallet.m_cached_stake_weight_height.store(-1, std::memory_order_release);
 }
 
 // Select some coins without random shuffle or best subset approximation
@@ -2424,11 +3835,9 @@ bool SelectCoinsForStaking(const CWallet& wallet, CAmount& nTargetValue, std::se
         }
     }
 
-    // Both current callers request the complete staking set. Publish that
-    // completed scan for status RPC/GUI readers so they never need to repeat
-    // the O(wallet history) walk on a latency-sensitive thread.
-    if (nTargetValue == MAX_MONEY) PublishCachedStakeWeight(wallet, nValueRet);
-
+    // The selection publishes no status weight: it is the unfiltered set, and the figure status readers see is
+    // what the constructor can use (the final stake reserve withheld, the reserve balance taken off). The callers
+    // that complete a scan publish that figure themselves, once the reserve is known.
     return true;
 }
 
@@ -2458,6 +3867,7 @@ static bool StakeSlotCacheIsCurrent(const CWallet& wallet, const StakeSlotCache&
            cache.wallet_locked == wallet.IsLocked() &&
            cache.staking_only == wallet.m_wallet_unlock_staking_only.load() &&
            cache.protected_rgb_seals == wallet.GetProtectedRGBSeals() &&
+           cache.final_reserve_enabled == FinalStakeReserveOptionEnabled() &&
            std::chrono::steady_clock::now() - cache.built_at < STAKE_SLOT_CACHE_MAX_AGE;
 }
 
@@ -2472,9 +3882,23 @@ static std::shared_ptr<StakeSlotCache> BuildStakeSlotCache(const CWallet& wallet
     cache->wallet_locked = wallet.IsLocked();
     cache->staking_only = wallet.m_wallet_unlock_staking_only.load();
     cache->protected_rgb_seals = wallet.GetProtectedRGBSeals();
+    cache->final_reserve_enabled = FinalStakeReserveOptionEnabled();
     cache->built_at = std::chrono::steady_clock::now();
     CAmount target{MAX_MONEY};
     SelectCoinsForStaking(wallet, target, cache->coins, cache->value_in);
+    // The final stake reserve of this tip: outputs the staker must leave alone while the guard is on. They stay in
+    // `coins` (the selection is what the status weight reports), and every user of the cache skips them.
+    if (cache->final_reserve_enabled && IsFinalStakeReserveGuardActive(Params().GetConsensus(), tip->nHeight + 1)) {
+        FinalStakeReserve reserve = ComputeFinalStakeReserve(wallet);
+        cache->final_reserve_active = reserve.active;
+        cache->final_reserve = std::move(reserve.enforced);
+        for (const auto& [wtx, n] : cache->coins) {
+            if (cache->final_reserve.count(COutPoint{wtx->GetHash(), n})) cache->final_reserve_value += wtx->tx->vout[n].nValue;
+        }
+    }
+    // Publish the stake weight of the completed full scan for status RPC/GUI readers so they never need to repeat
+    // the O(wallet history) walk on a latency-sensitive thread: only the final figure, the reserve already left out.
+    PublishCachedStakeWeight(wallet, cache->value_in, cache->final_reserve_value);
     // Under demurrage a kernel value depends on the live coin view, which
     // CheckKernel reads per call whatever the cache holds.
     if (with_kernels &&
@@ -2499,7 +3923,7 @@ std::shared_ptr<const StakeSlotCache> AcquireStakeSlotCache(const CWallet& walle
     }
     if (state.cache && StakeSlotCacheIsCurrent(wallet, *state.cache, tip)) {
         ++state.stats.hits;
-        PublishCachedStakeWeight(wallet, state.cache->value_in);
+        PublishCachedStakeWeight(wallet, state.cache->value_in, state.cache->final_reserve_value);
         return state.cache;
     }
     state.cache = BuildStakeSlotCache(wallet, tip, /*with_kernels=*/true);
@@ -2530,7 +3954,24 @@ StakeSlotKernel CheckStakeSlotKernel(const CWallet& wallet, const StakeSlotCache
         SelectCoinsForStaking(wallet, target, fresh, fresh_value);
         confirmed = fresh == slot.coins && fresh_value == slot.value_in;
     }
+    if (confirmed && slot.final_reserve_active) {
+        // The reserve is derived from the wallet and the chain, so a kernel is only reported once a fresh derivation
+        // agrees with the cached one, and never from an output that is in it.
+        const std::set<COutPoint> fresh_reserve = ComputeFinalStakeReserve(wallet).enforced;
+        if (fresh_reserve != slot.final_reserve) {
+            confirmed = false;
+        } else if (fresh_reserve.count(prevout)) {
+            return StakeSlotKernel::NONE;
+        }
+    }
+    if (confirmed) {
+        // Verified in full (selection and reserve): the fresh selection equals the slot's, so the weight shown is
+        // the usable part of it.
+        PublishCachedStakeWeight(wallet, slot.value_in, slot.final_reserve_value);
+    }
     if (!confirmed) {
+        // What the rejected cache published is not to be shown any more; the next scan publishes a figure of its own.
+        InvalidateCachedStakeWeight(wallet);
         StakeSlotCacheState& state = wallet.GetStakeSlotCacheStateLocked();
         ++state.stats.rejections;
         state.cache.reset();
@@ -2571,6 +4012,26 @@ std::vector<StakeKernelHit> ScanStakeKernels(const CWallet& wallet, unsigned int
 
 // peercoin: create coin stake transaction
 typedef std::vector<unsigned char> valtype;
+std::string LegacyReturnWindowCoinstakeProblem(const CMutableTransaction& coinstake, bool returns_to_quantum,
+                                               const LegacyStakeQuantumReturn& legacy_return)
+{
+    if (!returns_to_quantum || !legacy_return.available) {
+        return "refusing a legacy-return coinstake in the quantum return window";
+    }
+    size_t valued_outputs{0};
+    for (size_t i = 1; i < coinstake.vout.size(); ++i) {
+        if (coinstake.vout[i].nValue == 0) continue;
+        ++valued_outputs;
+        if (coinstake.vout[i].scriptPubKey != legacy_return.script) {
+            return "a legacy kernel in the quantum return window may pay only its quantum return output";
+        }
+    }
+    if (valued_outputs != 1) {
+        return "a legacy kernel in the quantum return window must pay exactly one output";
+    }
+    return "";
+}
+
 bool CreateCoinStake(CWallet& wallet, unsigned int nBits, int64_t nSearchInterval,
                      CMutableTransaction& txNew, CAmount& nFees,
                      CTxDestination destination,
@@ -2606,12 +4067,32 @@ bool CreateCoinStake(CWallet& wallet, unsigned int nBits, int64_t nSearchInterva
     const bool quantum_stake_rules_active = IsQuantumWitnessSpendActive(consensus, stake_mtp, stake_height);
     const bool final_quantum_lockout = consensus.IsQuantumFinalLockout(stake_mtp, stake_height);
     const bool stake_reward_split_active = consensus.IsStakeRewardSplitActive(stake_height);
+    // In the quantum return window a legacy kernel pays one quantum output of
+    // this wallet (principal plus reward, nothing else). Checked here as well
+    // as in the candidate filter. Without a ready return address, or if an exact
+    // reward split (which fixes the return script) were already active, no
+    // legacy kernel may stake: a legacy-return coinstake this late could never
+    // be spent before Final.
+    const bool legacy_mandatory_window = IsLegacyStakeBarredByMigrationEnd(consensus, stake_height);
+    // Earlier, in the opportunistic window, a legacy self-stake is also paid as one quantum output, but only while a
+    // return destination is ready (and no exact reward split fixes the return script); without one it stakes as
+    // it always did. The mandatory predicate above is never widened by it.
+    const bool legacy_opportunistic_window = IsLegacyStakeInOpportunisticReturnWindow(consensus, stake_height);
+    const LegacyStakeQuantumReturn legacy_return = (legacy_mandatory_window || legacy_opportunistic_window)
+        ? ResolveLegacyStakeQuantumReturn(wallet) : LegacyStakeQuantumReturn{};
+    const bool legacy_stake_barred = legacy_mandatory_window && (!legacy_return.available || stake_reward_split_active);
+    const bool legacy_in_window = legacy_mandatory_window ||
+        (legacy_opportunistic_window && legacy_return.available && !stake_reward_split_active);
+    bool fReturnToQuantum = false;
 
     // Select coins with suitable depth. The selection and the kernel inputs
     // are shared by every slot of this tip (see StakeSlotCache).
     const std::shared_ptr<const StakeSlotCache> stake_slot = AcquireStakeSlotCache(wallet, pindexPrev);
     const std::set<std::pair<const CWalletTx*, unsigned int>>& setCoins = stake_slot->coins;
-    nValueIn = stake_slot->value_in;
+    // The final stake reserve is not available to this coinstake: not as the kernel, not as an added input, and not
+    // as value the reserve balance may be taken from.
+    const std::set<COutPoint>& final_reserve = stake_slot->final_reserve;
+    nValueIn = stake_slot->value_in - stake_slot->final_reserve_value;
 
     if (setCoins.empty() || nValueIn <= wallet.m_reserve_balance)
         return false;
@@ -2648,7 +4129,13 @@ bool CreateCoinStake(CWallet& wallet, unsigned int nBits, int64_t nSearchInterva
         const COutPoint prevoutStake{pcoin.first->GetHash(), pcoin.second};
         if (forced_kernel && prevoutStake != *forced_kernel) continue;
         if (selected_tx_reserved_outpoints.count(prevoutStake)) continue;
+        if (final_reserve.count(prevoutStake)) continue;
         if (final_quantum_lockout &&
+            !IsQuantumMigrationScript(pcoin.first->tx->vout[pcoin.second].scriptPubKey) &&
+            !IsQuantumColdStakeScript(pcoin.first->tx->vout[pcoin.second].scriptPubKey)) {
+            continue;
+        }
+        if (legacy_stake_barred &&
             !IsQuantumMigrationScript(pcoin.first->tx->vout[pcoin.second].scriptPubKey) &&
             !IsQuantumColdStakeScript(pcoin.first->tx->vout[pcoin.second].scriptPubKey)) {
             continue;
@@ -2690,6 +4177,11 @@ bool CreateCoinStake(CWallet& wallet, unsigned int nBits, int64_t nSearchInterva
                     break;
                 }
 
+                if (!quantum_kernel && legacy_stake_barred)
+                {
+                    LogPrint(BCLog::COINSTAKE, "CreateCoinStake : skipping legacy kernel that could not mature before Final\n");
+                    break;
+                }
                 if (!quantum_kernel && whichType != TxoutType::PUBKEY && whichType != TxoutType::PUBKEYHASH && whichType != TxoutType::WITNESS_V0_KEYHASH && whichType != TxoutType::WITNESS_V1_TAPROOT)
                 {
                     LogPrint(BCLog::COINSTAKE, "CreateCoinStake : no support for kernel type=%s\n", GetTxnOutputType(whichType));
@@ -2765,7 +4257,13 @@ bool CreateCoinStake(CWallet& wallet, unsigned int nBits, int64_t nSearchInterva
                 {
                     std::vector<valtype> vSolutionsTmp;
                     CScript scriptPubKeyTmp = GetScriptForDestination(destination);
-                    Solver(scriptPubKeyTmp, vSolutionsTmp);
+                    // The block-signing key comes from the staking destination, which must be a key-hash script: a
+                    // label match alone does not make a saved address one.
+                    if (Solver(scriptPubKeyTmp, vSolutionsTmp) != TxoutType::PUBKEYHASH ||
+                        vSolutionsTmp.size() != 1 || vSolutionsTmp[0].size() != 20) {
+                        LogPrint(BCLog::COINSTAKE, "CreateCoinStake : the staking destination is not a key-hash address, so no minter key can be derived for output %s\n", pcoin.first->tx->vout[pcoin.second].ToString());
+                        break;
+                    }
                     std::unique_ptr<SigningProvider> provider = wallet.GetSolvingProvider(scriptPubKeyTmp);
                     if (!provider) {
                         LogPrint(BCLog::COINSTAKE, "CreateCoinStake : failed to get signing provider for output %s\n", pcoin.first->tx->vout[pcoin.second].ToString());
@@ -2781,6 +4279,13 @@ bool CreateCoinStake(CWallet& wallet, unsigned int nBits, int64_t nSearchInterva
                     bMinterKey = true;
                 }
 
+                if (!quantum_kernel && legacy_in_window) {
+                    // The legacy key stays the block-signing key (the value-0
+                    // minter output); the value goes to the quantum output.
+                    bMinterKey = true;
+                    fReturnToQuantum = true;
+                }
+
                 txNew.nTime = kernel_time;
                 txNew.vin.push_back(CTxIn(pcoin.first->GetHash(), pcoin.second));
                 nCredit += kernel_principal;
@@ -2792,7 +4297,8 @@ bool CreateCoinStake(CWallet& wallet, unsigned int nBits, int64_t nSearchInterva
                     // extra output for minter key
                     txNew.vout.push_back(CTxOut(0, scriptPubKeyOut));
                     // redefine scriptPubKeyOut to send output to input address
-                    scriptPubKeyOut = scriptPubKeyKernel;
+                    // (or, for a legacy kernel in the window, to the quantum return)
+                    scriptPubKeyOut = fReturnToQuantum ? legacy_return.script : scriptPubKeyKernel;
                 }
     
                 txNew.vout.push_back(CTxOut(0, scriptPubKeyOut));
@@ -2812,6 +4318,7 @@ bool CreateCoinStake(CWallet& wallet, unsigned int nBits, int64_t nSearchInterva
     for (const std::pair<const CWalletTx*, unsigned int> &pcoin : setCoins)
     {
         if (selected_tx_reserved_outpoints.count(COutPoint(pcoin.first->GetHash(), pcoin.second))) continue;
+        if (final_reserve.count(COutPoint(pcoin.first->GetHash(), pcoin.second))) continue;
         CTransactionRef tx = pcoin.first->tx;
         if (!tx) {
             LogPrint(BCLog::COINSTAKE, "CreateCoinStake : wallet transaction unavailable for %s\n", pcoin.first->GetHash().ToString());
@@ -2883,7 +4390,7 @@ bool CreateCoinStake(CWallet& wallet, unsigned int nBits, int64_t nSearchInterva
         wallet.GetQQDevelopmentDonationPercentage();
     bool qq_development_donation_enabled =
         qq_development_percentage > 0 &&
-        quantum_stake_rules_active &&
+        quantum_stake_rules_active && !fReturnToQuantum &&
         IsDirectQuantumMigrationScript(qq_development_script);
 
     // This is wallet policy, never a consensus treasury or required payment.
@@ -2907,7 +4414,7 @@ bool CreateCoinStake(CWallet& wallet, unsigned int nBits, int64_t nSearchInterva
     }
 
     // Split stake
-    if (nCredit >= GetStakeSplitThreshold())
+    if (nCredit >= GetStakeSplitThreshold() && !fReturnToQuantum)
         txNew.vout.push_back(CTxOut(0, scriptPubKeyOut));
 
     if (qq_development_donation_enabled)
@@ -2934,6 +4441,26 @@ bool CreateCoinStake(CWallet& wallet, unsigned int nBits, int64_t nSearchInterva
     if (IsShadowGoldRushRewardActive(consensus, stake_mtp, stake_height) &&
         !final_quantum_lockout) {
         txNew.vout.push_back(CTxOut(0, BuildQuantumQuasarBlockNoticeScript()));
+    }
+
+    // The independent guard: this wallet never emits a legacy-return coinstake in
+    // the window. A legacy kernel there has exactly one output of value, a
+    // quantum output of the wallet, and nothing else of value.
+    if (legacy_in_window && !fQuantumKernel) {
+        const std::string shape_problem = LegacyReturnWindowCoinstakeProblem(txNew, fReturnToQuantum, legacy_return);
+        if (!shape_problem.empty()) return error("CreateCoinStake : %s", shape_problem);
+    }
+
+    // The recheck before the coinstake is committed: a fresh derivation of the reserve, from the same wallet and chain
+    // state the coinstake was built from, must not contain any of its inputs.
+    if (stake_slot->final_reserve_active) {
+        const std::set<COutPoint> fresh_reserve = ComputeFinalStakeReserve(wallet).enforced;
+        for (const CTxIn& txin : txNew.vin) {
+            if (fresh_reserve.count(txin.prevout)) {
+                LogPrint(BCLog::COINSTAKE, "CreateCoinStake : refusing a coinstake that spends the final stake reserve\n");
+                return false;
+            }
+        }
     }
 
     // Sign
@@ -2965,4 +4492,20 @@ bool CreateCoinStake(CWallet& wallet, unsigned int nBits, int64_t nSearchInterva
     // Successfully generated coinstake
     return true;
 }
+
+AutoScanVerdict DecideAutoScan(int last_height, const uint256& last_tip,
+                               int height, const uint256& tip,
+                               std::chrono::steady_clock::time_point& last_reorg_scan,
+                               std::chrono::steady_clock::time_point now)
+{
+    if (height > last_height || last_tip.IsNull()) return AutoScanVerdict::SCAN;
+    if (height == last_height && tip == last_tip) return AutoScanVerdict::SKIP_SAME_TIP;
+    if (last_reorg_scan != std::chrono::steady_clock::time_point{} &&
+        now - last_reorg_scan < AUTO_SCAN_REORG_MIN_INTERVAL) {
+        return AutoScanVerdict::SKIP_REORG_BOUND;
+    }
+    last_reorg_scan = now;
+    return AutoScanVerdict::SCAN;
+}
+
 } // namespace wallet

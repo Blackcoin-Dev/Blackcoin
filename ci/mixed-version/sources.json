@@ -61,6 +61,19 @@
       "identity_contract": "version-banner-clean-source-commit-v1",
       "source_daemon": "blackcoind",
       "source_cli": "blackcoin-cli"
+    },
+    {
+      "version": "v30.1.6",
+      "product": "Blackcoin",
+      "install_dir": "v30.1.6",
+      "repository": "https://github.com/Blackcoin-Dev/Blackcoin.git",
+      "source_ref": "refs/tags/v30.1.6",
+      "ref_object": "9551d0217f47b1f702843232808b7b0f8c67762a",
+      "commit": "8aaa4257c52997a33c0e6499f3d9ba92effc5e1c",
+      "tag_kind": "annotated",
+      "identity_contract": "version-banner-clean-source-commit-v1",
+      "source_daemon": "blackcoind",
+      "source_cli": "blackcoin-cli"
     }
   ]
 }

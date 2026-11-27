@@ -1,0 +1,826 @@
+// Copyright (c) 2026 The Blackcoin developers
+// Distributed under the MIT software license, see the accompanying
+// file COPYING or http://www.opensource.org/licenses/mit-license.php.
+
+#include <addresstype.h>
+#include <chainparams.h>
+#include <common/args.h>
+#include <coins.h>
+#include <consensus/demurrage.h>
+#include <crypto/mldsa.h>
+#include <key.h>
+#include <script/script.h>
+#include <test/util/setup_common.h>
+#include <tinyformat.h>
+#include <uint256.h>
+#include <validation.h>
+#include <wallet/staking.h>
+#include <wallet/test/util.h>
+#include <wallet/wallet.h>
+
+#include <boost/test/unit_test.hpp>
+
+#include <memory>
+#include <set>
+#include <utility>
+#include <vector>
+
+namespace wallet {
+namespace {
+
+constexpr int STATE_HEIGHT{4321};
+constexpr uint32_t STATE_TIME{1700000000};
+constexpr uint32_t STATE_COVERAGE{4300};
+
+Consensus::DemurrageAttestationRecord Record(const uint256& block_hash, const uint256& txid, uint32_t output_index)
+{
+    Consensus::DemurrageAttestationRecord record;
+    record.pubkey_hash = uint256::ONE;
+    record.state.height = STATE_HEIGHT;
+    record.state.time = STATE_TIME;
+    record.state.coverage_start_height = STATE_COVERAGE;
+    record.source_block_hash = block_hash;
+    record.source_txid = txid;
+    record.source_output_index = output_index;
+    return record;
+}
+
+PendingWalletAttestation Pending(const uint256& key, const uint256& block_hash, const uint256& txid, uint32_t output_index)
+{
+    PendingWalletAttestation entry;
+    entry.key_hash = key;
+    entry.previous_height = STATE_HEIGHT;
+    entry.previous_time = STATE_TIME;
+    entry.previous_coverage_start_height = STATE_COVERAGE;
+    entry.previous_source = Consensus::DemurrageAttestationSource{block_hash, txid, output_index};
+    return entry;
+}
+
+} // namespace
+
+BOOST_FIXTURE_TEST_SUITE(demurrage_pending_attestation_tests, TestChain100Setup)
+
+BOOST_AUTO_TEST_CASE(a_pending_attestation_matches_only_the_complete_referenced_state)
+{
+    const uint256 block_a = uint256S("aa");
+    const uint256 block_b = uint256S("bb");
+    const uint256 tx_a = uint256S("1a");
+    const uint256 tx_b = uint256S("1b");
+    const std::optional<Consensus::DemurrageAttestationRecord> record = Record(block_a, tx_a, 2);
+
+    BOOST_CHECK(PendingAttestationReferencesRecord(Pending(uint256::ONE, block_a, tx_a, 2), record));
+    // Equal height, time and coverage on a competing history: a different referenced state.
+    BOOST_CHECK(!PendingAttestationReferencesRecord(Pending(uint256::ONE, block_b, tx_a, 2), record));
+    BOOST_CHECK(!PendingAttestationReferencesRecord(Pending(uint256::ONE, block_a, tx_b, 2), record));
+    BOOST_CHECK(!PendingAttestationReferencesRecord(Pending(uint256::ONE, block_a, tx_a, 3), record));
+
+    // The coordinates themselves still matter.
+    PendingWalletAttestation shifted = Pending(uint256::ONE, block_a, tx_a, 2);
+    shifted.previous_height = STATE_HEIGHT + 1;
+    BOOST_CHECK(!PendingAttestationReferencesRecord(shifted, record));
+    shifted = Pending(uint256::ONE, block_a, tx_a, 2);
+    shifted.previous_time = STATE_TIME + 1;
+    BOOST_CHECK(!PendingAttestationReferencesRecord(shifted, record));
+    shifted = Pending(uint256::ONE, block_a, tx_a, 2);
+    shifted.previous_coverage_start_height = STATE_COVERAGE + 1;
+    BOOST_CHECK(!PendingAttestationReferencesRecord(shifted, record));
+
+    // A key with no recorded state matches only an attestation that references none; a recorded state
+    // never matches an attestation that names no source, nor the reverse.
+    PendingWalletAttestation first_ever;
+    first_ever.key_hash = uint256::ONE;
+    BOOST_CHECK(PendingAttestationReferencesRecord(first_ever, std::nullopt));
+    BOOST_CHECK(!PendingAttestationReferencesRecord(first_ever, record));
+    BOOST_CHECK(!PendingAttestationReferencesRecord(Pending(uint256::ONE, block_a, tx_a, 2), std::nullopt));
+    PendingWalletAttestation without_source = Pending(uint256::ONE, block_a, tx_a, 2);
+    without_source.previous_source.reset();
+    BOOST_CHECK(!PendingAttestationReferencesRecord(without_source, record));
+    first_ever.previous_time = 1;
+    BOOST_CHECK(!PendingAttestationReferencesRecord(first_ever, std::nullopt));
+}
+
+BOOST_AUTO_TEST_CASE(finding_a_pending_attestation_skips_a_different_source_and_other_keys)
+{
+    const uint256 block_a = uint256S("aa");
+    const uint256 block_b = uint256S("bb");
+    const uint256 tx_a = uint256S("1a");
+    const uint256 other_key = uint256S("55");
+    const std::optional<Consensus::DemurrageAttestationRecord> record = Record(block_a, tx_a, 0);
+
+    std::vector<PendingWalletAttestation> pending;
+    pending.push_back(Pending(uint256::ONE, block_b, tx_a, 0));  // same coordinates, other source
+    pending.back().txid = uint256S("e1");
+    pending.push_back(Pending(other_key, block_a, tx_a, 0));      // same state, other key
+    pending.back().txid = uint256S("e2");
+    BOOST_CHECK(FindPendingAttestationForState(pending, uint256::ONE, record) == nullptr);
+
+    pending.push_back(Pending(uint256::ONE, block_a, tx_a, 0));
+    pending.back().txid = uint256S("e3");
+    const PendingWalletAttestation* found = FindPendingAttestationForState(pending, uint256::ONE, record);
+    BOOST_REQUIRE(found != nullptr);
+    BOOST_CHECK(found->txid == uint256S("e3"));
+}
+
+namespace {
+struct PendingFixture {
+    std::vector<unsigned char> public_key;
+    std::vector<unsigned char> private_key;
+    CScript key_script;
+    uint256 key_hash;
+};
+
+PendingFixture MakeKey()
+{
+    PendingFixture f;
+    BOOST_REQUIRE(ML_DSA::KeyGen(f.public_key, f.private_key));
+    f.key_script = GetScriptForDestination(WitnessUnknown{QUANTUM_MIGRATION_WITNESS_VERSION,
+                                                          QuantumMigrationProgramForPubkey(f.public_key)});
+    const auto hash = Consensus::DemurrageControllingKeyHashForScript(f.key_script);
+    BOOST_REQUIRE(hash.has_value());
+    f.key_hash = *hash;
+    return f;
+}
+
+//! A pending attestation transaction: spends `fee_input`, carries one attestation of `target` over the state
+//! `record` names (none for a first attestation). The signature is not verified by anything under test.
+CTransactionRef AttestationTransaction(const PendingFixture& f, const COutPoint& fee_input, const COutPoint& target,
+                                       const std::optional<Consensus::DemurrageAttestationRecord>& record)
+{
+    std::optional<Consensus::DemurrageAttestationSource> source;
+    if (record) source = Consensus::DemurrageAttestationSource{record->source_block_hash, record->source_txid, record->source_output_index};
+    CMutableTransaction tx;
+    tx.nVersion = 2;
+    tx.vin.emplace_back(fee_input);
+    tx.vout.emplace_back(COIN, CScript{} << OP_TRUE);
+    tx.vout.emplace_back(0, Consensus::BuildDemurrageAttestationScript(
+        fee_input, target, record ? std::optional<int>{record->state.height} : std::nullopt,
+        record ? record->state.time : 0, record ? record->state.coverage_start_height : 0, source, f.public_key,
+        std::vector<unsigned char>(ML_DSA::SIGNATURE_BYTES, 0x5a)));
+    return MakeTransactionRef(std::move(tx));
+}
+} // namespace
+
+BOOST_AUTO_TEST_CASE(pending_attestations_are_classified_by_state_target_inputs_and_broadcasting)
+{
+    const PendingFixture f = MakeKey();
+    CKey wallet_key;
+    wallet_key.MakeNewKey(true);
+    auto wallet = CreateSyncedWallet(*m_node.chain,
+        WITH_LOCK(Assert(m_node.chainman)->GetMutex(), return m_node.chainman->ActiveChain()), wallet_key);
+    wallet->SetBroadcastTransactions(true);
+    const Consensus::Params& consensus = Params().GetConsensus();
+    const int height = 150;
+    const int64_t time = 1700000000;
+
+    const COutPoint target{uint256S("7a"), 0};
+    const COutPoint fee_input{uint256S("7b"), 1};
+    const COutPoint second_input{uint256S("7c"), 1};
+    {
+        LOCK(cs_main);
+        CCoinsViewCache& view = m_node.chainman->ActiveChainstate().CoinsTip();
+        view.AddCoin(target, Coin{CTxOut{5 * COIN, f.key_script}, 10, false, false, 0}, /*possible_overwrite=*/false);
+        view.AddCoin(fee_input, Coin{CTxOut{2 * COIN, GetScriptForDestination(PKHash(wallet_key.GetPubKey()))}, 10, false, false, 0}, false);
+    }
+
+    const auto add_pending = [&](const COutPoint& input, const std::optional<Consensus::DemurrageAttestationRecord>& record, bool automatic) {
+        const CTransactionRef tx = AttestationTransaction(f, input, target, record);
+        LOCK(wallet->cs_wallet);
+        BOOST_REQUIRE(wallet->AddToWallet(tx, TxStateInactive{}, [&](CWalletTx& wtx, bool) {
+            if (automatic) wtx.mapValue["comment"] = "Quantum Quasar demurrage auto-attestation";
+            return true;
+        }));
+        return tx->GetHash();
+    };
+    const uint256 auto_txid = add_pending(fee_input, std::nullopt, /*automatic=*/true);
+    const uint256 manual_txid = add_pending(second_input, std::nullopt, /*automatic=*/false);
+
+    LOCK(cs_main);
+    LOCK(wallet->cs_wallet);
+    const CCoinsViewCache& view = m_node.chainman->ActiveChainstate().CoinsTip();
+    const std::vector<PendingWalletAttestation> pending = PendingWalletDemurrageAttestations(*wallet);
+    BOOST_REQUIRE_EQUAL(pending.size(), size_t{2});
+    for (const PendingWalletAttestation& entry : pending) {
+        BOOST_CHECK(entry.key_hash == f.key_hash);
+        BOOST_CHECK(entry.target == target);
+        BOOST_CHECK(!entry.previous_source.has_value());
+        BOOST_CHECK_EQUAL(entry.automatic, entry.txid == auto_txid); // only the automatic path's own comment counts
+    }
+    const auto find = [&](const uint256& txid) -> const PendingWalletAttestation& {
+        for (const PendingWalletAttestation& entry : pending) if (entry.txid == txid) return entry;
+        BOOST_FAIL("pending attestation not listed");
+        return pending.front();
+    };
+    const auto classify = [&](const PendingWalletAttestation& entry, const std::optional<Consensus::DemurrageAttestationRecord>& record) {
+        return ClassifyPendingAttestation(*wallet, view, consensus, height, time, entry, record);
+    };
+
+    // Current state (none), live target controlled by the key, input present, broadcasting enabled: reusable.
+    BOOST_CHECK(classify(find(auto_txid), std::nullopt) == PendingAttestationUse::REUSABLE);
+    // Broadcasting disabled: still usable, only temporarily unavailable. Never "unusable".
+    wallet->SetBroadcastTransactions(false);
+    BOOST_CHECK(classify(find(auto_txid), std::nullopt) == PendingAttestationUse::TEMPORARILY_UNAVAILABLE);
+    wallet->SetBroadcastTransactions(true);
+
+    // The key has since attested (a state exists that this attestation does not reference): unusable,
+    // and equal coordinates on a different source do not rescue it.
+    const Consensus::DemurrageAttestationRecord later = Record(uint256S("aa"), uint256S("1a"), 0);
+    BOOST_CHECK(classify(find(auto_txid), later) == PendingAttestationUse::UNUSABLE);
+    const COutPoint referencing_input{uint256S("7d"), 1};
+    {
+        LOCK(cs_main);
+        m_node.chainman->ActiveChainstate().CoinsTip().AddCoin(
+            referencing_input, Coin{CTxOut{2 * COIN, GetScriptForDestination(PKHash(wallet_key.GetPubKey()))}, 10, false, false, 0}, false);
+    }
+    // (A pending attestation that does reference `later` is reusable; the same coordinates with another
+    // source block are not.)
+    const uint256 same_source_txid = [&] {
+        const CTransactionRef tx = AttestationTransaction(f, referencing_input, target, later);
+        BOOST_REQUIRE(wallet->AddToWallet(tx, TxStateInactive{}));
+        return tx->GetHash();
+    }();
+    const std::vector<PendingWalletAttestation> pending_later = PendingWalletDemurrageAttestations(*wallet);
+    const PendingWalletAttestation* referencing = nullptr;
+    for (const PendingWalletAttestation& entry : pending_later) if (entry.txid == same_source_txid) referencing = &entry;
+    BOOST_REQUIRE(referencing != nullptr);
+    BOOST_CHECK(ClassifyPendingAttestation(*wallet, view, consensus, height, time, *referencing, later) == PendingAttestationUse::REUSABLE);
+    Consensus::DemurrageAttestationRecord other_source = later;
+    other_source.source_block_hash = uint256S("bb");
+    BOOST_CHECK(ClassifyPendingAttestation(*wallet, view, consensus, height, time, *referencing, other_source) == PendingAttestationUse::UNUSABLE);
+
+    // The target is gone: unusable.
+    {
+        LOCK(cs_main);
+        CCoinsViewCache& mutable_view = m_node.chainman->ActiveChainstate().CoinsTip();
+        BOOST_REQUIRE(mutable_view.SpendCoin(target));
+    }
+    BOOST_CHECK(classify(find(auto_txid), std::nullopt) == PendingAttestationUse::UNUSABLE);
+    BOOST_CHECK(classify(find(manual_txid), std::nullopt) == PendingAttestationUse::UNUSABLE);
+    {
+        LOCK(cs_main);
+        m_node.chainman->ActiveChainstate().CoinsTip().AddCoin(
+            target, Coin{CTxOut{5 * COIN, f.key_script}, 10, false, false, 0}, /*possible_overwrite=*/true);
+        // The target now belongs to another key.
+    }
+    BOOST_CHECK(classify(find(auto_txid), std::nullopt) == PendingAttestationUse::REUSABLE);
+    PendingFixture stranger = MakeKey();
+    {
+        LOCK(cs_main);
+        m_node.chainman->ActiveChainstate().CoinsTip().AddCoin(
+            target, Coin{CTxOut{5 * COIN, stranger.key_script}, 10, false, false, 0}, /*possible_overwrite=*/true);
+    }
+    BOOST_CHECK(classify(find(auto_txid), std::nullopt) == PendingAttestationUse::UNUSABLE);
+    {
+        LOCK(cs_main);
+        m_node.chainman->ActiveChainstate().CoinsTip().AddCoin(
+            target, Coin{CTxOut{5 * COIN, f.key_script}, 10, false, false, 0}, /*possible_overwrite=*/true);
+    }
+
+    // An input that is neither a chain coin nor the output of another unconfirmed transaction of the wallet:
+    // unusable. (second_input was never added to the chain view; manual_txid spends it.)
+    BOOST_CHECK(classify(find(manual_txid), std::nullopt) == PendingAttestationUse::UNUSABLE);
+    // The chain coin spent: unusable.
+    {
+        LOCK(cs_main);
+        BOOST_REQUIRE(m_node.chainman->ActiveChainstate().CoinsTip().SpendCoin(fee_input));
+    }
+    BOOST_CHECK(classify(find(auto_txid), std::nullopt) == PendingAttestationUse::UNUSABLE);
+}
+
+namespace {
+//! A wallet, a chain view with a live target for the key and a spendable fee input, and a way to add pending
+//! attestation transactions (automatic or manual) that spend a given input and attest a given target.
+struct KeyDecisionFixture {
+    PendingFixture f{MakeKey()};
+    CKey wallet_key;
+    std::unique_ptr<CWallet> wallet;
+    COutPoint live_target{uint256S("8a"), 0};
+    COutPoint dead_target{uint256S("8b"), 0}; // never in the chain view: a spent or missing target
+    int next_input{0};
+
+    KeyDecisionFixture(TestChain100Setup& setup)
+    {
+        wallet_key.MakeNewKey(true);
+        wallet = CreateSyncedWallet(*setup.m_node.chain,
+            WITH_LOCK(Assert(setup.m_node.chainman)->GetMutex(), return setup.m_node.chainman->ActiveChain()), wallet_key);
+        wallet->SetBroadcastTransactions(true);
+        LOCK(cs_main);
+        setup.m_node.chainman->ActiveChainstate().CoinsTip().AddCoin(
+            live_target, Coin{CTxOut{5 * COIN, f.key_script}, 10, false, false, 0}, /*possible_overwrite=*/false);
+    }
+
+    COutPoint FeeInput(TestChain100Setup& setup)
+    {
+        const COutPoint input{uint256S(strprintf("9%03x", next_input++)), 1};
+        LOCK(cs_main);
+        setup.m_node.chainman->ActiveChainstate().CoinsTip().AddCoin(
+            input, Coin{CTxOut{2 * COIN, GetScriptForDestination(PKHash(wallet_key.GetPubKey()))}, 10, false, false, 0}, false);
+        return input;
+    }
+
+    uint256 AddPending(const COutPoint& input, const COutPoint& target, bool automatic,
+                       const std::optional<Consensus::DemurrageAttestationRecord>& record = std::nullopt)
+    {
+        const CTransactionRef tx = AttestationTransaction(f, input, target, record);
+        LOCK(wallet->cs_wallet);
+        BOOST_REQUIRE(wallet->AddToWallet(tx, TxStateInactive{}, [&](CWalletTx& wtx, bool) {
+            if (automatic) wtx.mapValue["comment"] = "Quantum Quasar demurrage auto-attestation";
+            return true;
+        }));
+        return tx->GetHash();
+    }
+};
+
+const PendingWalletAttestation* Entry(const std::vector<PendingWalletAttestation>& pending, const uint256& txid)
+{
+    for (const PendingWalletAttestation& entry : pending) if (entry.txid == txid) return &entry;
+    return nullptr;
+}
+} // namespace
+
+BOOST_AUTO_TEST_CASE(an_unusable_pending_attestation_never_hides_a_usable_one_for_the_same_key)
+{
+    KeyDecisionFixture fx(*this);
+    const Consensus::Params& consensus = Params().GetConsensus();
+    const int height = 150;
+    const int64_t time = 1700000000;
+    const uint256 manual_unusable = fx.AddPending(fx.FeeInput(*this), fx.dead_target, /*automatic=*/false);
+    const uint256 usable_outside_mempool = fx.AddPending(fx.FeeInput(*this), fx.live_target, /*automatic=*/false);
+
+    LOCK(cs_main);
+    LOCK(fx.wallet->cs_wallet);
+    const CCoinsViewCache& view = m_node.chainman->ActiveChainstate().CoinsTip();
+    const std::vector<PendingWalletAttestation> pending = PendingWalletDemurrageAttestations(*fx.wallet);
+    const PendingWalletAttestation* bad = Entry(pending, manual_unusable);
+    const PendingWalletAttestation* good = Entry(pending, usable_outside_mempool);
+    BOOST_REQUIRE(bad && good);
+    BOOST_CHECK(!good->in_mempool);
+    BOOST_CHECK(ClassifyPendingAttestation(*fx.wallet, view, consensus, height, time, *bad, std::nullopt) == PendingAttestationUse::UNUSABLE);
+
+    // Either order (the wallet's map order is not defined): the usable entry suppresses construction, is
+    // offered again, and the manual unusable one is preserved.
+    for (const bool unusable_first : {true, false}) {
+        const std::vector<const PendingWalletAttestation*> order = unusable_first
+            ? std::vector<const PendingWalletAttestation*>{bad, good}
+            : std::vector<const PendingWalletAttestation*>{good, bad};
+        const KeyPendingDecision decision = DecidePendingAttestationsForKey(*fx.wallet, view, consensus, height, time, fx.f.key_script, order);
+        BOOST_CHECK(decision.suppress_construction);
+        BOOST_REQUIRE(decision.reported != nullptr);
+        BOOST_CHECK(decision.reported->txid == usable_outside_mempool);
+        BOOST_CHECK(decision.reported_use == PendingAttestationUse::REUSABLE);
+        BOOST_REQUIRE_EQUAL(decision.to_resubmit.size(), size_t{1});
+        BOOST_CHECK(decision.to_resubmit.front() == usable_outside_mempool);
+        BOOST_CHECK(decision.to_abandon.empty());
+    }
+
+    // Only the unusable one: construction is not suppressed, and a manual transaction is still not cleaned up.
+    {
+        const KeyPendingDecision decision = DecidePendingAttestationsForKey(*fx.wallet, view, consensus, height, time, fx.f.key_script, {bad});
+        BOOST_CHECK(!decision.suppress_construction);
+        BOOST_CHECK(decision.reported == nullptr);
+        BOOST_CHECK(decision.to_resubmit.empty());
+        BOOST_CHECK(decision.to_abandon.empty());
+    }
+    // Usable but temporarily unavailable (broadcasting off) still suppresses, and is kept, not offered.
+    fx.wallet->SetBroadcastTransactions(false);
+    {
+        const KeyPendingDecision decision = DecidePendingAttestationsForKey(*fx.wallet, view, consensus, height, time, fx.f.key_script, {bad, good});
+        BOOST_CHECK(decision.suppress_construction);
+        BOOST_CHECK(decision.reported_use == PendingAttestationUse::TEMPORARILY_UNAVAILABLE);
+        BOOST_CHECK(decision.to_resubmit.empty());
+    }
+}
+
+BOOST_AUTO_TEST_CASE(unusable_automatic_attestations_are_listed_for_cleanup_separately)
+{
+    KeyDecisionFixture fx(*this);
+    const Consensus::Params& consensus = Params().GetConsensus();
+    const int height = 150;
+    const int64_t time = 1700000000;
+    const uint256 automatic_unusable = fx.AddPending(fx.FeeInput(*this), fx.dead_target, /*automatic=*/true);
+    const uint256 usable = fx.AddPending(fx.FeeInput(*this), fx.live_target, /*automatic=*/true);
+
+    LOCK(cs_main);
+    LOCK(fx.wallet->cs_wallet);
+    const CCoinsViewCache& view = m_node.chainman->ActiveChainstate().CoinsTip();
+    const std::vector<PendingWalletAttestation> pending = PendingWalletDemurrageAttestations(*fx.wallet);
+    const PendingWalletAttestation* bad = Entry(pending, automatic_unusable);
+    const PendingWalletAttestation* good = Entry(pending, usable);
+    BOOST_REQUIRE(bad && good);
+    BOOST_CHECK(bad->automatic && !bad->in_mempool);
+
+    // Alongside a usable entry the unusable automatic one is listed, and construction is suppressed.
+    KeyPendingDecision decision = DecidePendingAttestationsForKey(*fx.wallet, view, consensus, height, time, fx.f.key_script, {bad, good});
+    BOOST_CHECK(decision.suppress_construction);
+    BOOST_REQUIRE_EQUAL(decision.to_abandon.size(), size_t{1});
+    BOOST_CHECK(decision.to_abandon.front() == automatic_unusable);
+    // Alone, it is listed and construction proceeds.
+    decision = DecidePendingAttestationsForKey(*fx.wallet, view, consensus, height, time, fx.f.key_script, {bad});
+    BOOST_CHECK(!decision.suppress_construction);
+    BOOST_REQUIRE_EQUAL(decision.to_abandon.size(), size_t{1});
+}
+
+namespace {
+//! The cleanup stage as the automatic path runs it: the decision of every key in the wallet, then the abandonment
+//! of the union of their lists. Returns the union.
+std::set<uint256> DecideAndCleanUp(TestChain100Setup& setup, CWallet& wallet,
+                                   const std::vector<std::pair<CScript, std::vector<uint256>>>& keys)
+{
+    const Consensus::Params& consensus = Params().GetConsensus();
+    std::set<uint256> to_abandon;
+    {
+        LOCK(cs_main);
+        LOCK(wallet.cs_wallet);
+        const CCoinsViewCache& view = setup.m_node.chainman->ActiveChainstate().CoinsTip();
+        const std::vector<PendingWalletAttestation> pending = PendingWalletDemurrageAttestations(wallet);
+        for (const auto& [script, txids] : keys) {
+            std::vector<const PendingWalletAttestation*> key_pending;
+            for (const uint256& txid : txids) {
+                const PendingWalletAttestation* entry = Entry(pending, txid);
+                BOOST_REQUIRE(entry != nullptr);
+                key_pending.push_back(entry);
+            }
+            const KeyPendingDecision decision = DecidePendingAttestationsForKey(wallet, view, consensus, 150, 1700000000, script, key_pending);
+            to_abandon.insert(decision.to_abandon.begin(), decision.to_abandon.end());
+        }
+    }
+    AbandonStaleAutomaticAttestations(wallet, to_abandon);
+    return to_abandon;
+}
+
+bool Abandoned(const CWallet& wallet, const uint256& txid)
+{
+    LOCK(wallet.cs_wallet);
+    const auto it = wallet.mapWallet.find(txid);
+    return it != wallet.mapWallet.end() && it->second.isAbandoned();
+}
+
+//! A second key of the same wallet with a live target in the chain view.
+struct SecondKey {
+    PendingFixture f{MakeKey()};
+    COutPoint live_target{uint256S("8c"), 0};
+    explicit SecondKey(TestChain100Setup& setup)
+    {
+        LOCK(cs_main);
+        setup.m_node.chainman->ActiveChainstate().CoinsTip().AddCoin(
+            live_target, Coin{CTxOut{5 * COIN, f.key_script}, 10, false, false, 0}, /*possible_overwrite=*/false);
+    }
+};
+} // namespace
+
+BOOST_AUTO_TEST_CASE(cleanup_abandons_an_independent_stale_automatic_attestation_and_releases_its_input)
+{
+    KeyDecisionFixture fx(*this);
+    const COutPoint fee_input = fx.FeeInput(*this);
+    const uint256 stale = fx.AddPending(fee_input, fx.dead_target, /*automatic=*/true);
+    BOOST_CHECK(WITH_LOCK(fx.wallet->cs_wallet, return fx.wallet->IsSpent(fee_input)));
+
+    const std::set<uint256> listed = DecideAndCleanUp(*this, *fx.wallet, {{fx.f.key_script, {stale}}});
+    BOOST_CHECK(listed.count(stale));
+    BOOST_CHECK(Abandoned(*fx.wallet, stale));
+    BOOST_CHECK(!WITH_LOCK(fx.wallet->cs_wallet, return fx.wallet->IsSpent(fee_input)));
+}
+
+BOOST_AUTO_TEST_CASE(cleanup_keeps_a_stale_attestation_that_a_pending_attestation_of_another_key_spends)
+{
+    KeyDecisionFixture fx(*this);
+    SecondKey other(*this);
+    const COutPoint fee_input = fx.FeeInput(*this);
+    const uint256 stale = fx.AddPending(fee_input, fx.dead_target, /*automatic=*/true);
+    // A pending attestation of the other key spends the stale one's output; the other key's decision keeps it.
+    const CTransactionRef child_tx = AttestationTransaction(other.f, COutPoint{stale, 0}, other.live_target, std::nullopt);
+    {
+        LOCK(fx.wallet->cs_wallet);
+        BOOST_REQUIRE(fx.wallet->AddToWallet(child_tx, TxStateInactive{}));
+    }
+    const uint256 child = child_tx->GetHash();
+
+    const std::set<uint256> listed = DecideAndCleanUp(*this, *fx.wallet,
+        {{fx.f.key_script, {stale}}, {other.f.key_script, {child}}});
+    BOOST_CHECK(listed.count(stale)); // the first key lists it; the stage must still refuse
+    BOOST_CHECK(!Abandoned(*fx.wallet, stale));
+    BOOST_CHECK(!Abandoned(*fx.wallet, child));
+    BOOST_CHECK(WITH_LOCK(fx.wallet->cs_wallet, return fx.wallet->IsSpent(fee_input)));
+    BOOST_CHECK(WITH_LOCK(fx.wallet->cs_wallet, return fx.wallet->IsSpent(COutPoint{stale, 0})));
+}
+
+BOOST_AUTO_TEST_CASE(cleanup_keeps_a_stale_attestation_with_an_indirect_pending_descendant)
+{
+    KeyDecisionFixture fx(*this);
+    const COutPoint fee_input = fx.FeeInput(*this);
+    const uint256 stale = fx.AddPending(fee_input, fx.dead_target, /*automatic=*/true);
+    // stale -> ordinary wallet transaction -> pending attestation of the same key.
+    CMutableTransaction ordinary;
+    ordinary.nVersion = 2;
+    ordinary.vin.emplace_back(COutPoint{stale, 0});
+    ordinary.vout.emplace_back(COIN / 2, CScript{} << OP_TRUE);
+    const CTransactionRef ordinary_tx = MakeTransactionRef(std::move(ordinary));
+    {
+        LOCK(fx.wallet->cs_wallet);
+        BOOST_REQUIRE(fx.wallet->AddToWallet(ordinary_tx, TxStateInactive{}));
+    }
+    const uint256 tail = fx.AddPending(COutPoint{ordinary_tx->GetHash(), 0}, fx.live_target, /*automatic=*/false);
+
+    const std::set<uint256> listed = DecideAndCleanUp(*this, *fx.wallet, {{fx.f.key_script, {stale, tail}}});
+    BOOST_CHECK(listed.count(stale));
+    BOOST_CHECK(!Abandoned(*fx.wallet, stale));
+    BOOST_CHECK(!Abandoned(*fx.wallet, ordinary_tx->GetHash()));
+    BOOST_CHECK(!Abandoned(*fx.wallet, tail));
+    BOOST_CHECK(WITH_LOCK(fx.wallet->cs_wallet, return fx.wallet->IsSpent(fee_input)));
+    BOOST_CHECK(WITH_LOCK(fx.wallet->cs_wallet, return fx.wallet->IsSpent(COutPoint{ordinary_tx->GetHash(), 0})));
+}
+
+BOOST_AUTO_TEST_CASE(cleanup_keeps_a_stale_attestation_with_a_descendant_of_a_key_whose_local_state_is_invalid)
+{
+    KeyDecisionFixture fx(*this);
+    SecondKey other(*this);
+    const COutPoint fee_input = fx.FeeInput(*this);
+    const uint256 stale = fx.AddPending(fee_input, fx.dead_target, /*automatic=*/true);
+    const CTransactionRef child_tx = AttestationTransaction(other.f, COutPoint{stale, 0}, other.live_target, std::nullopt);
+    {
+        LOCK(fx.wallet->cs_wallet);
+        BOOST_REQUIRE(fx.wallet->AddToWallet(child_tx, TxStateInactive{}));
+    }
+    const uint256 child = child_tx->GetHash();
+    {
+        // The other key's marker coin is malformed: its decision lists nothing and keeps everything.
+        LOCK(cs_main);
+        m_node.chainman->ActiveChainstate().CoinsTip().AddCoin(
+            Consensus::DemurrageLatestAttestationOutpoint(other.f.key_hash),
+            Coin{CTxOut{0, CScript{} << OP_TRUE}, 10, /*fCoinBaseIn=*/true, false, 0}, /*possible_overwrite=*/false);
+        BOOST_REQUIRE(!Consensus::IsDemurrageStateSaneForScript(m_node.chainman->ActiveChainstate().CoinsTip(), other.f.key_script));
+    }
+
+    const std::set<uint256> listed = DecideAndCleanUp(*this, *fx.wallet,
+        {{fx.f.key_script, {stale}}, {other.f.key_script, {child}}});
+    BOOST_CHECK(listed.count(stale));
+    BOOST_CHECK(!listed.count(child));
+    BOOST_CHECK(!Abandoned(*fx.wallet, stale));
+    BOOST_CHECK(!Abandoned(*fx.wallet, child));
+    BOOST_CHECK(WITH_LOCK(fx.wallet->cs_wallet, return fx.wallet->IsSpent(fee_input)));
+    BOOST_CHECK(WITH_LOCK(fx.wallet->cs_wallet, return fx.wallet->IsSpent(COutPoint{stale, 0})));
+}
+
+BOOST_AUTO_TEST_CASE(a_malformed_local_attestation_state_is_not_an_absent_record_and_abandons_nothing)
+{
+    KeyDecisionFixture fx(*this);
+    const Consensus::Params& consensus = Params().GetConsensus();
+    const int height = 150;
+    const int64_t time = 1700000000;
+    // An automatic attestation, not in the mempool, that references an existing record of the key.
+    const Consensus::DemurrageAttestationRecord referenced = Record(uint256S("aa"), uint256S("1a"), 0);
+    const COutPoint fee_input = fx.FeeInput(*this);
+    const uint256 automatic = fx.AddPending(fee_input, fx.live_target, /*automatic=*/true, referenced);
+    const COutPoint latest_marker = Consensus::DemurrageLatestAttestationOutpoint(fx.f.key_hash);
+
+    LOCK(cs_main);
+    LOCK(fx.wallet->cs_wallet);
+    CCoinsViewCache& view = m_node.chainman->ActiveChainstate().CoinsTip();
+    const std::vector<PendingWalletAttestation> pending = PendingWalletDemurrageAttestations(*fx.wallet);
+    const PendingWalletAttestation* entry = Entry(pending, automatic);
+    BOOST_REQUIRE(entry != nullptr);
+    BOOST_CHECK(entry->automatic && !entry->in_mempool);
+
+    // Authenticated absence: the chain has no record for the key, the entry references a state the key does
+    // not have, so it can never confirm and is cleaned up.
+    BOOST_CHECK(Consensus::IsDemurrageStateSaneForScript(view, fx.f.key_script));
+    KeyPendingDecision decision = DecidePendingAttestationsForKey(*fx.wallet, view, consensus, height, time, fx.f.key_script, {entry});
+    BOOST_CHECK(!decision.local_state_invalid);
+    BOOST_REQUIRE_EQUAL(decision.to_abandon.size(), size_t{1});
+    BOOST_CHECK(decision.to_abandon.front() == automatic);
+
+    // A malformed marker coin where the key's latest record belongs: the reader says "no record" for it too,
+    // but it is a local state error. Nothing is abandoned or offered, construction is suppressed, and the
+    // problem is flagged for the caller to report.
+    view.AddCoin(latest_marker, Coin{CTxOut{0, CScript{} << OP_TRUE}, 10, /*fCoinBaseIn=*/true, false, 0}, /*possible_overwrite=*/false);
+    BOOST_CHECK(!Consensus::IsDemurrageStateSaneForScript(view, fx.f.key_script));
+    BOOST_CHECK(!Consensus::LatestDemurrageAttestationRecord(view, fx.f.key_hash).has_value());
+    decision = DecidePendingAttestationsForKey(*fx.wallet, view, consensus, height, time, fx.f.key_script, {entry});
+    BOOST_CHECK(decision.local_state_invalid);
+    BOOST_CHECK(decision.suppress_construction);
+    BOOST_CHECK(decision.to_abandon.empty());
+    BOOST_CHECK(decision.to_resubmit.empty());
+    // The reservation: the transaction is still pending and its input is still counted as spent by it.
+    const auto wtx_it = fx.wallet->mapWallet.find(automatic);
+    BOOST_REQUIRE(wtx_it != fx.wallet->mapWallet.end());
+    BOOST_CHECK(!wtx_it->second.isAbandoned());
+    BOOST_CHECK(fx.wallet->IsSpent(fee_input));
+    // Even a manual or reusable entry is only preserved: nothing is resubmitted from a malformed state.
+    const uint256 manual = [&] {
+        const COutPoint input = fx.FeeInput(*this);
+        return fx.AddPending(input, fx.live_target, /*automatic=*/false, std::nullopt);
+    }();
+    const std::vector<PendingWalletAttestation> both = PendingWalletDemurrageAttestations(*fx.wallet);
+    const PendingWalletAttestation* manual_entry = Entry(both, manual);
+    const PendingWalletAttestation* auto_entry = Entry(both, automatic);
+    BOOST_REQUIRE(manual_entry && auto_entry);
+    decision = DecidePendingAttestationsForKey(*fx.wallet, view, consensus, height, time, fx.f.key_script, {manual_entry, auto_entry});
+    BOOST_CHECK(decision.local_state_invalid);
+    BOOST_CHECK(decision.to_abandon.empty());
+    BOOST_CHECK(decision.to_resubmit.empty());
+
+    // Repaired (the malformed coin is gone): the decision is made from the authenticated absence again.
+    BOOST_REQUIRE(view.SpendCoin(latest_marker));
+    decision = DecidePendingAttestationsForKey(*fx.wallet, view, consensus, height, time, fx.f.key_script, {manual_entry, auto_entry});
+    BOOST_CHECK(!decision.local_state_invalid);
+    BOOST_CHECK(decision.suppress_construction); // the manual entry references the (absent) state and is usable
+    BOOST_REQUIRE_EQUAL(decision.to_abandon.size(), size_t{1});
+    BOOST_CHECK(decision.to_abandon.front() == automatic);
+}
+
+namespace {
+//! The automatic pass's attempt loop, driven by a fake attempt function: the tests count what it is asked to do.
+struct AutoPassFixture {
+    std::unique_ptr<CWallet> wallet;
+    std::vector<AutoDemurrageAttestCandidate> candidates;
+    std::vector<COutPoint> fee_outpoints;
+    std::vector<std::pair<uint256, COutPoint>> calls; //! (key, fee input) of every attempt asked for
+    int call_count{0};
+
+    AutoPassFixture(TestChain100Setup& setup, size_t keys, size_t fee_inputs)
+    {
+        CKey wallet_key;
+        wallet_key.MakeNewKey(true);
+        wallet = CreateSyncedWallet(*setup.m_node.chain,
+            WITH_LOCK(Assert(setup.m_node.chainman)->GetMutex(), return setup.m_node.chainman->ActiveChain()), wallet_key);
+        for (size_t i = 0; i < keys; ++i) {
+            AutoDemurrageAttestCandidate candidate;
+            candidate.key_hash = uint256S(strprintf("%02x", 0x10 + i));
+            candidate.inactive_blocks = 100;
+            candidates.push_back(candidate);
+        }
+        for (size_t i = 0; i < fee_inputs; ++i) fee_outpoints.emplace_back(uint256S("fe"), static_cast<uint32_t>(i));
+    }
+
+    AutoDemurrageAttestPassStats Run(int height, const AutoDemurrageAttestAttemptFn& attempt, std::set<COutPoint> pending_targets = {})
+    {
+        return RunAutoDemurrageAttestAttempts(*wallet, candidates, fee_outpoints, std::move(pending_targets), height,
+                                              [&](const AutoDemurrageAttestCandidate& candidate, const COutPoint& fee) {
+                                                  ++call_count;
+                                                  calls.emplace_back(candidate.key_hash, fee);
+                                                  return attempt(candidate, fee);
+                                              });
+    }
+
+    bool Stamped(const uint256& key) const
+    {
+        LOCK(wallet->cs_wallet);
+        return wallet->m_demurrage_last_auto_attest_attempt_height.count(key) > 0;
+    }
+};
+
+AutoDemurrageAttestAttempt Failure(const std::string& reject_reason)
+{
+    AutoDemurrageAttestAttempt result;
+    result.reject_reason = reject_reason;
+    result.error = "broadcast failed: " + reject_reason;
+    return result;
+}
+
+AutoDemurrageAttestAttempt Success(const COutPoint& target)
+{
+    AutoDemurrageAttestAttempt result;
+    result.success = true;
+    result.target = target;
+    return result;
+}
+} // namespace
+
+BOOST_AUTO_TEST_CASE(a_pass_makes_at_most_sixteen_failed_attempts_however_many_keys_and_fee_inputs)
+{
+    AutoPassFixture fx(*this, /*keys=*/5, /*fee_inputs=*/60);
+    const AutoDemurrageAttestPassStats stats = fx.Run(200, [](const auto&, const auto&) { return Failure("scriptpubkey"); });
+    BOOST_CHECK_EQUAL(MAX_AUTO_DEMURRAGE_ATTEST_FAILED_ATTEMPTS_PER_PASS, 16);
+    BOOST_CHECK_EQUAL(fx.call_count, 16);
+    BOOST_CHECK_EQUAL(stats.attempts, 16);
+    BOOST_CHECK_EQUAL(stats.failed, 16);
+    BOOST_CHECK_EQUAL(stats.submitted, 0);
+    BOOST_CHECK_EQUAL(stats.visited.size(), size_t{1});
+    BOOST_CHECK_EQUAL(stats.deferred_keys, size_t{4});
+}
+
+BOOST_AUTO_TEST_CASE(a_construction_that_never_reaches_the_commit_counts_as_a_failed_attempt)
+{
+    AutoPassFixture fx(*this, 2, 60);
+    AutoDemurrageAttestAttempt construction_failed;
+    construction_failed.error = "Unable to select a fee input for demurrage attestation"; // no reject reason: no commit
+    const AutoDemurrageAttestPassStats stats = fx.Run(200, [&](const auto&, const auto&) { return construction_failed; });
+    BOOST_CHECK_EQUAL(stats.failed, 16);
+    BOOST_CHECK_EQUAL(fx.call_count, 16);
+}
+
+BOOST_AUTO_TEST_CASE(successes_and_failures_together_stay_within_thirty_two_attempts)
+{
+    // Every key fails its first three fee inputs and then succeeds: the failure budget ends the pass long
+    // before sixteen keys are attested.
+    AutoPassFixture fx(*this, 40, 200);
+    int tries_for_key{0};
+    uint256 current;
+    const AutoDemurrageAttestPassStats stats = fx.Run(200, [&](const AutoDemurrageAttestCandidate& candidate, const COutPoint& fee) {
+        if (candidate.key_hash != current) {
+            current = candidate.key_hash;
+            tries_for_key = 0;
+        }
+        return ++tries_for_key <= 3 ? Failure("scriptpubkey") : Success(COutPoint{uint256S("a1"), fee.n});
+    });
+    BOOST_CHECK_EQUAL(stats.failed, 16);
+    BOOST_CHECK_EQUAL(stats.submitted, 5);
+    BOOST_CHECK_LE(stats.attempts, 32);
+    BOOST_CHECK_EQUAL(stats.attempts, 21);
+    BOOST_CHECK_EQUAL(fx.call_count, 21);
+}
+
+BOOST_AUTO_TEST_CASE(the_sixteen_success_cap_stays_and_the_keys_it_defers_are_not_stamped)
+{
+    AutoPassFixture fx(*this, 20, 60);
+    const AutoDemurrageAttestPassStats stats = fx.Run(200, [](const auto&, const auto& fee) { return Success(COutPoint{uint256S("a1"), fee.n}); });
+    BOOST_CHECK_EQUAL(stats.submitted, 16);
+    BOOST_CHECK_EQUAL(stats.attempts, 16);
+    BOOST_CHECK_EQUAL(stats.failed, 0);
+    BOOST_CHECK_EQUAL(stats.deferred_keys, size_t{4});
+    for (size_t i = 0; i < 16; ++i) BOOST_CHECK(fx.Stamped(fx.candidates[i].key_hash));
+    for (size_t i = 16; i < 20; ++i) BOOST_CHECK(!fx.Stamped(fx.candidates[i].key_hash)); // never visited: not stamped
+}
+
+BOOST_AUTO_TEST_CASE(a_rejection_no_other_fee_input_can_cure_ends_the_keys_turn_after_one_attempt)
+{
+    for (const std::string reason : {"demurrage-attestation-target-unconfirmed", "stale-demurrage-attestation-state",
+                                     "demurrage-attestation-target-locked", "demurrage-attestation-too-soon",
+                                     "demurrage-attestation-target-conflict"}) {
+        AutoPassFixture fx(*this, 3, 40);
+        const AutoDemurrageAttestPassStats stats = fx.Run(200, [&](const auto&, const auto&) { return Failure(reason); });
+        BOOST_CHECK_MESSAGE(stats.attempts == 3 && stats.failed == 3 && stats.terminal_keys == 3 && stats.visited.size() == 3,
+                            reason << ": attempts=" << stats.attempts << " terminal=" << stats.terminal_keys);
+        // One attempt per key, each with the first fee input.
+        BOOST_CHECK_EQUAL(fx.calls.size(), size_t{3});
+        for (const auto& [key, fee] : fx.calls) BOOST_CHECK(fee == fx.fee_outpoints.front());
+    }
+}
+
+BOOST_AUTO_TEST_CASE(other_failures_and_a_conflict_caused_by_the_fee_input_try_the_next_fee_input)
+{
+    {
+        AutoPassFixture fx(*this, 1, 5);
+        const AutoDemurrageAttestPassStats stats = fx.Run(200, [](const auto&, const auto& fee) {
+            return fee.n < 3 ? Failure("scriptpubkey") : Success(COutPoint{uint256S("a1"), fee.n});
+        });
+        BOOST_CHECK_EQUAL(stats.failed, 3);
+        BOOST_CHECK_EQUAL(stats.submitted, 1);
+        BOOST_CHECK_EQUAL(stats.terminal_keys, 0);
+    }
+    {
+        // The first two fee inputs are targets of pending attestations: the mempool's conflict reason is the
+        // fee input's fault there, and the third fee input works.
+        AutoPassFixture fx(*this, 1, 5);
+        const std::set<COutPoint> pending_targets{fx.fee_outpoints[0], fx.fee_outpoints[1]};
+        const AutoDemurrageAttestPassStats stats = fx.Run(200, [&](const auto&, const auto& fee) {
+            return pending_targets.count(fee) ? Failure("demurrage-attestation-target-conflict") : Success(COutPoint{uint256S("a1"), fee.n});
+        }, pending_targets);
+        BOOST_CHECK_EQUAL(stats.failed, 2);
+        BOOST_CHECK_EQUAL(stats.submitted, 1);
+        BOOST_CHECK_EQUAL(stats.terminal_keys, 0);
+    }
+    BOOST_CHECK(!IsTerminalAutoAttestRejection("scriptpubkey", false));
+    BOOST_CHECK(!IsTerminalAutoAttestRejection("", false));
+    BOOST_CHECK(!IsTerminalAutoAttestRejection("demurrage-attestation-target-conflict", true));
+    BOOST_CHECK(IsTerminalAutoAttestRejection("demurrage-attestation-target-conflict", false));
+    BOOST_CHECK(IsTerminalAutoAttestRejection("demurrage-attestation-target-unconfirmed", true));
+}
+
+BOOST_AUTO_TEST_CASE(later_keys_make_progress_across_passes_when_the_first_keys_keep_failing)
+{
+    AutoPassFixture fx(*this, 4, 60);
+    const auto failing = [](const auto&, const auto&) { return Failure("scriptpubkey"); };
+    // Each pass exhausts its budget on one key; the keys not reached are not stamped and come first next time.
+    std::vector<uint256> order;
+    for (int pass = 0; pass < 5; ++pass) {
+        const AutoDemurrageAttestPassStats stats = fx.Run(200 + pass, failing);
+        BOOST_REQUIRE_EQUAL(stats.visited.size(), size_t{1});
+        BOOST_CHECK_EQUAL(stats.failed, 16);
+        order.push_back(stats.visited.front());
+        if (pass == 0) {
+            for (size_t i = 1; i < 4; ++i) BOOST_CHECK(!fx.Stamped(fx.candidates[i].key_hash));
+        }
+    }
+    BOOST_CHECK(order[0] == fx.candidates[0].key_hash);
+    BOOST_CHECK(order[1] == fx.candidates[1].key_hash);
+    BOOST_CHECK(order[2] == fx.candidates[2].key_hash);
+    BOOST_CHECK(order[3] == fx.candidates[3].key_hash);
+    BOOST_CHECK(order[4] == fx.candidates[0].key_hash); // a full rotation, then round again
+}
+
+BOOST_AUTO_TEST_CASE(the_automatic_pass_is_not_entered_before_demurrage_is_active)
+{
+    AutoPassFixture fx(*this, 0, 0);
+    gArgs.ForceSetArg("-qqautodemurrageattest", "1");
+    fx.wallet->m_enabled_staking = true;
+    BOOST_CHECK(!Params().GetConsensus().IsDemurrageActive(WITH_LOCK(cs_main, return m_node.chainman->ActiveChain().Height()) + 1, 0));
+    BOOST_CHECK_EQUAL(MaybeAutoDemurrageAttest(*fx.wallet), 0);
+    // The pass stopped at the activation check: it did not even record a scan.
+    BOOST_CHECK_EQUAL(WITH_LOCK(fx.wallet->cs_wallet, return fx.wallet->m_demurrage_last_auto_attest_scan_height), -1);
+    BOOST_CHECK(WITH_LOCK(fx.wallet->cs_wallet, return fx.wallet->m_demurrage_last_auto_attest_attempt_height.empty()));
+    gArgs.ForceSetArg("-qqautodemurrageattest", "0");
+}
+
+BOOST_AUTO_TEST_SUITE_END()
+
+} // namespace wallet

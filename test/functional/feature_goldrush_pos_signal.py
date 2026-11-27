@@ -134,9 +134,12 @@ class GoldRushPosSignalTest(BitcoinTestFramework):
         assert_equal(self._get_quantum_utxos(wallet, address), [])
 
     def _lock_non_whitelist_script_utxos(self, wallet, whitelist_script):
+        # The staker may take a coinbase output of a script that is not whitelisted from the block it matures
+        # in, one block before listunspent shows it as spendable: lock those outputs too, or the next block
+        # can be staked from a script that has no active signal and so pays no look-back payout.
         locked = [
             {"txid": utxo["txid"], "vout": utxo["vout"]}
-            for utxo in wallet.listunspent(1, 9999999)
+            for utxo in wallet.listunspent(1, 9999999, [], True, {"include_immature_coinbase": True})
             if utxo["scriptPubKey"] != whitelist_script
         ]
         if locked:

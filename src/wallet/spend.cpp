@@ -32,6 +32,7 @@
 #include <util/trace.h>
 #include <wallet/coincontrol.h>
 #include <wallet/fees.h>
+#include <wallet/final_stake_reserve.h>
 #include <wallet/receive.h>
 #include <wallet/spend.h>
 #include <wallet/transaction.h>
@@ -1773,10 +1774,16 @@ CoinsResult AvailableCoins(const CWallet& wallet,
     const CBlockIndex* tip = wallet.chain().getTip();
     const int spend_height = tip ? tip->nHeight + 1 : 0;
     const int64_t spend_time = tip ? tip->GetMedianTimePast() : 0;
+    // Depth at which a coinbase or coinstake is spendable in the next block
+    // (the same maturity IsNextBlockMatureGoldRushPayout uses).
+    const int consensus_maturity = Params().GetConsensus().nCoinbaseMaturity;
     std::vector<COutPoint> outpoints;
 
     // Never auto-select UTXOs carrying live RGB single-use-seal or EUTXO state.
     const std::set<COutPoint> protected_rgb_seals = wallet.GetProtectedRGBSeals();
+    // The final stake reserve, derived now (never cached), for an automatic selection that must leave it alone.
+    const std::set<COutPoint> final_stake_reserve = params.avoid_final_stake_reserve
+        ? FinalStakeReserveEnforcedOutpoints(wallet) : std::set<COutPoint>{};
 
     std::set<uint256> trusted_parents;
     size_t walked{0};
@@ -1818,6 +1825,7 @@ CoinsResult AvailableCoins(const CWallet& wallet,
             const COutPoint outpoint(wtxid, i);
 
             if (tx_immature && !params.include_immature_coinbase &&
+                !(params.include_next_block_mature_coinbase && nDepth >= consensus_maturity) &&
                 !IsNextBlockMatureGoldRushPayout(wallet, outpoint, spend_height, spend_time)) {
                 continue;
             }
@@ -1843,6 +1851,9 @@ CoinsResult AvailableCoins(const CWallet& wallet,
                 continue;
 
             if (wallet.IsSpent(outpoint))
+                continue;
+
+            if (!final_stake_reserve.empty() && final_stake_reserve.count(outpoint))
                 continue;
 
             // Spending an RGB seal / EUTXO-state UTXO as ordinary coin burns the asset; never
@@ -2698,7 +2709,11 @@ static util::Result<CreatedTransactionResult> CreateTransactionInternal(
     // allowed (coins automatically selected by the wallet)
     CoinsResult available_coins;
     if (coin_control.m_allow_other_inputs) {
-        available_coins = AvailableCoins(wallet, &coin_control, coin_selection_params.m_effective_feerate);
+        // Ordinary automatic selection avoids the final stake reserve; explicitly selected coins (coin control) may
+        // still spend it.
+        CoinFilterParams automatic_params;
+        automatic_params.avoid_final_stake_reserve = true;
+        available_coins = AvailableCoins(wallet, &coin_control, coin_selection_params.m_effective_feerate, automatic_params);
     }
 
     // Choose coins to use
@@ -2723,6 +2738,13 @@ static util::Result<CreatedTransactionResult> CreateTransactionInternal(
             }
             created_quantum_change = *destination;
             scriptChange = GetScriptForDestination(*destination);
+        } else {
+            // Positive change never goes to the quantum stake return key while it waits for its first verified backup;
+            // the key may still sign for, and stake, funds it already holds.
+            CTxDestination change_dest;
+            if (ExtractDestination(scriptChange, change_dest) && wallet.IsQuantumStakeReturnPendingKey(change_dest)) {
+                return util::Error{_("The change address is the quantum stake return key, a new key still waiting for its first verified wallet backup. Choose another change address or wait for that backup.")};
+            }
         }
         CTxOut newTxOut(change_amount, scriptChange);
         if (nChangePosInOut == -1) {
@@ -2760,6 +2782,9 @@ static util::Result<CreatedTransactionResult> CreateTransactionInternal(
                                               quantum_phase.spend_height);
         }
         if (!has_protected_lineage) {
+            if (final_quantum_lockout) {
+                return util::Error{_("Selected inputs have no fork-unique Quantum Quasar lineage. Legacy coins can no longer be spent; a quantum input with protected lineage (a migrated coin, a Gold Rush payout, or their descendants) must be among the selected inputs.")};
+            }
             return util::Error{_("Selected inputs have no fork-unique Quantum Quasar lineage. Add/select a P2PKH or non-witness P2SH anchor input; native or wrapped witness-only pre-Gold-Rush coins cannot be spent alone after activation.")};
         }
         if (spends_quantum_input && nChangePosInOut != -1 &&
@@ -3033,7 +3058,12 @@ util::Result<CreatedTransactionResult> CreateUTXOOptimizationTransaction(CWallet
 
     CAmount available_coins = 0;
     if (from_address) {
-        for (const COutput& out : AvailableCoins(wallet, &coin_control).All()) {
+        // The inputs are chosen here by the wallet, not by the user: naming an address is not an explicit
+        // authorization to spend an output the final stake reserve holds back, so the scan leaves them out and
+        // the amount to split comes from what is left.
+        CoinFilterParams from_params;
+        from_params.avoid_final_stake_reserve = true;
+        for (const COutput& out : AvailableCoins(wallet, &coin_control, /*feerate=*/std::nullopt, from_params).All()) {
             CTxDestination out_dest;
             if (ExtractDestination(out.txout.scriptPubKey, out_dest) && out_dest == *from_address) {
                 coin_control.Select(out.outpoint);
@@ -3043,6 +3073,13 @@ util::Result<CreatedTransactionResult> CreateUTXOOptimizationTransaction(CWallet
         coin_control.m_allow_other_inputs = false;
     } else {
         available_coins = GetBalance(wallet).m_mine_trusted;
+        // The transaction below selects automatically and leaves the reserve alone, so it cannot split that value.
+        if (const std::set<COutPoint> reserve = FinalStakeReserveEnforcedOutpoints(wallet); !reserve.empty()) {
+            for (const COutput& out : AvailableCoins(wallet, &coin_control).All()) {
+                if (reserve.count(out.outpoint)) available_coins -= out.txout.nValue;
+            }
+            available_coins = std::max<CAmount>(available_coins, 0);
+        }
     }
 
     if (available_coins == 0) {
@@ -3089,7 +3126,8 @@ bool FundTransaction(
     bool lockUnspents,
     const std::set<int>& setSubtractFeeFromOutputs,
     CCoinControl coinControl,
-    std::optional<CTxDestination>* created_quantum_change)
+    std::optional<CTxDestination>* created_quantum_change,
+    std::set<COutPoint>* operation_locks)
 {
     std::vector<CRecipient> vecSend;
 
@@ -3162,6 +3200,8 @@ bool FundTransaction(
 
         }
         if (lockUnspents) {
+            // Only a lock made here is this operation's own; one that was there already is the user's.
+            if (!wallet.IsLockedCoin(txin.prevout) && operation_locks) operation_locks->insert(txin.prevout);
             wallet.LockCoin(txin.prevout);
         }
 

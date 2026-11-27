@@ -182,6 +182,7 @@ BITCOIN_TESTS =\
   test/validation_chainstate_tests.cpp \
   test/validation_chainstatemanager_tests.cpp \
   test/validation_flush_tests.cpp \
+  test/validation_lifecycle_classification_tests.cpp \
   test/validation_stall_tests.cpp \
   test/validation_tests.cpp \
   test/validationinterface_tests.cpp \
@@ -197,6 +198,13 @@ BITCOIN_TESTS += \
   wallet/test/resubmit_retry_tests.cpp \
   wallet/test/payout_digest_tests.cpp \
   wallet/test/staking_candidate_tests.cpp \
+  wallet/test/quantum_return_backup_tests.cpp \
+  wallet/test/migration_batch_tests.cpp \
+  wallet/test/migration_residual_tests.cpp \
+  wallet/test/legacy_stake_cutoff_tests.cpp \
+  wallet/test/final_stake_reserve_tests.cpp \
+  wallet/test/demurrage_pending_attestation_tests.cpp \
+  wallet/test/status_countdown_tests.cpp \
   wallet/test/block_connect_activity_tests.cpp \
   wallet/test/coin_facts_tests.cpp \
   wallet/test/display_balance_tests.cpp \
@@ -205,6 +213,7 @@ BITCOIN_TESTS += \
   wallet/test/polled_balance_tests.cpp \
   wallet/test/wallet_tests.cpp \
   wallet/test/pow_miner_schedule_tests.cpp \
+  wallet/test/gold_rush_end_tests.cpp \
   wallet/test/reorg_scale_tests.cpp \
   wallet/test/wallet_durability_tests.cpp \
   wallet/test/walletdb_tests.cpp \

@@ -35,6 +35,21 @@ def load_module(name):
     return module
 
 
+def reproducibility_report(package_label, channel, configured_version, artifacts):
+    """A report with a digest entry for every file already in the artifact directory."""
+    lines = [
+        f"package_label={package_label}",
+        f"prerelease_channel={channel}",
+        f"configured_version={configured_version}",
+        "target=linux-64-bit",
+    ]
+    for path in sorted(artifacts.iterdir()):
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        lines.append(f"{digest}  linux-64-bit/{path.name}")
+    lines.append(f"source_commit={SOURCE_SHA}")
+    return "\n".join(lines) + "\n"
+
+
 def load_mixed_version_module(name):
     spec = importlib.util.spec_from_file_location(
         name, MIXED_VERSION_TOOLS / f"{name}.py"
@@ -143,10 +158,10 @@ class ReleaseToolTests(unittest.TestCase):
             )
             self.assertIsNotNone(match)
             components.append(match.group(1))
-        self.assertEqual(components, ["30", "1", "6", "0"])
+        self.assertEqual(components, ["30", "1", "7", "0"])
         # A zero maintenance revision is not part of the version string.
         version = ".".join(components[:3])
-        self.assertEqual(version, "30.1.6")
+        self.assertEqual(version, "30.1.7")
         self.assertIn("define(_CLIENT_VERSION_RC, 0)", configure)
         self.assertIn("define(_CLIENT_VERSION_IS_RELEASE, true)", configure)
 
@@ -167,8 +182,8 @@ class ReleaseToolTests(unittest.TestCase):
                 text = manpage.read_text(encoding="utf-8")
                 header = next(line for line in text.splitlines() if line.startswith(".TH "))
                 self.assertRegex(header, rf'"[^"\n]+ v{re.escape(version)}"(?:\s|$)')
-                self.assertEqual(re.findall(r"\bv30[.]1[.]6rc[0-9]+\b", text), [])
-                self.assertEqual(set(re.findall(r"\bv30[.]1[.]6[0-9A-Za-z.]*", text)), {f"v{version}"})
+                self.assertEqual(re.findall(r"\bv30[.]1[.]7rc[0-9]+\b", text), [])
+                self.assertEqual(set(re.findall(r"\bv30[.]1[.]7[0-9A-Za-z.]*", text)), {f"v{version}"})
                 self.assertNotIn(f"v{version}rc", text)
                 self.assertNotIn("v30.1.5.1", text)
                 self.assertNotIn("v30.1.4", text)
@@ -180,7 +195,7 @@ class ReleaseToolTests(unittest.TestCase):
         template = (
             "define(_CLIENT_VERSION_MAJOR, 30)\n"
             "define(_CLIENT_VERSION_MINOR, 1)\n"
-            "define(_CLIENT_VERSION_BUILD, 6)\n"
+            "define(_CLIENT_VERSION_BUILD, 7)\n"
             "define(_CLIENT_VERSION_REVISION, {revision})\n"
             "define(_CLIENT_VERSION_RC, {rc})\n"
             "define(_CLIENT_VERSION_IS_RELEASE, {release})\n"
@@ -206,7 +221,7 @@ class ReleaseToolTests(unittest.TestCase):
     def test_tracked_manpages_reject_candidate_or_prefix_version(self):
         original_tools = TOOLS
         configure = (TOOLS.parent.parent / "configure.ac").read_text(encoding="utf-8")
-        final_version = "30.1.6"
+        final_version = "30.1.7"
         # Execute the complete checker on a copy, then on copies whose header or
         # body names a candidate or a longer version that only starts the same.
         with tempfile.TemporaryDirectory() as temporary:
@@ -225,7 +240,7 @@ class ReleaseToolTests(unittest.TestCase):
                 for mismatch, placements in (
                     (f"{final_version}rc1", (True, False)),
                     (f"{final_version}0", (True, False)),
-                    ("30.1.5.2", (True,)),
+                    ("30.1.6", (True,)),
                 ):
                     for header_only in placements:
                         lines = [line.replace(final_version, mismatch) if line.startswith(".TH ") == header_only else line
@@ -247,12 +262,12 @@ class ReleaseToolTests(unittest.TestCase):
             "UNSIGNED_FINAL_ACK: ${{ vars.UNSIGNED_FINAL_ACK }}",
             workflow,
         )
-        self.assertIn('test "$BASE_VERSION" = "30.1.6"', workflow)
-        self.assertIn("expected='V30.1.6'", workflow)
-        self.assertIn("expected_ack='V30.1.6'", workflow)
+        self.assertIn('test "$BASE_VERSION" = "30.1.7"', workflow)
+        self.assertIn("expected='V30.1.7'", workflow)
+        self.assertIn("expected_ack='V30.1.7'", workflow)
         self.assertIn('NOTES="doc/release-notes/release-notes-$VERSION.md"', workflow)
         self.assertIn("Final release notes retain candidate or RC status", workflow)
-        self.assertIn("unreleased[[:space:]]+candidate|30[.]1[.]6rc[0-9]+", workflow)
+        self.assertIn("unreleased[[:space:]]+candidate|30[.]1[.]7rc[0-9]+", workflow)
         self.assertIn("--require-signatures", workflow)
         self.assertIn(f"--signing-fingerprint '{FINGERPRINT}'", workflow)
         self.assertNotIn("--require-unsigned-objects", workflow)
@@ -277,18 +292,18 @@ class ReleaseToolTests(unittest.TestCase):
         workflow = (root / ".github/workflows/build.yml").read_text(encoding="utf-8")
         pattern = re.search(r"! grep -Eiq '([^']+)' \"\$NOTES\"", workflow)
         self.assertIsNotNone(pattern)
-        notes = root / "doc/release-notes/release-notes-30.1.6.md"
+        notes = root / "doc/release-notes/release-notes-30.1.7.md"
         self.assertEqual(subprocess.run(["grep", "-Eiq", pattern.group(1), str(notes)]).returncode, 1)
         self.assertNotIn("RELEASE_NOTES_NOT_FINAL", notes.read_text(encoding="utf-8"))
         historical = root / "doc/release-notes/release-notes-30.1.5.2.md"
         self.assertEqual(subprocess.run(["grep", "-Eiq", pattern.group(1), str(historical)]).returncode, 1)
         for label in (
-            "unreleased candidate", "30.1.6rc1",
+            "unreleased candidate", "30.1.7rc1",
             "CLIENT_VERSION_IS_RELEASE=false", "Release qualification is pending",
         ):
             with self.subTest(label=label), tempfile.TemporaryDirectory() as temporary:
                 candidate = Path(temporary) / "notes.md"
-                candidate.write_text(f"# Blackcoin Core 30.1.6\n{label}\n", encoding="utf-8")
+                candidate.write_text(f"# Blackcoin Core 30.1.7\n{label}\n", encoding="utf-8")
                 self.assertEqual(
                     subprocess.run(["grep", "-Eiq", pattern.group(1), str(candidate)]).returncode,
                     0,
@@ -2983,10 +2998,7 @@ class ReleaseToolTests(unittest.TestCase):
                 SOURCE_SHA + "\n", encoding="utf-8"
             )
             (artifacts / f"{prefix}REPRODUCIBILITY.txt").write_text(
-                f"package_label={package_label}\n"
-                "prerelease_channel=alpha\n"
-                "configured_version=30.1.1rc1\n"
-                f"source_commit={SOURCE_SHA}\n",
+                reproducibility_report(package_label, "alpha", "30.1.1rc1", artifacts),
                 encoding="utf-8",
             )
             (artifacts / f"{prefix}UNSIGNED-CANARY.txt").write_text(
@@ -3080,10 +3092,7 @@ class ReleaseToolTests(unittest.TestCase):
                 SOURCE_SHA + "\n", encoding="utf-8"
             )
             (artifacts / f"{prefix}REPRODUCIBILITY.txt").write_text(
-                f"package_label={package_label}\n"
-                "prerelease_channel=beta\n"
-                "configured_version=30.1.1rc1\n"
-                f"source_commit={SOURCE_SHA}\n",
+                reproducibility_report(package_label, "beta", "30.1.1rc1", artifacts),
                 encoding="utf-8",
             )
             (artifacts / f"{prefix}UNSIGNED-CANARY.txt").write_text(
@@ -3120,6 +3129,133 @@ class ReleaseToolTests(unittest.TestCase):
             self.assertTrue(manifest["release"]["macos_adhoc_signed"])
             self.assertFalse(manifest["release"]["published"])
 
+    def _canary_fixture(self, artifacts, package_label="30.1.1-alpha1"):
+        prefix = f"Blackcoin-{package_label}-{SOURCE_SHA}-"
+        (artifacts / f"{prefix}Linux-x86_64.tar.gz").write_bytes(b"canary")
+        (artifacts / f"{prefix}Windows-x86_64.zip").write_bytes(b"windows")
+        (artifacts / f"{prefix}linux-64-bit-SOURCE_COMMIT.txt").write_text(
+            SOURCE_SHA + "\n", encoding="utf-8"
+        )
+        report = reproducibility_report(package_label, "alpha", "30.1.1rc1", artifacts)
+        (artifacts / f"{prefix}UNSIGNED-CANARY.txt").write_text(
+            "UNSIGNED CANARY ARTIFACTS - NOT A PRODUCTION RELEASE\n"
+            f"package_label={package_label}\n"
+            "prerelease_channel=alpha\n"
+            "configured_version=30.1.1rc1\n"
+            f"source_commit={SOURCE_SHA}\n"
+            "workflow_run_id=12345\n"
+            "signed=false\n"
+            "developer_id_signed=false\n"
+            "macos_adhoc_signed=false\n"
+            "notarized=false\npublished=false\n",
+            encoding="utf-8",
+        )
+        return prefix, report
+
+    def _generate_canary(self, generator, artifacts, prefix, report_text):
+        (artifacts / f"{prefix}REPRODUCIBILITY.txt").write_text(report_text, encoding="utf-8")
+        return generator.generate_manifest(
+            artifacts=artifacts,
+            package_label="30.1.1-alpha1",
+            source_version="30.1.1",
+            configured_version="30.1.1rc1",
+            source_sha=SOURCE_SHA,
+            release_candidate="1",
+            workflow_run_id="12345",
+            output=artifacts / f"{prefix}MANIFEST-UNSIGNED.json",
+        )
+
+    def test_canary_manifest_requires_a_valid_digest_for_every_artifact(self):
+        generator = load_module("generate_canary_manifest")
+        with tempfile.TemporaryDirectory() as temporary:
+            artifacts = Path(temporary)
+            prefix, report = self._canary_fixture(artifacts)
+            self._generate_canary(generator, artifacts, prefix, report)
+
+        lines = report.splitlines()
+        windows_entry = next(line for line in lines if line.endswith("Windows-x86_64.zip"))
+        bad_reports = {
+            "digest entry missing": [line for line in lines if line != windows_entry],
+            "appears under more than one target": lines[:-1] + [
+                "target=windows-64-bit",
+                windows_entry.replace("linux-64-bit/", "windows-64-bit/"),
+                lines[-1],
+            ],
+            "duplicate digest entry": lines[:-1] + [windows_entry, lines[-1]],
+            "malformed report line": lines[:-1] + [windows_entry.upper(), lines[-1]],
+            "does not match the file": [
+                ("0" * 64 + windows_entry[64:]) if line == windows_entry else line
+                for line in lines
+            ],
+            "no digest entry": [line for line in lines if "/" not in line]
+            [:4] + [lines[-1]],
+        }
+        for message, bad in bad_reports.items():
+            with self.subTest(message=message), tempfile.TemporaryDirectory() as temporary:
+                artifacts = Path(temporary)
+                prefix, _ = self._canary_fixture(artifacts)
+                with self.assertRaisesRegex(RuntimeError, message):
+                    self._generate_canary(
+                        generator, artifacts, prefix, "\n".join(bad) + "\n"
+                    )
+
+    def test_reproducibility_report_validator_checks_every_compared_artifact(self):
+        validator = load_module("validate_reproducibility_report")
+        package_label = "30.1.7-alpha1"
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            artifacts = root / "artifacts"
+            for target in ("linux-64-bit", "windows-64-bit"):
+                primary = artifacts / f"release-{package_label}-{target}-primary-{SOURCE_SHA}"
+                (primary / "sub").mkdir(parents=True)
+                (primary / f"{target}.tar.gz").write_bytes(target.encode())
+                (primary / "sub" / "nested.txt").write_bytes(b"nested " + target.encode())
+            expected = validator.collect_primaries(artifacts, package_label, SOURCE_SHA)
+            good = [
+                f"package_label={package_label}",
+                "prerelease_channel=alpha",
+                "configured_version=30.1.7rc1",
+            ]
+            for target, files in sorted(expected.items()):
+                good.append(f"target={target}")
+                good += [f"{digest}  {target}/{path}" for path, digest in sorted(files.items())]
+            good.append(f"source_commit={SOURCE_SHA}")
+
+            def run(lines):
+                report = root / "REPRODUCIBILITY.txt"
+                report.write_text("\n".join(lines) + "\n", encoding="utf-8")
+                return validator.validate(
+                    report, artifacts,
+                    package_label=package_label,
+                    prerelease_channel="alpha",
+                    configured_version="30.1.7rc1",
+                    source_sha=SOURCE_SHA,
+                )
+
+            self.assertEqual(run(good), 4)
+            nested = next(line for line in good if line.endswith("windows-64-bit/sub/nested.txt"))
+            cases = {
+                "digest entry missing": [line for line in good if line != nested],
+                "duplicate digest entry": good[:-1] + [nested, good[-1]],
+                "malformed report line": [
+                    line.replace("  ", " ") if line == nested else line for line in good
+                ],
+                "does not match the file": [
+                    ("f" * 64 + nested[64:]) if line == nested else line for line in good
+                ],
+                "not compared": good[:-1]
+                + [f"{'a' * 64}  windows-64-bit/extra.bin", good[-1]],
+                "unsafe artifact path": good[:-1]
+                + [f"{'a' * 64}  windows-64-bit/../x", good[-1]],
+                "no source_commit": good[:-1],
+                "targets differ": [line for line in good if "linux-64-bit" not in line],
+                "does not match the exact source": good[:-1] + ["source_commit=" + "1" * 40],
+            }
+            for message, lines in cases.items():
+                with self.subTest(message=message):
+                    with self.assertRaisesRegex(RuntimeError, message):
+                        run(lines)
+
     def test_unsigned_beta2_manifest_is_bound_to_rc2_and_exact_source(self):
         generator = load_module("generate_canary_manifest")
         package_label = "30.1.1-beta2"
@@ -3131,10 +3267,7 @@ class ReleaseToolTests(unittest.TestCase):
                 SOURCE_SHA + "\n", encoding="utf-8"
             )
             (artifacts / f"{prefix}REPRODUCIBILITY.txt").write_text(
-                f"package_label={package_label}\n"
-                "prerelease_channel=beta\n"
-                "configured_version=30.1.1rc2\n"
-                f"source_commit={SOURCE_SHA}\n",
+                reproducibility_report(package_label, "beta", "30.1.1rc2", artifacts),
                 encoding="utf-8",
             )
             (artifacts / f"{prefix}UNSIGNED-CANARY.txt").write_text(
@@ -3199,8 +3332,9 @@ class ReleaseToolTests(unittest.TestCase):
             "define(_CLIENT_VERSION_RC, 0)\n"
             "define(_CLIENT_VERSION_IS_RELEASE, true)\n"
         )
-        development_configure = candidate_configure.replace("BUILD, 5", "BUILD, 6").replace("REVISION, 2", "REVISION, 0")
+        development_configure = candidate_configure.replace("BUILD, 5", "BUILD, 7").replace("REVISION, 2", "REVISION, 0")
         release_3016_configure = current_final_configure.replace("BUILD, 5", "BUILD, 6").replace("REVISION, 2", "REVISION, 0")
+        release_3017_configure = current_final_configure.replace("BUILD, 5", "BUILD, 7").replace("REVISION, 2", "REVISION, 0")
         beta2_configure = (
             "define(_CLIENT_VERSION_MAJOR, 30)\n"
             "define(_CLIENT_VERSION_MINOR, 1)\n"
@@ -3229,9 +3363,13 @@ class ReleaseToolTests(unittest.TestCase):
             lint.RELEASE_3016_IDENTITY,
         )
         self.assertEqual(
+            lint.configured_release_identity(release_3017_configure),
+            lint.RELEASE_3017_IDENTITY,
+        )
+        self.assertEqual(
             lint.configured_release_identity(
                 (TOOLS.parent.parent / "configure.ac").read_text(encoding="utf-8")),
-            lint.RELEASE_3016_IDENTITY,
+            lint.RELEASE_3017_IDENTITY,
         )
 
         for configure, expected in (
@@ -3241,6 +3379,7 @@ class ReleaseToolTests(unittest.TestCase):
             (beta2_configure, "beta2"),
             (development_configure, "development"),
             (release_3016_configure, "release_3016"),
+            (release_3017_configure, "release_3017"),
         ):
             with self.subTest(expected=expected), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
@@ -3251,7 +3390,8 @@ class ReleaseToolTests(unittest.TestCase):
                      mock.patch.object(lint, "check_current_final_release_identity") as current_final_check, \
                      mock.patch.object(lint, "check_beta2_release_identity") as beta2_check, \
                      mock.patch.object(lint, "check_development_release_identity") as development_check, \
-                     mock.patch.object(lint, "check_3016_final_release_identity") as release_3016_check:
+                     mock.patch.object(lint, "check_3016_final_release_identity") as release_3016_check, \
+                     mock.patch.object(lint, "check_3017_final_release_identity") as release_3017_check:
                     lint.check_release_identity(root, failures)
                 self.assertEqual(failures, [])
                 self.assertEqual(final_check.call_count, expected == "final")
@@ -3260,6 +3400,7 @@ class ReleaseToolTests(unittest.TestCase):
                 self.assertEqual(beta2_check.call_count, expected == "beta2")
                 self.assertEqual(development_check.call_count, expected == "development")
                 self.assertEqual(release_3016_check.call_count, expected == "release_3016")
+                self.assertEqual(release_3017_check.call_count, expected == "release_3017")
 
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -3275,15 +3416,15 @@ class ReleaseToolTests(unittest.TestCase):
             lint.check_release_identity(root, failures)
             self.assertEqual(len(failures), 1)
             self.assertIn(
-                "historical final 30.1.5.1 RC0/true, candidate 30.1.5.2 RC1/false, final 30.1.5.2 RC0/true, development 30.1.6 positive RC/false, final 30.1.6 RC0/true, or replacement Beta 2 30.1.1 RC2/false",
+                "historical final 30.1.5.1 RC0/true, candidate 30.1.5.2 RC1/false, final 30.1.5.2 RC0/true, development 30.1.7 positive RC/false, final 30.1.6 RC0/true, final 30.1.7 RC0/true, or replacement Beta 2 30.1.1 RC2/false",
                 failures[0],
             )
 
     def test_unsigned_final_metadata_is_explicit_and_source_bound(self):
         generator = load_module("generate_unsigned_release_metadata")
         version = generator.EXPECTED_VERSION
-        self.assertEqual(version, "30.1.6")
-        self.assertEqual(generator.EXPECTED_ACKNOWLEDGEMENT, "V30.1.6")
+        self.assertEqual(version, "30.1.7")
+        self.assertEqual(generator.EXPECTED_ACKNOWLEDGEMENT, "V30.1.7")
         with tempfile.TemporaryDirectory() as temporary:
             artifacts = Path(temporary)
             required = (
@@ -3449,7 +3590,7 @@ class ReleaseToolTests(unittest.TestCase):
             })
             with self.assertRaisesRegex(
                 RuntimeError,
-                "version must match the authorized release: 30.1.6",
+                "version must match the authorized release: 30.1.7",
             ):
                 generator.generate_metadata(
                     acknowledgement=generator.EXPECTED_ACKNOWLEDGEMENT,
@@ -3467,7 +3608,7 @@ class ReleaseToolTests(unittest.TestCase):
         workflow = (TOOLS.parent.parent / ".github" / "workflows" / "build.yml").read_text(
             encoding="utf-8"
         )
-        self.assertIn("default: 30.1.6-beta1", workflow)
+        self.assertIn("default: 30.1.7-beta1", workflow)
         self.assertIn("CALLER_WORKFLOW_SHA: ${{ github.workflow_sha }}", workflow)
         self.assertIn('test "$CALLER_WORKFLOW_SHA" = "$TARGET_SHA"', workflow)
         self.assertIn('test "$EVENT_SHA" = "$TARGET_SHA"', workflow)
@@ -3480,9 +3621,9 @@ class ReleaseToolTests(unittest.TestCase):
         self.assertIn('test "$IS_RELEASE" = "false"', workflow)
         self.assertIn('test "$RC" = "0"', workflow)
         self.assertIn('test "$IS_RELEASE" = "true"', workflow)
-        self.assertIn("- 'v30.1.6'", workflow)
-        self.assertNotIn("- 'v30.1.6-alpha", workflow)
-        self.assertNotIn("- 'v30.1.6-beta", workflow)
+        self.assertIn("- 'v30.1.7'", workflow)
+        self.assertNotIn("- 'v30.1.7-alpha", workflow)
+        self.assertNotIn("- 'v30.1.7-beta", workflow)
         self.assertNotIn("30.1.4", workflow)
         self.assertIn("UNSIGNED CANARY ARTIFACTS - NOT A PRODUCTION RELEASE", workflow)
         self.assertIn("Verify non-macOS binary identity", workflow)
@@ -3504,7 +3645,7 @@ class ReleaseToolTests(unittest.TestCase):
         self.assertIn('metadata["LSArchitecturePriority"] = [os.environ["EXPECTED_ARCH"]]', workflow)
         self.assertIn('verify_plist_architecture "$verified_plist"', workflow)
         self.assertIn(
-            "Require explicit v30.1.6 signed-source publication acknowledgement",
+            "Require explicit v30.1.7 signed-source publication acknowledgement",
             workflow,
         )
         self.assertIn("--require-signatures", workflow)
@@ -3770,6 +3911,7 @@ class ReleaseToolTests(unittest.TestCase):
             "f2c046242c45c6c58ffd5702a3251ca5d5f9f06e",
             "5b06e327997424072d8ed97cf0a2c2ec58dacc72",
             "02672ab80857f063f1bf0dd00f2ceabee73c3f0d",
+            "38d57d41cc0c1fbdc623cf29a1d8df4fdc3e8746",
         )
         merge_metadata = (
             "Blackcoin-Dev\0"

@@ -982,10 +982,6 @@ public:
     {
         StopStake(wallet);
     }
-    uint64_t getStakeWeight(const wallet::CWallet& wallet) override
-    {
-        return GetStakeWeight(wallet);
-    }
     Span<const CRPCCommand> getStakingRPCCommands() override
     {
         return wallet::GetStakingRPCCommands();

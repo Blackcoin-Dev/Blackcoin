@@ -67,6 +67,9 @@ const std::string QUANTUM_COLDSTAKE{"quantumcoldstake"};
 const std::string QUANTUM_KEY_BACKUP_STATE{"quantumkeybackup"};
 const std::string QUANTUM_KEY{"quantumkey"};
 const std::string QUANTUM_REDELEGATION_AUTO_SCAN{"quantumredelegationautoscan"};
+const std::string QUANTUM_REDELEGATION_AUTO_SCAN_TIP{"quantumredelegationautoscantip"};
+const std::string QUANTUM_STAKE_RETURN{"quantumstakereturn"};
+const std::string QUANTUM_STAKE_RETURN_PENDING{"quantumreturnpending"};
 const std::string QUANTUM_REDELEGATION_LAST_ATTEMPT{"quantumredelegationlastattempt"};
 const std::string QUANTUM_REDELEGATION_LAST_SUCCESS{"quantumredelegationlastsuccess"};
 const std::string QUANTUM_REDELEGATION_LAST_WIN{"quantumredelegationlastwin"};
@@ -201,9 +204,29 @@ bool WalletBatch::WriteQuantumColdStakeDelegation(const std::vector<unsigned cha
     return WriteIC(std::make_pair(DBKeys::QUANTUM_COLDSTAKE, witness_program), record);
 }
 
+bool WalletBatch::WriteQuantumStakeReturn(const std::string& address)
+{
+    return WriteIC(DBKeys::QUANTUM_STAKE_RETURN, address);
+}
+
+bool WalletBatch::WriteQuantumStakeReturnPending(const QuantumStakeReturnPendingRecord& record)
+{
+    return WriteIC(DBKeys::QUANTUM_STAKE_RETURN_PENDING, record);
+}
+
+bool WalletBatch::EraseQuantumStakeReturnPending()
+{
+    return EraseIC(DBKeys::QUANTUM_STAKE_RETURN_PENDING);
+}
+
 bool WalletBatch::WriteQuantumRedelegationAutoScanHeight(int height)
 {
     return WriteIC(DBKeys::QUANTUM_REDELEGATION_AUTO_SCAN, height);
+}
+
+bool WalletBatch::WriteQuantumRedelegationAutoScanTip(int height, const uint256& tip)
+{
+    return WriteIC(DBKeys::QUANTUM_REDELEGATION_AUTO_SCAN_TIP, std::make_pair(height, tip));
 }
 
 bool WalletBatch::WriteQuantumRedelegationLastAttemptHeight(const std::vector<unsigned char>& witness_program, int height)
@@ -224,6 +247,16 @@ bool WalletBatch::WriteQuantumRedelegationLastWinHeight(const std::vector<unsign
 bool WalletBatch::EraseQuantumRedelegationLastWinHeight(const std::vector<unsigned char>& witness_program)
 {
     return EraseIC(std::make_pair(DBKeys::QUANTUM_REDELEGATION_LAST_WIN, witness_program));
+}
+
+bool WalletBatch::EraseQuantumRedelegationLastAttemptHeight(const std::vector<unsigned char>& witness_program)
+{
+    return EraseIC(std::make_pair(DBKeys::QUANTUM_REDELEGATION_LAST_ATTEMPT, witness_program));
+}
+
+bool WalletBatch::EraseQuantumRedelegationLastSuccessHeight(const std::vector<unsigned char>& witness_program)
+{
+    return EraseIC(std::make_pair(DBKeys::QUANTUM_REDELEGATION_LAST_SUCCESS, witness_program));
 }
 
 bool WalletBatch::WriteRGBContract(const uint256& contract_id, const RGBContractRecord& record)
@@ -1626,9 +1659,33 @@ static DBErrors LoadQuantumWalletRecords(CWallet* pwallet, DatabaseBatch& batch)
     });
     result = std::max(result, coldstake_res.m_result);
 
+    {
+        std::string stake_return;
+        if (batch.Read(DBKeys::QUANTUM_STAKE_RETURN, stake_return)) {
+            LOCK(pwallet->cs_wallet);
+            pwallet->m_quantum_stake_return = stake_return;
+        }
+        // A key made for the return address whose backup never completed. A record that names no key of this
+        // wallet is dropped with a warning: the wallet loads, and a new preparation starts from the key it has.
+        QuantumStakeReturnPendingRecord pending;
+        if (batch.Read(DBKeys::QUANTUM_STAKE_RETURN_PENDING, pending)) {
+            LOCK(pwallet->cs_wallet);
+            if (!pwallet->LoadQuantumStakeReturnPending(pending)) {
+                pwallet->WalletLogPrintf("Ignoring a pending quantum stake return record that names no key of this wallet.\n");
+            }
+        }
+    }
+
     int redelegation_scan_height{-1};
     if (batch.Read(DBKeys::QUANTUM_REDELEGATION_AUTO_SCAN, redelegation_scan_height)) {
         pwallet->m_redelegation_last_auto_scan_height = redelegation_scan_height;
+        // Trust the tip only when it was written for this very height; an
+        // older wallet that advanced the height alone leaves it unmatched.
+        std::pair<int, uint256> scan_tip;
+        if (batch.Read(DBKeys::QUANTUM_REDELEGATION_AUTO_SCAN_TIP, scan_tip) &&
+            scan_tip.first == redelegation_scan_height) {
+            pwallet->m_redelegation_last_auto_scan_tip = scan_tip.second;
+        }
     }
 
     LoadResult redelegation_attempt_res = LoadRecords(pwallet, batch, DBKeys::QUANTUM_REDELEGATION_LAST_ATTEMPT,

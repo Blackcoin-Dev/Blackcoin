@@ -3,6 +3,7 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <addresstype.h>
+#include <chainparams.h>
 #include <coins.h>
 #include <consensus/amount.h>
 #include <consensus/consensus.h>
@@ -18,10 +19,12 @@
 #include <serialize.h>
 #include <shadow.h>
 #include <streams.h>
+#include <sync.h>
 #include <test/util/setup_common.h>
 #include <uint256.h>
 #include <undo.h>
 #include <util/strencodings.h>
+#include <validation.h>
 
 #include <algorithm>
 #include <functional>
@@ -4294,6 +4297,78 @@ BOOST_AUTO_TEST_CASE(pow_shadow_target_relaxes_after_missed_claims_and_resets_on
         LookupAuthenticatedGoldRushPayoutMarker(
             *marker_cursor, COutPoint{uint256{123}, 9}, &claim_index,
             missing_info) == GoldRushPayoutMarkerLookupResult::MISSING);
+}
+
+// The two lifecycle gates that need an authenticated Gold Rush payout come from the producing
+// functions, and the mempool classifier reads both as a recent consensus change.
+BOOST_AUTO_TEST_CASE(gold_rush_payout_gate_reasons_come_from_the_producers)
+{
+    CCoinsView base;
+    CCoinsViewCache view{&base, true};
+
+    uint256 whitelist_hash;
+    CBlockIndex whitelist_index;
+    InitIndex(whitelist_index, SHADOW_WHITELIST_HEIGHT, nullptr, whitelist_hash);
+    ApplyLegacyWhitelistSnapshot(view, &whitelist_index);
+
+    uint256 first_hash;
+    CBlockIndex first_index;
+    InitIndex(first_index, SHADOW_REWARD_START_HEIGHT, &whitelist_index, first_hash);
+    CBlock first_block;
+    first_block.vtx.push_back(MakeCoinbaseTx(CScript{} << OP_TRUE));
+    BOOST_REQUIRE(ApplyShadowBlock(view, first_block, &first_index));
+
+    std::array<uint256, 70> empty_hashes;
+    std::array<CBlockIndex, 70> empty_indexes;
+    CBlockIndex* prev_index = &first_index;
+    for (size_t i = 0; i < empty_indexes.size(); ++i) {
+        InitIndex(empty_indexes[i], SHADOW_REWARD_START_HEIGHT + 1 + i, prev_index, empty_hashes[i]);
+        CBlock empty_block;
+        empty_block.vtx.push_back(MakeCoinbaseTx(CScript{} << OP_TRUE));
+        BOOST_REQUIRE(ApplyShadowBlock(view, empty_block, &empty_indexes[i]));
+        prev_index = &empty_indexes[i];
+    }
+    const CScript pow_target = CScript{} << OP_2;
+    const CScript quantum_payout = QuantumScript(0x48);
+    std::vector<unsigned char> pow_proof;
+    BOOST_REQUIRE(MineShadowProofData(pow_target, quantum_payout, prev_index, view, 20'000, pow_proof));
+    uint256 claim_hash;
+    CBlockIndex claim_index;
+    InitIndex(claim_index, prev_index->nHeight + 1, prev_index, claim_hash);
+    CBlock claim_block;
+    claim_block.vtx.push_back(MakeCoinbaseTx(CScript{} << OP_3));
+    claim_block.vtx.push_back(MakeCoinstakeTx(CScript{} << OP_4, {}, {CTxOut(580 * COIN, quantum_payout)}));
+    claim_block.vtx.push_back(MakePowClaimTx(pow_target, pow_proof));
+    CBlockUndo claim_undo = MakeUndoWithInputScripts(claim_block, {{1, CScript{} << OP_4}, {2, pow_target}});
+    BOOST_REQUIRE(ApplyShadowBlock(view, claim_block, &claim_index, &claim_undo));
+    const std::vector<ShadowSyntheticPayoutCoin> payouts = GetAppliedShadowClaimPayoutCoins(
+        view, claim_index.nHeight, claim_index.GetBlockHash(), claim_index.GetBlockTime());
+    BOOST_REQUIRE_EQUAL(payouts.size(), 1U);
+    const COutPoint payout = payouts[0].outpoint;
+    BOOST_REQUIRE(IsGoldRushSyntheticPayoutInput(view, payout, Params().GetConsensus(), nullptr));
+
+    CMutableTransaction spend;
+    spend.nVersion = 2;
+    spend.vin.emplace_back(payout);
+    spend.vout.emplace_back(0, CScript());
+    const CTransaction tx{spend};
+
+    // Quantum rules off: the authenticated payout may not be spent yet.
+    std::string reason;
+    BOOST_CHECK(!CheckQuantumQuasarTransaction(tx, view, /*flags=*/0, claim_index.nHeight + 1, Params().GetConsensus(),
+                                               claim_index.GetBlockTime(), reason));
+    BOOST_CHECK_EQUAL(reason, "goldrush-payout-spend-premature");
+    BOOST_CHECK_EQUAL(reason, std::string{quantum_reject::GOLDRUSH_PAYOUT_SPEND_PREMATURE});
+    BOOST_CHECK(IsQuantumLifecycleGateRejectReason(reason));
+
+    // The script-input producer refuses the same spend with its own gate text.
+    LOCK(cs_main);
+    TxValidationState state;
+    PrecomputedTransactionData txdata;
+    BOOST_CHECK(!CheckInputScripts(tx, state, view, /*flags=*/0, false, false, txdata));
+    BOOST_CHECK_EQUAL(state.GetRejectReason(), "blackcoin-migration-spend-premature");
+    BOOST_CHECK_EQUAL(state.GetRejectReason(), std::string{quantum_reject::MIGRATION_SPEND_PREMATURE});
+    BOOST_CHECK(IsQuantumLifecycleGateRejectReason(state.GetRejectReason()));
 }
 
 BOOST_AUTO_TEST_CASE(pow_shadow_ignores_claims_over_proof_evaluation_cap)
